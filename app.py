@@ -25,33 +25,39 @@ def chat():
 
     user_message = data.get(
         "message",
-        "Show me 3 bed condos in One Menerung for rent less than 10k a month"
+        "Show me 3 bed condos in One Menerung"
     )
 
     previous_response_id = data.get("previous_response_id")
 
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=user_message,
-        previous_response_id=previous_response_id if previous_response_id else None,
-        instructions="""
+    if (
+        previous_response_id is None
+        or previous_response_id == ""
+        or previous_response_id == "null"
+    ):
+        previous_response_id = None
+
+    response_args = {
+        "model": "gpt-5-mini",
+        "input": user_message,
+        "instructions": """
         You are Rentee AI, a Kuala Lumpur property assistant.
 
-        Always remember the conversation context.
+        Always remember the previous conversation.
 
         Never expose internal listing IDs.
 
-        When the user says things like:
+        When a user says things like:
         - yes
         - no
         - tell me more
         - which is cheapest
-        - expand the search
+        - show me similar properties
 
         interpret them in the context of the previous conversation.
         """,
-        tool_choice="auto",
-        tools=[
+        "tool_choice": "auto",
+        "tools": [
             {
                 "type": "function",
                 "name": "search_listings",
@@ -69,14 +75,19 @@ def chat():
                 }
             }
         ]
-    )
+    }
+
+    if previous_response_id:
+        response_args["previous_response_id"] = previous_response_id
+
+    response = client.responses.create(**response_args)
 
     tool_call = next(
         (item for item in response.output if item.type == "function_call"),
         None
     )
 
-    # No tool call required
+    # GPT answered without needing a tool
     if tool_call is None:
 
         return jsonify({
@@ -98,13 +109,15 @@ def chat():
     listings = search_data["response"]["listing"]
 
     condo_cache = {}
-
     ui_results = []
     gpt_results = []
 
     for listing in listings:
 
-        condo_id = listing["condo"]
+        condo_id = listing.get("condo")
+
+        if not condo_id:
+            continue
 
         if condo_id not in condo_cache:
 
@@ -114,14 +127,18 @@ def chat():
 
             condo_data = condo_response.json()
 
-            condo_name = condo_data["response"]["name"]
+            condo_name = (
+                condo_data
+                .get("response", {})
+                .get("name", "Unknown Condo")
+            )
 
             condo_cache[condo_id] = condo_name
 
         condo_name = condo_cache[condo_id]
 
         ui_results.append({
-            "listing_id": listing["_id"],
+            "listing_id": listing.get("_id"),
             "condo": condo_name,
             "beds": listing.get("beds"),
             "baths": listing.get("baths"),
