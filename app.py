@@ -10,7 +10,7 @@ client = OpenAI(
     api_key=os.environ["OPENAI_API_KEY"]
 )
 
-SEARCH_URL = "https://www.rentee.asia/version-test/api/1.1/wf/search_listings"
+SEARCH_URL = "https://www.rentee.asia/api/1.1/wf/search_listings"
 
 @app.route("/")
 def home():
@@ -122,7 +122,7 @@ def chat():
         if condo_id not in condo_cache:
 
             condo_response = requests.get(
-                f"https://www.rentee.asia/version-test/api/1.1/obj/condo/{condo_id}"
+                f"https://www.rentee.asia/api/1.1/obj/condo/{condo_id}"
             )
 
             condo_data = condo_response.json()
