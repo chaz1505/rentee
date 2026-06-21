@@ -28,9 +28,28 @@ def chat():
         "Show me 3 bed condos in One Menerung for rent less than 10k a month"
     )
 
+    previous_response_id = data.get("previous_response_id")
+
     response = client.responses.create(
         model="gpt-5-mini",
         input=user_message,
+        previous_response_id=previous_response_id if previous_response_id else None,
+        instructions="""
+        You are Rentee AI, a Kuala Lumpur property assistant.
+
+        Always remember the conversation context.
+
+        Never expose internal listing IDs.
+
+        When the user says things like:
+        - yes
+        - no
+        - tell me more
+        - which is cheapest
+        - expand the search
+
+        interpret them in the context of the previous conversation.
+        """,
         tool_choice="auto",
         tools=[
             {
@@ -57,9 +76,12 @@ def chat():
         None
     )
 
+    # No tool call required
     if tool_call is None:
+
         return jsonify({
             "message": response.output_text,
+            "response_id": response.id,
             "listings": []
         })
 
@@ -76,6 +98,7 @@ def chat():
     listings = search_data["response"]["listing"]
 
     condo_cache = {}
+
     ui_results = []
     gpt_results = []
 
@@ -129,9 +152,9 @@ def chat():
 
     return jsonify({
         "message": response2.output_text,
+        "response_id": response2.id,
         "listings": ui_results
     })
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
