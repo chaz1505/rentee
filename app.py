@@ -1,4 +1,6 @@
+
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from openai import OpenAI
 import os
 import requests
@@ -6,172 +8,89 @@ import json
 
 app = Flask(__name__)
 
-client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"]
-)
+CORS(app, resources={r"/*":{"origins":["https://www.rentee.asia","https://rentee.bubbleapps.io"]}})
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 SEARCH_URL = "https://www.rentee.asia/api/1.1/wf/search_listings"
+CONDO_URL = "https://www.rentee.asia/api/1.1/obj/condo"
 
 @app.route("/")
 def home():
-    return jsonify({
-        "status": "running"
-    })
+    return jsonify({"status":"running"})
 
-@app.route("/chat", methods=["POST"])
-def chat():
-
-    data = request.get_json() or {}
-
-    user_message = data.get(
-        "message",
-        "Show me 3 bed condos in One Menerung"
-    )
-
-    previous_response_id = data.get("previous_response_id")
-
-    if (
-        previous_response_id is None
-        or previous_response_id == ""
-        or previous_response_id == "null"
-    ):
-        previous_response_id = None
-
-    response_args = {
-        "model": "gpt-5-mini",
-        "input": user_message,
-        "instructions": """
-        You are Rentee AI, a Kuala Lumpur property assistant.
-
-        Always remember the previous conversation.
-
-        Never expose internal listing IDs.
-
-        When a user says things like:
-        - yes
-        - no
-        - tell me more
-        - which is cheapest
-        - show me similar properties
-
-        interpret them in the context of the previous conversation.
-        """,
-        "tool_choice": "auto",
-        "tools": [
-            {
-                "type": "function",
-                "name": "search_listings",
-                "description": "Search the Rentee property database.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "min_beds": {"type": "integer"},
-                        "priceRent": {"type": "number"},
-                        "priceSale": {"type": "number"},
-                        "condoName": {"type": "string"},
-                        "transactionType": {"type": "string"}
-                    },
-                    "additionalProperties": False
-                }
+def build_response_args(user_message, previous_response_id=None):
+    args={
+        "model":"gpt-5-mini",
+        "input":user_message,
+        "instructions":"You are Rentee AI, a Kuala Lumpur property assistant. Always remember the previous conversation. Never expose internal listing IDs.",
+        "tool_choice":"auto",
+        "tools":[{
+            "type":"function",
+            "name":"search_listings",
+            "description":"Search the Rentee property database.",
+            "parameters":{
+                "type":"object",
+                "properties":{
+                    "min_beds":{"type":"integer"},
+                    "priceRent":{"type":"number"},
+                    "priceSale":{"type":"number"},
+                    "condoName":{"type":"string"},
+                    "transactionType":{"type":"string"}
+                },
+                "additionalProperties":False
             }
-        ]
+        }]
     }
-
     if previous_response_id:
-        response_args["previous_response_id"] = previous_response_id
+        args["previous_response_id"]=previous_response_id
+    return args
 
-    response = client.responses.create(**response_args)
-
-    tool_call = next(
-        (item for item in response.output if item.type == "function_call"),
-        None
-    )
-
-    # GPT answered without needing a tool
-    if tool_call is None:
-
-        return jsonify({
-            "message": response.output_text,
-            "response_id": response.id,
-            "listings": []
-        })
-
-    args = json.loads(tool_call.arguments)
-
-    min_beds = args.get("min_beds", 0)
-
-    r = requests.get(
-        f"{SEARCH_URL}?min_beds={min_beds}"
-    )
-
-    search_data = r.json()
-
-    listings = search_data["response"]["listing"]
-
-    condo_cache = {}
-    ui_results = []
-    gpt_results = []
-
+def search_listings(tool_args):
+    r=requests.get(SEARCH_URL,params={"min_beds":tool_args.get("min_beds",0)},timeout=20)
+    r.raise_for_status()
+    listings=r.json()["response"]["listing"]
+    condo_cache={}
+    ui=[]
+    gpt=[]
     for listing in listings:
-
-        condo_id = listing.get("condo")
-
+        condo_id=listing.get("condo")
         if not condo_id:
             continue
-
         if condo_id not in condo_cache:
+            c=requests.get(f"{CONDO_URL}/{condo_id}",timeout=20)
+            c.raise_for_status()
+            condo_cache[condo_id]=c.json().get("response",{}).get("name","Unknown Condo")
+        name=condo_cache[condo_id]
+        ui.append({"listing_id":listing.get("_id"),"condo":name,"beds":listing.get("beds"),"baths":listing.get("baths"),"price_rent":listing.get("priceRent"),"price_sale":listing.get("priceSale"),"transactionType":listing.get("transactionType")})
+        gpt.append({"condo":name,"beds":listing.get("beds"),"baths":listing.get("baths"),"price_rent":listing.get("priceRent"),"price_sale":listing.get("priceSale")})
+    return ui,gpt
 
-            condo_response = requests.get(
-                f"https://www.rentee.asia/api/1.1/obj/condo/{condo_id}"
-            )
+@app.route("/chat",methods=["POST"])
+def chat():
+    try:
+        data=request.get_json(silent=True) or {}
+        previous=data.get("previous_response_id")
+        if previous in ("","null"):
+            previous=None
+        response=client.responses.create(**build_response_args(data.get("message","Show me 3 bed condos"),previous))
+        tool_call=next((x for x in response.output if x.type=="function_call"),None)
+        if tool_call is None:
+            return jsonify({"message":response.output_text,"response_id":response.id,"listings":[]})
+        tool_args=json.loads(tool_call.arguments)
+        ui,gpt=search_listings(tool_args)
+        final=client.responses.create(
+            model="gpt-5-mini",
+            previous_response_id=response.id,
+            input=[{
+                "type":"function_call_output",
+                "call_id":tool_call.call_id,
+                "output":json.dumps(gpt)
+            }]
+        )
+        return jsonify({"message":final.output_text,"response_id":final.id,"listings":ui})
+    except Exception as e:
+        return jsonify({"error":str(e)}),500
 
-            condo_data = condo_response.json()
-
-            condo_name = (
-                condo_data
-                .get("response", {})
-                .get("name", "Unknown Condo")
-            )
-
-            condo_cache[condo_id] = condo_name
-
-        condo_name = condo_cache[condo_id]
-
-        ui_results.append({
-            "listing_id": listing.get("_id"),
-            "condo": condo_name,
-            "beds": listing.get("beds"),
-            "baths": listing.get("baths"),
-            "price_rent": listing.get("priceRent"),
-            "price_sale": listing.get("priceSale"),
-            "transactionType": listing.get("transactionType")
-        })
-
-        gpt_results.append({
-            "condo": condo_name,
-            "beds": listing.get("beds"),
-            "baths": listing.get("baths"),
-            "price_rent": listing.get("priceRent"),
-            "price_sale": listing.get("priceSale")
-        })
-
-    response2 = client.responses.create(
-        model="gpt-5-mini",
-        previous_response_id=response.id,
-        input=[
-            {
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": json.dumps(gpt_results)
-            }
-        ]
-    )
-
-    return jsonify({
-        "message": response2.output_text,
-        "response_id": response2.id,
-        "listings": ui_results
-    })
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
