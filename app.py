@@ -4,6 +4,7 @@ from openai import OpenAI
 import os
 import requests
 import json
+import re
 
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
@@ -72,6 +73,15 @@ def build_response_args(user_message, previous_response_id=None):
 
     if previous_response_id:
         args["previous_response_id"] = previous_response_id
+
+    # Matching requests with a Bubble Lead ID should run the matching tool
+    # instead of allowing the model to ask for preferences it can fetch itself.
+    if re.search(r"\b\d{8,}x\d+\b", user_message) and re.search(
+        r"\b(match|matching|suitable|recommend|shortlist|listing)\b",
+        user_message,
+        re.IGNORECASE
+    ):
+        args["tool_choice"] = {"type": "function", "name": "match_lead"}
 
     return args
 
@@ -271,64 +281,40 @@ def chat_stream():
         if previous in ("", "null"):
             previous = None
 
-@stream_with_context
-def generate():
+        @stream_with_context
+        def generate():
+            # First response may request the Lead matching tool.
+            response = client.responses.create(
+                **build_response_args(data.get("message", ""), previous)
+            )
+            tool_call = next(
+                (x for x in response.output if x.type == "function_call"),
+                None
+            )
 
-    # First response (may request a tool)
-    response = client.responses.create(
-        **build_response_args(
-            data.get("message", ""),
-            previous
-        )
-    )
+            if tool_call is None:
+                final = response
+            else:
+                tool_args = json.loads(tool_call.arguments)
+                match_text = match_lead(tool_args)
+                final = client.responses.create(
+                    model="gpt-5-mini",
+                    previous_response_id=response.id,
+                    input=[{
+                        "type": "function_call_output",
+                        "call_id": tool_call.call_id,
+                        "output": match_text
+                    }]
+                )
 
-    # Did GPT request a tool?
-    tool_call = next(
-        (x for x in response.output if x.type == "function_call"),
-        None
-    )
+            for i in range(0, len(final.output_text), 25):
+                yield (
+                    f"data: {json.dumps({'delta': final.output_text[i:i + 25]})}\n\n"
+                )
 
-    if tool_call is None:
-        final = response
-    else:
-        tool_args = json.loads(tool_call.arguments)
-
-        print("Running match_lead:", tool_args)
-
-        match_text = match_lead(tool_args)
-
-        print("match_lead finished")
-
-        final = client.responses.create(
-            model="gpt-5-mini",
-            previous_response_id=response.id,
-            input=[{
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": match_text
-            }]
-        )
-
-    # Stream the final text back to Bubble
-    text = final.output_text
-
-    for i in range(0, len(text), 25):
-        chunk = text[i:i+25]
-
-        yield (
-            f"data: "
-            f"{json.dumps({'delta': chunk})}\n\n"
-        )
-
-    yield (
-        f"data: "
-        f"{json.dumps({'done': True, 'response_id': final.id})}\n\n"
-    )
-
-yield (
-    f"data: "
-    f"{json.dumps({'done': True, 'response_id': final.id})}\n\n"
-)
+            yield (
+                f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
+            )
 
         return Response(
             generate(),
