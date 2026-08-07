@@ -124,7 +124,9 @@ def match_lead(tool_args):
 
     lead = bubble(f"{LEAD_URL}/{tool_args['lead_id']}")
 
-    listings = get_all_listings()
+    listings = bubble(LISTING_URL)["results"]
+
+    print(len(listings))
 
     prompt = f"""
 
