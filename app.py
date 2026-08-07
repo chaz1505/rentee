@@ -41,7 +41,7 @@ def build_response_args(user_message, previous_response_id=None):
             "Never expose internal listing IDs."
         ),
         "tool_choice": "auto",
-        "tools": "tools": [
+        "tools": [
     {
         "type": "function",
         "name": "match_lead",
