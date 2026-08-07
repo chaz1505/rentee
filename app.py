@@ -204,71 +204,6 @@ Only recommend supplied properties.
 
     return response.output_text
 
-@app.route("/chat", methods=["POST"])
-def chat():
-
-    try:
-
-        data = request.get_json(silent=True) or {}
-
-        print("=" * 60)
-        print("CHAT_STREAM")
-        print("Message:", data.get("message"))
-
-        previous = data.get("previous_response_id")
-
-        if previous in ("", "null"):
-            previous = None
-
-        response = client.responses.create(
-            **build_response_args(
-                data.get("message", "Show me 3 bed condos"),
-                previous
-            )
-        )
-
-        tool_call = next(
-            (x for x in response.output if x.type == "function_call"),
-            None
-        )
-
-        if tool_call is None:
-
-            return jsonify({
-                "message": response.output_text,
-                "response_id": response.id,
-                "listings": []
-            })
-
-        tool_args = json.loads(tool_call.arguments)
-
-        match_text = match_lead(tool_args)
-
-        final = client.responses.create(
-            model="gpt-5-mini",
-            previous_response_id=response.id,
-            input=[{
-                "type": "function_call_output",
-                "call_id": tool_call.call_id,
-                "output": match_text
-            }]
-        )
-
-        return jsonify({
-            "message": final.output_text,
-            "response_id": final.id,
-            "listings": []
-        })
-
-    except Exception as e:
-
-        return jsonify({"error": str(e)}), 500
-
-
-########################################################################
-# STREAMING TEST ENDPOINT
-########################################################################
-
 @app.route("/chat_stream", methods=["POST"])
 def chat_stream():
 
@@ -283,7 +218,8 @@ def chat_stream():
 
         @stream_with_context
         def generate():
-            # First response may request the Lead matching tool.
+            # The initial turn carries the incoming response ID, preserving
+            # the user's existing conversation history.
             response = client.responses.create(
                 **build_response_args(data.get("message", ""), previous)
             )
@@ -293,15 +229,22 @@ def chat_stream():
             )
 
             if tool_call is None:
-                final = response
-            else:
-                tool_args = json.loads(tool_call.arguments)
-                print("Calling match_lead...")
-                match_text = match_lead(tool_args)
-                print("match_lead complete")
-                print("match_text length:", len(match_text))
-                print("Calling second OpenAI response...")
-                final = client.responses.create(                    
+                # This completed turn did not invoke a tool.
+                for i in range(0, len(response.output_text), 25):
+                    yield (
+                        f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
+                    )
+                yield (
+                    f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+                )
+                return
+
+            tool_args = json.loads(tool_call.arguments)
+            match_text = match_lead(tool_args)
+
+            # Continue the same response chain with the function result, then
+            # stream the final assistant answer back to Bubble.
+            with client.responses.stream(
                     model="gpt-5-mini",
                     previous_response_id=response.id,
                     input=[{
@@ -309,14 +252,12 @@ def chat_stream():
                         "call_id": tool_call.call_id,
                         "output": match_text
                     }]
-                )
+            ) as stream:
+                for event in stream:
+                    if event.type == "response.output_text.delta":
+                        yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
-                print("Second OpenAI response complete")
-
-            for i in range(0, len(final.output_text), 25):
-                yield (
-                    f"data: {json.dumps({'delta': final.output_text[i:i + 25]})}\n\n"
-                )
+                final = stream.get_final_response()
 
             yield (
                 f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
