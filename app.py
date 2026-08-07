@@ -27,10 +27,10 @@ CONDO_URL = "https://www.rentee.asia/api/1.1/obj/condo"
 # Bubble Data API endpoints. These are configurable in case the live and
 # development Bubble apps use different domains or API type slugs.
 LEAD_URL = os.environ.get(
-    "BUBBLE_LEAD_URL", "https://www.rentee.asia/version-test/api/1.1/obj/lead"
+    "BUBBLE_LEAD_URL", "https://www.rentee.asia/api/1.1/obj/lead"
 )
 LISTING_URL = os.environ.get(
-    "BUBBLE_LISTING_URL", "https://www.rentee.asia/version-test/api/1.1/obj/listing"
+    "BUBBLE_LISTING_URL", "https://www.rentee.asia/api/1.1/obj/listing"
 )
 SCORING_BATCH_SIZE = 40
 
