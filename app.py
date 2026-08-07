@@ -97,20 +97,38 @@ def bubble(url, **kwargs):
 
 def get_all_listings():
 
-    page = bubble(LISTING_URL)
+    listings = []
+    cursor = 0
+    seen_cursors = set()
 
-    print(page.keys())
+    while cursor not in seen_cursors:
+        seen_cursors.add(cursor)
+        page = bubble(LISTING_URL, params={"cursor": cursor})
+        results = page.get("results", [])
+        listings.extend(results)
+        remaining = page.get("remaining", 0) or 0
+        print(
+            f"Loaded {len(results)} listings; {remaining} remaining",
+            flush=True
+        )
 
-    return page["results"]
+        if not results or not remaining:
+            break
+
+        # Bubble's cursor is the current offset, so advance by this page size.
+        cursor += len(results)
+
+    return listings
 
 
 def match_lead(tool_args):
 
+    print(f"Loading Lead {tool_args['lead_id']}", flush=True)
     lead = bubble(f"{LEAD_URL}/{tool_args['lead_id']}")
 
-    listings = bubble(LISTING_URL)["results"]
+    listings = get_all_listings()
 
-    print(len(listings))
+    print(f"Scoring {len(listings)} listings", flush=True)
 
     prompt = f"""
 
@@ -188,6 +206,7 @@ Only recommend supplied properties.
 
     )
 
+    print("Matching model response received", flush=True)
     return response.output_text
 
 @app.route("/chat_stream", methods=["POST"])
@@ -196,6 +215,7 @@ def chat_stream():
     try:
 
         data = request.get_json(silent=True) or {}
+        print("Received /chat_stream request", flush=True)
 
         previous = data.get("previous_response_id")
 
@@ -204,50 +224,55 @@ def chat_stream():
 
         @stream_with_context
         def generate():
-            # The initial turn carries the incoming response ID, preserving
-            # the user's existing conversation history.
-            response = client.responses.create(
-                **build_response_args(data.get("message", ""), previous)
-            )
-            tool_call = next(
-                (x for x in response.output if x.type == "function_call"),
-                None
-            )
-
-            if tool_call is None:
-                # This completed turn did not invoke a tool.
-                for i in range(0, len(response.output_text), 25):
-                    yield (
-                        f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
-                    )
-                yield (
-                    f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+            try:
+                # The initial turn carries the incoming response ID, preserving
+                # the user's existing conversation history.
+                response = client.responses.create(
+                    **build_response_args(data.get("message", ""), previous)
                 )
-                return
+                tool_call = next(
+                    (x for x in response.output if x.type == "function_call"),
+                    None
+                )
 
-            tool_args = json.loads(tool_call.arguments)
-            match_text = match_lead(tool_args)
+                if tool_call is None:
+                    print("No tool call requested", flush=True)
+                    for i in range(0, len(response.output_text), 25):
+                        yield (
+                            f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
+                        )
+                    yield (
+                        f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+                    )
+                    return
 
-            # Continue the same response chain with the function result, then
-            # stream the final assistant answer back to Bubble.
-            with client.responses.stream(
-                    model="gpt-5-mini",
-                    previous_response_id=response.id,
-                    input=[{
-                        "type": "function_call_output",
-                        "call_id": tool_call.call_id,
-                        "output": match_text
-                    }]
-            ) as stream:
-                for event in stream:
-                    if event.type == "response.output_text.delta":
-                        yield f"data: {json.dumps({'delta': event.delta})}\n\n"
+                tool_args = json.loads(tool_call.arguments)
+                print(f"Running match_lead for {tool_args['lead_id']}", flush=True)
+                match_text = match_lead(tool_args)
 
-                final = stream.get_final_response()
+                # Continue the same response chain with the function result,
+                # then stream the final assistant answer back to Bubble.
+                with client.responses.stream(
+                        model="gpt-5-mini",
+                        previous_response_id=response.id,
+                        input=[{
+                            "type": "function_call_output",
+                            "call_id": tool_call.call_id,
+                            "output": match_text
+                        }]
+                ) as stream:
+                    for event in stream:
+                        if event.type == "response.output_text.delta":
+                            yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
-            yield (
-                f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
-            )
+                    final = stream.get_final_response()
+
+                yield (
+                    f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
+                )
+            except Exception as error:
+                print(f"/chat_stream failed: {error}", flush=True)
+                yield f"data: {json.dumps({'error': str(error), 'done': True})}\n\n"
 
         return Response(
             generate(),
