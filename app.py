@@ -223,7 +223,7 @@ def chat():
 
         tool_args = json.loads(tool_call.arguments)
 
-        ui, gpt = search_listings(tool_args)
+        match_text = match_lead(tool_args)
 
         final = client.responses.create(
             model="gpt-5-mini",
@@ -231,14 +231,14 @@ def chat():
             input=[{
                 "type": "function_call_output",
                 "call_id": tool_call.call_id,
-                "output": json.dumps(gpt)
+                "output": match_text
             }]
         )
 
         return jsonify({
             "message": final.output_text,
             "response_id": final.id,
-            "listings": ui
+            "listings": []
         })
 
     except Exception as e:
