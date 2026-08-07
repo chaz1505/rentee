@@ -71,69 +71,123 @@ def build_response_args(user_message, previous_response_id=None):
     return args
 
 
-def search_listings(tool_args):
+def bubble(url, **kwargs):
 
-    r = requests.get(
-        SEARCH_URL,
-        params={
-            "min_beds": tool_args.get("min_beds", 0)
-        },
-        timeout=20
-    )
+    r = requests.get(url, timeout=30, **kwargs)
 
     r.raise_for_status()
 
-    listings = r.json()["response"]["listing"]
+    return r.json()["response"]
 
-    condo_cache = {}
 
-    ui = []
-    gpt = []
+def get_all_listings():
+
+    listings = []
+
+    cursor = None
+
+    while True:
+
+        params = {}
+
+        if cursor:
+            params["cursor"] = cursor
+
+        page = bubble(LISTING_URL, params=params)
+
+        listings.extend(page.get("results", []))
+
+        if not page.get("remaining"):
+            break
+
+        cursor = page.get("cursor")
+
+    return listings
+
+
+def match_lead(tool_args):
+
+    lead = bubble(f"{LEAD_URL}/{tool_args['lead_id']}")
+
+    listings = get_all_listings()
+
+    prompt = f"""
+
+You are one of Kuala Lumpur's best real estate agents.
+
+Your job is to recommend the most suitable properties for the buyer.
+
+=========================
+
+BUYER
+
+=========================
+
+{lead["AIsearchtext"]}
+
+=========================
+
+AVAILABLE PROPERTIES
+
+=========================
+
+"""
 
     for listing in listings:
 
-        condo_id = listing.get("condo")
+        prompt += f"""
 
-        if not condo_id:
-            continue
+Listing ID: {listing["_id"]}
 
-        if condo_id not in condo_cache:
+Bedrooms: {listing.get("beds")}
 
-            c = requests.get(
-                f"{CONDO_URL}/{condo_id}",
-                timeout=20
-            )
+Bathrooms: {listing.get("baths")}
 
-            c.raise_for_status()
+Rent: {listing.get("priceRent")}
 
-            condo_cache[condo_id] = (
-                c.json()
-                .get("response", {})
-                .get("name", "Unknown Condo")
-            )
+Sale: {listing.get("priceSale")}
 
-        name = condo_cache[condo_id]
+{listing.get("AIsearchtext","")}
 
-        ui.append({
-            "listing_id": listing.get("_id"),
-            "condo": name,
-            "beds": listing.get("beds"),
-            "baths": listing.get("baths"),
-            "price_rent": listing.get("priceRent"),
-            "price_sale": listing.get("priceSale"),
-            "transactionType": listing.get("transactionType")
-        })
+----------------------------------------
 
-        gpt.append({
-            "condo": name,
-            "beds": listing.get("beds"),
-            "baths": listing.get("baths"),
-            "price_rent": listing.get("priceRent"),
-            "price_sale": listing.get("priceSale")
-        })
+"""
 
-    return ui, gpt
+    prompt += """
 
+Read EVERY listing.
+
+Choose the TEN best properties.
+
+Rank them from best to worst.
+
+For each property explain
+
+- Why it suits the buyer
+
+- Any compromises
+
+- Why you ranked it there
+
+Finally tell me which property you would show first.
+
+Write naturally as if speaking to another estate agent.
+
+Do not invent facts.
+
+Only recommend supplied properties.
+
+"""
+
+    response = client.responses.create(
+
+        model="gpt-5-mini",
+
+        input=prompt
+
+    )
+
+    return response.output_text
 
 @app.route("/chat", methods=["POST"])
 def chat():
