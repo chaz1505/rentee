@@ -41,38 +41,26 @@ def build_response_args(user_message, previous_response_id=None):
             "Never expose internal listing IDs."
         ),
         "tool_choice": "auto",
-        "tools": [
+        "tools": "tools": [
     {
         "type": "function",
         "name": "match_lead",
-        "description":
-            "description": """
-Use this tool whenever the user is asking you to recommend,
-match, shortlist, rank or identify suitable properties for a buyer.
-
-Examples:
-
-- Recommend properties for Lead 1775642052446x819076856508842000
-- Match this lead to listings
-- Which properties suit this buyer?
-- What should I show this client?
-- Find the best listings for Lead 12345
-- Shortlist properties for this lead
-- Which condos are the best fit?
-- Rank the available properties
-- Recommend homes for this buyer
-
-Do NOT answer from general knowledge.
-
-Always call this tool whenever property recommendations are required.
-""",
-
+        "description": (
+            "Use this tool whenever the user asks for suitable properties, "
+            "property recommendations, matching listings, ranking listings, "
+            "or identifying the best properties for a buyer lead. "
+            "Always use this tool when the user provides a Lead ID and wants "
+            "property recommendations."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "lead_id": {
                     "type": "string",
-                    "description": "Bubble Lead unique id"
+                    "description": (
+                        "The Bubble unique ID of the Lead. "
+                        "Example: 1775642052446x819076856508842000"
+                    )
                 }
             },
             "required": ["lead_id"],
