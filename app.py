@@ -46,9 +46,26 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "match_lead",
         "description":
-            "Use this whenever the user asks for suitable properties, "
-            "property recommendations, matching listings or the best "
-            "properties for a Lead.",
+            "description": """
+Use this tool whenever the user is asking you to recommend,
+match, shortlist, rank or identify suitable properties for a buyer.
+
+Examples:
+
+- Recommend properties for Lead 1775642052446x819076856508842000
+- Match this lead to listings
+- Which properties suit this buyer?
+- What should I show this client?
+- Find the best listings for Lead 12345
+- Shortlist properties for this lead
+- Which condos are the best fit?
+- Rank the available properties
+- Recommend homes for this buyer
+
+Do NOT answer from general knowledge.
+
+Always call this tool whenever property recommendations are required.
+""",
 
         "parameters": {
             "type": "object",
