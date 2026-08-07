@@ -22,8 +22,8 @@ CORS(
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-SEARCH_URL = "https://www.rentee.asia/api/1.1/wf/search_listings"
-CONDO_URL = "https://www.rentee.asia/api/1.1/obj/condo"
+LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
+LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
 
 
 @app.route("/")
@@ -41,22 +41,28 @@ def build_response_args(user_message, previous_response_id=None):
             "Never expose internal listing IDs."
         ),
         "tool_choice": "auto",
-        "tools": [{
-            "type": "function",
-            "name": "search_listings",
-            "description": "Search the Rentee property database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "min_beds": {"type": "integer"},
-                    "priceRent": {"type": "number"},
-                    "priceSale": {"type": "number"},
-                    "condoName": {"type": "string"},
-                    "transactionType": {"type": "string"}
-                },
-                "additionalProperties": False
-            }
-        }]
+        "tools": [
+    {
+        "type": "function",
+        "name": "match_lead",
+        "description":
+            "Use this whenever the user asks for suitable properties, "
+            "property recommendations, matching listings or the best "
+            "properties for a Lead.",
+
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "lead_id": {
+                    "type": "string",
+                    "description": "Bubble Lead unique id"
+                }
+            },
+            "required": ["lead_id"],
+            "additionalProperties": False
+        }
+    }
+]
     }
 
     if previous_response_id:
