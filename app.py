@@ -215,12 +215,34 @@ def chat_stream():
     try:
 
         data = request.get_json(silent=True) or {}
-        print("Received /chat_stream request", flush=True)
+        message = next(
+            (
+                data.get(field)
+                for field in ("message", "prompt", "user_message", "text")
+                if isinstance(data.get(field), str) and data.get(field).strip()
+            ),
+            ""
+        )
 
         previous = data.get("previous_response_id")
 
         if previous in ("", "null"):
             previous = None
+
+        print(
+            "Received /chat_stream request "
+            f"keys={list(data.keys())} message={message[:160]!r} "
+            f"has_previous={bool(previous)}",
+            flush=True
+        )
+
+        if not message:
+            return jsonify({
+                "error": (
+                    "Missing chat message. Send it as 'message' (or prompt, "
+                    "user_message, or text)."
+                )
+            }), 400
 
         @stream_with_context
         def generate():
@@ -228,7 +250,7 @@ def chat_stream():
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 response = client.responses.create(
-                    **build_response_args(data.get("message", ""), previous)
+                    **build_response_args(message, previous)
                 )
                 tool_call = next(
                     (x for x in response.output if x.type == "function_call"),
