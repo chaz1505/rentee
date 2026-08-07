@@ -4,6 +4,7 @@ from openai import OpenAI
 import os
 import requests
 import json
+import re
 
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
@@ -93,6 +94,18 @@ def build_response_args(user_message, previous_response_id=None):
 
     if previous_response_id:
         args["previous_response_id"] = previous_response_id
+
+    # Tool selection is otherwise optional for the model. A Bubble unique ID
+    # together with a matching request is enough to run the scorer directly.
+    if re.search(r"\b\d{8,}x\d+\b", user_message, re.IGNORECASE) and re.search(
+        r"\b(match|matching|suitable|recommend|shortlist|listing)\b",
+        user_message,
+        re.IGNORECASE
+    ):
+        args["tool_choice"] = {
+            "type": "function",
+            "name": "score_lead_listings"
+        }
 
     return args
 
