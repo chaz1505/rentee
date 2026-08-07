@@ -97,27 +97,11 @@ def bubble(url, **kwargs):
 
 def get_all_listings():
 
-    listings = []
+    page = bubble(LISTING_URL)
 
-    cursor = None
+    print(page.keys())
 
-    while True:
-
-        params = {}
-
-        if cursor:
-            params["cursor"] = cursor
-
-        page = bubble(LISTING_URL, params=params)
-
-        listings.extend(page.get("results", []))
-
-        if not page.get("remaining"):
-            break
-
-        cursor = page.get("cursor")
-
-    return listings
+    return page["results"]
 
 
 def match_lead(tool_args):
