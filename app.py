@@ -296,8 +296,13 @@ def chat_stream():
                 final = response
             else:
                 tool_args = json.loads(tool_call.arguments)
+                print("Calling match_lead...")
                 match_text = match_lead(tool_args)
+                print("match_lead complete")
+                print("match_text length:", len(match_text))
+                print("Calling second OpenAI response...")
                 final = client.responses.create(
+                    print("Second OpenAI response complete")
                     model="gpt-5-mini",
                     previous_response_id=response.id,
                     input=[{
