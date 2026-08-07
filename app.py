@@ -5,6 +5,7 @@ import os
 import requests
 import json
 
+# Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
 
 CORS(
