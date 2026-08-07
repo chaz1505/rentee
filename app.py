@@ -301,8 +301,7 @@ def chat_stream():
                 print("match_lead complete")
                 print("match_text length:", len(match_text))
                 print("Calling second OpenAI response...")
-                final = client.responses.create(
-                    print("Second OpenAI response complete")
+                final = client.responses.create(                    
                     model="gpt-5-mini",
                     previous_response_id=response.id,
                     input=[{
@@ -311,6 +310,8 @@ def chat_stream():
                         "output": match_text
                     }]
                 )
+
+                print("Second OpenAI response complete")
 
             for i in range(0, len(final.output_text), 25):
                 yield (
