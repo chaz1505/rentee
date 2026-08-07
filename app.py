@@ -25,6 +25,8 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
 LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
+# Temporary small batch for validating the end-to-end matching flow.
+MATCH_LISTING_LIMIT = 3
 
 
 @app.route("/")
@@ -126,9 +128,12 @@ def match_lead(tool_args):
     print(f"Loading Lead {tool_args['lead_id']}", flush=True)
     lead = bubble(f"{LEAD_URL}/{tool_args['lead_id']}")
 
-    listings = get_all_listings()
+    listings = get_all_listings()[:MATCH_LISTING_LIMIT]
 
-    print(f"Scoring {len(listings)} listings", flush=True)
+    print(
+        f"Scoring {len(listings)} listings (test limit: {MATCH_LISTING_LIMIT})",
+        flush=True
+    )
 
     prompt = f"""
 
