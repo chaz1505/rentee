@@ -201,6 +201,10 @@ def chat():
 
         data = request.get_json(silent=True) or {}
 
+        print("=" * 60)
+        print("CHAT_STREAM")
+        print("Message:", data.get("message"))
+
         previous = data.get("previous_response_id")
 
         if previous in ("", "null"):
@@ -270,31 +274,56 @@ def chat_stream():
         @stream_with_context
         def generate():
 
-            with client.responses.stream(
-                model="gpt-5-mini",
-                input=data.get("message", ""),
-                previous_response_id=previous,
-                instructions=(
-                    "You are Rentee AI, a Kuala Lumpur property assistant. "
-                    "Always remember the previous conversation."
-                )
-            ) as stream:
+            # First response (may request a tool)
+response = client.responses.create(
+    **build_response_args(
+        data.get("message", ""),
+        previous
+    )
+)
 
-                for event in stream:
+# Did GPT request a tool?
+tool_call = next(
+    (x for x in response.output if x.type == "function_call"),
+    None
+)
 
-                    if event.type == "response.output_text.delta":
+if tool_call is None:
+    final = response
+else:
+    tool_args = json.loads(tool_call.arguments)
 
-                        yield (
-                            f"data: "
-                            f"{json.dumps({'delta': event.delta})}\n\n"
-                        )
+    print("Running match_lead:", tool_args)
 
-                final = stream.get_final_response()
+    match_text = match_lead(tool_args)
 
-                yield (
-                    f"data: "
-                    f"{json.dumps({'done': True, 'response_id': final.id})}\n\n"
-                )
+    print("match_lead finished")
+
+    final = client.responses.create(
+        model="gpt-5-mini",
+        previous_response_id=response.id,
+        input=[{
+            "type": "function_call_output",
+            "call_id": tool_call.call_id,
+            "output": match_text
+        }]
+    )
+
+# Stream the final text back to Bubble
+text = final.output_text
+
+for i in range(0, len(text), 25):
+    chunk = text[i:i+25]
+
+    yield (
+        f"data: "
+        f"{json.dumps({'delta': chunk})}\n\n"
+    )
+
+yield (
+    f"data: "
+    f"{json.dumps({'done': True, 'response_id': final.id})}\n\n"
+)
 
         return Response(
             generate(),
