@@ -26,6 +26,7 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
 LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
 FOLIO_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folio"
+FOLIO_ITEM_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folioItem"
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 200
 
@@ -144,6 +145,49 @@ def get_all_listings():
     return listings
 
 
+def create_folio_items(listing_ids):
+
+    folio_item_ids = []
+
+    for listing_id in listing_ids:
+        try:
+            response = requests.post(
+                FOLIO_ITEM_URL,
+                headers={
+                    "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={"listing": listing_id},
+                timeout=30
+            )
+            response.raise_for_status()
+            folio_item_id = response.json().get("response", {}).get("_id")
+
+            if not folio_item_id:
+                raise ValueError("Bubble did not return a Folio Item ID.")
+
+            folio_item_ids.append(folio_item_id)
+        except Exception as error:
+            print(f"Failed to create Folio Item: {error}", flush=True)
+            return None
+
+    return folio_item_ids
+
+
+def update_folio_items(folio_id, folio_item_ids):
+
+    response = requests.patch(
+        f"{FOLIO_URL}/{folio_id}",
+        headers={
+            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"folioItems": folio_item_ids},
+        timeout=30
+    )
+    response.raise_for_status()
+
+
 def match_lead(folio_id):
 
     folio = bubble(f"{FOLIO_URL}/{folio_id}")
@@ -188,6 +232,8 @@ AVAILABLE PROPERTIES
 
         prompt += f"""
 
+INTERNAL LISTING ID: {listing.get("_id")}
+
 Bedrooms: {listing.get("beds")}
 
 Bathrooms: {listing.get("baths")}
@@ -224,18 +270,73 @@ the matching process, internal scoring, or estate-agent workflows.
 Do not invent facts. Only use information in the home seeker requirements and
 supplied property information.
 
+Return valid JSON with exactly these fields:
+- recommended_listing_ids: an array containing only INTERNAL LISTING IDs from
+  the supplied properties, in the same order as your ranking. Include only
+  properties you genuinely recommend; never invent an ID or add properties to
+  fill a list.
+- customer_response: concise, natural, customer-facing recommendation prose.
+  Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
+  matching process.
+
 """
 
     response = client.responses.create(
 
         model="gpt-5-mini",
 
-        input=prompt
+        input=prompt,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "listing_recommendations",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "recommended_listing_ids": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "customer_response": {"type": "string"}
+                    },
+                    "required": ["recommended_listing_ids", "customer_response"],
+                    "additionalProperties": False
+                }
+            }
+        }
 
     )
 
     print("Matching model response received", flush=True)
-    return response.output_text
+    try:
+        result = json.loads(response.output_text)
+    except json.JSONDecodeError as error:
+        print(f"Failed to parse matching JSON: {error}", flush=True)
+        return "I’m sorry, I couldn’t prepare your recommendations just now."
+
+    available_listing_ids = {
+        listing["_id"]
+        for listing in listings
+        if listing.get("_id")
+    }
+    recommended_listing_ids = []
+
+    for listing_id in result["recommended_listing_ids"]:
+        if listing_id not in available_listing_ids:
+            print("Ignoring invalid recommended listing ID", flush=True)
+        elif listing_id not in recommended_listing_ids:
+            recommended_listing_ids.append(listing_id)
+
+    folio_item_ids = create_folio_items(recommended_listing_ids)
+
+    if folio_item_ids is not None:
+        try:
+            update_folio_items(folio_id, folio_item_ids)
+        except Exception as error:
+            print(f"Failed to update Folio Items: {error}", flush=True)
+
+    return result["customer_response"]
 
 
 def update_lead_ai_searchtext(lead_id, updated_text):
