@@ -51,6 +51,18 @@ def build_response_args(user_message, previous_response_id=None):
             "When the user asks about properties, recommendations, or suitable listings "
             "based on their current requirements, use the property matching tool to identify "
             "the best available options. "
+            "Use web search when answering questions that depend on current, changing, "
+            "external, or internet-based information, or when you are materially uncertain "
+            "about an external factual claim that can be verified online. Prefer searching "
+            "rather than guessing for neighbourhood developments, infrastructure, transport, "
+            "schools, amenities, regulations, taxes, market information, and developer or "
+            "project news. Do not use web search as a source of current Rentee listing "
+            "availability: current available properties and recommendations must come from "
+            "match_lead. Facts about a currently available unit, including price, bedrooms, "
+            "bathrooms, size, furnishing, parking, facilities, availability, photos, and "
+            "floorplans, must come only from current Rentee listing data. Web search may be "
+            "used for external context about a building, neighbourhood, or surrounding area, "
+            "but must not overwrite or contradict authoritative listing data. "
             "Whenever the user asks about currently available properties, suitable listings, "
             "options, recommendations, or what is available for them, you MUST call the "
             "match_lead tool. Never answer current property availability or recommendations "
@@ -154,6 +166,9 @@ def build_response_args(user_message, previous_response_id=None):
             "required": ["preference_update"],
             "additionalProperties": False
         }
+    },
+    {
+        "type": "web_search"
     }
 ]
     }
@@ -162,6 +177,30 @@ def build_response_args(user_message, previous_response_id=None):
         args["previous_response_id"] = previous_response_id
 
     return args
+
+
+def get_web_citations(response):
+
+    citations = []
+    seen_urls = set()
+
+    for output_item in response.output:
+        for content in getattr(output_item, "content", []) or []:
+            for annotation in getattr(content, "annotations", []) or []:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+
+                citation = getattr(annotation, "url_citation", None)
+                url = getattr(citation, "url", None)
+
+                if url and url not in seen_urls:
+                    citations.append({
+                        "title": getattr(citation, "title", "Source"),
+                        "url": url
+                    })
+                    seen_urls.add(url)
+
+    return citations
 
 
 def bubble(url, **kwargs):
@@ -567,6 +606,11 @@ def chat_stream():
                     response = client.responses.create(
                         **build_response_args(message, None)
                     )
+                if any(
+                    output_item.type == "web_search_call"
+                    for output_item in response.output
+                ):
+                    print("Web search used", flush=True)
                 tool_call = next(
                     (x for x in response.output if x.type == "function_call"),
                     None
@@ -578,6 +622,10 @@ def chat_stream():
                         yield (
                             f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
                         )
+                    citations = get_web_citations(response)
+
+                    if citations:
+                        yield f"data: {json.dumps({'citations': citations})}\n\n"
                     yield (
                         f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
                     )
@@ -677,6 +725,11 @@ def chat_stream():
                     final = stream.get_final_response()
 
                 print("Tool lifecycle completed", flush=True)
+
+                citations = get_web_citations(final)
+
+                if citations:
+                    yield f"data: {json.dumps({'citations': citations})}\n\n"
 
                 yield (
                     f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
