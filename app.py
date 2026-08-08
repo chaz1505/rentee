@@ -273,24 +273,24 @@ def get_property_details(folio_id, property_reference, bubble_env):
 
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
-    listings = get_all_listings(base_url)
-    listings_by_id = {
-        listing["_id"]
-        : listing
-        for listing in listings
-        if listing.get("_id")
-    }
-    recommended_listing_ids = []
+    recommended_listings = []
 
     for folio_item_id in folio.get("folioItems", []) or []:
         try:
             folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
             listing_id = folio_item.get("listing")
+            listing = bubble(f"{base_url}/obj/listing/{listing_id}")
 
-            if listing_id in listings_by_id and listing_id not in recommended_listing_ids:
-                recommended_listing_ids.append(listing_id)
+            if listing.get("_id") and not any(
+                item.get("_id") == listing["_id"]
+                for item in recommended_listings
+            ):
+                recommended_listings.append(listing)
         except Exception as error:
             print(f"Failed to load Folio Item details: {error}", flush=True)
+
+    if not recommended_listings:
+        return "I couldn't find any current recommendations to check."
 
     reference = property_reference.lower().strip()
     selected_listing = None
@@ -300,27 +300,76 @@ def get_property_details(folio_id, property_reference, bubble_env):
         "second": 1,
         "2nd": 1,
         "third": 2,
-        "3rd": 2
+        "3rd": 2,
+        "number 1": 0,
+        "number 2": 1,
+        "number 3": 2
     }
 
     for ordinal, position in ordinal_positions.items():
-        if ordinal in reference and position < len(recommended_listing_ids):
-            selected_listing = listings_by_id[recommended_listing_ids[position]]
+        if ordinal in reference and position < len(recommended_listings):
+            selected_listing = recommended_listings[position]
             break
+
+    if selected_listing is None and "last" in reference:
+        selected_listing = recommended_listings[-1]
 
     if selected_listing is None:
         matching_listings = [
             listing
-            for listing in listings
+            for listing in recommended_listings
             if reference and reference in json.dumps(listing, ensure_ascii=False).lower()
         ]
 
         if len(matching_listings) == 1:
             selected_listing = matching_listings[0]
-        elif len(recommended_listing_ids) == 1 and reference in {
+        elif len(recommended_listings) == 1 and reference in {
             "it", "that one", "that unit", "the property you just showed me"
         }:
-            selected_listing = listings_by_id[recommended_listing_ids[0]]
+            selected_listing = recommended_listings[0]
+
+    if selected_listing is None:
+        candidates = [
+            {"listing_id": listing["_id"], "listing": listing}
+            for listing in recommended_listings
+        ]
+        resolver_response = client.responses.create(
+            model="gpt-5-mini",
+            input=(
+                "Resolve the customer's property reference against only the supplied current "
+                "recommended listings. Select one listing only if the reference can be matched "
+                "with confidence; otherwise return matched false.\n\n"
+                f"PROPERTY REFERENCE: {property_reference}\n\n"
+                f"CURRENT RECOMMENDED LISTINGS: {json.dumps(candidates, ensure_ascii=False)}"
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "property_reference_resolution",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "listing_id": {"type": "string"},
+                            "matched": {"type": "boolean"}
+                        },
+                        "required": ["listing_id", "matched"],
+                        "additionalProperties": False
+                    }
+                }
+            }
+        )
+        resolution = json.loads(resolver_response.output_text)
+
+        if resolution["matched"]:
+            selected_listing = next(
+                (
+                    listing
+                    for listing in recommended_listings
+                    if listing["_id"] == resolution["listing_id"]
+                ),
+                None
+            )
 
     if selected_listing is None:
         return (
