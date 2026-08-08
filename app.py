@@ -73,11 +73,11 @@ def build_response_args(user_message, previous_response_id=None):
             "bedrooms, bathrooms, size, furnishing, facilities, availability, parking, "
             "addresses, commute times, photos, or floorplans, may only be stated when they "
             "come from the CURRENT successful match_lead tool result. "
-            "After update_preferences succeeds, only acknowledge the preference update; do "
-            "not recap, volunteer, or recommend properties from conversation history unless "
-            "the user explicitly asks to see properties. Never claim a property is currently "
-            "available because it was mentioned earlier. Conversation history is for normal "
-            "continuity, not a database of property facts. Do not offer actions the system "
+            "After update_preferences succeeds, the application refreshes recommendations; "
+            "only describe fresh properties from that current tool result, never from "
+            "conversation history. Never claim a property is currently available because it "
+            "was mentioned earlier. Conversation history is for normal continuity, not a "
+            "database of property facts. Do not offer actions the system "
             "cannot actually perform, such as arranging viewings, sending photos, fetching "
             "floorplans, or checking exact commute times. "
             "Explain recommendations in clear, customer-friendly language. "
@@ -549,15 +549,30 @@ def chat_stream():
                         "or invent property information."
                     )
                 elif tool_call.name == "update_preferences":
-                    tool_result = update_preferences(
+                    preference_confirmation = update_preferences(
                         folio_id,
                         tool_args["preference_update"],
                         bubble_env
                     )
-                    follow_up_instructions = (
-                        "Return a short, natural confirmation of the completed preference "
-                        "update only. Do not mention or recommend properties."
-                    )
+                    try:
+                        recommendations = match_lead(folio_id, bubble_env)
+                        tool_result = (
+                            "Absolutely — I've updated your preferences. Based on that, "
+                            "here's what I'd recommend now:\n\n"
+                            f"{recommendations}"
+                        )
+                        follow_up_instructions = (
+                            "The tool output already contains the final customer-facing "
+                            "recommendations. Return it faithfully without adding, removing, "
+                            "or inventing property information."
+                        )
+                    except Exception as error:
+                        print(f"Matching after preference update failed: {error}", flush=True)
+                        tool_result = preference_confirmation
+                        follow_up_instructions = (
+                            "Return the completed preference-update confirmation naturally. "
+                            "Do not mention properties or internal errors."
+                        )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
