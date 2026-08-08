@@ -542,21 +542,21 @@ def chat_stream():
                 tool_args = json.loads(tool_call.arguments)
 
                 if tool_call.name == "match_lead":
-                    customer_response = match_lead(folio_id, bubble_env)
-
-                    for i in range(0, len(customer_response), 25):
-                        yield (
-                            f"data: {json.dumps({'delta': customer_response[i:i + 25]})}\n\n"
-                        )
-                    yield (
-                        f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+                    tool_result = match_lead(folio_id, bubble_env)
+                    follow_up_instructions = (
+                        "The tool output already contains the final customer-facing answer. "
+                        "Return it faithfully. Do not add, remove, reinterpret, embellish, "
+                        "or invent property information."
                     )
-                    return
                 elif tool_call.name == "update_preferences":
                     tool_result = update_preferences(
                         folio_id,
                         tool_args["preference_update"],
                         bubble_env
+                    )
+                    follow_up_instructions = (
+                        "Return a short, natural confirmation of the completed preference "
+                        "update only. Do not mention or recommend properties."
                     )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
@@ -566,6 +566,7 @@ def chat_stream():
                 with client.responses.stream(
                         model="gpt-5-mini",
                         previous_response_id=response.id,
+                        instructions=follow_up_instructions,
                         input=[{
                             "type": "function_call_output",
                             "call_id": tool_call.call_id,
