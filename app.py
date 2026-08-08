@@ -161,7 +161,8 @@ def create_folio_items(listing_ids):
                 timeout=30
             )
             response.raise_for_status()
-            folio_item_id = response.json().get("response", {}).get("_id")
+            data = response.json()
+            folio_item_id = data.get("id")
 
             if not folio_item_id:
                 raise ValueError("Bubble did not return a Folio Item ID.")
