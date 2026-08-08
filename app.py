@@ -245,12 +245,14 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
 
 def match_lead(folio_id, bubble_env):
 
+    yield "Checking your preferences..."
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
 
+    yield "Searching available properties..."
     listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
 
     print(
@@ -342,6 +344,7 @@ is not in the supplied property information, do not mention it.
 
 """
 
+    yield "Ranking the best matches..."
     response = client.responses.create(
 
         model="gpt-5-mini",
@@ -389,6 +392,7 @@ is not in the supplied property information, do not mention it.
         elif listing_id not in recommended_listing_ids:
             recommended_listing_ids.append(listing_id)
 
+    yield "Updating your shortlist..."
     folio_item_ids = create_folio_items(recommended_listing_ids, base_url)
 
     if folio_item_ids is not None:
@@ -398,6 +402,19 @@ is not in the supplied property information, do not mention it.
             print(f"Failed to update Folio Items: {error}", flush=True)
 
     return result["customer_response"]
+
+
+def stream_match_lead(folio_id, bubble_env):
+
+    match_flow = match_lead(folio_id, bubble_env)
+
+    while True:
+        try:
+            status = next(match_flow)
+        except StopIteration as completed:
+            return completed.value
+
+        yield f"data: {json.dumps({'status': status})}\n\n"
 
 
 def update_lead_ai_searchtext(lead_id, updated_text, base_url):
@@ -558,13 +575,17 @@ def chat_stream():
                 tool_args = json.loads(tool_call.arguments)
 
                 if tool_call.name == "match_lead":
-                    tool_result = match_lead(folio_id, bubble_env)
+                    tool_result = yield from stream_match_lead(folio_id, bubble_env)
+                    has_match_results = True
                     follow_up_instructions = (
                         "The tool output already contains the final customer-facing answer. "
                         "Return it faithfully. Do not add, remove, reinterpret, embellish, "
                         "or invent property information."
                     )
                 elif tool_call.name == "update_preferences":
+                    yield (
+                        f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
+                    )
                     preference_confirmation = update_preferences(
                         folio_id,
                         tool_args["preference_update"],
@@ -575,8 +596,15 @@ def chat_stream():
                             "Preference update complete; running automatic rematch",
                             flush=True
                         )
-                        recommendations = match_lead(folio_id, bubble_env)
+                        yield (
+                            f"data: {json.dumps({'status': 'Preferences updated — refreshing your recommendations...'})}\n\n"
+                        )
+                        recommendations = yield from stream_match_lead(
+                            folio_id,
+                            bubble_env
+                        )
                         print("Automatic rematch complete", flush=True)
+                        has_match_results = True
                         tool_result = (
                             "Absolutely — I've updated your preferences. Based on that, "
                             "here's what I'd recommend now:\n\n"
@@ -589,6 +617,7 @@ def chat_stream():
                         )
                     except Exception as error:
                         print(f"Matching after preference update failed: {error}", flush=True)
+                        has_match_results = False
                         tool_result = preference_confirmation
                         follow_up_instructions = (
                             "Return the completed preference-update confirmation naturally. "
@@ -596,6 +625,11 @@ def chat_stream():
                         )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
+
+                if has_match_results:
+                    yield (
+                        f"data: {json.dumps({'status': 'Found some options — putting them together...'})}\n\n"
+                    )
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
