@@ -202,7 +202,7 @@ supplied property information.
 
     response = client.responses.create(
 
-        model="gpt-5-nano",
+        model="gpt-5-mini",
 
         input=prompt
 
