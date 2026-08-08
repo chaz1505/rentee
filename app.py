@@ -589,6 +589,7 @@ def chat_stream():
         @stream_with_context
         def generate():
             try:
+                web_search_status_sent = False
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 try:
@@ -611,6 +612,10 @@ def chat_stream():
                     for output_item in response.output
                 ):
                     print("Web search used", flush=True)
+                    yield (
+                        f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
+                    )
+                    web_search_status_sent = True
                 tool_call = next(
                     (x for x in response.output if x.type == "function_call"),
                     None
@@ -719,6 +724,15 @@ def chat_stream():
                         }]
                 ) as stream:
                     for event in stream:
+                        if (
+                            event.type.startswith("response.web_search_call.")
+                            and not web_search_status_sent
+                        ):
+                            print("Web search used", flush=True)
+                            yield (
+                                f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
+                            )
+                            web_search_status_sent = True
                         if event.type == "response.output_text.delta":
                             yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
