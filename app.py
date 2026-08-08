@@ -26,7 +26,7 @@ LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
 LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
 FOLIO_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folio"
 # Temporary small batch for validating the end-to-end matching flow.
-MATCH_LISTING_LIMIT = 10
+MATCH_LISTING_LIMIT = 200
 
 
 @app.route("/")
