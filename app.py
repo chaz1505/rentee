@@ -4,7 +4,6 @@ from openai import OpenAI
 import os
 import requests
 import json
-import re
 
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
@@ -25,6 +24,7 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
 LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
+FOLIO_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folio"
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 3
 
@@ -51,22 +51,12 @@ def build_response_args(user_message, previous_response_id=None):
         "description": (
             "Use this tool whenever the user asks for suitable properties, "
             "property recommendations, matching listings, ranking listings, "
-            "or identifying the best properties for a buyer lead. "
-            "Always use this tool when the user provides a Lead ID and wants "
-            "property recommendations."
+            "or identifying the best properties for the current buyer."
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "lead_id": {
-                    "type": "string",
-                    "description": (
-                        "The Bubble unique ID of the Lead. "
-                        "Example: 1775642052446x819076856508842000"
-                    )
-                }
-            },
-            "required": ["lead_id"],
+            "properties": {},
+            "required": [],
             "additionalProperties": False
         }
     }
@@ -75,15 +65,6 @@ def build_response_args(user_message, previous_response_id=None):
 
     if previous_response_id:
         args["previous_response_id"] = previous_response_id
-
-    # Matching requests with a Bubble Lead ID should run the matching tool
-    # instead of allowing the model to ask for preferences it can fetch itself.
-    if re.search(r"\b\d{8,}x\d+\b", user_message) and re.search(
-        r"\b(match|matching|suitable|recommend|shortlist|listing)\b",
-        user_message,
-        re.IGNORECASE
-    ):
-        args["tool_choice"] = {"type": "function", "name": "match_lead"}
 
     return args
 
@@ -123,10 +104,12 @@ def get_all_listings():
     return listings
 
 
-def match_lead(tool_args):
+def match_lead(folio_id):
 
-    print(f"Loading Lead {tool_args['lead_id']}", flush=True)
-    lead = bubble(f"{LEAD_URL}/{tool_args['lead_id']}")
+    folio = bubble(f"{FOLIO_URL}/{folio_id}")
+    lead_id = folio["lead"]
+    print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
+    lead = bubble(f"{LEAD_URL}/{lead_id}")
 
     listings = get_all_listings()[:MATCH_LISTING_LIMIT]
 
@@ -220,6 +203,8 @@ def chat_stream():
     try:
 
         data = request.get_json(silent=True) or {}
+        folio_id = data.get("folio_id")
+        print(f"Folio ID received: {folio_id}", flush=True)
         message = next(
             (
                 data.get(field)
@@ -273,9 +258,7 @@ def chat_stream():
                     )
                     return
 
-                tool_args = json.loads(tool_call.arguments)
-                print(f"Running match_lead for {tool_args['lead_id']}", flush=True)
-                match_text = match_lead(tool_args)
+                match_text = match_lead(folio_id)
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
