@@ -63,6 +63,15 @@ def build_response_args(user_message, previous_response_id=None):
             "floorplans, must come only from current Rentee listing data. Web search may be "
             "used for external context about a building, neighbourhood, or surrounding area, "
             "but must not overwrite or contradict authoritative listing data. "
+            "After every get_property_details result, check whether it actually answers the "
+            "user's question. If the requested fact is missing and is a publicly discoverable "
+            "building, development, location, neighbourhood, transport, school, amenity, "
+            "regulatory, developer, historical, or other external fact, immediately use web "
+            "search before answering. The user should never need to ask you to search the web. "
+            "If a missing fact is specific to the individual available unit, such as its "
+            "balcony, facing direction, owner decisions, current availability, or parking "
+            "allocation, do not use web search or guess; explain that the current listing "
+            "information does not specify it. "
             "Use match_lead for current availability and recommendations, update_preferences "
             "for stored home-search requirements, and get_property_details for factual "
             "questions about a specific listing, unit, condo, building, or development. Do "
@@ -105,8 +114,9 @@ def build_response_args(user_message, previous_response_id=None):
             "conversation history. Never claim a property is currently available because it "
             "was mentioned earlier. Conversation history is for normal continuity, not a "
             "database of property facts. Do not offer actions the system "
-            "cannot actually perform, such as arranging viewings, sending photos, fetching "
-            "floorplans, or checking exact commute times. "
+            "cannot actually perform, such as contacting an owner or agent, arranging "
+            "viewings, sending photos, obtaining a floorplan, confirming information "
+            "privately, or checking exact commute times. "
             "Explain recommendations in clear, customer-friendly language. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
@@ -814,6 +824,7 @@ def chat_stream():
                 print(f"Tool selected: {tool_call.name}", flush=True)
                 print(f"Original call_id: {original_call_id}", flush=True)
                 tool_args = json.loads(tool_call.arguments)
+                follow_up_tools = None
 
                 if tool_call.name == "match_lead":
                     tool_result = yield from stream_match_lead(folio_id, bubble_env)
@@ -866,16 +877,25 @@ def chat_stream():
                         )
                 elif tool_call.name == "get_property_details":
                     has_match_results = False
+                    yield (
+                        f"data: {json.dumps({'status': 'Checking property details...'})}\n\n"
+                    )
                     tool_result = get_property_details(
                         folio_id,
                         tool_args["property_reference"],
                         bubble_env
                     )
                     follow_up_instructions = (
-                        "Answer the customer's factual property question naturally using only "
-                        "the authoritative Rentee details in the tool output. Do not invent, "
-                        "add, or expose internal identifiers."
+                        "Check whether the authoritative Rentee details in the tool output "
+                        "actually answer the customer's question. If a requested general "
+                        "building, development, location, neighbourhood, transport, school, "
+                        "amenity, developer, historical, regulatory, or other public external "
+                        "fact is missing, use web search immediately before answering. If a "
+                        "missing fact is specific to this available unit, do not search or "
+                        "guess; say the current listing information does not specify it. Do "
+                        "not expose internal identifiers or offer unsupported actions."
                     )
+                    follow_up_tools = [{"type": "web_search"}]
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
@@ -904,16 +924,21 @@ def chat_stream():
                         f"get_property_details call {original_call_id}",
                         flush=True
                     )
-                with client.responses.stream(
-                        model="gpt-5-mini",
-                        previous_response_id=original_response_id,
-                        instructions=follow_up_instructions,
-                        input=[{
-                            "type": "function_call_output",
-                            "call_id": original_call_id,
-                            "output": tool_result
-                        }]
-                ) as stream:
+                continuation_args = {
+                    "model": "gpt-5-mini",
+                    "previous_response_id": original_response_id,
+                    "instructions": follow_up_instructions,
+                    "input": [{
+                        "type": "function_call_output",
+                        "call_id": original_call_id,
+                        "output": tool_result
+                    }]
+                }
+
+                if follow_up_tools:
+                    continuation_args["tools"] = follow_up_tools
+
+                with client.responses.stream(**continuation_args) as stream:
                     for event in stream:
                         if (
                             event.type.startswith("response.web_search_call.")
