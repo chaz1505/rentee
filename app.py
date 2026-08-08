@@ -773,6 +773,7 @@ def chat_stream():
         def generate():
             try:
                 web_search_status_sent = False
+                property_details_web_fallback = False
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 try:
@@ -895,6 +896,10 @@ def chat_stream():
                         "guess; say the current listing information does not specify it. Do "
                         "not expose internal identifiers or offer unsupported actions."
                     )
+                    # The model decides whether the returned details are incomplete
+                    # and whether a public web lookup is appropriate. The streamed
+                    # web-search event below then selects the customer-facing status.
+                    property_details_web_fallback = True
                     follow_up_tools = [{"type": "web_search"}]
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
@@ -945,8 +950,13 @@ def chat_stream():
                             and not web_search_status_sent
                         ):
                             print("Web search used", flush=True)
+                            status = (
+                                "That detail isn’t in the listing — checking the web..."
+                                if property_details_web_fallback
+                                else "Searching the web for the latest information..."
+                            )
                             yield (
-                                f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
+                                f"data: {json.dumps({'status': status})}\n\n"
                             )
                             web_search_status_sent = True
                         if event.type == "response.output_text.delta":
