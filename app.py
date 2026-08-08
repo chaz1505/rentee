@@ -237,7 +237,10 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
             "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={"folioItems": folio_item_ids},
+        json={
+            "folioItems": folio_item_ids,
+            "newRecommendations": True
+        },
         timeout=30
     )
     response.raise_for_status()
