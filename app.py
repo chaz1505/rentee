@@ -21,6 +21,7 @@ CORS(
 )
 
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
 LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
@@ -237,6 +238,22 @@ supplied property information.
     return response.output_text
 
 
+def update_lead_ai_searchtext(lead_id, updated_text):
+
+    print(f"Updating AIsearchtext for lead {lead_id}", flush=True)
+    response = requests.patch(
+        f"{LEAD_URL}/{lead_id}",
+        headers={
+            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"AIsearchtext": updated_text},
+        timeout=30
+    )
+    response.raise_for_status()
+    print("AIsearchtext updated successfully", flush=True)
+
+
 def update_preferences(folio_id, preference_update):
 
     print(f"Updating preferences for folio: {folio_id}", flush=True)
@@ -299,13 +316,7 @@ REQUESTED PREFERENCE UPDATE:
     if not updated_ai_search_text.strip():
         raise ValueError("The updated home-search profile was empty.")
 
-    patch_response = requests.patch(
-        f"{LEAD_URL}/{lead_id}",
-        json={"AIsearchtext": updated_ai_search_text},
-        timeout=30
-    )
-    patch_response.raise_for_status()
-    print("AIsearchtext updated successfully", flush=True)
+    update_lead_ai_searchtext(lead_id, updated_ai_search_text)
 
     return result["confirmation"]
 
