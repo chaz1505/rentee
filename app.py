@@ -539,6 +539,10 @@ def chat_stream():
                     )
                     return
 
+                original_response_id = response.id
+                original_call_id = tool_call.call_id
+                print(f"Tool selected: {tool_call.name}", flush=True)
+                print(f"Original call_id: {original_call_id}", flush=True)
                 tool_args = json.loads(tool_call.arguments)
 
                 if tool_call.name == "match_lead":
@@ -555,7 +559,12 @@ def chat_stream():
                         bubble_env
                     )
                     try:
+                        print(
+                            "Preference update complete; running automatic rematch",
+                            flush=True
+                        )
                         recommendations = match_lead(folio_id, bubble_env)
+                        print("Automatic rematch complete", flush=True)
                         tool_result = (
                             "Absolutely — I've updated your preferences. Based on that, "
                             "here's what I'd recommend now:\n\n"
@@ -578,13 +587,25 @@ def chat_stream():
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
+                if tool_call.name == "update_preferences":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"update_preferences call {original_call_id}",
+                        flush=True
+                    )
+                else:
+                    print(
+                        "Submitting function_call_output for original "
+                        f"match_lead call {original_call_id}",
+                        flush=True
+                    )
                 with client.responses.stream(
                         model="gpt-5-mini",
-                        previous_response_id=response.id,
+                        previous_response_id=original_response_id,
                         instructions=follow_up_instructions,
                         input=[{
                             "type": "function_call_output",
-                            "call_id": tool_call.call_id,
+                            "call_id": original_call_id,
                             "output": tool_result
                         }]
                 ) as stream:
@@ -593,6 +614,8 @@ def chat_stream():
                             yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
                     final = stream.get_final_response()
+
+                print("Tool lifecycle completed", flush=True)
 
                 yield (
                     f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
