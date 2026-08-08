@@ -52,6 +52,9 @@ def build_response_args(user_message, previous_response_id=None):
             "use the property matching tool to identify the best available options. "
             "When the user provides new, changed, removed, or additional information "
             "that could affect which properties suit them, use the update_preferences tool. "
+            "A preference change by itself must use update_preferences only; do not run "
+            "property matching unless the user explicitly asks to see, compare, match, "
+            "or receive recommendations for properties. "
             "Explain recommendations in clear, customer-friendly language. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
@@ -69,9 +72,9 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "match_lead",
         "description": (
-            "Use this tool whenever the user asks for suitable properties, "
-            "property recommendations, matching listings, ranking listings, "
-            "or identifying the best properties for the current home seeker."
+            "Use this only when the customer explicitly asks to see, compare, match, "
+            "rank, or receive recommendations for properties. Do not use it for a "
+            "statement that only changes their preferences."
         ),
         "parameters": {
             "type": "object",
@@ -89,7 +92,8 @@ def build_response_args(user_message, previous_response_id=None):
             "includes any home-search preference, such as budget, location, property "
             "type, bedrooms, school or commute needs, family needs, parking, pets, "
             "furnishing, size, facilities, or timing. Do not use it for general "
-            "questions or a request to show properties."
+            "questions or a request to show properties. If the message is only a "
+            "preference change, use this tool and do not call match_lead."
         ),
         "parameters": {
             "type": "object",
@@ -282,6 +286,11 @@ Return valid JSON with exactly these fields:
 - customer_response: concise, natural, customer-facing recommendation prose.
   Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
   matching process.
+
+The recommended_listing_ids are the source of truth. customer_response must
+describe only the listings represented by those IDs, in the same order. Never
+invent a property, unit, building name, or property detail. If a name or detail
+is not in the supplied property information, do not mention it.
 
 """
 
@@ -497,7 +506,16 @@ def chat_stream():
                 tool_args = json.loads(tool_call.arguments)
 
                 if tool_call.name == "match_lead":
-                    tool_result = match_lead(folio_id, bubble_env)
+                    customer_response = match_lead(folio_id, bubble_env)
+
+                    for i in range(0, len(customer_response), 25):
+                        yield (
+                            f"data: {json.dumps({'delta': customer_response[i:i + 25]})}\n\n"
+                        )
+                    yield (
+                        f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+                    )
+                    return
                 elif tool_call.name == "update_preferences":
                     tool_result = update_preferences(
                         folio_id,
