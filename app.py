@@ -23,12 +23,14 @@ CORS(
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
-LEAD_URL = "https://www.rentee.asia/version-test/api/1.1/obj/lead"
-LISTING_URL = "https://www.rentee.asia/version-test/api/1.1/obj/listing"
-FOLIO_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folio"
-FOLIO_ITEM_URL = "https://www.rentee.asia/version-test/api/1.1/obj/folioItem"
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 200
+
+
+def get_bubble_base_url(bubble_env):
+    if bubble_env == "development":
+        return "https://www.rentee.asia/version-test/api/1.1"
+    return "https://www.rentee.asia/api/1.1"
 
 
 @app.route("/")
@@ -119,7 +121,7 @@ def bubble(url, **kwargs):
     return r.json()["response"]
 
 
-def get_all_listings():
+def get_all_listings(base_url):
 
     listings = []
     cursor = 0
@@ -127,7 +129,7 @@ def get_all_listings():
 
     while cursor not in seen_cursors:
         seen_cursors.add(cursor)
-        page = bubble(LISTING_URL, params={"cursor": cursor})
+        page = bubble(f"{base_url}/obj/listing", params={"cursor": cursor})
         results = page.get("results", [])
         listings.extend(results)
         remaining = page.get("remaining", 0) or 0
@@ -145,14 +147,14 @@ def get_all_listings():
     return listings
 
 
-def create_folio_items(listing_ids):
+def create_folio_items(listing_ids, base_url):
 
     folio_item_ids = []
 
     for listing_id in listing_ids:
         try:
             response = requests.post(
-                FOLIO_ITEM_URL,
+                f"{base_url}/obj/folioItem",
                 headers={
                     "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
                     "Content-Type": "application/json"
@@ -175,10 +177,10 @@ def create_folio_items(listing_ids):
     return folio_item_ids
 
 
-def update_folio_items(folio_id, folio_item_ids):
+def update_folio_items(folio_id, folio_item_ids, base_url):
 
     response = requests.patch(
-        f"{FOLIO_URL}/{folio_id}",
+        f"{base_url}/obj/folio/{folio_id}",
         headers={
             "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
             "Content-Type": "application/json"
@@ -189,14 +191,15 @@ def update_folio_items(folio_id, folio_item_ids):
     response.raise_for_status()
 
 
-def match_lead(folio_id):
+def match_lead(folio_id, bubble_env):
 
-    folio = bubble(f"{FOLIO_URL}/{folio_id}")
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
-    lead = bubble(f"{LEAD_URL}/{lead_id}")
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
 
-    listings = get_all_listings()[:MATCH_LISTING_LIMIT]
+    listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
 
     print(
         f"Scoring {len(listings)} listings (test limit: {MATCH_LISTING_LIMIT})",
@@ -329,22 +332,22 @@ Return valid JSON with exactly these fields:
         elif listing_id not in recommended_listing_ids:
             recommended_listing_ids.append(listing_id)
 
-    folio_item_ids = create_folio_items(recommended_listing_ids)
+    folio_item_ids = create_folio_items(recommended_listing_ids, base_url)
 
     if folio_item_ids is not None:
         try:
-            update_folio_items(folio_id, folio_item_ids)
+            update_folio_items(folio_id, folio_item_ids, base_url)
         except Exception as error:
             print(f"Failed to update Folio Items: {error}", flush=True)
 
     return result["customer_response"]
 
 
-def update_lead_ai_searchtext(lead_id, updated_text):
+def update_lead_ai_searchtext(lead_id, updated_text, base_url):
 
     print(f"Updating AIsearchtext for lead {lead_id}", flush=True)
     response = requests.patch(
-        f"{LEAD_URL}/{lead_id}",
+        f"{base_url}/obj/lead/{lead_id}",
         headers={
             "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
             "Content-Type": "application/json"
@@ -356,13 +359,14 @@ def update_lead_ai_searchtext(lead_id, updated_text):
     print("AIsearchtext updated successfully", flush=True)
 
 
-def update_preferences(folio_id, preference_update):
+def update_preferences(folio_id, preference_update, bubble_env):
 
+    base_url = get_bubble_base_url(bubble_env)
     print(f"Updating preferences for folio: {folio_id}", flush=True)
-    folio = bubble(f"{FOLIO_URL}/{folio_id}")
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     print(f"Resolved lead: {lead_id}", flush=True)
-    lead = bubble(f"{LEAD_URL}/{lead_id}")
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     existing_ai_search_text = lead.get("AIsearchtext", "")
 
     update_prompt = f"""
@@ -418,7 +422,7 @@ REQUESTED PREFERENCE UPDATE:
     if not updated_ai_search_text.strip():
         raise ValueError("The updated home-search profile was empty.")
 
-    update_lead_ai_searchtext(lead_id, updated_ai_search_text)
+    update_lead_ai_searchtext(lead_id, updated_ai_search_text, base_url)
 
     return result["confirmation"]
 
@@ -430,6 +434,12 @@ def chat_stream():
 
         data = request.get_json(silent=True) or {}
         folio_id = data.get("folio_id")
+        bubble_env = data.get("bubble_env", "live")
+
+        if bubble_env not in ("development", "live"):
+            bubble_env = "live"
+
+        print(f"Bubble environment: {bubble_env}", flush=True)
         print(f"Folio ID received: {folio_id}", flush=True)
         message = next(
             (
@@ -487,11 +497,12 @@ def chat_stream():
                 tool_args = json.loads(tool_call.arguments)
 
                 if tool_call.name == "match_lead":
-                    tool_result = match_lead(folio_id)
+                    tool_result = match_lead(folio_id, bubble_env)
                 elif tool_call.name == "update_preferences":
                     tool_result = update_preferences(
                         folio_id,
-                        tool_args["preference_update"]
+                        tool_args["preference_update"],
+                        bubble_env
                     )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
