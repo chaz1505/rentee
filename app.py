@@ -63,6 +63,13 @@ def build_response_args(user_message, previous_response_id=None):
             "floorplans, must come only from current Rentee listing data. Web search may be "
             "used for external context about a building, neighbourhood, or surrounding area, "
             "but must not overwrite or contradict authoritative listing data. "
+            "Use match_lead for current availability and recommendations, update_preferences "
+            "for stored home-search requirements, and get_property_details for factual "
+            "questions about a specific listing, unit, condo, building, or development. Do "
+            "not call match_lead merely to answer a factual property question. When a property "
+            "is already being discussed, use get_property_details rather than rerunning "
+            "matching. Prefer authoritative Rentee property data over web search whenever the "
+            "requested information exists in Rentee. "
             "Whenever the user asks about currently available properties, suitable listings, "
             "options, recommendations, or what is available for them, you MUST call the "
             "match_lead tool. Never answer current property availability or recommendations "
@@ -168,6 +175,30 @@ def build_response_args(user_message, previous_response_id=None):
         }
     },
     {
+        "type": "function",
+        "name": "get_property_details",
+        "description": (
+            "Retrieve authoritative Rentee information about a specific listing, unit, "
+            "condo, building, or development. Use this for factual questions about a "
+            "property already being discussed. Do not use it to search for or recommend "
+            "available properties."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "property_reference": {
+                    "type": "string",
+                    "description": (
+                        "The property, condo, building, unit, or listing being referred to, "
+                        "using the user's wording or conversational context."
+                    )
+                }
+            },
+            "required": ["property_reference"],
+            "additionalProperties": False
+        }
+    },
+    {
         "type": "web_search"
     }
 ]
@@ -236,6 +267,99 @@ def get_all_listings(base_url):
         cursor += len(results)
 
     return listings
+
+
+def get_property_details(folio_id, property_reference, bubble_env):
+
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    listings = get_all_listings(base_url)
+    listings_by_id = {
+        listing["_id"]
+        : listing
+        for listing in listings
+        if listing.get("_id")
+    }
+    recommended_listing_ids = []
+
+    for folio_item_id in folio.get("folioItems", []) or []:
+        try:
+            folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
+            listing_id = folio_item.get("listing")
+
+            if listing_id in listings_by_id and listing_id not in recommended_listing_ids:
+                recommended_listing_ids.append(listing_id)
+        except Exception as error:
+            print(f"Failed to load Folio Item details: {error}", flush=True)
+
+    reference = property_reference.lower().strip()
+    selected_listing = None
+    ordinal_positions = {
+        "first": 0,
+        "1st": 0,
+        "second": 1,
+        "2nd": 1,
+        "third": 2,
+        "3rd": 2
+    }
+
+    for ordinal, position in ordinal_positions.items():
+        if ordinal in reference and position < len(recommended_listing_ids):
+            selected_listing = listings_by_id[recommended_listing_ids[position]]
+            break
+
+    if selected_listing is None:
+        matching_listings = [
+            listing
+            for listing in listings
+            if reference and reference in json.dumps(listing, ensure_ascii=False).lower()
+        ]
+
+        if len(matching_listings) == 1:
+            selected_listing = matching_listings[0]
+        elif len(recommended_listing_ids) == 1 and reference in {
+            "it", "that one", "that unit", "the property you just showed me"
+        }:
+            selected_listing = listings_by_id[recommended_listing_ids[0]]
+
+    if selected_listing is None:
+        return (
+            "I couldn't identify a single property from that reference. Please tell me "
+            "the building name or which option you mean."
+        )
+
+    detail_fields = [
+        ("Property", ("name", "title", "listingName", "condoName")),
+        ("Property type", ("propertyType",)),
+        ("Bedrooms", ("beds",)),
+        ("Bathrooms", ("baths",)),
+        ("Rent", ("priceRent",)),
+        ("Sale price", ("priceSale",)),
+        ("Size", ("Sq Ft", "size")),
+        ("Furnishing", ("furnished",)),
+        ("Parking", ("parking", "car parks")),
+        ("Availability", ("availability",)),
+        ("Balcony", ("balcony",)),
+        ("Facilities", ("facilities", "amenities")),
+        ("Location", ("address", "location")),
+        ("Description", ("Description", "keyFacts", "AIsearchtext"))
+    ]
+    details = []
+
+    for label, field_names in detail_fields:
+        for field_name in field_names:
+            value = selected_listing.get(field_name)
+
+            if value not in (None, "", []):
+                if isinstance(value, list):
+                    value = ", ".join(str(item) for item in value)
+                details.append(f"{label}: {value}")
+                break
+
+    if not details:
+        return "I found the property, but Rentee does not have further details available."
+
+    return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
 def create_folio_items(listing_ids, base_url):
@@ -691,6 +815,18 @@ def chat_stream():
                             "Return the completed preference-update confirmation naturally. "
                             "Do not mention properties or internal errors."
                         )
+                elif tool_call.name == "get_property_details":
+                    has_match_results = False
+                    tool_result = get_property_details(
+                        folio_id,
+                        tool_args["property_reference"],
+                        bubble_env
+                    )
+                    follow_up_instructions = (
+                        "Answer the customer's factual property question naturally using only "
+                        "the authoritative Rentee details in the tool output. Do not invent, "
+                        "add, or expose internal identifiers."
+                    )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
@@ -707,10 +843,16 @@ def chat_stream():
                         f"update_preferences call {original_call_id}",
                         flush=True
                     )
-                else:
+                elif tool_call.name == "match_lead":
                     print(
                         "Submitting function_call_output for original "
                         f"match_lead call {original_call_id}",
+                        flush=True
+                    )
+                else:
+                    print(
+                        "Submitting function_call_output for original "
+                        f"get_property_details call {original_call_id}",
                         flush=True
                     )
                 with client.responses.stream(
