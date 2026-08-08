@@ -50,11 +50,17 @@ def build_response_args(user_message, previous_response_id=None):
             "conversational, concise, and proactive. "
             "When the user asks about properties, recommendations, or suitable listings, "
             "use the property matching tool to identify the best available options. "
-            "When the user provides new, changed, removed, or additional information "
-            "that could affect which properties suit them, use the update_preferences tool. "
-            "A preference change by itself must use update_preferences only; do not run "
-            "property matching unless the user explicitly asks to see, compare, match, "
-            "or receive recommendations for properties. "
+            "When the user tells you something that adds to, changes, replaces, narrows, "
+            "removes, or otherwise modifies their home-search requirements, you MUST call "
+            "the update_preferences tool rather than merely acknowledging the change in chat. "
+            "The user does not need to ask to update their preferences explicitly. Statements "
+            "such as 'I'm only interested in Serai now', 'My budget is now RM20k', 'We need "
+            "four bedrooms', 'We're also open to Mont Kiara', 'My children will attend the "
+            "British School', and 'We no longer need a pool' MUST call update_preferences. "
+            "Ordinary chat questions must not call update_preferences. A preference change "
+            "by itself must use update_preferences only; do not run property matching unless "
+            "the user explicitly asks to see, find, compare, match, rank, shortlist, or "
+            "receive recommendations for properties. "
             "Explain recommendations in clear, customer-friendly language. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
@@ -87,20 +93,26 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "update_preferences",
         "description": (
-            "Use this whenever the customer provides new, changed, removed, or "
-            "additional information that could affect property suitability. This "
-            "includes any home-search preference, such as budget, location, property "
-            "type, bedrooms, school or commute needs, family needs, parking, pets, "
-            "furnishing, size, facilities, or timing. Do not use it for general "
-            "questions or a request to show properties. If the message is only a "
-            "preference change, use this tool and do not call match_lead."
+            "Use this whenever the user states new, changed, removed, additional, or "
+            "clarified information that could affect which home is suitable for them. "
+            "This includes budget, areas, condos, bedrooms, bathrooms, property type, "
+            "buy/rent, schools, commute, parking, pets, furnishing, size, facilities, "
+            "family requirements, lifestyle preferences, move-in timing, or any other "
+            "information relevant to finding the right home. The user does not need to "
+            "explicitly ask to save or update their preferences. If they say 'I'm only "
+            "interested in Serai now', you MUST call this tool rather than simply "
+            "acknowledging it in chat. Do not use it for ordinary questions or an explicit "
+            "request to see, find, recommend, shortlist, rank, or compare properties."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "preference_update": {
                     "type": "string",
-                    "description": "The relevant new or changed customer preference."
+                    "description": (
+                        "A concise description of the new, changed, removed, or additional "
+                        "home-search information stated by the user."
+                    )
                 }
             },
             "required": ["preference_update"],
