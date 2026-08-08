@@ -46,6 +46,8 @@ def build_response_args(user_message, previous_response_id=None):
             "conversational, concise, and proactive. "
             "When the user asks about properties, recommendations, or suitable listings, "
             "use the property matching tool to identify the best available options. "
+            "When the user provides new, changed, removed, or additional information "
+            "that could affect which properties suit them, use the update_preferences tool. "
             "Explain recommendations in clear, customer-friendly language. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
@@ -71,6 +73,29 @@ def build_response_args(user_message, previous_response_id=None):
             "type": "object",
             "properties": {},
             "required": [],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "update_preferences",
+        "description": (
+            "Use this whenever the customer provides new, changed, removed, or "
+            "additional information that could affect property suitability. This "
+            "includes any home-search preference, such as budget, location, property "
+            "type, bedrooms, school or commute needs, family needs, parking, pets, "
+            "furnishing, size, facilities, or timing. Do not use it for general "
+            "questions or a request to show properties."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "preference_update": {
+                    "type": "string",
+                    "description": "The relevant new or changed customer preference."
+                }
+            },
+            "required": ["preference_update"],
             "additionalProperties": False
         }
     }
@@ -211,6 +236,80 @@ supplied property information.
     print("Matching model response received", flush=True)
     return response.output_text
 
+
+def update_preferences(folio_id, preference_update):
+
+    print(f"Updating preferences for folio: {folio_id}", flush=True)
+    folio = bubble(f"{FOLIO_URL}/{folio_id}")
+    lead_id = folio["lead"]
+    print(f"Resolved lead: {lead_id}", flush=True)
+    lead = bubble(f"{LEAD_URL}/{lead_id}")
+    existing_ai_search_text = lead.get("AIsearchtext", "")
+
+    update_prompt = f"""
+You maintain a living home-search profile for one customer.
+
+Return the complete updated AIsearchtext after applying the requested update.
+
+Rules:
+- Preserve all existing relevant home-search information.
+- Change or remove a preference only when the customer explicitly says to do so.
+- Add relevant new information, creating an appropriate structured category when needed.
+- Do not invent or infer preferences.
+- Do not rewrite, summarise, clean up, reorder, or delete any `secret notes` or
+  dated conversation/history content. It is immutable and must remain exactly
+  as written.
+- Do not summarise away, delete, or rewrite unrelated preferences.
+
+CURRENT AIsearchtext:
+{existing_ai_search_text}
+
+REQUESTED PREFERENCE UPDATE:
+{preference_update}
+"""
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=update_prompt,
+        instructions=(
+            "Return JSON matching the supplied schema. The confirmation must be a "
+            "short, natural sentence addressed directly to the customer and must not "
+            "mention internal IDs, fields, APIs, or tools."
+        ),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "updated_home_search_profile",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "updated_ai_search_text": {"type": "string"},
+                        "confirmation": {"type": "string"}
+                    },
+                    "required": ["updated_ai_search_text", "confirmation"],
+                    "additionalProperties": False
+                }
+            }
+        }
+    )
+    result = json.loads(response.output_text)
+    updated_ai_search_text = result["updated_ai_search_text"]
+
+    if not updated_ai_search_text.strip():
+        raise ValueError("The updated home-search profile was empty.")
+
+    patch_response = requests.patch(
+        f"{LEAD_URL}/{lead_id}",
+        json={"AIsearchtext": updated_ai_search_text},
+        timeout=30
+    )
+    patch_response.raise_for_status()
+    print("AIsearchtext updated successfully", flush=True)
+
+    return result["confirmation"]
+
+
 @app.route("/chat_stream", methods=["POST"])
 def chat_stream():
 
@@ -272,7 +371,17 @@ def chat_stream():
                     )
                     return
 
-                match_text = match_lead(folio_id)
+                tool_args = json.loads(tool_call.arguments)
+
+                if tool_call.name == "match_lead":
+                    tool_result = match_lead(folio_id)
+                elif tool_call.name == "update_preferences":
+                    tool_result = update_preferences(
+                        folio_id,
+                        tool_args["preference_update"]
+                    )
+                else:
+                    raise ValueError(f"Unsupported tool: {tool_call.name}")
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
@@ -282,7 +391,7 @@ def chat_stream():
                         input=[{
                             "type": "function_call_output",
                             "call_id": tool_call.call_id,
-                            "output": match_text
+                            "output": tool_result
                         }]
                 ) as stream:
                     for event in stream:
