@@ -552,9 +552,21 @@ def chat_stream():
             try:
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
-                response = client.responses.create(
-                    **build_response_args(message, previous)
-                )
+                try:
+                    response = client.responses.create(
+                        **build_response_args(message, previous)
+                    )
+                except Exception as error:
+                    if "No tool output found for function call" not in str(error):
+                        raise
+
+                    print(
+                        "Broken previous_response_id detected; starting a fresh conversation",
+                        flush=True
+                    )
+                    response = client.responses.create(
+                        **build_response_args(message, None)
+                    )
                 tool_call = next(
                     (x for x in response.output if x.type == "function_call"),
                     None
