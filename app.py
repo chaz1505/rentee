@@ -50,6 +50,13 @@ def build_response_args(user_message, previous_response_id=None):
             "conversational, concise, and proactive. "
             "When the user asks about properties, recommendations, or suitable listings, "
             "use the property matching tool to identify the best available options. "
+            "Whenever the user asks about currently available properties, suitable listings, "
+            "options, recommendations, or what is available for them, you MUST call the "
+            "match_lead tool. Never answer current property availability or recommendations "
+            "from conversation history; only a CURRENT match_lead result may be used to "
+            "describe available properties. Even if properties were mentioned earlier, do "
+            "not repeat, recall, summarise, or rely on them when the user asks what is "
+            "currently available: always call match_lead again. "
             "When the user tells you something that adds to, changes, replaces, narrows, "
             "removes, or otherwise modifies their home-search requirements, you MUST call "
             "the update_preferences tool rather than merely acknowledging the change in chat. "
@@ -90,9 +97,14 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "match_lead",
         "description": (
-            "Use this only when the customer explicitly asks to see, compare, match, "
-            "rank, or receive recommendations for properties. Do not use it for a "
-            "statement that only changes their preferences."
+            "Use this whenever the user asks to see, find, recommend, list, show, "
+            "shortlist, rank, compare, recall, or discuss currently available properties "
+            "that may suit them. This includes requests such as 'What do you have for me?', "
+            "'What have you got?', 'Show me some options', 'What properties are available?', "
+            "'Anything suitable?', 'What do you have in Serai?', 'Can you find something "
+            "for me?', 'What are my best options?', 'Show me what matches', and 'What can "
+            "I see?'. The user does not need to explicitly ask to match listings or recommend "
+            "properties. Do not use it for a statement that only changes preferences."
         ),
         "parameters": {
             "type": "object",
