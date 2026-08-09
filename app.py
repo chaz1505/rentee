@@ -4,6 +4,7 @@ from openai import OpenAI
 import os
 import requests
 import json
+import time
 
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
@@ -25,6 +26,14 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 200
+
+
+def log_timing(label, started, detail=""):
+
+    print(
+        f"[TIMING] {label}: {time.perf_counter() - started:.2f}s{detail}",
+        flush=True
+    )
 
 
 def get_bubble_base_url(bubble_env):
@@ -255,14 +264,21 @@ def bubble(url, **kwargs):
 
 def get_all_listings(base_url):
 
+    load_started = time.perf_counter()
     listings = []
     cursor = 0
     seen_cursors = set()
 
     while cursor not in seen_cursors:
         seen_cursors.add(cursor)
+        page_started = time.perf_counter()
         page = bubble(f"{base_url}/obj/listing", params={"cursor": cursor})
         results = page.get("results", [])
+        log_timing(
+            f"Listing page {len(seen_cursors)}",
+            page_started,
+            f" ({len(results)} listings)"
+        )
         listings.extend(results)
         remaining = page.get("remaining", 0) or 0
         print(
@@ -276,20 +292,28 @@ def get_all_listings(base_url):
         # Bubble's cursor is the current offset, so advance by this page size.
         cursor += len(results)
 
+    log_timing("Load all listings", load_started, f" ({len(listings)} listings)")
     return listings
 
 
 def get_property_details(folio_id, property_reference, bubble_env):
 
+    details_started = time.perf_counter()
     base_url = get_bubble_base_url(bubble_env)
+    folio_started = time.perf_counter()
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    log_timing("Property details - Folio lookup", folio_started)
     recommended_listings = []
 
     for folio_item_id in folio.get("folioItems", []) or []:
         try:
+            folio_item_started = time.perf_counter()
             folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
+            log_timing("Property details - FolioItem lookup", folio_item_started)
             listing_id = folio_item.get("listing")
+            listing_started = time.perf_counter()
             listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+            log_timing("Property details - Listing lookup", listing_started)
 
             if listing.get("_id") and not any(
                 item.get("_id") == listing["_id"]
@@ -300,6 +324,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
             print(f"Failed to load Folio Item details: {error}", flush=True)
 
     if not recommended_listings:
+        log_timing("Property details TOTAL", details_started)
         return "I couldn't find any current recommendations to check."
 
     reference = property_reference.lower().strip()
@@ -343,6 +368,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
             {"listing_id": listing["_id"], "listing": listing}
             for listing in recommended_listings
         ]
+        resolver_started = time.perf_counter()
         resolver_response = client.responses.create(
             model="gpt-5-mini",
             input=(
@@ -369,6 +395,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
                 }
             }
         )
+        log_timing("Property reference resolution OpenAI call", resolver_started)
         resolution = json.loads(resolver_response.output_text)
 
         if resolution["matched"]:
@@ -382,6 +409,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
             )
 
     if selected_listing is None:
+        log_timing("Property details TOTAL", details_started)
         return (
             "I couldn't identify a single property from that reference. Please tell me "
             "the building name or which option you mean."
@@ -416,19 +444,23 @@ def get_property_details(folio_id, property_reference, bubble_env):
                 break
 
     if not details:
+        log_timing("Property details TOTAL", details_started)
         return "I found the property, but Rentee does not have further details available."
 
+    log_timing("Property details TOTAL", details_started)
     return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
 def create_folio_items(recommendations, base_url):
 
+    create_started = time.perf_counter()
     folio_item_ids = []
 
-    for recommendation in recommendations:
+    for position, recommendation in enumerate(recommendations, start=1):
         listing_id = recommendation["listing_id"]
         reco_summary = recommendation["reco_summary"]
         try:
+            folio_item_started = time.perf_counter()
             response = requests.post(
                 f"{base_url}/obj/folioItem",
                 headers={
@@ -443,6 +475,7 @@ def create_folio_items(recommendations, base_url):
                 timeout=30
             )
             response.raise_for_status()
+            log_timing(f"Create FolioItem {position}", folio_item_started)
             data = response.json()
             folio_item_id = data.get("id")
 
@@ -454,11 +487,17 @@ def create_folio_items(recommendations, base_url):
             print(f"Failed to create Folio Item: {error}", flush=True)
             return None
 
+    log_timing(
+        "Create all FolioItems",
+        create_started,
+        f" ({len(folio_item_ids)} items)"
+    )
     return folio_item_ids
 
 
 def clear_folio_item_newly_added(folio_item_id, base_url):
 
+    clear_started = time.perf_counter()
     response = requests.patch(
         f"{base_url}/obj/folioItem/{folio_item_id}",
         headers={
@@ -469,10 +508,12 @@ def clear_folio_item_newly_added(folio_item_id, base_url):
         timeout=30
     )
     response.raise_for_status()
+    log_timing("Clear FolioItem newlyAdded", clear_started)
 
 
 def update_folio_items(folio_id, folio_item_ids, base_url):
 
+    patch_started = time.perf_counter()
     response = requests.patch(
         f"{base_url}/obj/folio/{folio_id}",
         headers={
@@ -486,17 +527,22 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
         timeout=30
     )
     response.raise_for_status()
+    log_timing("Patch Folio", patch_started)
 
 
 def match_lead(folio_id, bubble_env):
 
+    match_started = time.perf_counter()
     yield "Checking your preferences..."
     base_url = get_bubble_base_url(bubble_env)
+    folio_started = time.perf_counter()
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    log_timing("match_lead - Folio lookup", folio_started)
     existing_folio_item_ids = list(folio.get("folioItems", []) or [])
     existing_listing_ids = set()
     previously_new_folio_item_ids = []
 
+    existing_items_started = time.perf_counter()
     for existing_folio_item_id in existing_folio_item_ids:
         existing_folio_item = bubble(
             f"{base_url}/obj/folioItem/{existing_folio_item_id}"
@@ -508,19 +554,29 @@ def match_lead(folio_id, bubble_env):
 
         if existing_folio_item.get("newlyAdded") is True:
             previously_new_folio_item_ids.append(existing_folio_item_id)
+    log_timing(
+        "match_lead - load existing FolioItems",
+        existing_items_started,
+        f" ({len(existing_folio_item_ids)} items)"
+    )
 
     lead_id = folio["lead"]
     print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
+    lead_started = time.perf_counter()
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    log_timing("match_lead - Lead lookup", lead_started)
 
     yield "Searching available properties..."
+    listings_started = time.perf_counter()
     listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
+    log_timing("match_lead - load listings", listings_started)
 
     print(
         f"Scoring {len(listings)} listings (test limit: {MATCH_LISTING_LIMIT})",
         flush=True
     )
 
+    prompt_started = time.perf_counter()
     prompt = f"""
 
 You are helping a property seeker find their ideal home.
@@ -614,8 +670,10 @@ a property, unit, building name, or property detail. If a name or detail is not
 in the supplied property information, do not mention it.
 
 """
+    log_timing("match_lead - build matching input", prompt_started)
 
     yield "Ranking the best matches..."
+    matching_started = time.perf_counter()
     response = client.responses.create(
 
         model="gpt-5-mini",
@@ -650,12 +708,15 @@ in the supplied property information, do not mention it.
         }
 
     )
+    log_timing("match_lead - OpenAI matching", matching_started)
 
     print("Matching model response received", flush=True)
+    parse_started = time.perf_counter()
     try:
         result = json.loads(response.output_text)
     except json.JSONDecodeError as error:
         print(f"Failed to parse matching JSON: {error}", flush=True)
+        log_timing("match_lead TOTAL", match_started)
         return "I’m sorry, I couldn’t prepare your recommendations just now."
 
     available_listing_ids = {
@@ -679,16 +740,22 @@ in the supplied property information, do not mention it.
         for recommendation in validated_recommendations
         if recommendation["listing_id"] not in existing_listing_ids
     ]
+    log_timing("match_lead - parse/validate", parse_started)
 
     yield "Updating your shortlist..."
 
     if new_recommendations:
+        folio_items_update_started = time.perf_counter()
+        clear_started = time.perf_counter()
         try:
             for previous_folio_item_id in previously_new_folio_item_ids:
                 clear_folio_item_newly_added(previous_folio_item_id, base_url)
         except Exception as error:
             print(f"Failed to clear previous Folio Item flags: {error}", flush=True)
+            log_timing("Clear previous newlyAdded flags", clear_started)
+            log_timing("match_lead TOTAL", match_started)
             return result["customer_response"]
+        log_timing("Clear previous newlyAdded flags", clear_started)
 
         new_folio_item_ids = create_folio_items(new_recommendations, base_url)
 
@@ -698,7 +765,9 @@ in the supplied property information, do not mention it.
                 update_folio_items(folio_id, final_folio_item_ids, base_url)
             except Exception as error:
                 print(f"Failed to update Folio Items: {error}", flush=True)
+        log_timing("match_lead - update FolioItems", folio_items_update_started)
 
+    log_timing("match_lead TOTAL", match_started)
     return result["customer_response"]
 
 
@@ -718,6 +787,7 @@ def stream_match_lead(folio_id, bubble_env):
 def update_lead_ai_searchtext(lead_id, updated_text, base_url):
 
     print(f"Updating AIsearchtext for lead {lead_id}", flush=True)
+    update_started = time.perf_counter()
     response = requests.patch(
         f"{base_url}/obj/lead/{lead_id}",
         headers={
@@ -728,17 +798,23 @@ def update_lead_ai_searchtext(lead_id, updated_text, base_url):
         timeout=30
     )
     response.raise_for_status()
+    log_timing("Update Lead AIsearchtext", update_started)
     print("AIsearchtext updated successfully", flush=True)
 
 
 def update_preferences(folio_id, preference_update, bubble_env):
 
+    preferences_started = time.perf_counter()
     base_url = get_bubble_base_url(bubble_env)
     print(f"Updating preferences for folio: {folio_id}", flush=True)
+    folio_started = time.perf_counter()
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    log_timing("update_preferences - Folio lookup", folio_started)
     lead_id = folio["lead"]
     print(f"Resolved lead: {lead_id}", flush=True)
+    lead_started = time.perf_counter()
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    log_timing("update_preferences - Lead lookup", lead_started)
     existing_ai_search_text = lead.get("AIsearchtext", "")
 
     update_prompt = f"""
@@ -763,6 +839,7 @@ REQUESTED PREFERENCE UPDATE:
 {preference_update}
 """
 
+    extraction_started = time.perf_counter()
     response = client.responses.create(
         model="gpt-5-mini",
         input=update_prompt,
@@ -788,20 +865,27 @@ REQUESTED PREFERENCE UPDATE:
             }
         }
     )
+    log_timing("Preference extraction OpenAI call", extraction_started)
+    parse_started = time.perf_counter()
     result = json.loads(response.output_text)
+    log_timing("update_preferences - parse result", parse_started)
     updated_ai_search_text = result["updated_ai_search_text"]
 
     if not updated_ai_search_text.strip():
         raise ValueError("The updated home-search profile was empty.")
 
+    bubble_update_started = time.perf_counter()
     update_lead_ai_searchtext(lead_id, updated_ai_search_text, base_url)
+    log_timing("update_preferences - AIsearchtext update", bubble_update_started)
 
+    log_timing("update_preferences TOTAL", preferences_started)
     return result["confirmation"]
 
 
 @app.route("/chat_stream", methods=["POST"])
 def chat_stream():
 
+    request_started = time.perf_counter()
     try:
 
         data = request.get_json(silent=True) or {}
@@ -835,6 +919,7 @@ def chat_stream():
         )
 
         if not message:
+            log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
             return jsonify({
                 "error": (
                     "Missing chat message. Send it as 'message' (or prompt, "
@@ -847,8 +932,10 @@ def chat_stream():
             try:
                 web_search_status_sent = False
                 property_details_web_fallback = False
+                first_delta_sent = False
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
+                initial_openai_started = time.perf_counter()
                 try:
                     response = client.responses.create(
                         **build_response_args(message, previous)
@@ -857,13 +944,25 @@ def chat_stream():
                     if "No tool output found for function call" not in str(error):
                         raise
 
+                    log_timing(
+                        "Initial OpenAI/tool selection (broken chain)",
+                        initial_openai_started
+                    )
+
                     print(
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
+                    retry_openai_started = time.perf_counter()
                     response = client.responses.create(
                         **build_response_args(message, None)
                     )
+                    log_timing(
+                        "Initial OpenAI/tool selection retry",
+                        retry_openai_started
+                    )
+                else:
+                    log_timing("Initial OpenAI/tool selection", initial_openai_started)
                 if any(
                     output_item.type == "web_search_call"
                     for output_item in response.output
@@ -881,6 +980,9 @@ def chat_stream():
                 if tool_call is None:
                     print("No tool call requested", flush=True)
                     for i in range(0, len(response.output_text), 25):
+                        if not first_delta_sent:
+                            log_timing("FIRST DELTA", request_started)
+                            first_delta_sent = True
                         yield (
                             f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
                         )
@@ -888,6 +990,7 @@ def chat_stream():
 
                     if citations:
                         yield f"data: {json.dumps({'citations': citations})}\n\n"
+                    log_timing("TOTAL REQUEST", request_started)
                     yield (
                         f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
                     )
@@ -1016,6 +1119,7 @@ def chat_stream():
                 if follow_up_tools:
                     continuation_args["tools"] = follow_up_tools
 
+                final_openai_started = time.perf_counter()
                 with client.responses.stream(**continuation_args) as stream:
                     for event in stream:
                         if (
@@ -1033,9 +1137,13 @@ def chat_stream():
                             )
                             web_search_status_sent = True
                         if event.type == "response.output_text.delta":
+                            if not first_delta_sent:
+                                log_timing("FIRST DELTA", request_started)
+                                first_delta_sent = True
                             yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
                     final = stream.get_final_response()
+                log_timing("Final OpenAI completion", final_openai_started)
 
                 print("Tool lifecycle completed", flush=True)
 
@@ -1044,11 +1152,13 @@ def chat_stream():
                 if citations:
                     yield f"data: {json.dumps({'citations': citations})}\n\n"
 
+                log_timing("TOTAL REQUEST", request_started)
                 yield (
                     f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
                 )
             except Exception as error:
                 print(f"/chat_stream failed: {error}", flush=True)
+                log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
                 yield f"data: {json.dumps({'error': str(error), 'done': True})}\n\n"
 
         return Response(
@@ -1063,6 +1173,7 @@ def chat_stream():
 
     except Exception as e:
 
+        log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
         return jsonify({"error": str(e)}), 500
 
 
