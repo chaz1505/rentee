@@ -715,20 +715,23 @@ def stream_match_lead(folio_id, bubble_env):
         yield f"data: {json.dumps({'status': status})}\n\n"
 
 
-def update_lead_ai_searchtext(lead_id, updated_text, base_url):
+def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url):
 
-    print(f"Updating AIsearchtext for lead {lead_id}", flush=True)
+    print(f"Updating Lead preferences for lead {lead_id}", flush=True)
     response = requests.patch(
         f"{base_url}/obj/lead/{lead_id}",
         headers={
             "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
             "Content-Type": "application/json"
         },
-        json={"AIsearchtext": updated_text},
+        json={
+            "AIsearchtext": updated_text,
+            "AIsearchsummary": ai_search_summary
+        },
         timeout=30
     )
     response.raise_for_status()
-    print("AIsearchtext updated successfully", flush=True)
+    print("Lead preferences updated successfully", flush=True)
 
 
 def update_preferences(folio_id, preference_update, bubble_env):
@@ -744,7 +747,8 @@ def update_preferences(folio_id, preference_update, bubble_env):
     update_prompt = f"""
 You maintain a living home-search profile for one customer.
 
-Return the complete updated AIsearchtext after applying the requested update.
+Return the complete updated AIsearchtext and a clean AIsearchsummary after
+applying the requested update.
 
 Rules:
 - Preserve all existing relevant home-search information.
@@ -755,6 +759,18 @@ Rules:
   dated conversation/history content. It is immutable and must remain exactly
   as written.
 - Do not summarise away, delete, or rewrite unrelated preferences.
+
+AIsearchsummary rules:
+- Generate it from the FINAL updated AIsearchtext, not only this latest request.
+- It is a concise, customer-facing, easy-to-scan summary of current home-search
+  preferences only.
+- Include relevant current preferences where available, such as transaction type,
+  budget, areas, condos, bedrooms, property type, furnishing, parking, schools,
+  commute, family, facilities, and move-in requirements.
+- Exclude secret notes, dated conversation/history content, internal IDs, internal
+  implementation notes, and preferences that have been replaced.
+- Use plain structured text with only non-empty categories. Do not use a table,
+  generic introductory prose, or internal terminology.
 
 CURRENT AIsearchtext:
 {existing_ai_search_text}
@@ -769,7 +785,9 @@ REQUESTED PREFERENCE UPDATE:
         instructions=(
             "Return JSON matching the supplied schema. The confirmation must be a "
             "short, natural sentence addressed directly to the customer and must not "
-            "mention internal IDs, fields, APIs, or tools."
+            "mention internal IDs, fields, APIs, or tools. ai_search_summary must be "
+            "a clean current customer-facing search summary derived from the final "
+            "updated_ai_search_text."
         ),
         text={
             "format": {
@@ -780,9 +798,14 @@ REQUESTED PREFERENCE UPDATE:
                     "type": "object",
                     "properties": {
                         "updated_ai_search_text": {"type": "string"},
+                        "ai_search_summary": {"type": "string"},
                         "confirmation": {"type": "string"}
                     },
-                    "required": ["updated_ai_search_text", "confirmation"],
+                    "required": [
+                        "updated_ai_search_text",
+                        "ai_search_summary",
+                        "confirmation"
+                    ],
                     "additionalProperties": False
                 }
             }
@@ -790,11 +813,17 @@ REQUESTED PREFERENCE UPDATE:
     )
     result = json.loads(response.output_text)
     updated_ai_search_text = result["updated_ai_search_text"]
+    ai_search_summary = result["ai_search_summary"]
 
     if not updated_ai_search_text.strip():
         raise ValueError("The updated home-search profile was empty.")
 
-    update_lead_ai_searchtext(lead_id, updated_ai_search_text, base_url)
+    update_lead_ai_searchtext(
+        lead_id,
+        updated_ai_search_text,
+        ai_search_summary,
+        base_url
+    )
 
     return result["confirmation"]
 
