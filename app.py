@@ -62,18 +62,6 @@ def build_response_args(user_message, previous_response_id=None):
             "removed, narrowed, broadened, or clarified home-search preference, you MUST "
             "call update_preferences. Do not answer or acknowledge that preference change "
             "in normal chat; it must be saved through update_preferences first. "
-            "HIGH-PRIORITY WEB RULE: If the user's request requires current or external "
-            "information that web search can answer, you MUST call use_web_search directly. "
-            "Never offer to search, ask whether to search, or explain that the information "
-            "is not in Rentee data. This includes distances, driving times, routes, nearby "
-            "schools or amenities, public transport, neighbourhood information, and current "
-            "external facts. "
-            "HIGH-PRIORITY CONTEXT RULE: Interpret follow-up messages using the preceding "
-            "conversation. Resolve pronouns, omitted entities, and abbreviated requests from "
-            "that context before choosing a tool. Follow-ups such as 'yes', 'look it up', "
-            "'driving time?', 'what about Serai?', or 'during rush hour?' inherit the "
-            "unresolved request and locations already discussed. Ask for clarification only "
-            "when the necessary information genuinely is not available in the conversation. "
             "When the user asks about properties, recommendations, or suitable listings "
             "based on their current requirements, use the property matching tool to identify "
             "the best available options. "
@@ -246,14 +234,12 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "use_web_search",
         "description": (
-            "Call this tool whenever answering the user's current request requires current, "
-            "external, or internet-based information. Also call it for follow-ups to an "
-            "earlier external-information question, even when the current message omits "
-            "locations or other entities; use previous conversation context to understand "
-            "what to search. Do not offer to search first: call this tool directly. This "
-            "includes travel times, routes, news, interest rates, schools, amenities, and "
-            "neighbourhood facts. Do not use it for currently available Rentee properties "
-            "or recommendations; use match_lead for those."
+            "Use this when answering the user's question requires current, external, "
+            "or internet-based information that is not available from Rentee property "
+            "data or conversation context. This includes current travel times, news, "
+            "interest rates, schools, amenities, neighbourhood facts, and other facts "
+            "that should be looked up online. Do not use it for currently available "
+            "Rentee properties or recommendations; use match_lead for those."
         ),
         "parameters": {
             "type": "object",
