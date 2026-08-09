@@ -25,7 +25,7 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
-MATCH_LISTING_LIMIT = 200
+MATCH_LISTING_LIMIT = 50
 
 
 def log_timing(label, started, detail=""):
