@@ -58,10 +58,6 @@ def build_response_args(user_message, previous_response_id=None):
             "You are speaking directly to the property seeker, not to an estate agent. "
             "Always address the user naturally using 'you' and 'your'. Be helpful, "
             "conversational, concise, and proactive. "
-            "HIGH-PRIORITY ROUTING RULE: If the user states any new, changed, additional, "
-            "removed, narrowed, broadened, or clarified home-search preference, you MUST "
-            "call update_preferences. Do not answer or acknowledge that preference change "
-            "in normal chat; it must be saved through update_preferences first. "
             "When the user asks about properties, recommendations, or suitable listings "
             "based on their current requirements, use the property matching tool to identify "
             "the best available options. "
@@ -172,14 +168,8 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "update_preferences",
         "description": (
-            "Use this whenever the user states information that could affect which property "
-            "is suitable, even if they do not explicitly ask to save or update it. This "
-            "includes any new, changed, removed, additional, or clarified home-search "
-            "information. Additive language such as 'also', 'as well', 'too', 'open to', "
-            "'add', or 'include', and replacement or removal language such as 'now', "
-            "'instead', 'only', 'remove', 'no longer', or 'don't need' indicates a "
-            "preference change. If the message contains such a preference change, prefer "
-            "this tool over a normal assistant response. "
+            "Use this whenever the user states new, changed, removed, additional, or "
+            "clarified information that could affect which home is suitable for them. "
             "This includes budget, areas, condos, bedrooms, bathrooms, property type, "
             "buy/rent, schools, commute, parking, pets, furnishing, size, facilities, "
             "family requirements, lifestyle preferences, move-in timing, or any other "
