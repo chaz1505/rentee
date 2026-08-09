@@ -433,7 +433,10 @@ def create_folio_items(listing_ids, base_url):
                     "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
                     "Content-Type": "application/json"
                 },
-                json={"listing": listing_id},
+                json={
+                    "listing": listing_id,
+                    "newlyAdded": True
+                },
                 timeout=30
             )
             response.raise_for_status()
@@ -449,6 +452,20 @@ def create_folio_items(listing_ids, base_url):
             return None
 
     return folio_item_ids
+
+
+def clear_folio_item_newly_added(folio_item_id, base_url):
+
+    response = requests.patch(
+        f"{base_url}/obj/folioItem/{folio_item_id}",
+        headers={
+            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"newlyAdded": False},
+        timeout=30
+    )
+    response.raise_for_status()
 
 
 def update_folio_items(folio_id, folio_item_ids, base_url):
@@ -475,6 +492,7 @@ def match_lead(folio_id, bubble_env):
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     existing_folio_item_ids = list(folio.get("folioItems", []) or [])
     existing_listing_ids = set()
+    previously_new_folio_item_ids = []
 
     for existing_folio_item_id in existing_folio_item_ids:
         existing_folio_item = bubble(
@@ -484,6 +502,9 @@ def match_lead(folio_id, bubble_env):
 
         if existing_listing_id:
             existing_listing_ids.add(existing_listing_id)
+
+        if existing_folio_item.get("newlyAdded") is True:
+            previously_new_folio_item_ids.append(existing_folio_item_id)
 
     lead_id = folio["lead"]
     print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
@@ -638,6 +659,13 @@ is not in the supplied property information, do not mention it.
     yield "Updating your shortlist..."
 
     if new_listing_ids:
+        try:
+            for previous_folio_item_id in previously_new_folio_item_ids:
+                clear_folio_item_newly_added(previous_folio_item_id, base_url)
+        except Exception as error:
+            print(f"Failed to clear previous Folio Item flags: {error}", flush=True)
+            return result["customer_response"]
+
         new_folio_item_ids = create_folio_items(new_listing_ids, base_url)
 
         if new_folio_item_ids is not None:
