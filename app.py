@@ -49,8 +49,7 @@ def home():
 
 def build_response_args(user_message, previous_response_id=None):
     args = {
-        "model": "gpt-5-nano",
-        "reasoning": {"effort": "minimal"},
+        "model": "gpt-5-mini",
         "input": user_message,
         "instructions": (
             "You are Rentee, a friendly and highly capable personal property "
