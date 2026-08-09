@@ -50,7 +50,6 @@ def home():
 def build_response_args(user_message, previous_response_id=None):
     args = {
         "model": "gpt-5-nano",
-        "reasoning": {"effort": "minimal"},
         "input": user_message,
         "instructions": (
             "You are Rentee, a friendly and highly capable personal property "
@@ -61,16 +60,16 @@ def build_response_args(user_message, previous_response_id=None):
             "When the user asks about properties, recommendations, or suitable listings "
             "based on their current requirements, use the property matching tool to identify "
             "the best available options. "
-            "Use use_web_search when answering questions that depend on current, changing, "
+            "Use web search when answering questions that depend on current, changing, "
             "external, or internet-based information, or when you are materially uncertain "
             "about an external factual claim that can be verified online. Prefer searching "
             "rather than guessing for neighbourhood developments, infrastructure, transport, "
             "schools, amenities, regulations, taxes, market information, and developer or "
-            "project news. Do not use use_web_search as a source of current Rentee listing "
+            "project news. Do not use web search as a source of current Rentee listing "
             "availability: current available properties and recommendations must come from "
             "match_lead. Facts about a currently available unit, including price, bedrooms, "
             "bathrooms, size, furnishing, parking, facilities, availability, photos, and "
-            "floorplans, must come only from current Rentee listing data. Web information may be "
+            "floorplans, must come only from current Rentee listing data. Web search may be "
             "used for external context about a building, neighbourhood, or surrounding area, "
             "but must not overwrite or contradict authoritative listing data. "
             "After every get_property_details result, check whether it actually answers the "
@@ -219,22 +218,7 @@ def build_response_args(user_message, previous_response_id=None):
         }
     },
     {
-        "type": "function",
-        "name": "use_web_search",
-        "description": (
-            "Use this when answering the user's question requires current, external, "
-            "or internet-based information that is not available from Rentee property "
-            "data or conversation context. This includes current travel times, news, "
-            "interest rates, schools, amenities, neighbourhood facts, and other facts "
-            "that should be looked up online. Do not use it for currently available "
-            "Rentee properties or recommendations; use match_lead for those."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False
-        }
+        "type": "web_search"
     }
 ]
     }
@@ -1043,7 +1027,6 @@ def chat_stream():
                 print(f"Original call_id: {original_call_id}", flush=True)
                 tool_args = json.loads(tool_call.arguments)
                 follow_up_tools = None
-                web_escalation = False
 
                 if tool_call.name == "match_lead":
                     tool_result = yield from stream_match_lead(folio_id, bubble_env)
@@ -1119,20 +1102,6 @@ def chat_stream():
                     # web-search event below then selects the customer-facing status.
                     property_details_web_fallback = True
                     follow_up_tools = [{"type": "web_search"}]
-                elif tool_call.name == "use_web_search":
-                    has_match_results = False
-                    web_escalation = True
-                    log_timing("Web escalation selected", request_started)
-                    tool_result = (
-                        "Use web search to answer the user's original question. Return a "
-                        "concise customer-facing answer with accurate source citations."
-                    )
-                    follow_up_instructions = (
-                        "Use web search to answer the user's original question accurately. "
-                        "Return a concise, customer-facing answer. Do not expose internal "
-                        "tools, IDs, or implementation details."
-                    )
-                    follow_up_tools = [{"type": "web_search"}]
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
@@ -1153,12 +1122,6 @@ def chat_stream():
                     print(
                         "Submitting function_call_output for original "
                         f"match_lead call {original_call_id}",
-                        flush=True
-                    )
-                elif tool_call.name == "use_web_search":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"use_web_search call {original_call_id}",
                         flush=True
                     )
                 else:
@@ -1182,7 +1145,6 @@ def chat_stream():
                     continuation_args["tools"] = follow_up_tools
 
                 final_openai_started = time.perf_counter()
-                web_enabled_first_delta_sent = False
                 with client.responses.stream(**continuation_args) as stream:
                     for event in stream:
                         if (
@@ -1200,22 +1162,13 @@ def chat_stream():
                             )
                             web_search_status_sent = True
                         if event.type == "response.output_text.delta":
-                            if web_escalation and not web_enabled_first_delta_sent:
-                                log_timing(
-                                    "Web-enabled OpenAI FIRST DELTA",
-                                    final_openai_started
-                                )
-                                web_enabled_first_delta_sent = True
                             if not first_delta_sent:
                                 log_timing("FIRST DELTA", request_started)
                                 first_delta_sent = True
                             yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
                     final = stream.get_final_response()
-                if web_escalation:
-                    log_timing("Web-enabled OpenAI completion", final_openai_started)
-                else:
-                    log_timing("Final OpenAI completion", final_openai_started)
+                log_timing("Final OpenAI completion", final_openai_started)
 
                 print("Tool lifecycle completed", flush=True)
 
