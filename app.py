@@ -1017,15 +1017,9 @@ def chat_stream():
 
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
-                initial_response_args = build_response_args(message, previous)
-                print(
-                    "Initial tools available: "
-                    f"{[tool['name'] for tool in initial_response_args['tools'] if tool['type'] == 'function']}",
-                    flush=True
-                )
                 try:
-                    final_initial = yield from stream_initial_response(
-                        initial_response_args,
+                    response = yield from stream_initial_response(
+                        build_response_args(message, previous),
                         "Initial OpenAI/tool selection"
                     )
                 except Exception as error:
@@ -1036,25 +1030,13 @@ def chat_stream():
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
-                    retry_response_args = build_response_args(message, None)
-                    print(
-                        "Initial tools available: "
-                        f"{[tool['name'] for tool in retry_response_args['tools'] if tool['type'] == 'function']}",
-                        flush=True
-                    )
-                    final_initial = yield from stream_initial_response(
-                        retry_response_args,
+                    response = yield from stream_initial_response(
+                        build_response_args(message, None),
                         "Initial OpenAI/tool selection retry"
                     )
-                response = final_initial
-                print(
-                    "Initial response output types: "
-                    f"{[output_item.type for output_item in final_initial.output]}",
-                    flush=True
-                )
                 if any(
                     output_item.type == "web_search_call"
-                    for output_item in final_initial.output
+                    for output_item in response.output
                 ) and not web_search_status_sent:
                     print("Web search used", flush=True)
                     yield (
@@ -1062,11 +1044,7 @@ def chat_stream():
                     )
                     web_search_status_sent = True
                 tool_call = next(
-                    (
-                        x
-                        for x in final_initial.output
-                        if x.type == "function_call"
-                    ),
+                    (x for x in response.output if x.type == "function_call"),
                     None
                 )
 
