@@ -84,13 +84,11 @@ def build_response_args(user_message, previous_response_id=None):
             "information does not specify it. "
             "Use match_lead for current availability and recommendations, update_preferences "
             "for stored home-search requirements, and get_property_details for factual "
-            "questions about a specific listing, unit, condo, building, or development when "
-            "the answer should come from Rentee property data. Use use_web_search instead for "
-            "external context such as travel, schools, amenities, or neighbourhood facts. Do "
+            "questions about a specific listing, unit, condo, building, or development. Do "
             "not call match_lead merely to answer a factual property question. When a property "
             "is already being discussed, use get_property_details rather than rerunning "
-            "matching. Prefer authoritative Rentee property data whenever the requested "
-            "information exists in Rentee. "
+            "matching. Prefer authoritative Rentee property data over web search whenever the "
+            "requested information exists in Rentee. "
             "Whenever the user asks about currently available properties, suitable listings, "
             "options, recommendations, or what is available for them, you MUST call the "
             "match_lead tool. Never answer current property availability or recommendations "
@@ -586,20 +584,7 @@ def match_lead(folio_id, bubble_env):
 
     yield "Searching available properties..."
     listings_started = time.perf_counter()
-    all_listings = get_all_listings(base_url)
-    active_filter_started = time.perf_counter()
-    active_listings = [
-        listing
-        for listing in all_listings
-        if str(listing.get("status", "")).strip().lower() == "active"
-    ]
-    log_timing("Active listing filter", active_filter_started)
-    print(
-        f"Loaded {len(all_listings)} total listings; "
-        f"{len(active_listings)} active listings",
-        flush=True
-    )
-    listings = active_listings[:MATCH_LISTING_LIMIT]
+    listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
     log_timing("match_lead - load listings", listings_started)
 
     print(
@@ -965,11 +950,9 @@ def chat_stream():
                 property_details_web_fallback = False
                 first_delta_sent = False
                 initial_first_event_logged = False
-                initial_first_delta_logged = False
 
                 def stream_initial_response(response_args, timing_label):
                     nonlocal first_delta_sent, initial_first_event_logged
-                    nonlocal initial_first_delta_logged
                     nonlocal web_search_status_sent
 
                     initial_started = time.perf_counter()
@@ -994,12 +977,6 @@ def chat_stream():
                                     web_search_status_sent = True
 
                                 if event.type == "response.output_text.delta":
-                                    if not initial_first_delta_logged:
-                                        log_timing(
-                                            "Initial OpenAI FIRST DELTA",
-                                            initial_started
-                                        )
-                                        initial_first_delta_logged = True
                                     if not first_delta_sent:
                                         log_timing("FIRST DELTA", request_started)
                                         first_delta_sent = True
