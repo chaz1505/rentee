@@ -421,11 +421,13 @@ def get_property_details(folio_id, property_reference, bubble_env):
     return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
-def create_folio_items(listing_ids, base_url):
+def create_folio_items(recommendations, base_url):
 
     folio_item_ids = []
 
-    for listing_id in listing_ids:
+    for recommendation in recommendations:
+        listing_id = recommendation["listing_id"]
+        reco_summary = recommendation["reco_summary"]
         try:
             response = requests.post(
                 f"{base_url}/obj/folioItem",
@@ -435,7 +437,8 @@ def create_folio_items(listing_ids, base_url):
                 },
                 json={
                     "listing": listing_id,
-                    "newlyAdded": True
+                    "newlyAdded": True,
+                    "RecoSummary": reco_summary
                 },
                 timeout=30
             )
@@ -587,18 +590,28 @@ Do not invent facts. Only use information in the home seeker requirements and
 supplied property information.
 
 Return valid JSON with exactly these fields:
-- recommended_listing_ids: an array containing only INTERNAL LISTING IDs from
-  the supplied properties, in the same order as your ranking. Include only
-  properties you genuinely recommend; never invent an ID or add properties to
-  fill a list.
+- recommendations: an array in ranking order. Each item must contain the
+  INTERNAL LISTING ID from the supplied properties as listing_id and a
+  personalised reco_summary. Include only properties you genuinely recommend;
+  never invent an ID or add properties to fill a list.
 - customer_response: concise, natural, customer-facing recommendation prose.
   Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
   matching process.
 
-The recommended_listing_ids are the source of truth. customer_response must
-describe only the listings represented by those IDs, in the same order. Never
-invent a property, unit, building name, or property detail. If a name or detail
-is not in the supplied property information, do not mention it.
+For every recommended listing, reco_summary must be a short, personalised
+one- or two-sentence explanation of why this listing suits this home seeker.
+Focus on the one to three strongest relevant requirements and actual listing
+attributes, and mention a material trade-off when applicable. Use natural,
+consumer-friendly language. Do not mention IDs, scores, matching logic, or
+AIsearchtext; do not use generic real-estate marketing language; and do not
+invent facts or claim a requirement exists unless it appears in the supplied
+home seeker requirements. reco_summary is recommendation reasoning, not a
+rewritten listing description.
+
+The recommendations array is the source of truth. customer_response must
+describe only the listings represented there, in the same order. Never invent
+a property, unit, building name, or property detail. If a name or detail is not
+in the supplied property information, do not mention it.
 
 """
 
@@ -616,13 +629,21 @@ is not in the supplied property information, do not mention it.
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "recommended_listing_ids": {
+                        "recommendations": {
                             "type": "array",
-                            "items": {"type": "string"}
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "listing_id": {"type": "string"},
+                                    "reco_summary": {"type": "string"}
+                                },
+                                "required": ["listing_id", "reco_summary"],
+                                "additionalProperties": False
+                            }
                         },
                         "customer_response": {"type": "string"}
                     },
-                    "required": ["recommended_listing_ids", "customer_response"],
+                    "required": ["recommendations", "customer_response"],
                     "additionalProperties": False
                 }
             }
@@ -642,23 +663,26 @@ is not in the supplied property information, do not mention it.
         for listing in listings
         if listing.get("_id")
     }
-    recommended_listing_ids = []
+    validated_recommendations = []
+    seen_recommended_listing_ids = set()
 
-    for listing_id in result["recommended_listing_ids"]:
+    for recommendation in result["recommendations"]:
+        listing_id = recommendation["listing_id"]
         if listing_id not in available_listing_ids:
             print("Ignoring invalid recommended listing ID", flush=True)
-        elif listing_id not in recommended_listing_ids:
-            recommended_listing_ids.append(listing_id)
+        elif listing_id not in seen_recommended_listing_ids:
+            validated_recommendations.append(recommendation)
+            seen_recommended_listing_ids.add(listing_id)
 
-    new_listing_ids = [
-        listing_id
-        for listing_id in recommended_listing_ids
-        if listing_id not in existing_listing_ids
+    new_recommendations = [
+        recommendation
+        for recommendation in validated_recommendations
+        if recommendation["listing_id"] not in existing_listing_ids
     ]
 
     yield "Updating your shortlist..."
 
-    if new_listing_ids:
+    if new_recommendations:
         try:
             for previous_folio_item_id in previously_new_folio_item_ids:
                 clear_folio_item_newly_added(previous_folio_item_id, base_url)
@@ -666,7 +690,7 @@ is not in the supplied property information, do not mention it.
             print(f"Failed to clear previous Folio Item flags: {error}", flush=True)
             return result["customer_response"]
 
-        new_folio_item_ids = create_folio_items(new_listing_ids, base_url)
+        new_folio_item_ids = create_folio_items(new_recommendations, base_url)
 
         if new_folio_item_ids is not None:
             final_folio_item_ids = existing_folio_item_ids + new_folio_item_ids
