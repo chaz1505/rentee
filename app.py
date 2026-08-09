@@ -473,6 +473,18 @@ def match_lead(folio_id, bubble_env):
     yield "Checking your preferences..."
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    existing_folio_item_ids = list(folio.get("folioItems", []) or [])
+    existing_listing_ids = set()
+
+    for existing_folio_item_id in existing_folio_item_ids:
+        existing_folio_item = bubble(
+            f"{base_url}/obj/folioItem/{existing_folio_item_id}"
+        )
+        existing_listing_id = existing_folio_item.get("listing")
+
+        if existing_listing_id:
+            existing_listing_ids.add(existing_listing_id)
+
     lead_id = folio["lead"]
     print(f"Folio {folio_id} -> Lead {lead_id}", flush=True)
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
@@ -617,14 +629,23 @@ is not in the supplied property information, do not mention it.
         elif listing_id not in recommended_listing_ids:
             recommended_listing_ids.append(listing_id)
 
-    yield "Updating your shortlist..."
-    folio_item_ids = create_folio_items(recommended_listing_ids, base_url)
+    new_listing_ids = [
+        listing_id
+        for listing_id in recommended_listing_ids
+        if listing_id not in existing_listing_ids
+    ]
 
-    if folio_item_ids is not None:
-        try:
-            update_folio_items(folio_id, folio_item_ids, base_url)
-        except Exception as error:
-            print(f"Failed to update Folio Items: {error}", flush=True)
+    yield "Updating your shortlist..."
+
+    if new_listing_ids:
+        new_folio_item_ids = create_folio_items(new_listing_ids, base_url)
+
+        if new_folio_item_ids is not None:
+            final_folio_item_ids = existing_folio_item_ids + new_folio_item_ids
+            try:
+                update_folio_items(folio_id, final_folio_item_ids, base_url)
+            except Exception as error:
+                print(f"Failed to update Folio Items: {error}", flush=True)
 
     return result["customer_response"]
 
