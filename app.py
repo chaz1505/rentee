@@ -36,6 +36,30 @@ def log_timing(label, started, detail=""):
     )
 
 
+def log_token_usage(label, response):
+
+    def value(source, field):
+        if source is None:
+            return 0
+        if isinstance(source, dict):
+            return source.get(field, 0) or 0
+        return getattr(source, field, 0) or 0
+
+    usage = value(response, "usage")
+    input_details = value(usage, "input_tokens_details")
+    output_details = value(usage, "output_tokens_details")
+
+    print(
+        f"[TOKENS] {label}: "
+        f"input={value(usage, 'input_tokens')} "
+        f"cached={value(input_details, 'cached_tokens')} "
+        f"output={value(usage, 'output_tokens')} "
+        f"reasoning={value(output_details, 'reasoning_tokens')} "
+        f"total={value(usage, 'total_tokens')}",
+        flush=True
+    )
+
+
 def get_bubble_base_url(bubble_env):
     if bubble_env == "development":
         return "https://www.rentee.asia/version-test/api/1.1"
@@ -386,6 +410,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
                 }
             }
         )
+        log_token_usage("Property reference resolution", resolver_response)
         resolution = json.loads(resolver_response.output_text)
 
         if resolution["matched"]:
@@ -696,6 +721,7 @@ in the supplied property information, do not mention it.
 
     )
     log_timing("match_lead - OpenAI matching", matching_started)
+    log_token_usage("Matching", response)
 
     print("Matching model response received", flush=True)
     parse_started = time.perf_counter()
@@ -876,6 +902,7 @@ REQUESTED PREFERENCE UPDATE:
         }
     )
     log_timing("Preference extraction OpenAI call", extraction_started)
+    log_token_usage("Preference", response)
     parse_started = time.perf_counter()
     result = json.loads(response.output_text)
     log_timing("update_preferences - parse result", parse_started)
@@ -992,6 +1019,7 @@ def chat_stream():
                                     )
 
                             final_response = stream.get_final_response()
+                            log_token_usage("Initial", final_response)
                     except Exception:
                         log_timing(f"{timing_label} failed", initial_started)
                         raise
@@ -1191,6 +1219,7 @@ def chat_stream():
                             yield f"data: {json.dumps({'delta': event.delta})}\n\n"
 
                     final = stream.get_final_response()
+                log_token_usage("Final", final)
                 log_timing("Final OpenAI completion", final_openai_started)
 
                 print("Tool lifecycle completed", flush=True)
