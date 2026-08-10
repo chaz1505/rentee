@@ -949,16 +949,64 @@ def chat_stream():
                 web_search_status_sent = False
                 property_details_web_fallback = False
                 first_delta_sent = False
+                initial_first_event_logged = False
+                initial_first_delta_logged = False
+
+                def stream_initial_response(response_args, timing_label):
+                    nonlocal first_delta_sent, initial_first_event_logged
+                    nonlocal initial_first_delta_logged, web_search_status_sent
+
+                    initial_started = time.perf_counter()
+                    try:
+                        with client.responses.stream(**response_args) as stream:
+                            for event in stream:
+                                if not initial_first_event_logged:
+                                    log_timing(
+                                        "Initial OpenAI FIRST EVENT",
+                                        initial_started
+                                    )
+                                    initial_first_event_logged = True
+
+                                if (
+                                    event.type.startswith("response.web_search_call.")
+                                    and not web_search_status_sent
+                                ):
+                                    print("Web search used", flush=True)
+                                    yield (
+                                        f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
+                                    )
+                                    web_search_status_sent = True
+
+                                if event.type == "response.output_text.delta":
+                                    if not initial_first_delta_logged:
+                                        log_timing(
+                                            "Initial OpenAI FIRST DELTA",
+                                            initial_started
+                                        )
+                                        initial_first_delta_logged = True
+                                    if not first_delta_sent:
+                                        log_timing("FIRST DELTA", request_started)
+                                        first_delta_sent = True
+                                    yield (
+                                        f"data: {json.dumps({'delta': event.delta})}\n\n"
+                                    )
+
+                            final_response = stream.get_final_response()
+                    except Exception:
+                        log_timing(f"{timing_label} failed", initial_started)
+                        raise
+
+                    log_timing(f"{timing_label} complete", initial_started)
+                    return final_response
+
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
-                initial_openai_started = time.perf_counter()
                 try:
-                    response = client.responses.create(
-                        **build_response_args(message, previous)
+                    response = yield from stream_initial_response(
+                        build_response_args(message, previous),
+                        "Initial OpenAI/tool selection"
                     )
-                    log_timing("Initial OpenAI/tool selection", initial_openai_started)
                 except Exception as error:
-                    log_timing("Initial OpenAI/tool selection", initial_openai_started)
                     if "No tool output found for function call" not in str(error):
                         raise
 
@@ -966,18 +1014,14 @@ def chat_stream():
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
-                    retry_openai_started = time.perf_counter()
-                    response = client.responses.create(
-                        **build_response_args(message, None)
-                    )
-                    log_timing(
-                        "Initial OpenAI/tool selection retry",
-                        retry_openai_started
+                    response = yield from stream_initial_response(
+                        build_response_args(message, None),
+                        "Initial OpenAI/tool selection retry"
                     )
                 if any(
                     output_item.type == "web_search_call"
                     for output_item in response.output
-                ):
+                ) and not web_search_status_sent:
                     print("Web search used", flush=True)
                     yield (
                         f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
@@ -990,13 +1034,6 @@ def chat_stream():
 
                 if tool_call is None:
                     print("No tool call requested", flush=True)
-                    for i in range(0, len(response.output_text), 25):
-                        if not first_delta_sent:
-                            log_timing("FIRST DELTA", request_started)
-                            first_delta_sent = True
-                        yield (
-                            f"data: {json.dumps({'delta': response.output_text[i:i + 25]})}\n\n"
-                        )
                     citations = get_web_citations(response)
 
                     if citations:
