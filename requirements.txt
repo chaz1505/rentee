@@ -3,3 +3,4 @@ gunicorn
 openai>=1.99.0
 requests
 flask-cors
+beautifulsoup4>=4.12.0
