@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Development-only PropertyGuru -> Rentee Bubble importer.
+"""Development-only iProperty Malaysia -> Rentee Bubble importer.
 
-The scraper deliberately uses ordinary HTTP and stops when PropertyGuru presents
-an access-control or bot-challenge page. It does not try to solve or bypass one.
+The scraper stops when iProperty presents an access-control or bot-challenge
+page. It does not try to solve or bypass one.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Iterator
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -40,11 +41,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
-LOGGER = logging.getLogger("propertyguru_scraper")
+LOGGER = logging.getLogger("iproperty_scraper")
 BUBBLE_BASE_URL = "https://www.rentee.asia/version-test/api/1.1"
-DEFAULT_SEARCH_URL = "https://www.propertyguru.com.my/property-for-rent/p/one-menerung-bangsar"
-PROPERTYGURU_HOSTS = {"propertyguru.com.my", "www.propertyguru.com.my"}
-LISTING_PATH_RE = re.compile(r"/(?:property-listing|bm/senarai-hartanah)/[^?#]*?(\d{7,})/?$")
+DEFAULT_SEARCH_URL = "https://www.iproperty.com.my/property-for-rent/p/one-menerung"
+IPROPERTY_HOSTS = {"iproperty.com.my", "www.iproperty.com.my"}
+LISTING_PATH_RE = re.compile(
+    r"/(?:property|bm/properti)/[^?#]+/rent-(\d{7,})/?$", re.I
+)
 MONEY_RE = re.compile(r"RM\s*([\d,]+)(?:\.\d+)?\s*/\s*(?:mo|month|bulan)", re.I)
 AREA_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*ft|sqft|sf)\b", re.I)
 LISTING_ID_RE = re.compile(r"Listing\s*ID\s*[-:#]?\s*(\d{7,})", re.I)
@@ -54,6 +57,7 @@ BLOCK_MARKERS = (
     "captcha",
     "verify you are human",
     "access denied",
+    "bot protection",
 )
 
 
@@ -141,7 +145,7 @@ def assert_development_endpoint(base_url: str) -> None:
         )
 
 
-class PropertyGuruClient:
+class IPropertyClient:
     def __init__(self, delay: float = 1.5, timeout: float = 30.0):
         self.delay = max(0.0, delay)
         self.timeout = timeout
@@ -151,11 +155,11 @@ class PropertyGuruClient:
         self.context: BrowserContext | None = None
         self.page: Page | None = None
 
-    def __enter__(self) -> "PropertyGuruClient":
+    def __enter__(self) -> "IPropertyClient":
         LOGGER.info("Launching Chromium...")
         try:
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.launch(headless=True)
+            self.browser = self.playwright.chromium.launch(headless=False)
             self.context = self.browser.new_context(
                 viewport={"width": 1440, "height": 1000},
                 locale="en-MY",
@@ -209,10 +213,15 @@ class PropertyGuruClient:
             raise ScraperError("Chromium has not been launched.")
         return self.page
 
-    def get(self, url: str, content_selector: str | None = None) -> str:
+    def get(
+        self,
+        url: str,
+        content_selector: str | None = None,
+        pagination_page_number: int | None = None,
+    ) -> str:
         host = (urlparse(url).hostname or "").lower()
-        if host not in PROPERTYGURU_HOSTS:
-            raise ScraperError(f"Refusing unexpected PropertyGuru host: {host}")
+        if host not in IPROPERTY_HOSTS:
+            raise ScraperError(f"Refusing unexpected iProperty host: {host}")
         page = self._require_page()
         remaining = self.delay - (time.monotonic() - self._last_request_at)
         if remaining > 0:
@@ -228,71 +237,152 @@ class PropertyGuruClient:
                 "challenge, login, or anti-bot bypass was attempted."
             )
         if response is not None and response.status >= 400:
-            raise ScraperError(f"PropertyGuru returned HTTP {response.status} at {url}.")
+            raise ScraperError(f"iProperty returned HTTP {response.status} at {url}.")
+        if pagination_page_number is not None:
+            LOGGER.info("Page %d DOM loaded", pagination_page_number)
+            settle_seconds = random.uniform(2.0, 4.0)
+            LOGGER.info(
+                "Waiting %.1fs for page state to settle...", settle_seconds
+            )
+            page.wait_for_timeout(settle_seconds * 1000)
         if content_selector:
             try:
                 page.wait_for_selector(content_selector, state="attached", timeout=10000)
             except PlaywrightTimeoutError:
                 # Inspect the rendered page below: this may be an empty-result page,
                 # a changed selector, or an access-control page with a useful title.
-                LOGGER.warning("Expected PropertyGuru content did not appear within 10 seconds")
+                LOGGER.warning("Expected iProperty content did not appear within 10 seconds")
         html = page.content()
         self._detect_access_control(html, page.title(), page.url)
         return html
 
-    @staticmethod
-    def _listing_urls(html: str, base_url: str) -> dict[str, str]:
-        found: dict[str, str] = {}
-        soup = BeautifulSoup(html, "html.parser")
-        for anchor in soup.select("a[href]"):
-            absolute = canonical_propertyguru_url(urljoin(base_url, anchor["href"]))
-            match = LISTING_PATH_RE.search(urlparse(absolute).path)
-            if match:
-                found.setdefault(match.group(1), absolute)
-        return found
-
-    def discover_listing_urls(
+    def discover_listings(
         self, search_url: str, max_pages: int, limit: int | None = None
-    ) -> list[str]:
-        found: dict[str, str] = {}
-        next_url: str | None = search_url
-        visited: set[str] = set()
-        for _ in range(max_pages):
-            if not next_url or next_url in visited:
+    ) -> list[NormalizedListing]:
+        found: dict[str, NormalizedListing] = {}
+        LOGGER.info("Fetching results page: %s", search_url)
+        html = self.get(search_url, 'a[href*="/rent-"]')
+        page = self._require_page()
+        seen_page_signatures: set[tuple[str, ...]] = set()
+        for page_number in range(1, max_pages + 1):
+            LOGGER.info("Parsing page %d...", page_number)
+            page_found = parse_search_results(html, page.url, "One Menerung")
+            signature = tuple(item.source_listing_id for item in page_found)
+            if signature in seen_page_signatures:
                 break
-            visited.add(next_url)
-            LOGGER.info("Fetching results page: %s", next_url)
-            html = self.get(
-                next_url,
-                'a[href*="/property-listing/"], a[href*="/bm/senarai-hartanah/"]',
+            seen_page_signatures.add(signature)
+            for item in page_found:
+                found.setdefault(item.source_listing_id, item)
+            LOGGER.info(
+                "Search page %d loaded; found %d listing links so far",
+                page_number, len(found),
             )
-            page = self._require_page()
-            stagnant_scrolls = 0
-            previous_count = -1
-            while stagnant_scrolls < 3 and not (limit and len(found) >= limit):
-                found.update(self._listing_urls(html, page.url))
-                if len(found) == previous_count:
-                    stagnant_scrolls += 1
-                else:
-                    stagnant_scrolls = 0
-                    previous_count = len(found)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1000)
-                html = page.content()
-                self._detect_access_control(html, page.title(), page.url)
-            LOGGER.info("Search page loaded; found %d listing links so far", len(found))
+            LOGGER.info("Page %d parsed", page_number)
             if limit and len(found) >= limit:
                 break
-            soup = BeautifulSoup(html, "html.parser")
-            next_link = soup.select_one('link[rel="next"][href], a[rel="next"][href]')
-            candidate = urljoin(page.url, next_link["href"]) if next_link else None
-            next_url = candidate if candidate and candidate not in visited else None
-        return list(found.values())
+            next_page_number = page_number + 1
+            current_search_url = page.url
+            next_page_url = discover_pagination_url(
+                html, current_search_url, next_page_number, "One Menerung"
+            )
+            if not next_page_url:
+                break
+            LOGGER.info("Current search URL: %s", current_search_url)
+            LOGGER.info(
+                "Page %d href discovered: %s", next_page_number, next_page_url
+            )
+            pagination_delay = random.uniform(8.0, 15.0)
+            LOGGER.info(
+                "Waiting %.1fs before page %d...",
+                pagination_delay, next_page_number,
+            )
+            page.wait_for_timeout(pagination_delay * 1000)
+            LOGGER.info("Navigating to page %d...", next_page_number)
+            try:
+                html = self.get(
+                    next_page_url,
+                    'a[href*="/rent-"]',
+                    pagination_page_number=next_page_number,
+                )
+            except AccessBlockedError:
+                LOGGER.warning(
+                    "WARNING: iProperty blocked page %d. Stopping pagination and "
+                    "continuing with %d listings already collected.",
+                    next_page_number, len(found),
+                )
+                break
+        listings = list(found.values())
+        return listings[:limit] if limit else listings
 
 
-def canonical_propertyguru_url(url: str) -> str:
+def canonical_iproperty_url(url: str) -> str:
     parsed = urlparse(url)
     return parsed._replace(query="", fragment="").geturl()
+
+
+def discover_pagination_url(
+    html: str, current_url: str, page_number: int, expected_condo: str
+) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    page_link = soup.select_one(
+        f'a[title="Page {page_number}"][href], '
+        f'a[da-id="hui-pagination-btn-page-{page_number}"][href]'
+    )
+    if page_link:
+        href = urljoin(current_url, page_link["href"])
+        # Current iProperty sometimes renders a stale self-link and relies on an
+        # obsolete click handler. Use a real, distinct pagination href verbatim.
+        if href != current_url and re.search(rf"/{page_number}(?:\?|/?$)", href):
+            return href
+
+    script = soup.select_one("script#__NEXT_DATA__")
+    if not script:
+        return None
+    try:
+        next_data = json.loads(script.string or script.get_text())
+    except (TypeError, json.JSONDecodeError):
+        return None
+    page_data = (
+        next_data.get("props", {}).get("pageProps", {}).get("pageData", {})
+    )
+    search_params = page_data.get("searchParams", {})
+    listing_type = compact_text(search_params.get("listingType")).casefold()
+    if listing_type != "rent":
+        return None
+
+    project_ids = set()
+    for wrapper in nested_items(page_data, "data", "listingsData"):
+        if not isinstance(wrapper, dict):
+            continue
+        metadata = (
+            wrapper.get("segment", {}).get("parameters", {})
+            .get("metaData", {}).get("listingData", {})
+        )
+        listing = wrapper.get("listingData", {})
+        if not isinstance(metadata, dict) or not isinstance(listing, dict):
+            continue
+        if (
+            re.match(
+                rf"^{re.escape(expected_condo)}(?:,|$)",
+                compact_text(listing.get("localizedTitle")), re.I,
+            )
+            and re.search(r"\bJalan Menerung\b", compact_text(listing.get("fullAddress")), re.I)
+            and compact_text((listing.get("property") or {}).get("subTypeText")).casefold()
+            == "condominium"
+        ):
+            project_id = compact_text(metadata.get("projectNanoId"))
+            if project_id:
+                project_ids.add(project_id)
+    if len(project_ids) != 1:
+        return None
+
+    query = {
+        "isCommercial": str(bool(search_params.get("isCommercial", False))).lower(),
+        "_freetextDisplay": expected_condo,
+        "propertyId": project_ids.pop(),
+    }
+    base_url = f"{urlparse(current_url).scheme}://{urlparse(current_url).netloc}"
+    return f"{base_url}/property-for-rent/{page_number}?{urlencode(query)}"
 
 
 def walk_json(value: Any) -> Iterator[tuple[str, Any]]:
@@ -357,7 +447,9 @@ def meaningful_image(url: str) -> bool:
     return not any(marker in lowered for marker in excluded)
 
 
-def extract_photos(soup: BeautifulSoup, documents: list[Any]) -> list[str]:
+def extract_photos(
+    soup: BeautifulSoup, documents: list[Any], listing_id: str
+) -> list[str]:
     candidates: list[str] = []
     photo_keys = {"photos", "images", "media", "gallery", "image", "imageurl", "imageurls"}
     for value in values_for_keys(documents, photo_keys):
@@ -372,11 +464,15 @@ def extract_photos(soup: BeautifulSoup, documents: list[Any]) -> list[str]:
             srcset = [part.strip().split()[0] for part in image["srcset"].split(",")]
             candidates.extend(reversed(srcset))
     output = []
-    seen = set()
+    seen_media = set()
     for candidate in candidates:
         url = candidate.replace("\\u002F", "/").replace("\\/", "/")
-        if meaningful_image(url) and url not in seen:
-            seen.add(url)
+        if f"/listing/{listing_id}/" not in url or "${" in url:
+            continue
+        media_match = re.search(r"/UPHO\.(\d+)\.", url, re.I)
+        identity = media_match.group(1) if media_match else url
+        if meaningful_image(url) and identity not in seen_media:
+            seen_media.add(identity)
             output.append(url)
     return output
 
@@ -413,10 +509,22 @@ def parse_bedrooms(value: Any) -> tuple[float | None, float | None]:
 
 
 def parse_availability(text: str) -> str | None:
-    match = re.search(r"Available\s+(?:from|on)\s+([^|\n.,;]+(?:\s+\d{4})?)", text, re.I)
+    match = re.search(
+        r"Available\s+(?:(?:from|on)\s+)?"
+        r"((?:end\s+of\s+)?[A-Za-z]+(?:\s+\d{1,2})?(?:\s+\d{4})?|"
+        r"\d{1,2}\s+[A-Za-z]+(?:\s+\d{4})?)",
+        text,
+        re.I,
+    )
     if not match:
         return None
     raw = compact_text(match.group(1))
+    end_of_month = re.fullmatch(r"end\s+of\s+([A-Za-z]+)\s+(\d{4})", raw, re.I)
+    if end_of_month:
+        parsed = datetime.strptime(
+            f"1 {end_of_month.group(1)} {end_of_month.group(2)}", "%d %B %Y"
+        )
+        return parsed.replace(day=calendar.monthrange(parsed.year, parsed.month)[1]).isoformat()
     for fmt in ("%d %b %Y", "%d %B %Y", "%d %b", "%d %B"):
         try:
             parsed = datetime.strptime(raw, fmt)
@@ -428,6 +536,167 @@ def parse_availability(text: str) -> str | None:
     return None
 
 
+def nested_items(value: Any, *path: str) -> list[Any]:
+    for key in path:
+        if not isinstance(value, dict):
+            return []
+        value = value.get(key)
+    return value if isinstance(value, list) else []
+
+
+def listing_feature_texts(listing_data: dict[str, Any]) -> list[str]:
+    output = []
+    for value in listing_data.get("listingFeatures", []) or []:
+        values = value if isinstance(value, list) else [value]
+        for feature in values:
+            if not isinstance(feature, dict):
+                continue
+            text = compact_text(feature.get("text"))
+            if text and text not in output:
+                output.append(text)
+    return output
+
+
+def search_listing_photos(
+    listing_data: dict[str, Any], listing_id: str
+) -> list[str]:
+    items = nested_items(
+        listing_data, "mediaCarousel", "previewMedia", "images", "items"
+    )
+    output = []
+    seen_media = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = compact_text(item.get("src"))
+        # iProperty mixes generic project photos into the card carousel. Keep
+        # only media belonging to this exact listing.
+        if f"/listing/{listing_id}/" not in url or not meaningful_image(url):
+            continue
+        media_match = re.search(r"/UPHO\.(\d+)\.", url, re.I)
+        identity = media_match.group(1) if media_match else url
+        if identity not in seen_media:
+            seen_media.add(identity)
+            output.append(url)
+    return output
+
+
+def first_search_video(listing_data: dict[str, Any]) -> str | None:
+    preview = (
+        listing_data.get("mediaCarousel", {}).get("previewMedia", {})
+        if isinstance(listing_data.get("mediaCarousel"), dict)
+        else {}
+    )
+    for key in ("videos", "heroVideos", "virtualTours"):
+        for item in nested_items(preview, key, "items"):
+            if isinstance(item, dict):
+                for url_key in ("src", "url", "embedUrl"):
+                    value = item.get(url_key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        return value
+    return None
+
+
+def parse_search_results(
+    html: str, search_url: str, expected_condo: str
+) -> list[NormalizedListing]:
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.select_one("script#__NEXT_DATA__")
+    if not script:
+        raise ScraperError("iProperty search page did not contain __NEXT_DATA__.")
+    try:
+        next_data = json.loads(script.string or script.get_text())
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ScraperError(f"Could not parse iProperty search-page data: {error}") from error
+
+    listings_data = nested_items(
+        next_data, "props", "pageProps", "pageData", "data", "listingsData"
+    )
+    if not listings_data:
+        raise ScraperError("iProperty search-page data contained no listing records.")
+
+    output = []
+    for wrapper in listings_data:
+        listing = wrapper.get("listingData") if isinstance(wrapper, dict) else None
+        if not isinstance(listing, dict):
+            continue
+        relative_url = compact_text(listing.get("url"))
+        relative_url_match = LISTING_PATH_RE.search(urlparse(relative_url).path)
+        listing_id = relative_url_match.group(1) if relative_url_match else ""
+        title = compact_text(listing.get("localizedTitle"))
+        address = compact_text(listing.get("fullAddress"))
+        property_data = listing.get("property") or {}
+        property_type = compact_text(property_data.get("subTypeText"))
+        if (
+            not re.fullmatch(r"\d{7,}", listing_id)
+            or relative_url_match is None
+            or not re.match(rf"^{re.escape(expected_condo)}(?:,|$)", title, re.I)
+            or not re.search(r"\bJalan Menerung\b", address, re.I)
+            or property_type.casefold() != "condominium"
+            or compact_text(listing.get("typeCode")).upper() != "RENT"
+        ):
+            continue
+
+        source_url = canonical_iproperty_url(urljoin(search_url, relative_url))
+        url_match = LISTING_PATH_RE.search(urlparse(source_url).path)
+        if not url_match:
+            raise ScraperError(f"Could not extract iProperty listing ID from {source_url}.")
+
+        features = listing_feature_texts(listing)
+        furnish_text = next(
+            (
+                compact_text(feature.get("text"))
+                for value in listing.get("listingFeatures", []) or []
+                for feature in (value if isinstance(value, list) else [value])
+                if isinstance(feature, dict)
+                and feature.get("dataAutomationId") == "listing-card-v2-furnish"
+            ),
+            "",
+        )
+        furnished = None
+        if re.search(r"\b(?:fully|partially|partly|semi)[ -]?furnished\b", furnish_text, re.I):
+            furnished = "Yes"
+        elif re.search(r"\bunfurnished\b", furnish_text, re.I):
+            furnished = "No"
+
+        badges = [
+            compact_text(item.get("text"))
+            for item in listing.get("badges", []) or []
+            if isinstance(item, dict) and compact_text(item.get("text"))
+        ]
+        availability_text = compact_text(listing.get("availabilityInfo"))
+        recency = compact_text((listing.get("recency") or {}).get("text"))
+        price_data = listing.get("price") or {}
+        card_summary_parts = [
+            title,
+            address,
+            compact_text(price_data.get("pretty")),
+            "; ".join(features),
+            availability_text,
+            recency,
+        ]
+        description = ". ".join(value for value in card_summary_parts if value)
+        facts = "; ".join(dict.fromkeys(features + badges)) or None
+        photos = search_listing_photos(listing, listing_id)
+
+        output.append(NormalizedListing(
+            source_listing_id=listing_id,
+            source_url=source_url,
+            price_rent=parse_number(price_data.get("value") or price_data.get("localeStringValue")),
+            beds=parse_number(listing.get("bedrooms")),
+            baths=parse_number(listing.get("bathrooms")),
+            sq_ft=parse_number(listing.get("floorArea")),
+            description=description or None,
+            furnished=furnished,
+            availability=parse_availability(availability_text),
+            video_url=first_search_video(listing),
+            keyfacts=facts,
+            cover_photo_url=photos[0] if photos else None,
+            photo_urls=photos,
+        ))
+    return output
+
+
 def parse_listing(html: str, source_url: str, expected_condo: str) -> NormalizedListing:
     soup = BeautifulSoup(html, "html.parser")
     documents = embedded_documents(soup)
@@ -435,20 +704,36 @@ def parse_listing(html: str, source_url: str, expected_condo: str) -> Normalized
     title = compact_text(soup.select_one("h1").get_text(" ") if soup.select_one("h1") else "")
     structured_name = compact_text(first_value(documents, {"name", "headline"}))
     identity_text = f"{title} {structured_name} {visible[:2500]}"
-    if not re.search(rf"\b{re.escape(expected_condo)}\b", identity_text, re.I):
+    exact_title = re.match(rf"^{re.escape(expected_condo)}(?:,|$)", title, re.I)
+    if (
+        not exact_title
+        or not re.search(rf"\b{re.escape(expected_condo)}\b", identity_text, re.I)
+        or not re.search(r"\bJalan Menerung\b", visible, re.I)
+        or not re.search(r"\bCondominium for rent\b", visible, re.I)
+    ):
         raise ScraperError(f"Rejected listing because it does not clearly identify {expected_condo}.")
 
     url_id = LISTING_PATH_RE.search(urlparse(source_url).path)
     text_id = LISTING_ID_RE.search(visible)
     structured_id = first_value(documents, {"listingId", "listing_id", "sku", "productID"})
-    listing_id = str(structured_id or (text_id.group(1) if text_id else "") or (url_id.group(1) if url_id else ""))
+    listing_id = str(
+        (url_id.group(1) if url_id else "")
+        or (text_id.group(1) if text_id else "")
+        or structured_id
+    )
     if not re.fullmatch(r"\d{7,}", listing_id):
-        raise ScraperError(f"Could not determine PropertyGuru listing ID for {source_url}")
+        raise ScraperError(f"Could not determine iProperty listing ID for {source_url}")
+    if text_id and text_id.group(1) != listing_id:
+        raise ScraperError(
+            f"iProperty listing ID mismatch: URL has {listing_id}, page has {text_id.group(1)}."
+        )
 
     price = parse_number(first_value(documents, {"price", "rentPrice", "askingPrice"}))
     if price is None and (match := MONEY_RE.search(visible)):
         price = parse_number(match.group(1))
-    beds_raw = first_value(documents, {"bedrooms", "beds", "numberOfRooms"})
+    beds_raw = first_value(
+        documents, {"bedrooms", "beds", "numberOfRooms", "numberOfBedrooms"}
+    )
     beds, plus_rooms = parse_bedrooms(beds_raw)
     if beds is None and (match := re.search(r"(\d+(?:\s*\+\s*\d+)?)\s*Beds?\b", visible, re.I)):
         beds, plus_rooms = parse_bedrooms(match.group(1))
@@ -460,9 +745,17 @@ def parse_listing(html: str, source_url: str, expected_condo: str) -> Normalized
         area = parse_number(match.group(1))
 
     description = first_value(documents, {"description"})
-    about = soup.select_one('[data-testid*="description"], section:has(h2), article')
-    if about and (not description or len(compact_text(about.get_text(" "))) > len(compact_text(description))):
-        description = compact_text(about.get_text(" "))
+    description_block = soup.select_one(
+        '[da-id="description-widget"] .description, .about-section .description'
+    )
+    description_title = soup.select_one('[da-id="description-widget"] .subtitle')
+    if description_block:
+        description = "\n".join(
+            value for value in (
+                compact_text(description_title.get_text(" ")) if description_title else "",
+                compact_text(description_block.get_text(" ")),
+            ) if value
+        )
     description = compact_text(description) or None
 
     furnishing = None
@@ -471,6 +764,14 @@ def parse_listing(html: str, source_url: str, expected_condo: str) -> Normalized
     elif re.search(r"\bunfurnished\b", visible, re.I):
         furnishing = "No"
     amenities = []
+    for feature_group in values_for_keys(documents, {"amenityFeature"}):
+        if not isinstance(feature_group, list):
+            continue
+        for feature in feature_group:
+            if isinstance(feature, dict) and feature.get("value") is True:
+                name = compact_text(feature.get("name"))
+                if name:
+                    amenities.append(name)
     for heading in soup.find_all(["h3", "h4", "h5"]):
         if any(word in heading.get_text(" ").lower() for word in ("amenities", "details", "features")):
             container = heading.parent
@@ -478,7 +779,7 @@ def parse_listing(html: str, source_url: str, expected_condo: str) -> Normalized
             amenities.extend(value for value in values if 1 < len(value) < 100)
     amenities = list(dict.fromkeys(amenities))
     facts = "; ".join(amenities) or None
-    photos = extract_photos(soup, documents)
+    photos = extract_photos(soup, documents, listing_id)
     feature_text = f"{visible} {description or ''} {facts or ''}"
     maid_room = parse_room_count(feature_text, "maid room") or parse_room_count(feature_text, "maids room")
     if maid_room is None and plus_rooms is not None and re.search(r"\bmaid(?:'s)?\b", visible, re.I):
@@ -489,7 +790,7 @@ def parse_listing(html: str, source_url: str, expected_condo: str) -> Normalized
         video = next(flatten_urls(video), None)
     return NormalizedListing(
         source_listing_id=listing_id,
-        source_url=canonical_propertyguru_url(source_url),
+        source_url=canonical_iproperty_url(source_url),
         price_rent=price,
         beds=beds,
         baths=baths,
@@ -518,7 +819,40 @@ class BubbleClient:
         self.timeout = 30
 
     def _json(self, response: requests.Response) -> dict[str, Any]:
-        response.raise_for_status()
+        if not response.ok:
+            try:
+                response_body = json.dumps(
+                    response.json(), ensure_ascii=False, indent=2
+                )
+            except (ValueError, TypeError):
+                response_body = response.text or "<empty response body>"
+
+            request = response.request
+            method = request.method if request is not None else "UNKNOWN"
+            request_url = request.url if request is not None else response.url
+            payload_keys: list[str] = []
+            if request is not None and request.body:
+                try:
+                    request_body = request.body
+                    if isinstance(request_body, bytes):
+                        request_body = request_body.decode("utf-8")
+                    parsed_body = json.loads(request_body)
+                    if isinstance(parsed_body, dict):
+                        payload_keys = list(parsed_body.keys())
+                except (UnicodeDecodeError, TypeError, ValueError):
+                    pass
+
+            details = [
+                f"Bubble API error {response.status_code}",
+                f"{method} {request_url}",
+            ]
+            if payload_keys:
+                details.append(
+                    "Payload keys: " + ", ".join(payload_keys)
+                )
+            details.extend(["Response:", response_body])
+            raise ScraperError("\n".join(details))
+
         data = response.json()
         return data.get("response", data)
 
@@ -575,6 +909,10 @@ class BubbleClient:
 
     def write_listing(self, payload: dict[str, Any], existing_id: str | None) -> str:
         assert_development_endpoint(self.base_url + "/")
+        LOGGER.info(
+            "Outgoing Bubble Listing payload:\n%s",
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
         if existing_id:
             response = self.session.patch(
                 f"{self.base_url}/obj/listing/{existing_id}", json=payload, timeout=self.timeout
@@ -607,7 +945,7 @@ def bubble_payload(item: NormalizedListing, condo_id: str) -> dict[str, Any]:
         "availability": item.availability,
         "unitNumber": item.unit_number,
         "Video URL": item.video_url,
-        "keyfacts": item.keyfacts,
+        "keyFacts": item.keyfacts,
         "coverPhoto": item.cover_photo_url,
         "photos": item.photo_urls or None,
         "sourceURL": item.source_url,
@@ -637,21 +975,17 @@ def run(args: argparse.Namespace) -> int:
     LOGGER.info("Found %s: %s (matched field: %s)", args.condo, condo_id, condo_field)
 
     stats = {"found": 0, "created": 0, "updated": 0, "failed": 0}
-    with PropertyGuruClient(args.delay, args.timeout) as client:
-        LOGGER.info("Searching PropertyGuru...")
-        urls = client.discover_listing_urls(args.search_url, args.max_pages, args.limit)
-        if args.limit:
-            urls = urls[:args.limit]
-        stats["found"] = len(urls)
-        LOGGER.info("Found %d %s rental listing links", len(urls), args.condo)
-        for index, url in enumerate(urls, 1):
-            url_match = LISTING_PATH_RE.search(urlparse(url).path)
-            listing_label = url_match.group(1) if url_match else url
-            LOGGER.info("[%d/%d] Loading PropertyGuru listing %s", index, len(urls), listing_label)
+    with IPropertyClient(args.delay, args.timeout) as client:
+        LOGGER.info("Searching iProperty...")
+        items = client.discover_listings(args.search_url, args.max_pages, args.limit)
+        stats["found"] = len(items)
+        LOGGER.info("Found %d %s rental listings", len(items), args.condo)
+        for index, item in enumerate(items, 1):
+            LOGGER.info(
+                "[%d/%d] Processing iProperty search result %s",
+                index, len(items), item.source_listing_id,
+            )
             try:
-                html = client.get(url, "h1")
-                LOGGER.info("Rendered listing page")
-                item = parse_listing(html, url, args.condo)
                 LOGGER.info(
                     "Parsed: RM%s | %s beds | %s baths | %s sq ft | %d photos",
                     display_number(item.price_rent), display_number(item.beds),
@@ -674,7 +1008,7 @@ def run(args: argparse.Namespace) -> int:
                 raise
             except Exception as error:  # one malformed listing must not terminate the run
                 stats["failed"] += 1
-                LOGGER.error("Failed %s: %s", url, error)
+                LOGGER.error("Failed search result %s: %s", item.source_listing_id, error)
     LOGGER.info("Complete")
     LOGGER.info("Found: %d", stats["found"])
     LOGGER.info("Created: %d", stats["created"])
@@ -687,10 +1021,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--condo", required=True, help='Must be "One Menerung" for v1')
     parser.add_argument("--dry-run", action="store_true", help="Read Bubble development but perform no writes")
-    parser.add_argument("--search-url", default=DEFAULT_SEARCH_URL, help="PropertyGuru One Menerung rentals page")
+    parser.add_argument("--search-url", default=DEFAULT_SEARCH_URL, help="iProperty One Menerung rentals page")
     parser.add_argument("--max-pages", type=int, default=10)
     parser.add_argument("--limit", type=int, help="Process at most this many discovered listings")
-    parser.add_argument("--delay", type=float, default=1.5, help="Minimum seconds between PropertyGuru requests")
+    parser.add_argument("--delay", type=float, default=1.5, help="Minimum seconds between iProperty requests")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--bubble-base-url", default=BUBBLE_BASE_URL, help=argparse.SUPPRESS)
     return parser
