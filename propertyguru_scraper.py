@@ -22,6 +22,20 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+# Keep Chromium beside the installed Playwright package so Render includes it in
+# the deployed build instead of leaving it in a build-machine-only home cache.
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -129,31 +143,117 @@ def assert_development_endpoint(base_url: str) -> None:
 
 class PropertyGuruClient:
     def __init__(self, delay: float = 1.5, timeout: float = 30.0):
-        self.session = make_session()
         self.delay = max(0.0, delay)
         self.timeout = timeout
         self._last_request_at = 0.0
+        self.playwright: Playwright | None = None
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
 
-    def get(self, url: str) -> str:
+    def __enter__(self) -> "PropertyGuruClient":
+        LOGGER.info("Launching Chromium...")
+        try:
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(headless=True)
+            self.context = self.browser.new_context(
+                viewport={"width": 1440, "height": 1000},
+                locale="en-MY",
+                timezone_id="Asia/Kuala_Lumpur",
+                java_script_enabled=True,
+            )
+            self.page = self.context.new_page()
+            self.page.set_default_navigation_timeout(self.timeout * 1000)
+            self.page.set_default_timeout(min(self.timeout, 15.0) * 1000)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        # Close in reverse creation order. Each step is independent so a failed
+        # context close cannot leave the browser or Playwright driver running.
+        for resource_name in ("page", "context", "browser"):
+            resource = getattr(self, resource_name)
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as error:
+                    LOGGER.warning("Failed to close Chromium %s: %s", resource_name, error)
+                finally:
+                    setattr(self, resource_name, None)
+        if self.playwright is not None:
+            try:
+                self.playwright.stop()
+            except Exception as error:
+                LOGGER.warning("Failed to stop Playwright: %s", error)
+            finally:
+                self.playwright = None
+
+    @staticmethod
+    def _detect_access_control(html: str, title: str, url: str) -> None:
+        sample = f"{title}\n{html[:50000]}".lower()
+        marker = next((value for value in BLOCK_MARKERS if value in sample), None)
+        if marker:
+            raise AccessBlockedError(
+                f'Playwright encountered an access-control page at {url} '
+                f'(detected "{marker}"). No CAPTCHA, challenge, login, or anti-bot '
+                "bypass was attempted."
+            )
+
+    def _require_page(self) -> Page:
+        if self.page is None:
+            raise ScraperError("Chromium has not been launched.")
+        return self.page
+
+    def get(self, url: str, content_selector: str | None = None) -> str:
         host = (urlparse(url).hostname or "").lower()
         if host not in PROPERTYGURU_HOSTS:
             raise ScraperError(f"Refusing unexpected PropertyGuru host: {host}")
+        page = self._require_page()
         remaining = self.delay - (time.monotonic() - self._last_request_at)
         if remaining > 0:
-            time.sleep(remaining + random.uniform(0, min(0.25, self.delay / 4)))
-        response = self.session.get(url, timeout=self.timeout)
-        self._last_request_at = time.monotonic()
-        lowered = response.text[:20000].lower()
-        if response.status_code in (401, 403) or any(x in lowered for x in BLOCK_MARKERS):
-            raise AccessBlockedError(
-                f"PropertyGuru blocked ordinary HTTP retrieval at {url} "
-                f"(HTTP {response.status_code}). No CAPTCHA, challenge, login, or "
-                "anti-bot bypass was attempted."
+            page.wait_for_timeout(
+                (remaining + random.uniform(0, min(0.25, self.delay / 4))) * 1000
             )
-        response.raise_for_status()
-        return response.text
+        LOGGER.info("Loading: %s", url)
+        response = page.goto(url, wait_until="domcontentloaded")
+        self._last_request_at = time.monotonic()
+        if response is not None and response.status in (401, 403):
+            raise AccessBlockedError(
+                f"Playwright received HTTP {response.status} at {url}. No CAPTCHA, "
+                "challenge, login, or anti-bot bypass was attempted."
+            )
+        if response is not None and response.status >= 400:
+            raise ScraperError(f"PropertyGuru returned HTTP {response.status} at {url}.")
+        if content_selector:
+            try:
+                page.wait_for_selector(content_selector, state="attached", timeout=10000)
+            except PlaywrightTimeoutError:
+                # Inspect the rendered page below: this may be an empty-result page,
+                # a changed selector, or an access-control page with a useful title.
+                LOGGER.warning("Expected PropertyGuru content did not appear within 10 seconds")
+        html = page.content()
+        self._detect_access_control(html, page.title(), page.url)
+        return html
 
-    def discover_listing_urls(self, search_url: str, max_pages: int) -> list[str]:
+    @staticmethod
+    def _listing_urls(html: str, base_url: str) -> dict[str, str]:
+        found: dict[str, str] = {}
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.select("a[href]"):
+            absolute = canonical_propertyguru_url(urljoin(base_url, anchor["href"]))
+            match = LISTING_PATH_RE.search(urlparse(absolute).path)
+            if match:
+                found.setdefault(match.group(1), absolute)
+        return found
+
+    def discover_listing_urls(
+        self, search_url: str, max_pages: int, limit: int | None = None
+    ) -> list[str]:
         found: dict[str, str] = {}
         next_url: str | None = search_url
         visited: set[str] = set()
@@ -162,14 +262,31 @@ class PropertyGuruClient:
                 break
             visited.add(next_url)
             LOGGER.info("Fetching results page: %s", next_url)
-            soup = BeautifulSoup(self.get(next_url), "html.parser")
-            for anchor in soup.select("a[href]"):
-                absolute = canonical_propertyguru_url(urljoin(next_url, anchor["href"]))
-                match = LISTING_PATH_RE.search(urlparse(absolute).path)
-                if match:
-                    found.setdefault(match.group(1), absolute)
+            html = self.get(
+                next_url,
+                'a[href*="/property-listing/"], a[href*="/bm/senarai-hartanah/"]',
+            )
+            page = self._require_page()
+            stagnant_scrolls = 0
+            previous_count = -1
+            while stagnant_scrolls < 3 and not (limit and len(found) >= limit):
+                found.update(self._listing_urls(html, page.url))
+                if len(found) == previous_count:
+                    stagnant_scrolls += 1
+                else:
+                    stagnant_scrolls = 0
+                    previous_count = len(found)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+                html = page.content()
+                self._detect_access_control(html, page.title(), page.url)
+            LOGGER.info("Search page loaded; found %d listing links so far", len(found))
+            if limit and len(found) >= limit:
+                break
+            soup = BeautifulSoup(html, "html.parser")
             next_link = soup.select_one('link[rel="next"][href], a[rel="next"][href]')
-            next_url = urljoin(next_url, next_link["href"]) if next_link else None
+            candidate = urljoin(page.url, next_link["href"]) if next_link else None
+            next_url = candidate if candidate and candidate not in visited else None
         return list(found.values())
 
 
@@ -519,41 +636,45 @@ def run(args: argparse.Namespace) -> int:
     condo_id, condo_field = bubble.find_condo(args.condo)
     LOGGER.info("Found %s: %s (matched field: %s)", args.condo, condo_id, condo_field)
 
-    client = PropertyGuruClient(args.delay, args.timeout)
-    LOGGER.info("Searching PropertyGuru...")
-    urls = client.discover_listing_urls(args.search_url, args.max_pages)
-    if args.limit:
-        urls = urls[:args.limit]
-    LOGGER.info("Found %d %s rental listing links", len(urls), args.condo)
-    stats = {"found": len(urls), "created": 0, "updated": 0, "failed": 0}
-    for index, url in enumerate(urls, 1):
-        url_match = LISTING_PATH_RE.search(urlparse(url).path)
-        LOGGER.info("[%d/%d] Processing PropertyGuru listing %s", index, len(urls), url_match.group(1) if url_match else url)
-        try:
-            item = parse_listing(client.get(url), url, args.condo)
-            LOGGER.info(
-                "Parsed: RM%s | %s beds | %s baths | %s sq ft | %d photos",
-                display_number(item.price_rent), display_number(item.beds),
-                display_number(item.baths), display_number(item.sq_ft), len(item.photo_urls),
-            )
-            existing = bubble.find_listing(item.source_listing_id)
-            payload = bubble_payload(item, condo_id)
-            LOGGER.info("%s Bubble listing found", "Existing" if existing else "No existing")
-            if args.dry_run:
-                print(json.dumps({
-                    "action": "update" if existing else "create",
-                    "normalized": asdict(item), "bubble_payload": payload,
-                }, ensure_ascii=False, indent=2))
-            else:
-                action = "updated" if existing else "created"
-                LOGGER.info("%s...", "Updating" if existing else "Creating")
-                bubble.write_listing(payload, existing.get("_id") if existing else None)
-                stats[action] += 1
-        except AccessBlockedError:
-            raise
-        except Exception as error:  # one malformed listing must not terminate the run
-            stats["failed"] += 1
-            LOGGER.error("Failed %s: %s", url, error)
+    stats = {"found": 0, "created": 0, "updated": 0, "failed": 0}
+    with PropertyGuruClient(args.delay, args.timeout) as client:
+        LOGGER.info("Searching PropertyGuru...")
+        urls = client.discover_listing_urls(args.search_url, args.max_pages, args.limit)
+        if args.limit:
+            urls = urls[:args.limit]
+        stats["found"] = len(urls)
+        LOGGER.info("Found %d %s rental listing links", len(urls), args.condo)
+        for index, url in enumerate(urls, 1):
+            url_match = LISTING_PATH_RE.search(urlparse(url).path)
+            listing_label = url_match.group(1) if url_match else url
+            LOGGER.info("[%d/%d] Loading PropertyGuru listing %s", index, len(urls), listing_label)
+            try:
+                html = client.get(url, "h1")
+                LOGGER.info("Rendered listing page")
+                item = parse_listing(html, url, args.condo)
+                LOGGER.info(
+                    "Parsed: RM%s | %s beds | %s baths | %s sq ft | %d photos",
+                    display_number(item.price_rent), display_number(item.beds),
+                    display_number(item.baths), display_number(item.sq_ft), len(item.photo_urls),
+                )
+                existing = bubble.find_listing(item.source_listing_id)
+                payload = bubble_payload(item, condo_id)
+                LOGGER.info("%s Bubble listing found", "Existing" if existing else "No existing")
+                if args.dry_run:
+                    print(json.dumps({
+                        "action": "update" if existing else "create",
+                        "normalized": asdict(item), "bubble_payload": payload,
+                    }, ensure_ascii=False, indent=2))
+                else:
+                    action = "updated" if existing else "created"
+                    LOGGER.info("%s...", "Updating" if existing else "Creating")
+                    bubble.write_listing(payload, existing.get("_id") if existing else None)
+                    stats[action] += 1
+            except AccessBlockedError:
+                raise
+            except Exception as error:  # one malformed listing must not terminate the run
+                stats["failed"] += 1
+                LOGGER.error("Failed %s: %s", url, error)
     LOGGER.info("Complete")
     LOGGER.info("Found: %d", stats["found"])
     LOGGER.info("Created: %d", stats["created"])
@@ -579,7 +700,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     try:
         return run(build_parser().parse_args())
-    except (ScraperError, requests.RequestException) as error:
+    except (ScraperError, requests.RequestException, PlaywrightError) as error:
         LOGGER.error("ERROR: %s", error)
         return 2
 

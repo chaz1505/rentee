@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import MagicMock, patch
 
 from propertyguru_scraper import (
     NormalizedListing,
+    PropertyGuruClient,
     SafetyError,
     assert_development_endpoint,
     bubble_payload,
@@ -10,6 +12,46 @@ from propertyguru_scraper import (
 
 
 class PropertyGuruParserTests(unittest.TestCase):
+    @patch("propertyguru_scraper.sync_playwright")
+    def test_one_browser_context_is_reused_and_closed(self, mocked_sync_playwright):
+        manager = MagicMock()
+        playwright = MagicMock()
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        mocked_sync_playwright.return_value = manager
+        manager.start.return_value = playwright
+        playwright.chromium.launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+
+        with PropertyGuruClient() as client:
+            self.assertIs(client.page, page)
+
+        manager.start.assert_called_once_with()
+        playwright.chromium.launch.assert_called_once_with(headless=True)
+        browser.new_context.assert_called_once()
+        context.new_page.assert_called_once_with()
+        page.close.assert_called_once_with()
+        context.close.assert_called_once_with()
+        browser.close.assert_called_once_with()
+        playwright.stop.assert_called_once_with()
+
+    def test_listing_url_extraction_deduplicates_by_id(self):
+        html = '''<a href="/property-listing/one-menerung-for-rent-501195195">one</a>
+        <a href="/property-listing/duplicate-name-501195195?tracking=yes">duplicate</a>
+        <a href="/property-listing/one-menerung-for-rent-501063229">two</a>'''
+        found = PropertyGuruClient._listing_urls(
+            html, "https://www.propertyguru.com.my/property-for-rent/p/one-menerung-bangsar"
+        )
+        self.assertEqual(list(found), ["501195195", "501063229"])
+
+    def test_playwright_access_control_detection(self):
+        with self.assertRaisesRegex(Exception, "access-control page"):
+            PropertyGuruClient._detect_access_control(
+                "<html>Verify you are human</html>", "Just a moment...", "https://example.test"
+            )
+
     def test_structured_listing_and_photo_order(self):
         html = '''
         <html><head>
