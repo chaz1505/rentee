@@ -156,13 +156,7 @@ class IPropertyClient:
         self.page: Page | None = None
 
     def __enter__(self) -> "IPropertyClient":
-        display = os.environ.get("DISPLAY")
-        LOGGER.info("Browser mode: headed")
-        LOGGER.info("DISPLAY: %s", display or "<not set>")
-        if display:
-            LOGGER.info("Launching headed Chromium under virtual display...")
-        else:
-            LOGGER.info("Launching headed Chromium...")
+        LOGGER.info("Launching Chromium...")
         try:
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.launch(headless=False)

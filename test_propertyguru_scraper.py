@@ -32,16 +32,8 @@ class IPropertyParserTests(unittest.TestCase):
         browser.new_context.return_value = context
         context.new_page.return_value = page
 
-        with patch.dict("propertyguru_scraper.os.environ", {"DISPLAY": ":99"}):
-            with self.assertLogs("iproperty_scraper", level="INFO") as logs:
-                with IPropertyClient() as client:
-                    self.assertIs(client.page, page)
-
-        self.assertIn("Browser mode: headed", logs.output[0])
-        self.assertIn("DISPLAY: :99", logs.output[1])
-        self.assertIn(
-            "Launching headed Chromium under virtual display...", logs.output[2]
-        )
+        with IPropertyClient() as client:
+            self.assertIs(client.page, page)
 
         manager.start.assert_called_once_with()
         playwright.chromium.launch.assert_called_once_with(headless=False)
