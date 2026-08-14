@@ -1,0 +1,590 @@
+[
+  {
+    "requested_name": "One Menerung",
+    "bubble_name": "One Menerung",
+    "iproperty_search_name": "One Menerung",
+    "iproperty_project_name": "One Menerung",
+    "iproperty_project_id": "fd12m8",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Sri Penaga",
+    "bubble_name": "Sri Penaga",
+    "iproperty_search_name": "Sri Penaga",
+    "iproperty_project_name": "Sri Penaga",
+    "iproperty_project_id": "xzqc7y",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Ken Bangsar",
+    "bubble_name": "Ken Bangsar",
+    "iproperty_search_name": "Ken Bangsar",
+    "iproperty_project_name": "Ken Bangsar",
+    "iproperty_project_id": "pcv9hj",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Estate",
+    "bubble_name": "The Estate Bangsar South",
+    "iproperty_search_name": "The Estate",
+    "iproperty_project_name": "The Estate",
+    "iproperty_project_id": "qluzvi",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "DC Residensi",
+    "bubble_name": "DC Residensi",
+    "iproperty_search_name": "DC Residensi",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "hxtifi",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Bangsar Peak",
+    "bubble_name": "Bangsar Peak",
+    "iproperty_search_name": "Bangsar Peak",
+    "iproperty_project_name": "Bangsar Peak",
+    "iproperty_project_id": "zm73p2",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Zehn Bukit Pantai",
+    "bubble_name": "Zehn Bukit Pantai",
+    "iproperty_search_name": "Zehn Bukit Pantai",
+    "iproperty_project_name": "Zehn Bukit Pantai",
+    "iproperty_project_id": "qbtqs7",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Loft Bangsar",
+    "bubble_name": "The Loft Bangsar",
+    "iproperty_search_name": "The Loft Bangsar",
+    "iproperty_project_name": "The Loft Bangsar",
+    "iproperty_project_id": "95yubm",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Palmyra",
+    "bubble_name": "Palmyra Bangsar",
+    "iproperty_search_name": "Palmyra",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "50gbzf",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Ara Bangsar",
+    "bubble_name": "The Ara",
+    "iproperty_search_name": "The Ara Bangsar",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "keb12n",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Clear Water Residence",
+    "bubble_name": "ClearWater Residences",
+    "iproperty_search_name": "Clear Water Residence",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "2w9hch",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Kapas Height",
+    "bubble_name": "Kapas Heights",
+    "iproperty_search_name": "Kapas Heights",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Setia Sky Seputeh",
+    "bubble_name": "Setia Sky Seputeh",
+    "iproperty_search_name": "Setia Sky Seputeh",
+    "iproperty_project_name": "Setia Sky Seputeh",
+    "iproperty_project_id": "lrskyv",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "10 D'sara Heights",
+    "bubble_name": "10 Damansara Heights",
+    "iproperty_search_name": "10 Damansara Heights",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "iDamansara",
+    "bubble_name": "iDamansara",
+    "iproperty_search_name": "iDamansara",
+    "iproperty_project_name": "Idamansara",
+    "iproperty_project_id": "df5yzl",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Jelutong Villas",
+    "bubble_name": "Jelutong Villas ",
+    "iproperty_search_name": "Jelutong Villas",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Beringin Residence",
+    "bubble_name": "Beringin Residence",
+    "iproperty_search_name": "Beringin Residence",
+    "iproperty_project_name": "Beringin Residence",
+    "iproperty_project_id": "otpou2",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Seri Beringin",
+    "bubble_name": "Seri Beringin",
+    "iproperty_search_name": "Seri Beringin",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "9 Beringin",
+    "bubble_name": "9 Beringin",
+    "iproperty_search_name": "9 Beringin",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "iproperty_search_mode": "freetext",
+    "group": "Bangsar/Damansara Heights",
+    "enabled": true
+  },
+  {
+    "requested_name": "Residensi22",
+    "bubble_name": "Residensi 22 Mont’Kiara",
+    "iproperty_search_name": "Residensi 22 Mont Kiara",
+    "iproperty_project_name": "Residensi 22",
+    "iproperty_project_id": "pcdy51",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "MK28",
+    "bubble_name": "28 Mont’ Kiara",
+    "iproperty_search_name": "28 Mont Kiara",
+    "iproperty_project_name": "28 Mont Kiara @ MK28",
+    "iproperty_project_id": "iymabk",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "MK10",
+    "bubble_name": "10 Mont Kiara",
+    "iproperty_search_name": "10 Mont Kiara",
+    "iproperty_project_name": "10 Mont Kiara @ MK10",
+    "iproperty_project_id": "06tzry",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "MK11",
+    "bubble_name": "11 Mont Kiara",
+    "iproperty_search_name": "11 Mont Kiara",
+    "iproperty_project_name": "11 Mont Kiara @ MK11",
+    "iproperty_project_id": "9s4gis",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Sunway Vivaldi",
+    "bubble_name": "Sunway Vivaldi",
+    "iproperty_search_name": "Sunway Vivaldi",
+    "iproperty_project_name": "Sunway Vivaldi",
+    "iproperty_project_id": "bu36cj",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Mont Kiara Palma",
+    "bubble_name": "Mont Kiara Palma",
+    "iproperty_search_name": "Mont Kiara Palma",
+    "iproperty_project_name": "Mont Kiara Palma",
+    "iproperty_project_id": "ceintz",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Icon Residences",
+    "bubble_name": "The Icon Residences",
+    "iproperty_search_name": "The Icon Residences",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "r8u4yz",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Agile",
+    "bubble_name": "Agile Mont Kiara ",
+    "iproperty_search_name": "Agile Mont Kiara",
+    "iproperty_project_name": "Agile Mont Kiara",
+    "iproperty_project_id": "ezx0wo",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Kami",
+    "bubble_name": "KaMi Mont Kiara",
+    "iproperty_search_name": "KaMi Mont Kiara",
+    "iproperty_project_name": "Kami",
+    "iproperty_project_id": "qinh82",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Kiaramas Danai",
+    "bubble_name": "Kiaramas Danai",
+    "iproperty_search_name": "Kiaramas Danai",
+    "iproperty_project_name": "Kiaramas Danai",
+    "iproperty_project_id": "mu6d4r",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Kiaraville",
+    "bubble_name": "Kiaraville",
+    "iproperty_search_name": "Kiaraville",
+    "iproperty_project_name": "Kiaraville",
+    "iproperty_project_id": "oc8hns",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Pavilion Hilltop",
+    "bubble_name": "Pavilion Hilltop",
+    "iproperty_search_name": "Pavilion Hilltop",
+    "iproperty_project_name": "Pavilion Hilltop",
+    "iproperty_project_id": "9biiy1",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Trinity Pentamont",
+    "bubble_name": "Trinity Pentamont Mont' Kiara",
+    "iproperty_search_name": "Trinity Pentamont",
+    "iproperty_project_name": "Trinity Pentamont",
+    "iproperty_project_id": "brnlec",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Tiffani Mont Kiara",
+    "bubble_name": "Tiffani Mont Kiara",
+    "iproperty_search_name": "Tiffani Mont Kiara",
+    "iproperty_project_name": "Tiffani Kiara",
+    "iproperty_project_id": "jjtrko",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Allevia",
+    "bubble_name": "Allevia Mont' Kiara",
+    "iproperty_search_name": "Allevia Mont Kiara",
+    "iproperty_project_name": "Allevia",
+    "iproperty_project_id": "s49us1",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Kiara Hills",
+    "bubble_name": "Kiara Hills",
+    "iproperty_search_name": "Kiara Hills",
+    "iproperty_project_name": "Kiara Hills",
+    "iproperty_project_id": "6ol0iy",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Amarin Kiara",
+    "bubble_name": "Amarin Kiara",
+    "iproperty_search_name": "Amarin Kiara",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "iproperty_search_mode": "freetext",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Serene Villa",
+    "bubble_name": "Villa Serene Kiara",
+    "iproperty_search_name": "Villa Serene Kiara",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "42jrsl",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "KH Villa",
+    "bubble_name": "KH Villa",
+    "iproperty_search_name": "KH Villa",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "3y36h3",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Serene MK",
+    "bubble_name": "Serene Mont Kiara",
+    "iproperty_search_name": "Serene Mont Kiara",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "xumowl",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Villa Aseana",
+    "bubble_name": "Aseana Villa Residence",
+    "iproperty_search_name": "Aseana Villa Residence",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "cgvjii",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Duta Tropika",
+    "bubble_name": "Duta Tropika",
+    "iproperty_search_name": "Duta Tropika",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "yem7zi",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "Duta Nusantara",
+    "bubble_name": "Duta Nusantara ",
+    "iproperty_search_name": "Duta Nusantara",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "6n6jma",
+    "group": "Mont Kiara",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Avare",
+    "bubble_name": "The Avare",
+    "iproperty_search_name": "The Avare",
+    "iproperty_project_name": "The Avare",
+    "iproperty_project_id": "ot6w71",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Oval",
+    "bubble_name": "The Oval",
+    "iproperty_search_name": "The Oval",
+    "iproperty_project_name": "The Oval",
+    "iproperty_project_id": "519v9c",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Binjai on the Park",
+    "bubble_name": "Binjai on the Park",
+    "iproperty_search_name": "Binjai on the Park",
+    "iproperty_project_name": "The Binjai on the Park",
+    "iproperty_project_id": "v47506",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Stonor 3",
+    "bubble_name": "Stonor 3",
+    "iproperty_search_name": "Stonor 3",
+    "iproperty_project_name": "Stonor 3",
+    "iproperty_project_id": "r9pf14",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "OneKL",
+    "bubble_name": "One KL",
+    "iproperty_search_name": "One KL",
+    "iproperty_project_name": "One KL",
+    "iproperty_project_id": "ockpnx",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "St Mary Residences",
+    "bubble_name": "St Mary's Residence",
+    "iproperty_search_name": "St Mary Residences",
+    "iproperty_project_name": "St Mary Residences",
+    "iproperty_project_id": "5ke0r0",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Ritz Carlton Residence",
+    "bubble_name": "The Ritz Carlton Residence",
+    "iproperty_search_name": "The Ritz Carlton Residence",
+    "iproperty_project_name": "The Ritz-Carlton Residences",
+    "iproperty_project_id": "zltrst",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Marc Residence",
+    "bubble_name": "Marc Residence",
+    "iproperty_search_name": "Marc Residence",
+    "iproperty_project_name": "Marc Residence",
+    "iproperty_project_id": "czexg5",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Verticas Residensi",
+    "bubble_name": "Verticas Residensi",
+    "iproperty_search_name": "Verticas Residensi",
+    "iproperty_project_name": "Verticas Residensi",
+    "iproperty_project_id": "25n48v",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Pavilion Ceylon",
+    "bubble_name": "Pavilion Ceylon",
+    "iproperty_search_name": "Pavilion Ceylon",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "dvkeco",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Ruma",
+    "bubble_name": "The Ruma",
+    "iproperty_search_name": "The Ruma",
+    "iproperty_project_name": "The Ruma",
+    "iproperty_project_id": "w8di49",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Quadro Residences",
+    "bubble_name": "Quadro",
+    "iproperty_search_name": "Quadro Residences",
+    "iproperty_project_name": "Quadro Residences",
+    "iproperty_project_id": "idre0h",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Residensi Kia Peng",
+    "bubble_name": "Residensi Kia Peng",
+    "iproperty_search_name": "Residensi Kia Peng",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "iproperty_search_mode": "freetext",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "TRX Residences",
+    "bubble_name": "TRX Residences",
+    "iproperty_search_name": "TRX Residences",
+    "iproperty_project_name": "TRX Residences",
+    "iproperty_project_id": "aho832",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Agile Bukit Bintang",
+    "bubble_name": "Agile Bukit Bintang",
+    "iproperty_search_name": "Agile Bukit Bintang",
+    "iproperty_project_name": "Agile Bukit Bintang",
+    "iproperty_project_id": "ki4ljt",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Lucentia",
+    "bubble_name": "Lucentia Residences",
+    "iproperty_search_name": "Lucentia",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Aria Luxury Residences",
+    "bubble_name": "Aria Residence",
+    "iproperty_search_name": "Aria Luxury Residences",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "lvdr8g",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Banyan Tree",
+    "bubble_name": "Banyan Tree KL",
+    "iproperty_search_name": "Banyan Tree",
+    "iproperty_project_name": null,
+    "iproperty_project_id": "f5xkye",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Four Seasons Place",
+    "bubble_name": "Four Seasons Place",
+    "iproperty_search_name": "Four Seasons Place",
+    "iproperty_project_name": "Four Seasons Place",
+    "iproperty_project_id": "0bx87x",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Pavilion Residence",
+    "bubble_name": "Pavilion Residences",
+    "iproperty_search_name": "Pavilion Residence",
+    "iproperty_project_name": "Pavilion Residences",
+    "iproperty_project_id": "oyeabi",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "The Manor",
+    "bubble_name": "The Manor",
+    "iproperty_search_name": "The Manor",
+    "iproperty_project_name": "The Manor",
+    "iproperty_project_id": "hkgc0g",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Vipod Residences",
+    "bubble_name": "VIPOD Residences ",
+    "iproperty_search_name": "Vipod Residences",
+    "iproperty_project_name": "Vipod Residence",
+    "iproperty_project_id": "rviofm",
+    "group": "KLCC",
+    "enabled": true
+  },
+  {
+    "requested_name": "Stonor on the Park",
+    "bubble_name": "Stonor Park",
+    "iproperty_search_name": "Stonor on the Park",
+    "iproperty_project_name": null,
+    "iproperty_project_id": null,
+    "group": "KLCC",
+    "enabled": true
+  }
+]
