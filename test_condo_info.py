@@ -243,6 +243,28 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
 
+    def test_additive_preference_merge_preserves_old_and_new_constraints(self):
+        existing = (
+            "Bedrooms: 3 or 4\n"
+            "Budget: maximum RM7,800\n"
+            "Pets: two cats"
+        )
+        generated = "Area: TTDI"
+        merged = app_module.merge_updated_preference_text(
+            existing, generated, "Avoid a unit looking over a car park"
+        )
+        self.assertIn(existing, merged)
+        self.assertIn("Avoid a unit looking over a car park", merged)
+
+    def test_replacement_preference_can_use_generated_profile(self):
+        merged = app_module.merge_updated_preference_text(
+            "Budget: RM7,800",
+            "Budget: RM9,000",
+            "My budget is now RM9,000"
+        )
+        self.assertNotIn("Budget: RM7,800", merged)
+        self.assertIn("Budget: RM9,000", merged)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,3 +46,17 @@ tests/results/<case>_<timestamp>_fix_prompt.md
 The Markdown file is a ready-to-paste Codex task containing evidence, prioritised fixes, regression constraints, and required verification. Review it before giving it to Codex; the benchmark diagnoses only and never edits application code.
 
 After Codex makes a fix, rerun `python tests/run_benchmark.py`. The next evaluation automatically compares the new run with the preceding one. v1 contains only the Sofia case.
+
+## Optional Git persistence
+
+By default, `python tests/run_benchmark.py` only generates the three artifacts locally and runs no Git commands.
+
+To stage, commit, and push the raw result, evaluation, and fix prompt automatically:
+
+```bash
+BENCHMARK_COMMIT_RESULTS=true python tests/run_benchmark.py
+```
+
+Only those three generated files are staged and committed. `tests/.autotest_state.json` remains ignored because it contains environment-specific Bubble test IDs. The helper stays on the current branch, never force-pushes, and uses the branch's configured upstream.
+
+The Render runtime must have Git credentials with permission to push to the repository. Render may be able to clone for deployment without providing push credentials. If commit or push authentication fails, the benchmark still completes and all artifacts remain on the Render filesystem; the console reports the useful Git error.
