@@ -28,7 +28,7 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
-MATCH_LISTING_LIMIT = 200
+MATCH_LISTING_LIMIT = 600
 CONDO_SHEET_CSV_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1wnXHS6cHoUmAVXFpkzZ9PhBKmEgG6g-n8n0jcyodYig/export?format=csv&gid=0"
