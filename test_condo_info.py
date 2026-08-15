@@ -1,5 +1,7 @@
 import os
+import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -83,6 +85,96 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("not found", missing.get_json()["error"])
         self.assertEqual(blank.status_code, 400)
         self.assertIn("name", blank.get_json()["error"])
+
+    @patch("app.requests.get")
+    def test_multi_condo_tool_output_returns_found_and_not_found_rows(self, mocked_get):
+        mocked_get.return_value = self.response()
+
+        result = json.loads(app_module.get_condo_infos([
+            "Ken Bangsar", "One Menerung", "Unknown Condo"
+        ]))
+
+        self.assertEqual(len(result["condos"]), 3)
+        self.assertTrue(result["condos"][0]["found"])
+        self.assertEqual(result["condos"][0]["data"]["Persona"], "Family persona")
+        self.assertIn("Future Column", result["condos"][0]["data"])
+        self.assertTrue(result["condos"][1]["found"])
+        self.assertFalse(result["condos"][2]["found"])
+        mocked_get.assert_called_once()
+
+    def test_response_tool_schema_accepts_condo_name_array(self):
+        args = app_module.build_response_args("Compare Ken Bangsar and One Menerung")
+        tool = next(
+            item for item in args["tools"]
+            if item.get("name") == "get_condo_info"
+        )
+        condo_names = tool["parameters"]["properties"]["condo_names"]
+        self.assertEqual(condo_names["type"], "array")
+        self.assertEqual(condo_names["items"], {"type": "string"})
+        self.assertEqual(tool["parameters"]["required"], ["condo_names"])
+        self.assertIn("Persona", args["instructions"])
+        self.assertIn("one tool call", args["instructions"])
+
+    @patch("app.get_condo_infos")
+    def test_chat_stream_executes_condo_tool_and_continues_same_response(
+        self, mocked_condo_infos
+    ):
+        requested_names = ["Ken Bangsar", "One Menerung"]
+        mocked_condo_infos.return_value = json.dumps({"condos": []})
+        tool_call = SimpleNamespace(
+            type="function_call",
+            name="get_condo_info",
+            call_id="condo-call",
+            arguments=json.dumps({"condo_names": requested_names})
+        )
+        initial = SimpleNamespace(id="initial-response", output=[tool_call], usage=None)
+        final = SimpleNamespace(id="final-response", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response = response
+                self.events = events
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def __iter__(self):
+                return iter(self.events)
+
+            def get_final_response(self):
+                return self.response
+
+        final_event = SimpleNamespace(
+            type="response.output_text.delta", delta="Comparison answer"
+        )
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial), FakeStream(final, [final_event])
+        ]
+        fake_client = SimpleNamespace(responses=responses)
+
+        with patch.object(app_module, "client", fake_client):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": "Compare them", "previous_response_id": None}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        mocked_condo_infos.assert_called_once_with(requested_names)
+        self.assertIn("Checking condo information", body)
+        self.assertIn("Comparison answer", body)
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertEqual(continuation["previous_response_id"], "initial-response")
+        self.assertEqual(
+            continuation["input"][0]["call_id"], "condo-call"
+        )
+        self.assertEqual(
+            continuation["input"][0]["output"], mocked_condo_infos.return_value
+        )
 
 
 if __name__ == "__main__":

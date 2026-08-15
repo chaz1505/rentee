@@ -129,6 +129,41 @@ def get_condo_info(condo_name):
     return dict(row)
 
 
+def get_condo_infos(condo_names):
+    results = []
+    for condo_name in condo_names:
+        requested = " ".join(str(condo_name or "").split())
+        if not requested:
+            results.append({
+                "requested": requested,
+                "found": False,
+                "error": "A condo name is required."
+            })
+            continue
+        try:
+            condo = get_condo_info(requested)
+        except CondoDataError as error:
+            results.append({
+                "requested": requested,
+                "found": False,
+                "error": str(error)
+            })
+            continue
+        if "error" in condo:
+            results.append({
+                "requested": requested,
+                "found": False,
+                "error": condo["error"]
+            })
+        else:
+            results.append({
+                "requested": requested,
+                "found": True,
+                "data": condo
+            })
+    return json.dumps({"condos": results}, ensure_ascii=False)
+
+
 def log_timing(label, started, detail=""):
 
     print(
@@ -221,8 +256,9 @@ def build_response_args(user_message, previous_response_id=None):
             "allocation, do not use web search or guess; explain that the current listing "
             "information does not specify it. "
             "Use match_lead for current availability and recommendations, update_preferences "
-            "for stored home-search requirements, and get_property_details for factual "
-            "questions about a specific listing, unit, condo, building, or development. Do "
+            "for stored home-search requirements, get_property_details for factual questions "
+            "about a specific current listing or unit, and get_condo_info for general facts "
+            "or qualitative questions about a condo, building, or development. Do "
             "not call match_lead merely to answer a factual property question. When a property "
             "is already being discussed, use get_property_details rather than rerunning "
             "matching. Prefer authoritative Rentee property data over web search whenever the "
@@ -253,7 +289,8 @@ def build_response_args(user_message, previous_response_id=None):
             "such as 'what do you have for me?', 'show me my best matches', 'what properties "
             "are available?', or 'find me something suitable' must call match_lead directly. "
             "Never treat property details in previous conversation history as authoritative "
-            "listing information. Property-specific facts, including names, units, prices, "
+            "listing information. Current listing- or unit-specific facts, including names, "
+            "units, prices, "
             "bedrooms, bathrooms, size, furnishing, facilities, availability, parking, "
             "addresses, commute times, photos, or floorplans, may only be stated when they "
             "come from the CURRENT successful match_lead tool result. "
@@ -273,6 +310,13 @@ def build_response_args(user_message, previous_response_id=None):
             "and calmly without exposing internal data structures. "
             "For general questions, answer normally without using the matching tool unless "
             "the user asks for recommendations or which available properties suit them. "
+            "Use get_condo_info on demand for condo-specific questions, using a condo name "
+            "already established in the conversation when appropriate. For comparisons, "
+            "request all relevant condos in one tool call. Base condo-specific factual claims "
+            "on that data rather than guessing. Persona contains qualitative expert insight: "
+            "use it for lifestyle fit, strengths, weaknesses, and trade-offs, but present "
+            "judgement as opinion rather than objective fact. If the condo data does not "
+            "contain the requested information, say so rather than inventing it. "
             "Never invent property details; only state property-specific facts present in "
             "the supplied data."
         ),
@@ -329,6 +373,31 @@ def build_response_args(user_message, previous_response_id=None):
                 }
             },
             "required": ["preference_update"],
+            "additionalProperties": False
+        }
+    },
+    {
+        "type": "function",
+        "name": "get_condo_info",
+        "description": (
+            "Retrieve the complete Rentee condo knowledge rows for one or more named condos. "
+            "Use this for condo-specific facts, facilities, schools, accessibility, lifestyle "
+            "fit, strengths, weaknesses, trade-offs, or comparisons. Use condo names already "
+            "available in the conversation or listing context when the user says 'this condo'. "
+            "For comparisons, request all condo names together in one call. Do not use this "
+            "to search current listing availability or rank listings."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "condo_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Exact condo names to retrieve in one request."
+                }
+            },
+            "required": ["condo_names"],
             "additionalProperties": False
         }
     },
@@ -1268,6 +1337,24 @@ def chat_stream():
                     # web-search event below then selects the customer-facing status.
                     property_details_web_fallback = True
                     follow_up_tools = [{"type": "web_search"}]
+                elif tool_call.name == "get_condo_info":
+                    has_match_results = False
+                    yield (
+                        f"data: {json.dumps({'status': 'Checking condo information...'})}\n\n"
+                    )
+                    condo_names = tool_args.get("condo_names")
+                    if not isinstance(condo_names, list):
+                        condo_names = []
+                    tool_result = get_condo_infos(condo_names)
+                    follow_up_instructions = (
+                        "Answer the customer's condo question using the supplied condo data. "
+                        "Use factual fields as facts. Treat Persona as qualitative expert "
+                        "insight and phrase opinions, suitability, strengths, weaknesses, and "
+                        "trade-offs accordingly. For comparisons, compare only the returned "
+                        "data. Clearly identify condos that were not found and say when the "
+                        "requested information is unavailable. Do not invent missing details, "
+                        "claim current listing availability, or expose tool/internal field names."
+                    )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
@@ -1288,6 +1375,12 @@ def chat_stream():
                     print(
                         "Submitting function_call_output for original "
                         f"match_lead call {original_call_id}",
+                        flush=True
+                    )
+                elif tool_call.name == "get_condo_info":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"get_condo_info call {original_call_id}",
                         flush=True
                     )
                 else:
