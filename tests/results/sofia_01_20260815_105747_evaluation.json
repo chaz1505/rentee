@@ -1,0 +1,125 @@
+{
+  "case_id": "sofia_01",
+  "overall_status": "fail",
+  "summary": "2 issue groups detected; 1 critical/high.",
+  "metrics": {
+    "total_turns": 5,
+    "average_first_event_s": 7.792,
+    "average_first_delta_s": 14.426,
+    "average_total_s": 16.712,
+    "slow_turns": [
+      1,
+      5
+    ],
+    "critical_slow_turns": [
+      5
+    ],
+    "unsupported_action_violations": 0,
+    "excessive_question_turns": 0,
+    "repeated_question_pairs": 0,
+    "preference_persistence_failures": 0
+  },
+  "issues": [
+    {
+      "id": "first_text_latency",
+      "category": "speed",
+      "severity": "critical",
+      "turns": [
+        1,
+        5
+      ],
+      "evidence": [
+        "Turn 1 first text: 12.412s",
+        "Turn 5 first text: 36.875s"
+      ],
+      "diagnosis": "Customer-facing text is delayed beyond the benchmark threshold.",
+      "recommended_fix": "Trace the tool path and model calls before the first delta; preserve grounding while removing unnecessary work from non-recommendation turns."
+    },
+    {
+      "id": "qualitative_behavior",
+      "category": "conversation",
+      "severity": "medium",
+      "turns": [],
+      "evidence": [
+        "recommendation_reasoning: 1/3",
+        "decision_progress: 1/3",
+        "Tool-call artifacts and placeholders appeared in the reply (distracting and reduces trust).",
+        "Listings were presented without verifying key constraints you gave (school walking time to Alice Smith, pet policy for two cats, whether unit faces a car park, and partial furnishing/white goods) — so matches weren’t meaningfully filtered on your highest priorities.",
+        "The assistant introduced a specific year for the move‑in date (1 Oct 2026) even though you only said 1 October, which risks changing an already-supplied fact rather than confirming it.",
+        "Recommendations lacked prioritization or trade-off reasoning (e.g., which options best balance TTDI preference, school proximity and pet-friendliness).",
+        "The assistant asked you to confirm availability for the move-in date and other facts that were already provided as requirements instead of showing results already filtered by them."
+      ],
+      "diagnosis": "The qualitative judge found weak conversation intelligence, adaptation, question quality, recommendation reasoning, or decision progress.",
+      "recommended_fix": "When returning matches, filter and prioritize listings by the tenant’s highest-priority constraints (Alice Smith walking time, pet policy for two cats, TTDI preference, no car-park view, partial furnishing/white goods) and present a short prioritized shortlist with explicit reasoning for each pick; remove tool artifacts and avoid inventing or altering supplied dates."
+    }
+  ],
+  "passes": [
+    "No unsupported action promises were detected.",
+    "All configured preference checks were found in final AIsearchtext."
+  ],
+  "qualitative_evaluation": {
+    "scores": {
+      "conversation_intelligence": 2,
+      "recommendation_reasoning": 1,
+      "adaptiveness": 2,
+      "question_quality": 2,
+      "decision_progress": 1
+    },
+    "qualitative_issues": [
+      "Tool-call artifacts and placeholders appeared in the reply (distracting and reduces trust).",
+      "Listings were presented without verifying key constraints you gave (school walking time to Alice Smith, pet policy for two cats, whether unit faces a car park, and partial furnishing/white goods) — so matches weren’t meaningfully filtered on your highest priorities.",
+      "The assistant introduced a specific year for the move‑in date (1 Oct 2026) even though you only said 1 October, which risks changing an already-supplied fact rather than confirming it.",
+      "Recommendations lacked prioritization or trade-off reasoning (e.g., which options best balance TTDI preference, school proximity and pet-friendliness).",
+      "The assistant asked you to confirm availability for the move-in date and other facts that were already provided as requirements instead of showing results already filtered by them."
+    ],
+    "strengths": [
+      "Consistently saved and echoed your stated preferences through the conversation (showed context tracking).",
+      "Explicitly incorporated your new constraint to avoid units overlooking a car park.",
+      "Provided several concrete listing options within your budget and suggested practical next checks to validate each listing.",
+      "Asked a useful clarifying question about whether you’d consider landed houses, which is a relevant trade-off to explore."
+    ],
+    "highest_priority_improvement": "When returning matches, filter and prioritize listings by the tenant’s highest-priority constraints (Alice Smith walking time, pet policy for two cats, TTDI preference, no car-park view, partial furnishing/white goods) and present a short prioritized shortlist with explicit reasoning for each pick; remove tool artifacts and avoid inventing or altering supplied dates."
+  },
+  "comparison_to_previous_run": {
+    "available": true,
+    "previous_result": "/opt/render/project/src/tests/results/sofia_01_20260815_103134.json",
+    "first_delta_change_pct": -39.7,
+    "total_latency_change_pct": -34.3,
+    "slow_turns": {
+      "previous": 5,
+      "current": 2
+    },
+    "unsupported_actions": {
+      "previous": 0,
+      "current": 0
+    },
+    "excessive_questioning": {
+      "previous": 0,
+      "current": 0
+    },
+    "repeated_questions": {
+      "previous": 0,
+      "current": 0
+    },
+    "preference_persistence_failures": {
+      "previous": 1,
+      "current": 0
+    },
+    "qualitative_scores": {
+      "previous": {
+        "conversation_intelligence": 1,
+        "recommendation_reasoning": 2,
+        "adaptiveness": 2,
+        "question_quality": 1,
+        "decision_progress": 2
+      },
+      "current": {
+        "conversation_intelligence": 2,
+        "recommendation_reasoning": 1,
+        "adaptiveness": 2,
+        "question_quality": 2,
+        "decision_progress": 1
+      }
+    }
+  }
+}
