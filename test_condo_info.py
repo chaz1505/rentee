@@ -187,6 +187,62 @@ class CondoInfoTests(unittest.TestCase):
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
 
+    @patch("app.stream_match_lead")
+    @patch("app.update_preferences", return_value="Saved your cat preference.")
+    def test_preference_only_update_does_not_rematch_or_leak_selection_text(
+        self, _mocked_update, mocked_match
+    ):
+        tool_call = SimpleNamespace(
+            type="function_call", name="update_preferences", call_id="update-call",
+            arguments=json.dumps({
+                "preference_update": "Two cats",
+                "recommendations_requested": False
+            })
+        )
+        initial = SimpleNamespace(
+            id="initial-response", output=[tool_call], usage=None,
+            output_text="Now calling match_lead to fetch current property matches..."
+        )
+        final = SimpleNamespace(id="final-response", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        leaked_event = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="Now calling match_lead to fetch current property matches..."
+        )
+        final_event = SimpleNamespace(
+            type="response.output_text.delta", delta="Saved your cat preference."
+        )
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial, [leaked_event]), FakeStream(final, [final_event])
+        ]
+
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": "We also have two cats.", "folio_id": "folio-1"}
+            )
+            body = response.get_data(as_text=True)
+        mocked_match.assert_not_called()
+        self.assertNotIn("Now calling match_lead", body)
+        self.assertIn("Saved your cat preference.", body)
+        self.assertEqual(responses.stream.call_args_list[1].kwargs["tools"], [])
+
+    def test_update_preferences_schema_distinguishes_recommendation_request(self):
+        args = app_module.build_response_args("TTDI please; recommend something now")
+        tool = next(item for item in args["tools"] if item.get("name") == "update_preferences")
+        self.assertIn("recommendations_requested", tool["parameters"]["properties"])
+        self.assertIn("recommendations_requested", tool["parameters"]["required"])
+        self.assertFalse(args["parallel_tool_calls"])
+
 
 if __name__ == "__main__":
     unittest.main()

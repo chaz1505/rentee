@@ -5,7 +5,7 @@
     "initial_ai_searchtext": "Home search requirements:\nNo preferences provided yet.",
     "turns": [
       {
-        "message": "I need to move quite quickly. I’m British, one adult with two kids, looking for 3 or 4 bedrooms. Ideally partially furnished with white goods. Budget max RM7,800 and move-in 1 August."
+        "message": "I need to move quite quickly. I’m British, one adult with two kids, looking for 3 or 4 bedrooms. Ideally partially furnished with white goods. Budget max RM7,800 and move-in 1 October."
       },
       {
         "message": "We also have two cats."
@@ -17,7 +17,8 @@
         "message": "TTDI would actually be my favourite area if it works for school."
       },
       {
-        "message": "One thing I really don't want is a unit looking over a car park. What would you recommend for us now?"
+        "message": "One thing I really don't want is a unit looking over a car park. What would you recommend for us now?",
+        "expectation": "recommendations"
       }
     ],
     "hard_constraints": {
@@ -25,6 +26,16 @@
       "min_bedrooms": 3,
       "pets": ["cat"],
       "pet_count": 2
-    }
+    },
+    "preference_checks": [
+      {"id": "bedrooms", "description": "3 or 4 bedrooms", "patterns": ["3\\s*(?:or|-)\\s*4\\s*bed", "three\\s*(?:or|-)\\s*four\\s*bed"]},
+      {"id": "max_rent", "description": "maximum rent of RM7,800", "patterns": ["(?:rm\\s*)?7[,]?800", "max(?:imum)?[^.\\n]{0,30}7800"]},
+      {"id": "furnishing", "description": "partially furnished with white goods", "patterns": ["partial(?:ly)?\\s+furnish", "white\\s+goods"]},
+      {"id": "cats", "description": "two cats", "patterns": ["(?:two|2)\\s+cats?"]},
+      {"id": "school", "description": "Alice Smith school", "patterns": ["alice\\s+smith"]},
+      {"id": "school_bus_walk", "description": "walk 10–15 minutes to the school bus stop without driving", "patterns": ["10\\s*[-–]\\s*15[^.\\n]{0,40}(?:walk|bus)", "(?:walk|bus)[^.\\n]{0,40}10\\s*[-–]\\s*15", "do(?:es)?n.t\\s+want\\s+to\\s+drive"]},
+      {"id": "area", "description": "TTDI preference", "patterns": ["\\bttdi\\b"]},
+      {"id": "view", "description": "avoid a car-park view", "patterns": ["(?:avoid|no|not|don.t want)[^.\\n]{0,40}car\\s*park", "car\\s*park[^.\\n]{0,30}view"]}
+    ]
   }
 ]
