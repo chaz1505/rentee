@@ -114,6 +114,17 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(tool["parameters"]["required"], ["condo_names"])
         self.assertIn("Persona", args["instructions"])
         self.assertIn("one tool call", args["instructions"])
+        self.assertIn("MUST call get_condo_info first", args["instructions"])
+        self.assertIn("primary source", args["instructions"])
+        self.assertIn("Do not use web search instead", args["instructions"])
+        self.assertIn("MUST be called first", tool["description"])
+
+        property_tool = next(
+            item for item in args["tools"]
+            if item.get("name") == "get_property_details"
+        )
+        self.assertIn("specific current Rentee listing or unit", property_tool["description"])
+        self.assertIn("use get_condo_info instead", property_tool["description"])
 
     @patch("app.get_condo_infos")
     def test_chat_stream_executes_condo_tool_and_continues_same_response(
