@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import requests
 
 try:
-    from .bubble_test_data import get_bubble_dev_base
+    from .bubble_test_data import get_bubble_base
     from .evaluate_run import evaluate_run
     from .generate_fix_prompt import generate_fix_prompt
     from .generate_evaluation_markdown import generate_evaluation_markdown
@@ -18,7 +18,7 @@ try:
         snapshot_test_subject,
     )
 except ImportError:
-    from bubble_test_data import get_bubble_dev_base
+    from bubble_test_data import get_bubble_base
     from evaluate_run import evaluate_run
     from generate_fix_prompt import generate_fix_prompt
     from generate_evaluation_markdown import generate_evaluation_markdown
@@ -72,13 +72,13 @@ def _iter_sse_events(response):
         yield "\n".join(data_lines)
 
 
-def run_turn(message, folio_id, previous_response_id=None):
+def run_turn(message, folio_id, previous_response_id=None, environment="development"):
     stream_url = os.environ.get("RENTEE_STREAM_URL", DEFAULT_STREAM_URL)
     payload = {
         "message": message,
         "previous_response_id": previous_response_id,
         "folio_id": folio_id,
-        "bubble_env": "development"
+        "bubble_env": environment
     }
     started = time.perf_counter()
     response = requests.post(
@@ -153,29 +153,33 @@ def _load_cases():
         return json.load(cases_file)
 
 
-def _save_result(case_id, result):
+def _save_result(case_id, result, environment="development"):
     results_dir = os.path.join(TESTS_DIR, "results")
     os.makedirs(results_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(results_dir, f"{case_id}_{timestamp}.json")
+    environment_suffix = "_live" if environment == "live" else ""
+    path = os.path.join(
+        results_dir, f"{case_id}{environment_suffix}_{timestamp}.json"
+    )
     with open(path, "w", encoding="utf-8") as result_file:
         json.dump(result, result_file, indent=2, ensure_ascii=False)
         result_file.write("\n")
     return path
 
 
-def run_case(case, run_id=None, progress_callback=None):
+def run_case(case, run_id=None, progress_callback=None, environment="development"):
     # Force development-base validation before any Bubble request or chat turn.
-    get_bubble_dev_base()
+    get_bubble_base(environment)
     benchmark_log("=" * 40)
     benchmark_log("Starting benchmark run")
     if run_id:
         benchmark_log(f"Run ID: {run_id}")
     benchmark_log(f"Case: {case['name']}")
+    benchmark_log(f"Environment: {environment.upper()}")
     benchmark_log("=" * 40)
     benchmark_log("Resetting Bubble test subject...")
-    subject = ensure_test_subject(case)
-    reset_test_subject(case, subject)
+    subject = ensure_test_subject(case, environment)
+    reset_test_subject(case, subject, environment)
     benchmark_log("Reset complete.")
     benchmark_log(f"Using Lead: {subject['lead_id']}")
     benchmark_log(f"Using Folio: {subject['folio_id']}")
@@ -185,9 +189,9 @@ def run_case(case, run_id=None, progress_callback=None):
         "case_name": case["name"],
         "started_at_utc": _utc_now(),
         "stream_url": os.environ.get("RENTEE_STREAM_URL", DEFAULT_STREAM_URL),
-        "bubble_env": "development",
+        "bubble_env": environment,
         "subject": subject,
-        "initial_state": snapshot_test_subject(subject),
+        "initial_state": snapshot_test_subject(subject, environment),
         "turns": [],
         "final_state": {},
         "completed_at_utc": None,
@@ -202,7 +206,9 @@ def run_case(case, run_id=None, progress_callback=None):
         benchmark_log(f"TURN {turn_number}")
         benchmark_log(f"Tenant: {message}")
         try:
-            turn_result = run_turn(message, subject["folio_id"], previous_response_id)
+            turn_result = run_turn(
+                message, subject["folio_id"], previous_response_id, environment
+            )
         except BenchmarkTurnError as error:
             turn_result = error.turn_result
             result["failure"] = {
@@ -256,7 +262,7 @@ def run_case(case, run_id=None, progress_callback=None):
             break
 
     try:
-        result["final_state"] = snapshot_test_subject(subject)
+        result["final_state"] = snapshot_test_subject(subject, environment)
     except Exception as error:
         if result["failure"] is None:
             result["failure"] = {
@@ -267,7 +273,7 @@ def run_case(case, run_id=None, progress_callback=None):
         else:
             result["failure"]["final_state_error"] = str(error)
     result["completed_at_utc"] = _utc_now()
-    output_path = _save_result(case["id"], result)
+    output_path = _save_result(case["id"], result, environment)
     evaluation_path, evaluation = evaluate_run(output_path)
     evaluation_markdown_path = generate_evaluation_markdown(
         output_path, evaluation_path
@@ -343,10 +349,32 @@ def get_benchmark_case_ids():
     return [case["id"] for case in _load_cases()]
 
 
-def run_all_benchmarks(run_id=None, progress_callback=None):
+def validate_benchmark_environment(environment):
+    if environment not in ("development", "live"):
+        raise BenchmarkError(f"Unsupported benchmark environment: {environment}")
+    if (
+        environment == "live"
+        and os.environ.get("BENCHMARK_LIVE_ENABLED", "").strip().lower() != "true"
+    ):
+        raise BenchmarkError(
+            "Live benchmark is disabled; set BENCHMARK_LIVE_ENABLED=true explicitly."
+        )
+    get_bubble_base(environment)
+    return environment
+
+
+def run_all_benchmarks(
+    run_id=None, progress_callback=None, environment="development"
+):
+    validate_benchmark_environment(environment)
     results = []
     for case in _load_cases():
-        results.append(run_case(case, run_id=run_id, progress_callback=progress_callback))
+        results.append(run_case(
+            case,
+            run_id=run_id,
+            progress_callback=progress_callback,
+            environment=environment
+        ))
     return {
         "run_id": run_id,
         "results": results,
@@ -357,7 +385,8 @@ def run_all_benchmarks(run_id=None, progress_callback=None):
 def main():
     failed = False
     try:
-        suite = run_all_benchmarks()
+        environment = os.environ.get("BENCHMARK_ENVIRONMENT", "development")
+        suite = run_all_benchmarks(environment=environment)
         failed = suite["failed"]
     except Exception as error:
         print(f"BENCHMARK FAILED: {error}", file=sys.stderr, flush=True)

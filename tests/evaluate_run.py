@@ -333,13 +333,18 @@ def qualitative_evaluation(case, result, deterministic_issues):
     return json.loads(response.output_text)
 
 
-def _previous_result_path(result_path, case_id):
+def _previous_result_path(result_path, case_id, environment="development"):
     candidates = []
     for path in glob.glob(os.path.join(RESULTS_DIR, f"{case_id}_*.json")):
         name = os.path.basename(path)
         if path == result_path or name.endswith("_evaluation.json"):
             continue
-        candidates.append(path)
+        try:
+            candidate = _load_json(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if candidate.get("bubble_env", "development") == environment:
+            candidates.append(path)
     return max(candidates, key=os.path.getmtime) if candidates else None
 
 
@@ -349,7 +354,9 @@ def _count_issue(issues, issue_id):
 
 
 def compare_previous(result_path, case, current_metrics, current_issues):
-    previous_path = _previous_result_path(result_path, case["id"])
+    previous_path = _previous_result_path(
+        result_path, case["id"], result.get("bubble_env", "development")
+    )
     if not previous_path:
         return {"available": False}
     previous = _load_json(previous_path)

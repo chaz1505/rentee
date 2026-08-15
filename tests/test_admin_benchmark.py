@@ -157,10 +157,49 @@ class AdminBenchmarkTests(unittest.TestCase):
         self.assertNotIn(secret, output.getvalue())
         self.assertNotIn("incorrect-secret", output.getvalue())
 
+    def test_live_endpoint_requires_enable_and_ignores_arbitrary_ids(self):
+        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "correct-key"}, clear=True):
+            disabled = self.client.post(
+                "/admin/run_benchmark",
+                headers=self._headers(),
+                json={
+                    "environment": "live",
+                    "lead_id": "customer-lead",
+                    "folio_id": "customer-folio"
+                }
+            )
+        self.assertEqual(disabled.status_code, 403)
+        with app_module._benchmark_state_lock:
+            self.assertEqual(app_module._benchmark_state, {"status": "idle"})
+
+    @patch("app.threading.Thread", FakeThread)
+    @patch("tests.run_benchmark.get_benchmark_case_ids", return_value=["sofia_01"])
+    def test_enabled_live_endpoint_passes_only_environment_to_worker(
+        self, _mocked_cases
+    ):
+        with patch.dict(os.environ, {
+            "BENCHMARK_API_KEY": "correct-key",
+            "BENCHMARK_LIVE_ENABLED": "true"
+        }, clear=True):
+            response = self.client.post(
+                "/admin/run_benchmark",
+                headers=self._headers(),
+                json={
+                    "environment": "live",
+                    "lead_id": "customer-lead",
+                    "folio_id": "customer-folio"
+                }
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["environment"], "live")
+        self.assertEqual(FakeThread.instances[0].args[1], "live")
+        self.assertNotIn("customer-lead", FakeThread.instances[0].args)
+        self.assertNotIn("customer-folio", FakeThread.instances[0].args)
+
     @patch("tests.run_benchmark.run_all_benchmarks", return_value={"failed": False})
     def test_cli_main_uses_reusable_suite(self, mocked_suite):
         self.assertEqual(run_benchmark.main(), 0)
-        mocked_suite.assert_called_once_with()
+        mocked_suite.assert_called_once_with(environment="development")
 
 
 if __name__ == "__main__":
