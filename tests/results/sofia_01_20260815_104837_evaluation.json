@@ -1,0 +1,160 @@
+{
+  "case_id": "sofia_01",
+  "overall_status": "fail",
+  "summary": "4 issue groups detected; 3 critical/high.",
+  "metrics": {
+    "total_turns": 5,
+    "average_first_event_s": 7.182,
+    "average_first_delta_s": 24.492,
+    "average_total_s": 26.118,
+    "slow_turns": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "critical_slow_turns": [
+      1,
+      2,
+      4,
+      5
+    ],
+    "unsupported_action_violations": 0,
+    "excessive_question_turns": 0,
+    "repeated_question_pairs": 0,
+    "preference_persistence_failures": 2
+  },
+  "issues": [
+    {
+      "id": "first_text_latency",
+      "category": "speed",
+      "severity": "critical",
+      "turns": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "evidence": [
+        "Turn 1 first text: 24.556s",
+        "Turn 2 first text: 26.102s",
+        "Turn 3 first text: 17.052s",
+        "Turn 4 first text: 23.615s",
+        "Turn 5 first text: 31.133s"
+      ],
+      "diagnosis": "Customer-facing text is delayed beyond the benchmark threshold.",
+      "recommended_fix": "Trace the tool path and model calls before the first delta; preserve grounding while removing unnecessary work from non-recommendation turns."
+    },
+    {
+      "id": "preference_update_latency",
+      "category": "speed",
+      "severity": "critical",
+      "turns": [
+        2
+      ],
+      "evidence": [
+        "Simple preference turn 2 total: 27.822s; recommendation-turn average: 32.773s"
+      ],
+      "diagnosis": "The simple update appears to execute approximately as much work as a recommendation turn. A likely cause, based on Rentee's architecture, is automatic rematching after update_preferences even when recommendations were not requested.",
+      "recommended_fix": "Inspect the update_preferences continuation in app.py. Persist and briefly confirm preference-only updates without a full rematch; retain matching when the user actually asks for current recommendations."
+    },
+    {
+      "id": "preference_persistence",
+      "category": "state",
+      "severity": "high",
+      "turns": [],
+      "evidence": [
+        "Final AIsearchtext is missing: 3 or 4 bedrooms",
+        "Final AIsearchtext is missing: avoid a car-park view"
+      ],
+      "diagnosis": "One or more explicitly supplied preferences are absent from the final Bubble Lead profile.",
+      "recommended_fix": "Ensure update_preferences merges every new constraint into the complete AIsearchtext without dropping earlier requirements."
+    },
+    {
+      "id": "qualitative_behavior",
+      "category": "conversation",
+      "severity": "medium",
+      "turns": [],
+      "evidence": [
+        "conversation_intelligence: 1/3",
+        "Final saved profile omitted explicit 3–4 bedroom requirement and the user’s ‘no unit looking over a car park’ constraint despite those being stated in the conversation.",
+        "Assistant reported a shortlist of seven listings but relied on incomplete listing data and did not confirm key matching facts (pet policy, furnishing/white goods, exact address/walk time) before presenting them — premature shortlisting.",
+        "Missed opportunity to ask targeted clarifying questions about view/floor-level preferences to enforce the ‘no car-park view’ constraint (e.g., preferred floor, balcony facing).",
+        "Requested a preference between “lower vs. closer to your budget” without illustrating trade-offs or giving example rents/locations to make that choice actionable.",
+        "The assistant repeated confirmations across turns rather than producing a single synthesized preference summary for user sign-off before progressing."
+      ],
+      "diagnosis": "The qualitative judge found weak conversation intelligence, adaptation, question quality, recommendation reasoning, or decision progress.",
+      "recommended_fix": "Ensure complete preference persistence and explicit confirmation before shortlisting: surface every user-stated hard and soft constraint (3–4 bedrooms, two cats allowed, move-in date, max RM7,800, partial furnishing/white goods, 10–15min walk to Alice Smith bus stop, and ‘no car-park view’). If any constraint is missing or ambiguous, ask targeted clarifying questions (e.g., acceptable floor/view, which white goods are essential) before claiming or presenting a shortlist."
+    }
+  ],
+  "passes": [
+    "No unsupported action promises were detected."
+  ],
+  "qualitative_evaluation": {
+    "scores": {
+      "conversation_intelligence": 1,
+      "recommendation_reasoning": 2,
+      "adaptiveness": 2,
+      "question_quality": 2,
+      "decision_progress": 2
+    },
+    "qualitative_issues": [
+      "Final saved profile omitted explicit 3–4 bedroom requirement and the user’s ‘no unit looking over a car park’ constraint despite those being stated in the conversation.",
+      "Assistant reported a shortlist of seven listings but relied on incomplete listing data and did not confirm key matching facts (pet policy, furnishing/white goods, exact address/walk time) before presenting them — premature shortlisting.",
+      "Missed opportunity to ask targeted clarifying questions about view/floor-level preferences to enforce the ‘no car-park view’ constraint (e.g., preferred floor, balcony facing).",
+      "Requested a preference between “lower vs. closer to your budget” without illustrating trade-offs or giving example rents/locations to make that choice actionable.",
+      "The assistant repeated confirmations across turns rather than producing a single synthesized preference summary for user sign-off before progressing."
+    ],
+    "strengths": [
+      "Consistently acknowledged and attempted to record the user’s main preferences (pets, school walk-time, preferred area conditional on school access).",
+      "Adapted the search logic to include the Alice Smith bus-stop walking constraint and conditional preference for TTDI.",
+      "Gave a clear, practical checklist of next steps to validate listings (confirm address/walk time, pet policy, availability, white goods).",
+      "Offered a concrete, helpful follow-up action (drafting agent/owner questions) to move the process forward."
+    ],
+    "highest_priority_improvement": "Ensure complete preference persistence and explicit confirmation before shortlisting: surface every user-stated hard and soft constraint (3–4 bedrooms, two cats allowed, move-in date, max RM7,800, partial furnishing/white goods, 10–15min walk to Alice Smith bus stop, and ‘no car-park view’). If any constraint is missing or ambiguous, ask targeted clarifying questions (e.g., acceptable floor/view, which white goods are essential) before claiming or presenting a shortlist."
+  },
+  "comparison_to_previous_run": {
+    "available": true,
+    "previous_result": "/opt/render/project/src/tests/results/sofia_01_20260815_103134.json",
+    "first_delta_change_pct": 2.3,
+    "total_latency_change_pct": 2.7,
+    "slow_turns": {
+      "previous": 5,
+      "current": 5
+    },
+    "unsupported_actions": {
+      "previous": 0,
+      "current": 0
+    },
+    "excessive_questioning": {
+      "previous": 0,
+      "current": 0
+    },
+    "repeated_questions": {
+      "previous": 0,
+      "current": 0
+    },
+    "preference_persistence_failures": {
+      "previous": 1,
+      "current": 2
+    },
+    "qualitative_scores": {
+      "previous": {
+        "conversation_intelligence": 1,
+        "recommendation_reasoning": 2,
+        "adaptiveness": 2,
+        "question_quality": 1,
+        "decision_progress": 2
+      },
+      "current": {
+        "conversation_intelligence": 1,
+        "recommendation_reasoning": 2,
+        "adaptiveness": 2,
+        "question_quality": 2,
+        "decision_progress": 2
+      }
+    }
+  }
+}
