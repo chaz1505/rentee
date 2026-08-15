@@ -89,8 +89,8 @@ def publish_benchmark_results(paths):
         os.environ.get("OPENAI_API_KEY", "")
     ]
     try:
-        if len(paths) != 3:
-            raise ValueError("Exactly three benchmark artifact paths are required.")
+        if len(paths) != 4:
+            raise ValueError("Exactly four benchmark artifact paths are required.")
         artifacts = []
         for path in paths:
             repo_path = _repo_relative_result_path(path)
@@ -119,6 +119,7 @@ def publish_benchmark_results(paths):
         expected_paths = {
             f"{basename}.json",
             f"{basename}_evaluation.json",
+            f"{basename}_evaluation.md",
             f"{basename}_fix_prompt.md"
         }
         if repo_paths != expected_paths:

@@ -61,21 +61,33 @@ After the conversation completes, deterministic evaluation checks latency, strea
 
 The evaluator compares the run with the most recent earlier raw result for the same case. It reports latency changes and changes in the major violation counts; qualitative scores are compared when the prior evaluation file exists.
 
-Each completed run generates three files:
+Each completed run generates four files:
 
 ```text
 tests/results/<case>_<timestamp>.json
 tests/results/<case>_<timestamp>_evaluation.json
+tests/results/<case>_<timestamp>_evaluation.md
 tests/results/<case>_<timestamp>_fix_prompt.md
 ```
 
-The Markdown file is a ready-to-paste Codex task containing evidence, prioritised fixes, regression constraints, and required verification. Review it before giving it to Codex; the benchmark diagnoses only and never edits application code.
+The raw JSON contains the transcript, timings, and state. The evaluation JSON is the structured machine-readable assessment. The `_evaluation.md` report is the main human-readable artifact and includes performance, comparisons, strengths, problems, scores, priorities, and the full verbatim conversation. The `_fix_prompt.md` file is a ready-to-paste implementation task for Codex.
+
+Normal review workflow:
+
+```text
+Trigger benchmark
+→ watch progress in Render Logs
+→ open GitHub tests/results/
+→ open the latest _evaluation.md
+→ review performance and the full conversation
+→ open _fix_prompt.md if changes are needed
+```
 
 After Codex makes a fix, rerun `python tests/run_benchmark.py`. The next evaluation automatically compares the new run with the preceding one. v1 contains only the Sofia case.
 
 ## GitHub artifact publishing
 
-When `GITHUB_RESULTS_TOKEN` is configured, each run automatically publishes its three generated artifacts to `chaz1505/rentee` on `main`, under `tests/results/`. Publishing uses the GitHub Contents API and does not depend on Render having a usable Git checkout or push remote.
+When `GITHUB_RESULTS_TOKEN` is configured, each run automatically publishes its four generated artifacts to `chaz1505/rentee` on `main`, under `tests/results/`. Publishing uses the GitHub Contents API and does not depend on Render having a usable Git checkout or push remote.
 
 Run normally:
 
@@ -89,6 +101,6 @@ If the token is absent, the benchmark still completes and the artifacts remain l
 BENCHMARK_SKIP_GITHUB=true python tests/run_benchmark.py
 ```
 
-The token is used only in the GitHub API authorization header. It requires Contents write access to `chaz1505/rentee`. Before publishing, the helper scans all three artifacts for configured GitHub, Bubble, and OpenAI secret values and refuses the entire run if one is found. `tests/.autotest_state.json` is never eligible for publication.
+The token is used only in the GitHub API authorization header. It requires Contents write access to `chaz1505/rentee`. Before publishing, the helper scans all four artifacts for configured GitHub, Bubble, and OpenAI secret values and refuses the entire run if one is found. `tests/.autotest_state.json` is never eligible for publication.
 
 Publishing failures never change the benchmark result. Partial artifacts from failed Rentee conversations are evaluated, turned into a fix prompt, and published through the same flow when credentials are available.
