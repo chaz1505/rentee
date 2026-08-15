@@ -1,9 +1,12 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
+import csv
+import io
 import os
 import requests
 import json
+import threading
 import time
 
 # Connection-test marker: confirms updates can be applied to this app.
@@ -26,6 +29,104 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 200
+CONDO_SHEET_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "1wnXHS6cHoUmAVXFpkzZ9PhBKmEgG6g-n8n0jcyodYig/export?format=csv&gid=0"
+)
+CONDO_CACHE_TTL_SECONDS = 300
+CONDO_SHEET_TIMEOUT_SECONDS = 15
+
+_condo_cache = None
+_condo_cache_checked_at = 0.0
+_condo_cache_lock = threading.Lock()
+
+
+class CondoDataError(RuntimeError):
+    pass
+
+
+def normalize_condo_name(value):
+    return " ".join(str(value or "").split()).lower()
+
+
+def _download_condo_lookup():
+    response = requests.get(
+        CONDO_SHEET_CSV_URL,
+        timeout=CONDO_SHEET_TIMEOUT_SECONDS
+    )
+    response.raise_for_status()
+    text = response.content.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    fieldnames = reader.fieldnames or []
+    condo_column = next(
+        (
+            field
+            for field in fieldnames
+            if normalize_condo_name(field) == "condo name"
+        ),
+        None
+    )
+    if not condo_column:
+        raise CondoDataError("Condo sheet is missing the 'Condo name' column.")
+
+    lookup = {}
+    for source_row in reader:
+        row = {
+            field: "" if source_row.get(field) is None else str(source_row.get(field)).strip()
+            for field in fieldnames
+        }
+        key = normalize_condo_name(row.get(condo_column))
+        if key and key not in lookup:
+            lookup[key] = row
+    return lookup
+
+
+def _get_condo_lookup():
+    global _condo_cache, _condo_cache_checked_at
+
+    now = time.monotonic()
+    if (
+        _condo_cache is not None
+        and now - _condo_cache_checked_at < CONDO_CACHE_TTL_SECONDS
+    ):
+        return _condo_cache
+
+    with _condo_cache_lock:
+        now = time.monotonic()
+        if (
+            _condo_cache is not None
+            and now - _condo_cache_checked_at < CONDO_CACHE_TTL_SECONDS
+        ):
+            return _condo_cache
+        try:
+            refreshed = _download_condo_lookup()
+        except Exception as error:
+            _condo_cache_checked_at = now
+            if _condo_cache is not None:
+                print(
+                    f"Condo data refresh failed; using stale cache: {error}",
+                    flush=True
+                )
+                return _condo_cache
+            print(f"Initial condo data load failed: {error}", flush=True)
+            raise CondoDataError(
+                "Condo information is temporarily unavailable."
+            ) from error
+
+        _condo_cache = refreshed
+        _condo_cache_checked_at = now
+        print(f"Condo data refreshed: {len(refreshed)} condos loaded", flush=True)
+        return _condo_cache
+
+
+def get_condo_info(condo_name):
+    normalized_name = normalize_condo_name(condo_name)
+    if not normalized_name:
+        return {"error": "A condo name is required."}
+    row = _get_condo_lookup().get(normalized_name)
+    if row is None:
+        return {"error": f'Condo "{str(condo_name).strip()}" was not found.'}
+    return dict(row)
 
 
 def log_timing(label, started, detail=""):
@@ -69,6 +170,20 @@ def get_bubble_base_url(bubble_env):
 @app.route("/")
 def home():
     return jsonify({"status": "running"})
+
+
+@app.route("/test_condo", methods=["GET"])
+def test_condo():
+    condo_name = request.args.get("name", "")
+    if not normalize_condo_name(condo_name):
+        return jsonify({"error": "Missing required query parameter: name"}), 400
+    try:
+        result = get_condo_info(condo_name)
+    except CondoDataError as error:
+        return jsonify({"error": str(error)}), 503
+    if "error" in result:
+        return jsonify(result), 404
+    return jsonify(result), 200
 
 
 def build_response_args(user_message, previous_response_id=None):
