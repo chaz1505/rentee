@@ -1,0 +1,30 @@
+[
+  {
+    "id": "sofia_01",
+    "name": "Sofia - school bus, cats and teenage bedroom",
+    "initial_ai_searchtext": "Home search requirements:\nNo preferences provided yet.",
+    "turns": [
+      {
+        "message": "I need to move quite quickly. I’m British, one adult with two kids, looking for 3 or 4 bedrooms. Ideally partially furnished with white goods. Budget max RM7,800 and move-in 1 August."
+      },
+      {
+        "message": "We also have two cats."
+      },
+      {
+        "message": "The children go to Alice Smith and I don't want to drive them to a bus stop. A 10–15 minute walk to a stop is okay."
+      },
+      {
+        "message": "TTDI would actually be my favourite area if it works for school."
+      },
+      {
+        "message": "One thing I really don't want is a unit looking over a car park. What would you recommend for us now?"
+      }
+    ],
+    "hard_constraints": {
+      "max_rent": 7800,
+      "min_bedrooms": 3,
+      "pets": ["cat"],
+      "pet_count": 2
+    }
+  }
+]

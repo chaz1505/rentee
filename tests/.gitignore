@@ -1,0 +1,3 @@
+.autotest_state.json
+results/*.json
+!results/.gitkeep
