@@ -973,6 +973,16 @@ For each recommended property:
 - Explain briefly why it suits the user's requirements.
 - Mention any important compromise or consideration.
 - Keep the explanation focused on what matters to the user.
+- Include the rent and bedroom count when supplied, so the customer can evaluate
+  concrete trade-offs rather than choosing between vague categories.
+- Distinguish verified listing facts from requirements that remain unverified.
+- Never claim that pets, furnishing or white goods, view/facing, school transport,
+  walking time, exact location, or availability satisfy a requirement unless the
+  supplied property information explicitly supports that claim.
+- Do not recommend a property that explicitly contradicts a hard requirement such
+  as maximum budget or minimum bedrooms. If a different hard requirement cannot be
+  verified from the supplied data, identify that uncertainty prominently for that
+  property rather than presenting it as confirmed.
 
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
@@ -1182,6 +1192,25 @@ def merge_updated_preference_text(existing_text, generated_text, preference_upda
     return generated_text
 
 
+def preference_update_requires_rewrite(preference_update):
+    return bool(re.search(
+        r"\b(?:no longer|instead|replace|remove|delete|change(?:d)?|only interested|"
+        r"budget is now|now want|now need)\b",
+        preference_update or "",
+        re.I
+    ))
+
+
+def append_preference_summary(existing_summary, preference_update):
+    existing_summary = (existing_summary or "").strip()
+    preference_update = (preference_update or "").strip()
+    if not existing_summary:
+        return preference_update
+    if preference_update.lower() in existing_summary.lower():
+        return existing_summary
+    return f"{existing_summary}\n{preference_update}"
+
+
 def update_preferences(folio_id, preference_update, bubble_env):
 
     preferences_started = time.perf_counter()
@@ -1196,6 +1225,25 @@ def update_preferences(folio_id, preference_update, bubble_env):
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     log_timing("update_preferences - Lead lookup", lead_started)
     existing_ai_search_text = lead.get("AIsearchtext", "")
+
+    if not preference_update_requires_rewrite(preference_update):
+        updated_ai_search_text = merge_updated_preference_text(
+            existing_ai_search_text,
+            "Home search requirements:",
+            preference_update
+        )
+        ai_search_summary = append_preference_summary(
+            lead.get("AIsearchsummary", ""),
+            preference_update
+        )
+        update_lead_ai_searchtext(
+            lead_id,
+            updated_ai_search_text,
+            ai_search_summary,
+            base_url
+        )
+        log_timing("update_preferences TOTAL", preferences_started)
+        return f"Got it — I’ve saved this preference: {preference_update}"
 
     update_prompt = f"""
 You maintain a living home-search profile for one customer.
@@ -1466,9 +1514,14 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
                     )
+                    preference_text = (
+                        tool_args["preference_update"]
+                        if tool_args.get("recommendations_requested") is True
+                        else message
+                    )
                     preference_confirmation = update_preferences(
                         folio_id,
-                        tool_args["preference_update"],
+                        preference_text,
                         bubble_env
                     )
                     if tool_args.get("recommendations_requested") is True:

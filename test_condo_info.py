@@ -232,6 +232,9 @@ class CondoInfoTests(unittest.TestCase):
             )
             body = response.get_data(as_text=True)
         mocked_match.assert_not_called()
+        _mocked_update.assert_called_once_with(
+            "folio-1", "We also have two cats.", "live"
+        )
         self.assertNotIn("Now calling match_lead", body)
         self.assertIn("Saved your cat preference.", body)
         self.assertEqual(responses.stream.call_args_list[1].kwargs["tools"], [])
@@ -264,6 +267,45 @@ class CondoInfoTests(unittest.TestCase):
         )
         self.assertNotIn("Budget: RM7,800", merged)
         self.assertIn("Budget: RM9,000", merged)
+
+    @patch("app.update_lead_ai_searchtext")
+    @patch("app.bubble")
+    def test_additive_update_uses_fast_deterministic_path(
+        self, mocked_bubble, mocked_update_lead
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"},
+            {
+                "AIsearchtext": "Bedrooms: 3 or 4",
+                "AIsearchsummary": "3 or 4 bedrooms"
+            }
+        ]
+        fake_client = MagicMock()
+        with patch.object(app_module, "client", fake_client):
+            confirmation = app_module.update_preferences(
+                "folio-1", "We also have two cats.", "development"
+            )
+
+        fake_client.responses.create.assert_not_called()
+        mocked_update_lead.assert_called_once()
+        updated_text = mocked_update_lead.call_args.args[1]
+        updated_summary = mocked_update_lead.call_args.args[2]
+        self.assertIn("Bedrooms: 3 or 4", updated_text)
+        self.assertIn("We also have two cats.", updated_text)
+        self.assertIn("We also have two cats.", updated_summary)
+        self.assertIn("We also have two cats.", confirmation)
+
+    def test_replacement_detection_keeps_model_rewrite_path_available(self):
+        self.assertTrue(
+            app_module.preference_update_requires_rewrite(
+                "My budget is now RM9,000 instead"
+            )
+        )
+        self.assertFalse(
+            app_module.preference_update_requires_rewrite(
+                "We also have two cats"
+            )
+        )
 
 
 if __name__ == "__main__":
