@@ -7,8 +7,11 @@ import os
 import requests
 import json
 import re
+import hmac
+import traceback
 import threading
 import time
+from datetime import datetime, timezone
 
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
@@ -40,6 +43,9 @@ CONDO_SHEET_TIMEOUT_SECONDS = 15
 _condo_cache = None
 _condo_cache_checked_at = 0.0
 _condo_cache_lock = threading.Lock()
+_benchmark_run_lock = threading.Lock()
+_benchmark_state_lock = threading.Lock()
+_benchmark_state = {"status": "idle"}
 
 
 class CondoDataError(RuntimeError):
@@ -220,6 +226,104 @@ def test_condo():
     if "error" in result:
         return jsonify(result), 404
     return jsonify(result), 200
+
+
+def _benchmark_auth_error():
+    configured_key = os.environ.get("BENCHMARK_API_KEY")
+    if not configured_key:
+        return jsonify({"error": "Benchmark endpoint is not configured."}), 503
+    supplied_key = request.headers.get("X-Benchmark-Key", "")
+    if not supplied_key or not hmac.compare_digest(supplied_key, configured_key):
+        return jsonify({"error": "Unauthorized."}), 401
+    return None
+
+
+def _update_benchmark_state(run_id, updates):
+    with _benchmark_state_lock:
+        if _benchmark_state.get("run_id") == run_id:
+            _benchmark_state.update(updates)
+
+
+def _run_benchmark_background(run_id):
+    try:
+        from tests.run_benchmark import run_all_benchmarks
+
+        def progress(update):
+            _update_benchmark_state(run_id, update)
+
+        suite = run_all_benchmarks(run_id=run_id, progress_callback=progress)
+        first_result = suite.get("results", [{}])[0]
+        execution = first_result.get("execution", {})
+        _update_benchmark_state(run_id, {
+            "status": "complete",
+            "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "benchmark_status": execution.get("benchmark_status", "fail"),
+            "result_path": execution.get("result_path"),
+            "evaluation_path": execution.get("evaluation_path"),
+            "fix_prompt_path": execution.get("fix_prompt_path"),
+            "github_published": execution.get("github_published", False)
+        })
+    except Exception as error:
+        print(f"[BENCHMARK] BENCHMARK FAILED: {error}", flush=True)
+        traceback.print_exc()
+        _update_benchmark_state(run_id, {
+            "status": "failed",
+            "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "error": str(error)
+        })
+    finally:
+        _benchmark_run_lock.release()
+
+
+@app.route("/admin/run_benchmark", methods=["POST"])
+def admin_run_benchmark():
+    auth_error = _benchmark_auth_error()
+    if auth_error:
+        return auth_error
+    if not _benchmark_run_lock.acquire(blocking=False):
+        with _benchmark_state_lock:
+            running = dict(_benchmark_state)
+        return jsonify({
+            "status": "already_running",
+            "run_id": running.get("run_id"),
+            "started_at": running.get("started_at")
+        }), 409
+
+    try:
+        from tests.run_benchmark import get_benchmark_case_ids
+        case_ids = get_benchmark_case_ids()
+        case_id = case_ids[0] if case_ids else "benchmark"
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{case_id}"
+        with _benchmark_state_lock:
+            _benchmark_state.clear()
+            _benchmark_state.update({
+                "status": "running",
+                "run_id": run_id,
+                "case": case_id,
+                "started_at": started_at,
+                "current_turn": 0
+            })
+        thread = threading.Thread(
+            target=_run_benchmark_background,
+            args=(run_id,),
+            name=f"benchmark-{run_id}",
+            daemon=True
+        )
+        thread.start()
+    except Exception:
+        _benchmark_run_lock.release()
+        raise
+    return jsonify({"status": "started", "run_id": run_id, "case": case_id}), 202
+
+
+@app.route("/admin/benchmark_status", methods=["GET"])
+def admin_benchmark_status():
+    auth_error = _benchmark_auth_error()
+    if auth_error:
+        return auth_error
+    with _benchmark_state_lock:
+        return jsonify(dict(_benchmark_state)), 200
 
 
 def build_response_args(user_message, previous_response_id=None):
