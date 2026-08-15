@@ -11,7 +11,10 @@ try:
     from .evaluate_run import evaluate_run
     from .generate_fix_prompt import generate_fix_prompt
     from .generate_evaluation_markdown import generate_evaluation_markdown
-    from .publish_results import publish_benchmark_results
+    from .save_benchmark_run import (
+        get_previous_benchmark_run,
+        save_benchmark_run,
+    )
     from .test_subject import (
         ensure_test_subject,
         reset_test_subject,
@@ -22,7 +25,10 @@ except ImportError:
     from evaluate_run import evaluate_run
     from generate_fix_prompt import generate_fix_prompt
     from generate_evaluation_markdown import generate_evaluation_markdown
-    from publish_results import publish_benchmark_results
+    from save_benchmark_run import (
+        get_previous_benchmark_run,
+        save_benchmark_run,
+    )
     from test_subject import ensure_test_subject, reset_test_subject, snapshot_test_subject
 
 
@@ -157,9 +163,8 @@ def _save_result(case_id, result, environment="development"):
     results_dir = os.path.join(TESTS_DIR, "results")
     os.makedirs(results_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    environment_suffix = "_live" if environment == "live" else ""
     path = os.path.join(
-        results_dir, f"{case_id}{environment_suffix}_{timestamp}.json"
+        results_dir, f"{case_id}_{environment}_{timestamp}.json"
     )
     with open(path, "w", encoding="utf-8") as result_file:
         json.dump(result, result_file, indent=2, ensure_ascii=False)
@@ -170,6 +175,11 @@ def _save_result(case_id, result, environment="development"):
 def run_case(case, run_id=None, progress_callback=None, environment="development"):
     # Force development-base validation before any Bubble request or chat turn.
     get_bubble_base(environment)
+    if not run_id:
+        run_id = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{case['id']}_{environment}"
+        )
     benchmark_log("=" * 40)
     benchmark_log("Starting benchmark run")
     if run_id:
@@ -185,6 +195,7 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
     benchmark_log(f"Using Folio: {subject['folio_id']}")
 
     result = {
+        "run_id": run_id,
         "case_id": case["id"],
         "case_name": case["name"],
         "started_at_utc": _utc_now(),
@@ -274,18 +285,37 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
             result["failure"]["final_state_error"] = str(error)
     result["completed_at_utc"] = _utc_now()
     output_path = _save_result(case["id"], result, environment)
-    evaluation_path, evaluation = evaluate_run(output_path)
+    previous_benchmark_run = None
+    try:
+        previous_benchmark_run = get_previous_benchmark_run(
+            case["id"], environment, run_id
+        )
+    except Exception as error:
+        benchmark_log(f"Bubble previous-run lookup unavailable: {error}")
+    evaluation_path, evaluation = evaluate_run(
+        output_path, previous_benchmark_run=previous_benchmark_run
+    )
     evaluation_markdown_path = generate_evaluation_markdown(
         output_path, evaluation_path
     )
     prompt_path = generate_fix_prompt(output_path, evaluation_path)
-    publishing_result = publish_benchmark_results([
-        output_path, evaluation_path, evaluation_markdown_path, prompt_path
-    ])
+    with open(evaluation_markdown_path, "r", encoding="utf-8") as source:
+        evaluation_markdown = source.read()
+    with open(prompt_path, "r", encoding="utf-8") as source:
+        fix_prompt = source.read()
+    persistence = {"persisted": False, "benchmark_run_id": None, "error": None}
+    try:
+        persistence["benchmark_run_id"] = save_benchmark_run(
+            result, evaluation, evaluation_markdown, fix_prompt, environment
+        )
+        persistence["persisted"] = True
+    except Exception as error:
+        persistence["error"] = str(error)
 
     benchmark_log("")
     benchmark_log("=" * 40)
     benchmark_log("BENCHMARK FAILED" if result["failure"] else "BENCHMARK COMPLETE")
+    benchmark_log(f"Environment: {environment.upper()}")
     benchmark_log(f"Status: {evaluation['overall_status'].upper()}")
     benchmark_log(
         f"Average first text: "
@@ -295,6 +325,11 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
         f"Average total: "
         f"{_format_seconds(evaluation.get('metrics', {}).get('average_total_s'))}"
     )
+    first_text_values = [
+        turn.get("timing", {}).get("first_delta_s") for turn in result.get("turns", [])
+    ]
+    first_text_values = [value for value in first_text_values if isinstance(value, (int, float))]
+    benchmark_log(f"Max first text: {_format_seconds(max(first_text_values) if first_text_values else None)}")
     important = [
         issue for issue in evaluation.get("issues", [])
         if issue.get("severity") in ("critical", "high")
@@ -322,15 +357,15 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
     benchmark_log(f"Human evaluation: {evaluation_markdown_path}")
     benchmark_log(f"Codex fix prompt: {prompt_path}")
     benchmark_log(
-        "GitHub publishing: SUCCESS"
-        if publishing_result.get("status") == "published"
-        else f"GitHub publishing: {publishing_result.get('status', 'unknown').upper()}"
+        "Bubble persistence: SUCCESS" if persistence["persisted"]
+        else "Bubble persistence: FAILED"
     )
-    benchmark_log(publishing_result["message"])
-    if publishing_result.get("published"):
-        benchmark_log("Published:")
-        for path in publishing_result["published"]:
-            benchmark_log(f"- {path}")
+    if persistence["persisted"]:
+        benchmark_log(f"BenchmarkRun Bubble ID: {persistence['benchmark_run_id']}")
+    else:
+        benchmark_log(persistence["error"] or "Unknown persistence error")
+        benchmark_log("Local benchmark artifacts remain available on Render.")
+    benchmark_log(f"Run ID: {run_id}")
     benchmark_log("=" * 40)
     result["execution"] = {
         "run_id": run_id,
@@ -339,14 +374,66 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
         "evaluation_path": evaluation_path,
         "evaluation_markdown_path": evaluation_markdown_path,
         "fix_prompt_path": prompt_path,
-        "github_published": publishing_result.get("status") == "published",
-        "github_publishing": publishing_result
+        "benchmark_run_id": persistence["benchmark_run_id"],
+        "result_persisted": persistence["persisted"],
+        "persistence_error": persistence["error"]
     }
     return result
 
 
 def get_benchmark_case_ids():
     return [case["id"] for case in _load_cases()]
+
+
+def _record_infrastructure_error(case, run_id, environment, error):
+    now = _utc_now()
+    result = {
+        "run_id": run_id,
+        "case_id": case["id"],
+        "case_name": case["name"],
+        "started_at_utc": now,
+        "completed_at_utc": now,
+        "bubble_env": environment,
+        "turns": [],
+        "initial_state": {},
+        "final_state": {},
+        "failure": {"turn": None, "type": "infrastructure", "message": str(error)},
+        "infrastructure_error": str(error),
+    }
+    output_path = _save_result(case["id"], result, environment)
+    evaluation_path, evaluation = evaluate_run(
+        output_path, previous_benchmark_run=None
+    )
+    evaluation_markdown_path = generate_evaluation_markdown(
+        output_path, evaluation_path
+    )
+    prompt_path = generate_fix_prompt(output_path, evaluation_path)
+    with open(evaluation_markdown_path, "r", encoding="utf-8") as source:
+        evaluation_markdown = source.read()
+    with open(prompt_path, "r", encoding="utf-8") as source:
+        fix_prompt = source.read()
+    persisted, benchmark_run_id, persistence_error = False, None, None
+    try:
+        benchmark_run_id = save_benchmark_run(
+            result, evaluation, evaluation_markdown, fix_prompt, environment
+        )
+        persisted = True
+    except Exception as persistence_exception:
+        persistence_error = str(persistence_exception)
+        benchmark_log("Bubble persistence: FAILED")
+        benchmark_log(persistence_error)
+        benchmark_log("Local benchmark artifacts remain available on Render.")
+    return dict(result, execution={
+        "run_id": run_id,
+        "benchmark_status": "error",
+        "result_path": output_path,
+        "evaluation_path": evaluation_path,
+        "evaluation_markdown_path": evaluation_markdown_path,
+        "fix_prompt_path": prompt_path,
+        "benchmark_run_id": benchmark_run_id,
+        "result_persisted": persisted,
+        "persistence_error": persistence_error,
+    })
 
 
 def validate_benchmark_environment(environment):
@@ -369,12 +456,22 @@ def run_all_benchmarks(
     validate_benchmark_environment(environment)
     results = []
     for case in _load_cases():
-        results.append(run_case(
-            case,
-            run_id=run_id,
-            progress_callback=progress_callback,
-            environment=environment
-        ))
+        case_run_id = run_id or (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{case['id']}_{environment}"
+        )
+        try:
+            results.append(run_case(
+                case,
+                run_id=case_run_id,
+                progress_callback=progress_callback,
+                environment=environment
+            ))
+        except Exception as error:
+            benchmark_log(f"Benchmark infrastructure error: {error}")
+            results.append(_record_infrastructure_error(
+                case, case_run_id, environment, error
+            ))
     return {
         "run_id": run_id,
         "results": results,

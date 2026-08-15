@@ -1,6 +1,6 @@
 # Rentee end-to-end benchmark v1
 
-This benchmark calls Rentee's real `POST /chat_stream` endpoint and follows one scripted tenant conversation: **Sofia - school bus, cats and teenage bedroom**. It captures SSE statuses, assistant text, citations, response IDs, timings, and Bubble state before and after the conversation, then runs deterministic and qualitative evaluation.
+This benchmark calls Rentee's real `POST /chat_stream` endpoint and follows one scripted tenant conversation: **Sofia - school bus, cats and teenage bedroom**. It captures SSE statuses, assistant text, citations, response IDs, timings, and Bubble state before and after the conversation, then runs deterministic and qualitative evaluation. Each execution is stored as one Bubble `BenchmarkRun`.
 
 ## Test data and reset
 
@@ -21,7 +21,6 @@ The runner refuses any Bubble base URL that does not contain `/version-test/`. I
 - `BUBBLE_DEV_BASE` — optional; defaults to `https://www.rentee.asia/version-test/api/1.1` and must contain `/version-test/`.
 - `RENTEE_STREAM_URL` — optional; defaults to `https://rentee-2.onrender.com/chat_stream`.
 - `BENCHMARK_API_KEY` — required to use the protected HTTP trigger and status endpoints.
-- `GITHUB_RESULTS_TOKEN` — optional; publishes completed artifacts to GitHub when present.
 
 ## Run
 
@@ -45,7 +44,7 @@ curl \
   https://rentee-2.onrender.com/admin/benchmark_status
 ```
 
-Only one benchmark can run per service process. Status is ephemeral and resets when Render restarts; generated GitHub artifacts are permanent.
+Only one benchmark can run per service process. Status is ephemeral and resets when Render restarts; Bubble `BenchmarkRun` is the durable execution history.
 
 ### Fallback: command line
 
@@ -59,15 +58,15 @@ On Render, the same command works when `BUBBLE_API_TOKEN` is already configured 
 
 After the conversation completes, deterministic evaluation checks latency, stream integrity, unsupported promises, excessive and repeated questions, current-recommendation behaviour, historical-recommendation language, and configured preference persistence. One `gpt-5-mini` evaluator call then assesses genuinely qualitative behaviour: conversation intelligence, recommendation reasoning, adaptiveness, question quality, and decision progress. Set `RENTEE_EVALUATOR_MODEL` to override that model.
 
-The evaluator compares the run with the most recent earlier raw result for the same case. It reports latency changes and changes in the major violation counts; qualitative scores are compared when the prior evaluation file exists.
+The evaluator first preserves comparison with an available local earlier result for the same case and environment, and can use the latest prior environment-specific Bubble `BenchmarkRun` when local history is unavailable. Failure to find history never prevents persistence.
 
 Each completed run generates four files:
 
 ```text
-tests/results/<case>_<timestamp>.json
-tests/results/<case>_<timestamp>_evaluation.json
-tests/results/<case>_<timestamp>_evaluation.md
-tests/results/<case>_<timestamp>_fix_prompt.md
+tests/results/<case>_<environment>_<timestamp>.json
+tests/results/<case>_<environment>_<timestamp>_evaluation.json
+tests/results/<case>_<environment>_<timestamp>_evaluation.md
+tests/results/<case>_<environment>_<timestamp>_fix_prompt.md
 ```
 
 The raw JSON contains the transcript, timings, and state. The evaluation JSON is the structured machine-readable assessment. The `_evaluation.md` report is the main human-readable artifact and includes performance, comparisons, strengths, problems, scores, priorities, and the full verbatim conversation. The `_fix_prompt.md` file is a ready-to-paste implementation task for Codex.
@@ -76,34 +75,22 @@ Normal review workflow:
 
 ```text
 Trigger benchmark
-→ watch progress in Render Logs
-→ open GitHub tests/results/
-→ open the latest _evaluation.md
-→ review performance and the full conversation
-→ open _fix_prompt.md if changes are needed
+→ watch Render Logs if desired
+→ BenchmarkRun saved automatically
+→ open Rentee AI Testing admin page
+→ read evaluationMarkdown and review the full conversation
+→ copy fixPrompt into Codex
 ```
 
 After Codex makes a fix, rerun `python tests/run_benchmark.py`. The next evaluation automatically compares the new run with the preceding one. v1 contains only the Sofia case.
 
-## GitHub artifact publishing
+## Result storage
 
-When `GITHUB_RESULTS_TOKEN` is configured, each run automatically publishes its four generated artifacts to `chaz1505/rentee` on `main`, under `tests/results/`. Publishing uses the GitHub Contents API and does not depend on Render having a usable Git checkout or push remote.
+GitHub stores benchmark code, benchmark cases, and evaluator code. It is not used as the durable store for new execution results and `GITHUB_RESULTS_TOKEN` is not required.
 
-Run normally:
+Bubble `BenchmarkRun` stores benchmark history, raw results, structured evaluation, the complete human-readable evaluation, fix prompts, and metrics. Development runs write only to the development endpoint; live runs write only to the live endpoint. Four local artifacts are retained for evaluation, debugging, and persistence-failure recovery.
 
-```bash
-python tests/run_benchmark.py
-```
-
-If the token is absent, the benchmark still completes and the artifacts remain local on Render. To explicitly disable publishing even when the token exists:
-
-```bash
-BENCHMARK_SKIP_GITHUB=true python tests/run_benchmark.py
-```
-
-The token is used only in the GitHub API authorization header. It requires Contents write access to `chaz1505/rentee`. Before publishing, the helper scans all four artifacts for configured GitHub, Bubble, and OpenAI secret values and refuses the entire run if one is found. `tests/.autotest_state.json` is never eligible for publication.
-
-Publishing failures never change the benchmark result. Partial artifacts from failed Rentee conversations are evaluated, turned into a fix prompt, and published through the same flow when credentials are available.
+Until the Rentee AI Testing admin page exists, inspect results at **Bubble → Data → App data → BenchmarkRun**. Partial conversation failures are evaluated and persisted with `status=fail` where possible. Infrastructure failures use `status=error`; if Bubble persistence itself fails, local artifacts remain and the safe error appears in Render Logs and `/admin/benchmark_status`.
 
 ## Live benchmark safety
 

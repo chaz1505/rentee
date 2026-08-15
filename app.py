@@ -266,7 +266,9 @@ def _run_benchmark_background(run_id, environment="development"):
             "evaluation_path": execution.get("evaluation_path"),
             "evaluation_markdown_path": execution.get("evaluation_markdown_path"),
             "fix_prompt_path": execution.get("fix_prompt_path"),
-            "github_published": execution.get("github_published", False)
+            "benchmark_run_id": execution.get("benchmark_run_id"),
+            "result_persisted": execution.get("result_persisted", False),
+            "persistence_error": execution.get("persistence_error")
         })
     except Exception as error:
         print(f"[BENCHMARK] BENCHMARK FAILED: {error}", flush=True)
@@ -310,7 +312,10 @@ def admin_run_benchmark():
         case_ids = get_benchmark_case_ids()
         case_id = case_ids[0] if case_ids else "benchmark"
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{case_id}"
+        run_id = (
+            f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
+            f"{case_id}_{environment}"
+        )
         with _benchmark_state_lock:
             _benchmark_state.clear()
             _benchmark_state.update({
