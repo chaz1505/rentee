@@ -216,6 +216,12 @@ def home():
     return jsonify({"status": "running"})
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    deployed_commit = os.environ.get("RENDER_GIT_COMMIT", "").strip() or None
+    return jsonify({"status": "ok", "commit": deployed_commit}), 200
+
+
 @app.route("/test_condo", methods=["GET"])
 def test_condo():
     condo_name = request.args.get("name", "")
