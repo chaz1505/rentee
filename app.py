@@ -1400,7 +1400,17 @@ def merge_updated_preference_text(existing_text, generated_text, preference_upda
 
     if existing_text and not empty_profile and not replacement_update:
         # Additive updates are the common path. Preserve the stored profile byte-for-byte
-        # and append the new explicit requirement rather than trusting a model rewrite.
+        # (apart from non-preference placeholders) and append the new explicit requirement
+        # rather than trusting a model rewrite.
+        existing_text = "\n".join(
+            line for line in existing_text.splitlines()
+            if not re.match(
+                r"^\s*(?:areas?|locations?|neighbou?rhoods?|other(?: notes)?)\s*:\s*"
+                r"(?:no\b|none\b|not (?:provided|given|specified|recorded)\b)",
+                line,
+                re.I
+            )
+        ).strip()
         if preference_update.lower() in existing_text.lower():
             return existing_text
         return f"{existing_text}\n\nCustomer-stated preference update:\n{preference_update}"
@@ -1732,11 +1742,10 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
                     )
-                    preference_text = (
-                        tool_args["preference_update"]
-                        if tool_args.get("recommendations_requested") is True
-                        else message
-                    )
+                    # The tool argument is model-produced and can accidentally compress
+                    # away a qualifier or negative constraint. The original customer text
+                    # is authoritative on both preference-only and combined search turns.
+                    preference_text = message
                     preference_confirmation = update_preferences(
                         folio_id,
                         preference_text,
