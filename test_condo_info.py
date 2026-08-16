@@ -196,7 +196,9 @@ class CondoInfoTests(unittest.TestCase):
             type="function_call", name="update_preferences", call_id="update-call",
             arguments=json.dumps({
                 "preference_update": "Two cats",
-                "recommendations_requested": False
+                # Simulate history leaking an earlier recommendation intent into
+                # the model-produced flag. The current message is update-only.
+                "recommendations_requested": True
             })
         )
         initial = SimpleNamespace(
@@ -245,6 +247,18 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["properties"])
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
+        self.assertEqual(args["reasoning"], {"effort": "minimal"})
+
+    def test_recommendation_request_must_be_explicit_in_current_message(self):
+        self.assertFalse(app_module.explicitly_requests_recommendations(
+            "One more thing: the unit must allow two cats."
+        ))
+        self.assertTrue(app_module.explicitly_requests_recommendations(
+            "Add pet-friendly to my requirements and show me current options."
+        ))
+        self.assertTrue(app_module.explicitly_requests_recommendations(
+            "TTDI is my preference; what can I see?"
+        ))
 
     def test_additive_preference_merge_preserves_old_and_new_constraints(self):
         existing = (
