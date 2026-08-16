@@ -139,8 +139,13 @@ class CodexClientTests(unittest.TestCase):
         codex_call = next(call for call in calls if call[0][1] == "exec")
         self.assertEqual(codex_call[0], [
             "/usr/bin/codex", "exec", "--ignore-user-config", "--ephemeral",
+            "--model", "gpt-5.6-luna",
             "--dangerously-bypass-approvals-and-sandbox", "-"
         ])
+        self.assertEqual(
+            codex_call[0][codex_call[0].index("--model") + 1],
+            "gpt-5.6-luna",
+        )
         self.assertNotIn("workspace-write", codex_call[0])
         self.assertEqual(
             Path(codex_call[1]["cwd"]).resolve(),

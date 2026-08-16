@@ -16,6 +16,7 @@ CODEX_PROVIDER = "codex_local_cli"
 CODEX_REPOSITORY = "chaz1505/rentee"
 CODEX_REPOSITORY_URL = "https://github.com/chaz1505/rentee.git"
 CODEX_BASE_BRANCH = "main"
+CODEX_AUTONOMOUS_MODEL = "gpt-5.6-luna"
 WORKSPACE_ROOT = Path("/tmp/rentee-codex")
 AUTH_ROOT = Path("/tmp/rentee-codex-auth")
 WORKSPACE_TTL_SECONDS = 24 * 60 * 60
@@ -720,6 +721,7 @@ def submit_codex_fix(
         execution = _run(
             [
                 codex_path, "exec", "--ignore-user-config", "--ephemeral",
+                "--model", CODEX_AUTONOMOUS_MODEL,
                 "--dangerously-bypass-approvals-and-sandbox", "-",
             ],
             cwd=execution_workspace,
