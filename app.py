@@ -46,6 +46,8 @@ _condo_cache_lock = threading.Lock()
 _benchmark_run_lock = threading.Lock()
 _benchmark_state_lock = threading.Lock()
 _benchmark_state = {"status": "idle"}
+_codex_task_metadata_lock = threading.Lock()
+_codex_task_metadata = {}
 
 
 class CondoDataError(RuntimeError):
@@ -351,6 +353,41 @@ def admin_benchmark_status():
         return jsonify(dict(_benchmark_state)), 200
 
 
+def _run_codex_fix_background(
+    prompt, run_id, benchmark_run_id, environment, task_id
+):
+    from automation.codex_client import CodexSubmissionError, submit_codex_fix
+    from tests.human_review import patch_codex_state
+
+    try:
+        metadata = submit_codex_fix(
+            prompt, run_id, benchmark_run_id, environment, task_id=task_id
+        )
+        patch_codex_state(benchmark_run_id, environment, {
+            "codexSubmitted": True,
+            "codexStatus": "completed",
+            "codexTaskID": task_id,
+        })
+        with _codex_task_metadata_lock:
+            _codex_task_metadata[task_id] = metadata
+        print(f"[CODEX] Task completed: {task_id}", flush=True)
+    except Exception as error:
+        safe_error = str(error) if isinstance(error, CodexSubmissionError) else type(error).__name__
+        print(f"[CODEX] Background execution failed: {safe_error}", flush=True)
+        try:
+            patch_codex_state(benchmark_run_id, environment, {
+                "codexSubmitted": False,
+                "codexStatus": "failed",
+                "codexTaskID": task_id,
+            })
+        except Exception:
+            print("[CODEX] Failed to persist Codex failure state.", flush=True)
+        with _codex_task_metadata_lock:
+            _codex_task_metadata[task_id] = {
+                "task_id": task_id, "status": "failed", "error": safe_error
+            }
+
+
 @app.route("/admin/benchmark/<benchmark_run_id>/fix", methods=["POST"])
 def admin_benchmark_fix(benchmark_run_id):
     auth_error = _benchmark_auth_error()
@@ -367,7 +404,7 @@ def admin_benchmark_fix(benchmark_run_id):
         patch_codex_state,
         update_fix_prompt_with_human_review,
     )
-    from automation.codex_client import CodexSubmissionError, submit_codex_fix
+    from automation.codex_client import create_codex_task_id
 
     print(f"[BENCHMARK FIX] Loading BenchmarkRun {benchmark_run_id}", flush=True)
     print(f"[BENCHMARK FIX] Environment: {environment.upper()}", flush=True)
@@ -399,36 +436,7 @@ def admin_benchmark_fix(benchmark_run_id):
     updated_prompt = result.pop("updated_fix_prompt")
     print(f"[CODEX] Preparing fix task for BenchmarkRun {benchmark_run_id}", flush=True)
     print(f"[CODEX] Run ID: {result.get('run_id')}", flush=True)
-    try:
-        patch_codex_state(
-            benchmark_run_id, environment, {"codexStatus": "working"}
-        )
-        print("[CODEX] Starting Codex task...", flush=True)
-        codex = submit_codex_fix(
-            updated_prompt,
-            result.get("run_id"),
-            benchmark_run_id,
-            environment,
-        )
-    except Exception as error:
-        safe_error = (
-            str(error)
-            if isinstance(error, (CodexSubmissionError, BenchmarkReviewError))
-            else type(error).__name__
-        )
-        print(f"[CODEX] Submission failed: {safe_error}", flush=True)
-        try:
-            patch_codex_state(benchmark_run_id, environment, {
-                "codexSubmitted": False,
-                "codexStatus": "failed",
-            })
-        except Exception:
-            print("[CODEX] Failed to persist Codex failure state.", flush=True)
-        return jsonify({
-            "error": "Codex submission failed.",
-            "fix_prompt_updated": True,
-            "codex_submitted": False,
-        }), 502
+    task_id = create_codex_task_id(result.get("run_id"))
     submitted_at = datetime.now(timezone.utc).isoformat(
         timespec="milliseconds"
     ).replace("+00:00", "Z")
@@ -436,26 +444,49 @@ def admin_benchmark_fix(benchmark_run_id):
         patch_codex_state(benchmark_run_id, environment, {
             "codexSubmitted": True,
             "codexSubmittedAt": submitted_at,
-            "codexStatus": "submitted",
-            "codexTaskID": codex["task_id"],
+            "codexStatus": "working",
+            "codexTaskID": task_id,
         })
     except BenchmarkReviewError as error:
-        print(f"[CODEX] Task started but metadata update failed: {error}", flush=True)
+        print(f"[CODEX] Failed to initialize task state: {error}", flush=True)
         return jsonify({
-            "error": "Codex task started but its metadata could not be saved.",
+            "error": "Codex task state could not be initialized.",
             "fix_prompt_updated": True,
-            "codex_submitted": True,
-            "codex_task_id": codex["task_id"],
+            "codex_submitted": False,
         }), 502
-    print("[CODEX] Codex task submitted successfully.", flush=True)
-    print(f"[CODEX] Task ID: {codex['task_id']}", flush=True)
+    try:
+        thread = threading.Thread(
+            target=_run_codex_fix_background,
+            args=(
+                updated_prompt, result.get("run_id"), benchmark_run_id,
+                environment, task_id,
+            ),
+            name=f"codex-{task_id}",
+            daemon=True,
+        )
+        thread.start()
+    except Exception as error:
+        print(f"[CODEX] Failed to start background task: {type(error).__name__}", flush=True)
+        try:
+            patch_codex_state(benchmark_run_id, environment, {
+                "codexSubmitted": False, "codexStatus": "failed",
+            })
+        except Exception:
+            print("[CODEX] Failed to persist Codex failure state.", flush=True)
+        return jsonify({
+            "error": "Codex background task could not be started.",
+            "fix_prompt_updated": True,
+            "codex_submitted": False,
+        }), 502
+    print("[CODEX] Local Codex task started in background.", flush=True)
+    print(f"[CODEX] Task ID: {task_id}", flush=True)
     return jsonify({
-        "status": "submitted",
+        "status": "working",
         **result,
         "codex_submitted": True,
-        "codex_status": "submitted",
-        "codex_task_id": codex["task_id"],
-    }), 200
+        "codex_status": "working",
+        "codex_task_id": task_id,
+    }), 202
 
 
 @app.route("/admin/benchmark/<benchmark_run_id>/fix_status", methods=["GET"])

@@ -153,7 +153,7 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
     if not isinstance(record, dict) or not record:
         raise BenchmarkRunNotFound("BenchmarkRun not found.")
 
-    if record.get("codexStatus") in ("working", "submitted"):
+    if record.get("codexStatus") in ("working", "submitted", "completed"):
         raise CodexAlreadyActive(
             record.get("codexStatus"), record.get("codexTaskID")
         )

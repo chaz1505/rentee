@@ -12,6 +12,21 @@ import app as app_module
 from . import human_review
 
 
+class CapturingThread:
+    instances = []
+
+    def __init__(self, target, args, name, daemon):
+        self.target = target
+        self.args = args
+        self.name = name
+        self.daemon = daemon
+        self.started = False
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+
 def response(body=None, status=200):
     result = Mock(ok=200 <= status < 300, status_code=status)
     if body is None:
@@ -121,12 +136,16 @@ class HumanReviewHelperTests(unittest.TestCase):
 
     @patch("tests.human_review.requests.get")
     def test_active_codex_is_rejected_but_failed_can_retry(self, mocked_get):
-        mocked_get.return_value = response({"response": self.record(
-            codexStatus="working", codexTaskID="task-id"
-        )})
-        with self.assertRaises(human_review.CodexAlreadyActive) as caught:
-            human_review.update_fix_prompt_with_human_review("id", "development")
-        self.assertEqual(caught.exception.codex_task_id, "task-id")
+        for status in ("working", "completed"):
+            mocked_get.return_value = response({"response": self.record(
+                codexStatus=status, codexTaskID="task-id"
+            )})
+            with self.assertRaises(human_review.CodexAlreadyActive) as caught:
+                human_review.update_fix_prompt_with_human_review(
+                    "id", "development"
+                )
+            self.assertEqual(caught.exception.codex_status, status)
+            self.assertEqual(caught.exception.codex_task_id, "task-id")
         with patch("tests.human_review.requests.patch", return_value=response(status=204)):
             mocked_get.return_value = response({"response": self.record(
                 codexStatus="failed"
@@ -154,6 +173,9 @@ class HumanReviewHelperTests(unittest.TestCase):
 class HumanReviewEndpointTests(unittest.TestCase):
     def setUp(self):
         self.client = app_module.app.test_client()
+        CapturingThread.instances.clear()
+        with app_module._codex_task_metadata_lock:
+            app_module._codex_task_metadata.clear()
 
     def test_auth_is_required_before_processing(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -174,37 +196,39 @@ class HumanReviewEndpointTests(unittest.TestCase):
             )
         self.assertEqual(result.status_code, 400)
 
+    @patch("app.threading.Thread", CapturingThread)
+    @patch("automation.codex_client.create_codex_task_id", return_value="codex-task-1")
     @patch("tests.human_review.patch_codex_state")
-    @patch("automation.codex_client.submit_codex_fix")
     @patch("tests.human_review.update_fix_prompt_with_human_review")
     def test_success_response_and_default_development(
-        self, mocked_update, mocked_codex, mocked_state
+        self, mocked_update, mocked_state, _mocked_task_id
     ):
         mocked_update.return_value = {
             "benchmark_run_id": "bubble-id", "run_id": "run-id",
             "environment": "development", "fix_prompt_updated": True,
             "updated_fix_prompt": "automatic prompt\n<!-- HUMAN_REVIEW_START -->human review<!-- HUMAN_REVIEW_END -->",
         }
-        mocked_codex.return_value = {"task_id": "codex-task-1"}
         with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
             result = self.client.post(
                 "/admin/benchmark/bubble-id/fix",
                 headers={"X-Benchmark-Key": "right"},
             )
-        self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.get_json()["status"], "submitted")
+        self.assertEqual(result.status_code, 202)
+        self.assertEqual(result.get_json()["status"], "working")
         self.assertTrue(result.get_json()["codex_submitted"])
         self.assertEqual(result.get_json()["codex_task_id"], "codex-task-1")
         mocked_update.assert_called_once_with("bubble-id", "development")
-        submitted_prompt = mocked_codex.call_args.args[0]
-        self.assertIn("automatic prompt", submitted_prompt)
-        self.assertIn("human review", submitted_prompt)
-        self.assertEqual(mocked_state.call_args_list[0].args[2], {"codexStatus": "working"})
-        final_state = mocked_state.call_args_list[1].args[2]
-        self.assertTrue(final_state["codexSubmitted"])
-        self.assertEqual(final_state["codexStatus"], "submitted")
-        self.assertEqual(final_state["codexTaskID"], "codex-task-1")
-        self.assertRegex(final_state["codexSubmittedAt"], r"Z$")
+        initial_state = mocked_state.call_args.args[2]
+        self.assertTrue(initial_state["codexSubmitted"])
+        self.assertEqual(initial_state["codexStatus"], "working")
+        self.assertEqual(initial_state["codexTaskID"], "codex-task-1")
+        self.assertRegex(initial_state["codexSubmittedAt"], r"Z$")
+        self.assertEqual(len(CapturingThread.instances), 1)
+        self.assertTrue(CapturingThread.instances[0].started)
+        background_args = CapturingThread.instances[0].args
+        self.assertIn("automatic prompt", background_args[0])
+        self.assertIn("human review", background_args[0])
+        self.assertEqual(background_args[-1], "codex-task-1")
 
     @patch("tests.human_review.update_fix_prompt_with_human_review")
     def test_not_found_and_bubble_failure_use_safe_statuses(self, mocked_update):
@@ -241,32 +265,49 @@ class HumanReviewEndpointTests(unittest.TestCase):
 
     @patch("tests.human_review.patch_codex_state")
     @patch("automation.codex_client.submit_codex_fix")
-    @patch("tests.human_review.update_fix_prompt_with_human_review")
-    def test_codex_failure_keeps_prompt_and_marks_failed(
-        self, mocked_update, mocked_codex, mocked_state
+    def test_background_codex_failure_marks_failed(
+        self, mocked_codex, mocked_state
     ):
         from automation.codex_client import CodexSubmissionError
-        mocked_update.return_value = {
-            "benchmark_run_id": "bubble-id", "run_id": "run-id",
-            "environment": "development", "fix_prompt_updated": True,
-            "updated_fix_prompt": "updated prompt with human review",
-        }
         mocked_codex.side_effect = CodexSubmissionError("safe failure")
-        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
-            result = self.client.post(
-                "/admin/benchmark/bubble-id/fix",
-                headers={"X-Benchmark-Key": "right"},
-            )
-        self.assertEqual(result.status_code, 502)
-        self.assertTrue(result.get_json()["fix_prompt_updated"])
-        self.assertFalse(result.get_json()["codex_submitted"])
+        app_module._run_codex_fix_background(
+            "updated prompt with human review", "run-id", "bubble-id",
+            "development", "task-id",
+        )
         mocked_codex.assert_called_once_with(
-            "updated prompt with human review", "run-id", "bubble-id", "development"
+            "updated prompt with human review", "run-id", "bubble-id",
+            "development", task_id="task-id",
         )
         self.assertEqual(
             mocked_state.call_args_list[-1].args[2],
-            {"codexSubmitted": False, "codexStatus": "failed"},
+            {
+                "codexSubmitted": False, "codexStatus": "failed",
+                "codexTaskID": "task-id",
+            },
         )
+
+    @patch("tests.human_review.patch_codex_state")
+    @patch("automation.codex_client.submit_codex_fix")
+    def test_background_success_marks_completed(
+        self, mocked_codex, mocked_state
+    ):
+        mocked_codex.return_value = {
+            "task_id": "task-id", "status": "completed",
+            "changes_detected": True, "changed_files": ["app.py"],
+        }
+        app_module._run_codex_fix_background(
+            "prompt", "run-id", "bubble-id", "live", "task-id"
+        )
+        self.assertEqual(mocked_state.call_args.args[2], {
+            "codexSubmitted": True,
+            "codexStatus": "completed",
+            "codexTaskID": "task-id",
+        })
+        with app_module._codex_task_metadata_lock:
+            self.assertEqual(
+                app_module._codex_task_metadata["task-id"]["changed_files"],
+                ["app.py"],
+            )
 
     @patch("tests.human_review.update_fix_prompt_with_human_review")
     def test_duplicate_submission_returns_409(self, mocked_update):
