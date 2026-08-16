@@ -537,6 +537,9 @@ def admin_benchmark_fix_status(benchmark_run_id):
 def build_response_args(user_message, previous_response_id=None):
     args = {
         "model": "gpt-5-mini",
+        # This call primarily routes to a tool. Keep reasoning light so preference
+        # updates do not wait on unnecessary deliberation before customer-facing text.
+        "reasoning": {"effort": "minimal"},
         "input": user_message,
         "instructions": (
             "You are Rentee, a friendly and highly capable personal property "
@@ -1183,6 +1186,9 @@ For each recommended property:
 - Include the rent and bedroom count when supplied, so the customer can evaluate
   concrete trade-offs rather than choosing between vague categories.
 - Distinguish verified listing facts from requirements that remain unverified.
+- Start with a compact, aggregated account of the requirements that drove the
+  shortlist. Include every hard constraint, without repeating the customer's
+  wording at length, so omissions and unverified requirements are visible.
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
@@ -1193,6 +1199,10 @@ For each recommended property:
 
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
+Prefer a decision-ready shortlist of the two or three strongest suitable options
+when that many exist. End with at most one high-value clarification about a material
+unresolved trade-off (for example flexibility in bedroom count, lease length, or
+floor/view preference). Do not delay the requested shortlist to ask it.
 
 Write directly to the property seeker using 'you' and 'your'. Be helpful,
 confident, and conversational, like a highly knowledgeable personal property
@@ -1404,6 +1414,23 @@ def preference_update_requires_rewrite(preference_update):
         r"\b(?:no longer|instead|replace|remove|delete|change(?:d)?|only interested|"
         r"budget is now|now want|now need)\b",
         preference_update or "",
+        re.I
+    ))
+
+
+def explicitly_requests_recommendations(message):
+    """Return whether this message itself asks for current property options.
+
+    Conversation history can make the routing model carry an earlier search intent
+    into a later preference-only turn. Requiring an explicit search action in the
+    current message prevents that turn from paying for (and presenting) a rematch.
+    """
+    return bool(re.search(
+        r"\b(?:find|show|see|recommend|suggest|search|match|rank|shortlist|compare|list)\b"
+        r"|\bwhat (?:do you have|have you got|is available|are available)\b"
+        r"|\b(?:any|something|anything) suitable\b"
+        r"|\b(?:best|current) (?:matches|options|properties|listings)\b",
+        message or "",
         re.I
     ))
 
@@ -1721,17 +1748,19 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
                     )
-                    preference_text = (
-                        tool_args["preference_update"]
-                        if tool_args.get("recommendations_requested") is True
-                        else message
-                    )
+                    # Persist the customer's complete current message. Tool arguments
+                    # are model-generated summaries and can omit qualifiers or negatives.
+                    preference_text = message
                     preference_confirmation = update_preferences(
                         folio_id,
                         preference_text,
                         bubble_env
                     )
-                    if tool_args.get("recommendations_requested") is True:
+                    recommendations_requested = (
+                        tool_args.get("recommendations_requested") is True
+                        and explicitly_requests_recommendations(message)
+                    )
+                    if recommendations_requested:
                         print(
                             "Preference update complete; recommendation request requires rematch",
                             flush=True
