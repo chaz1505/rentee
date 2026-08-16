@@ -351,6 +351,45 @@ def admin_benchmark_status():
         return jsonify(dict(_benchmark_state)), 200
 
 
+@app.route("/admin/benchmark/<benchmark_run_id>/fix", methods=["POST"])
+def admin_benchmark_fix(benchmark_run_id):
+    auth_error = _benchmark_auth_error()
+    if auth_error:
+        return auth_error
+    request_data = request.get_json(silent=True) or {}
+    environment = request_data.get("environment", "development")
+    if environment not in ("development", "live"):
+        return jsonify({"error": "environment must be development or live"}), 400
+
+    from tests.human_review import (
+        BenchmarkReviewError,
+        update_fix_prompt_with_human_review,
+    )
+
+    print(f"[BENCHMARK FIX] Loading BenchmarkRun {benchmark_run_id}", flush=True)
+    print(f"[BENCHMARK FIX] Environment: {environment.upper()}", flush=True)
+    try:
+        result = update_fix_prompt_with_human_review(
+            benchmark_run_id, environment
+        )
+    except BenchmarkReviewError as error:
+        print(f"[BENCHMARK FIX] Failed: {error}", flush=True)
+        return jsonify({"error": str(error)}), error.status_code
+    except Exception as error:
+        print(
+            "[BENCHMARK FIX] Unexpected Bubble review handoff failure: "
+            f"{type(error).__name__}",
+            flush=True,
+        )
+        return jsonify({"error": "BenchmarkRun update failed."}), 502
+    print("[BENCHMARK FIX] Human review verified.", flush=True)
+    print(
+        "[BENCHMARK FIX] BenchmarkRun fixPrompt updated successfully.",
+        flush=True,
+    )
+    return jsonify({"status": "ready", **result}), 200
+
+
 def build_response_args(user_message, previous_response_id=None):
     args = {
         "model": "gpt-5-mini",
