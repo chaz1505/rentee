@@ -154,7 +154,7 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(result["base_commit"], "abc123def456")
         self.assertEqual(result["changed_files"], ["app.py", "tests/test_new.py"])
         self.assertTrue(result["changes_detected"])
-        self.assertEqual(result["status"], "pr_created")
+        self.assertEqual(result["status"], "merged")
         mocked_publish.assert_called_once()
         self.assertTrue(Path(result["workspace"]).exists())
 
@@ -254,7 +254,10 @@ class CodexClientTests(unittest.TestCase):
             "OPENAI_API_KEY": "openai-secret",
             "BENCHMARK_API_KEY": "benchmark-secret",
             "BUBBLE_API_TOKEN": "bubble-secret",
-        }, clear=True):
+        }, clear=True), patch(
+            "automation.codex_client._merge_pull_request",
+            return_value="merge123",
+        ) as mocked_merge:
             result = codex_client.persist_codex_changes_to_github(
                 "/usr/bin/git", workspace, "codex/benchmark-run-unique",
                 "run-id", "live", "task-id", "base123",
@@ -300,6 +303,12 @@ class CodexClientTests(unittest.TestCase):
         ))
         self.assertEqual(result["fix_commit"], "fix123")
         self.assertEqual(result["pr_number"], 42)
+        self.assertTrue(result["merged"])
+        self.assertEqual(result["merge_commit"], "merge123")
+        self.assertRegex(result["merged_at"], r"Z$")
+        mocked_merge.assert_called_once_with(
+            "github-secret", 42, "codex/benchmark-run-unique", "fix123"
+        )
         self.assertEqual(mocked_get.call_args.kwargs["params"], {
             "state": "open", "head": "chaz1505:codex/benchmark-run-unique",
             "base": "main",
@@ -348,7 +357,10 @@ class CodexClientTests(unittest.TestCase):
         with patch("automation.codex_client._run", side_effect=fake_run), patch(
             "automation.codex_client.requests.get",
             return_value=self._github_response([existing_pr]),
-        ), patch("automation.codex_client.requests.post") as mocked_post, patch.dict(
+        ), patch("automation.codex_client.requests.post") as mocked_post, patch(
+            "automation.codex_client._merge_pull_request",
+            return_value="merge123",
+        ), patch.dict(
             os.environ, {"GITHUB_TOKEN": "token"}, clear=True
         ):
             result = codex_client.persist_codex_changes_to_github(
@@ -359,6 +371,108 @@ class CodexClientTests(unittest.TestCase):
         self.assertFalse(any(command[1] == "push" for command in calls))
         mocked_post.assert_not_called()
         self.assertEqual(result["pr_number"], 9)
+
+    def _pull_detail(self, **updates):
+        detail = {
+            "state": "open",
+            "merged": False,
+            "merge_commit_sha": None,
+            "base": {
+                "ref": "main",
+                "repo": {"full_name": "chaz1505/rentee"},
+            },
+            "head": {
+                "ref": "codex/benchmark-safe",
+                "sha": "fix123",
+                "repo": {"full_name": "chaz1505/rentee"},
+            },
+        }
+        detail.update(updates)
+        return detail
+
+    def test_merge_validates_pull_and_uses_squash_api(self):
+        with patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response(self._pull_detail()),
+        ) as mocked_get, patch(
+            "automation.codex_client.requests.put",
+            return_value=self._github_response({
+                "merged": True, "sha": "merge123",
+                "message": "Pull Request successfully merged",
+            }),
+        ) as mocked_put:
+            result = codex_client._merge_pull_request(
+                "token", 42, "codex/benchmark-safe", "fix123"
+            )
+        self.assertEqual(result, "merge123")
+        self.assertTrue(mocked_get.call_args.args[0].endswith(
+            "/repos/chaz1505/rentee/pulls/42"
+        ))
+        self.assertTrue(mocked_put.call_args.args[0].endswith(
+            "/repos/chaz1505/rentee/pulls/42/merge"
+        ))
+        self.assertEqual(mocked_put.call_args.kwargs["json"], {
+            "merge_method": "squash", "sha": "fix123",
+        })
+
+    def test_merge_rejects_wrong_repo_base_head_and_closed_pr(self):
+        unsafe_pulls = (
+            self._pull_detail(base={
+                "ref": "main", "repo": {"full_name": "other/repo"},
+            }),
+            self._pull_detail(base={
+                "ref": "develop",
+                "repo": {"full_name": "chaz1505/rentee"},
+            }),
+            self._pull_detail(head={
+                "ref": "feature/unsafe", "sha": "fix123",
+                "repo": {"full_name": "chaz1505/rentee"},
+            }),
+            self._pull_detail(state="closed"),
+        )
+        for pull in unsafe_pulls:
+            with self.subTest(pull=pull), patch(
+                "automation.codex_client.requests.get",
+                return_value=self._github_response(pull),
+            ), patch("automation.codex_client.requests.put") as mocked_put:
+                with self.assertRaises(codex_client.CodexSubmissionError):
+                    codex_client._merge_pull_request(
+                        "token", 42, "codex/benchmark-safe", "fix123"
+                    )
+                mocked_put.assert_not_called()
+
+    def test_already_merged_pull_is_idempotent_success(self):
+        pull = self._pull_detail(
+            state="closed", merged=True, merge_commit_sha="merge123"
+        )
+        with patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response(pull),
+        ), patch("automation.codex_client.requests.put") as mocked_put:
+            result = codex_client._merge_pull_request(
+                "token", 42, "codex/benchmark-safe", "fix123"
+            )
+        self.assertEqual(result, "merge123")
+        mocked_put.assert_not_called()
+
+    def test_unmergeable_pull_fails_without_retry_or_token_leak(self):
+        token = "github-secret"
+        output = io.StringIO()
+        with patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response(self._pull_detail()),
+        ), patch(
+            "automation.codex_client.requests.put",
+            return_value=self._github_response({"message": token}, 405),
+        ) as mocked_put, redirect_stdout(output), self.assertRaisesRegex(
+            codex_client.CodexSubmissionError, "pull request merge failed"
+        ) as caught:
+            codex_client._merge_pull_request(
+                token, 42, "codex/benchmark-safe", "fix123"
+            )
+        self.assertEqual(mocked_put.call_count, 1)
+        self.assertNotIn(token, output.getvalue())
+        self.assertNotIn(token, str(caught.exception))
 
     def test_pull_request_creation_failure_is_distinct(self):
         with patch(

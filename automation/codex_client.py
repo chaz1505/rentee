@@ -483,6 +483,81 @@ def _find_or_create_pull_request(
     return created.json()
 
 
+def _merge_pull_request(
+    github_token, pull_number, expected_branch, expected_head_sha
+):
+    endpoint = (
+        f"{GITHUB_API_URL}/repos/{CODEX_REPOSITORY}/pulls/{pull_number}"
+    )
+    headers = _github_headers(github_token)
+    print("[CODEX] Validating PR before merge...", flush=True)
+    response = requests.get(
+        endpoint,
+        headers=headers,
+        timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not response.ok:
+        raise _github_error("pull request validation", response, github_token)
+    pull = response.json()
+    base = pull.get("base") or {}
+    head = pull.get("head") or {}
+    base_repo = (base.get("repo") or {}).get("full_name")
+    head_repo = (head.get("repo") or {}).get("full_name")
+    if base_repo != CODEX_REPOSITORY or head_repo != CODEX_REPOSITORY:
+        raise CodexSubmissionError(
+            "Merge refused: pull request repository does not match Rentee."
+        )
+    if base.get("ref") != CODEX_BASE_BRANCH:
+        raise CodexSubmissionError(
+            "Merge refused: pull request base branch is not main."
+        )
+    if (
+        head.get("ref") != expected_branch
+        or not str(head.get("ref") or "").startswith("codex/benchmark-")
+    ):
+        raise CodexSubmissionError(
+            "Merge refused: pull request head branch is unsafe."
+        )
+    if head.get("sha") != expected_head_sha:
+        raise CodexSubmissionError(
+            "Merge refused: pull request head commit changed unexpectedly."
+        )
+    if pull.get("merged") is True:
+        merge_commit = pull.get("merge_commit_sha")
+        if not merge_commit:
+            raise CodexSubmissionError(
+                "Merged pull request returned no merge commit SHA."
+            )
+        print("[CODEX] PR is already merged.", flush=True)
+        return merge_commit
+    if pull.get("state") != "open":
+        raise CodexSubmissionError(
+            "Merge refused: pull request is not open."
+        )
+
+    print(
+        f"[CODEX] Merging PR #{pull_number} into main...",
+        flush=True,
+    )
+    merged = requests.put(
+        f"{endpoint}/merge",
+        headers=headers,
+        json={"merge_method": "squash", "sha": expected_head_sha},
+        timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not merged.ok:
+        raise _github_error("pull request merge", merged, github_token)
+    result = merged.json()
+    if result.get("merged") is not True or not result.get("sha"):
+        reason = _sanitize_cli_output(result.get("message"), (github_token,))
+        raise CodexSubmissionError(
+            f"GitHub pull request merge failed: {reason or 'not mergeable'}"
+        )
+    print("[CODEX] PR merged successfully.", flush=True)
+    print(f"[CODEX] Merge commit: {result['sha']}", flush=True)
+    return result["sha"]
+
+
 def persist_codex_changes_to_github(
     git_path, workspace, branch, run_id, environment, task_id,
     base_commit, changed_files, final_summary, progress_callback=None,
@@ -554,10 +629,31 @@ def persist_codex_changes_to_github(
     pull = _find_or_create_pull_request(
         github_token, branch, run_id, body
     )
+    print(f"[CODEX] PR created: #{pull['number']}", flush=True)
+    if progress_callback:
+        progress_callback("pr_created", {
+            "branch": branch,
+            "fix_commit": fix_commit,
+            "pr_number": pull["number"],
+            "pr_url": pull["html_url"],
+        })
+    try:
+        merge_commit = _merge_pull_request(
+            github_token, pull["number"], branch, fix_commit
+        )
+    except CodexSubmissionError as error:
+        print(f"[CODEX] Merge failed: {error}", flush=True)
+        raise
+    merged_at = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
     return {
         "fix_commit": fix_commit,
         "pr_number": pull["number"],
         "pr_url": pull["html_url"],
+        "merged": True,
+        "merged_at": merged_at,
+        "merge_commit": merge_commit,
     }
 
 
@@ -696,5 +792,5 @@ def submit_codex_fix(
         progress_callback=progress_callback,
     )
     metadata.update(published)
-    metadata["status"] = "pr_created"
+    metadata["status"] = "merged"
     return metadata

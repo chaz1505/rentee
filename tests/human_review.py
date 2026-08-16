@@ -155,7 +155,7 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
 
     if record.get("codexStatus") in (
         "working", "submitted", "codex_completed", "pushing",
-        "completed", "pr_created",
+        "completed", "pr_created", "merged",
     ):
         raise CodexAlreadyActive(
             record.get("codexStatus"), record.get("codexTaskID")
@@ -206,6 +206,7 @@ def patch_codex_state(benchmark_run_id, environment, payload):
     allowed = {
         "codexSubmitted", "codexSubmittedAt", "codexStatus", "codexTaskID",
         "codexBranch", "codexCommit", "codexPRNumber", "codexPRURL",
+        "codexMerged", "codexMergedAt", "codexMergeCommit",
     }
     if not payload or not set(payload).issubset(allowed):
         raise ValueError("Invalid Codex state payload.")
@@ -243,4 +244,7 @@ def get_benchmark_run_codex_status(benchmark_run_id, environment):
         "codex_commit": record.get("codexCommit"),
         "codex_pr_number": record.get("codexPRNumber"),
         "codex_pr_url": record.get("codexPRURL"),
+        "codex_merged": record.get("codexMerged") is True,
+        "codex_merged_at": record.get("codexMergedAt"),
+        "codex_merge_commit": record.get("codexMergeCommit"),
     }
