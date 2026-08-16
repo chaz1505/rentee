@@ -2,8 +2,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -356,20 +358,39 @@ def _verify_publish_branch(branch):
         raise CodexSubmissionError("Refusing to publish an unsafe Git branch.")
 
 
-def _git_publish_environment(github_token):
-    environment = os.environ.copy()
-    for name in (
-        "OPENAI_API_KEY", "BENCHMARK_API_KEY", "BUBBLE_API_TOKEN",
-        "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN",
-    ):
-        environment.pop(name, None)
-    environment.update({
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {github_token}",
-    })
-    return environment
+@contextmanager
+def _git_authenticated_environment(github_token):
+    with tempfile.TemporaryDirectory(prefix="rentee-git-auth-") as temp_dir:
+        askpass_path = Path(temp_dir) / "git-askpass.sh"
+        askpass_path.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  *Username*) printf '%s\\n' \"$RENTEE_GITHUB_USERNAME\" ;;\n"
+            "  *) printf '%s\\n' \"$RENTEE_GITHUB_PASSWORD\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        askpass_path.chmod(0o700)
+        environment = os.environ.copy()
+        for name in (
+            "OPENAI_API_KEY", "BENCHMARK_API_KEY", "BUBBLE_API_TOKEN",
+            "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN",
+        ):
+            environment.pop(name, None)
+        environment.update({
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": str(askpass_path),
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "",
+            "RENTEE_GITHUB_USERNAME": "x-access-token",
+            "RENTEE_GITHUB_PASSWORD": github_token,
+        })
+        print(
+            "[CODEX] GitHub authentication configured for orchestration.",
+            flush=True,
+        )
+        yield environment
 
 
 def _github_headers(github_token):
@@ -504,23 +525,28 @@ def persist_codex_changes_to_github(
         })
 
     _verify_publish_branch(branch)
-    git_environment = _git_publish_environment(github_token)
-    remote = _run(
-        [git_path, "ls-remote", "--heads", "origin", branch],
-        cwd=resolved_workspace,
-        env=git_environment,
-    )
-    _require_success(remote, "Remote branch lookup", (github_token,))
-    remote_commit = (remote.stdout.strip().split() or [None])[0]
-    if remote_commit == fix_commit:
-        print("[CODEX] Remote branch already has the expected commit.", flush=True)
-    else:
-        push = _run(
-            [git_path, "push", "origin", branch],
+    with _git_authenticated_environment(github_token) as git_environment:
+        print("[CODEX] Checking remote branch...", flush=True)
+        remote = _run(
+            [git_path, "ls-remote", "--heads", "origin", branch],
             cwd=resolved_workspace,
             env=git_environment,
         )
-        _require_success(push, "Git branch push", (github_token,))
+        _require_success(remote, "Remote branch lookup", (github_token,))
+        remote_commit = (remote.stdout.strip().split() or [None])[0]
+        if remote_commit == fix_commit:
+            print(
+                "[CODEX] Remote branch already has the expected commit.",
+                flush=True,
+            )
+        else:
+            print("[CODEX] Pushing branch...", flush=True)
+            push = _run(
+                [git_path, "push", "origin", branch],
+                cwd=resolved_workspace,
+                env=git_environment,
+            )
+            _require_success(push, "Git branch push", (github_token,))
     body = _pull_request_body(
         run_id, environment, task_id, base_commit, fix_commit,
         changed_files, final_summary,
