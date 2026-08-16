@@ -1194,13 +1194,21 @@ For each recommended property:
 - Include the rent and bedroom count when supplied, so the customer can evaluate
   concrete trade-offs rather than choosing between vague categories.
 - Distinguish verified listing facts from requirements that remain unverified.
+- Before selecting any property, make a complete checklist of every explicit
+  requirement in HOME SEEKER REQUIREMENTS, including negative requirements and
+  quantities (for example, the number of pets). Check each candidate against the
+  supplied property information. Do not silently omit a requirement from this
+  validation merely because the listing data does not mention it.
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
 - Do not recommend a property that explicitly contradicts a hard requirement such
   as maximum budget or minimum bedrooms. If a different hard requirement cannot be
-  verified from the supplied data, identify that uncertainty prominently for that
-  property rather than presenting it as confirmed.
+  verified from the supplied data, identify the exact unresolved requirement
+  prominently for that property rather than presenting it as confirmed. In
+  particular, pet allowance must cover the customer's stated kind and number of
+  pets; a generic claim that a property is pet-friendly is insufficient unless the
+  supplied data supports it.
 
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
@@ -1228,7 +1236,11 @@ Return valid JSON with exactly these fields:
   never invent an ID or add properties to fill a list.
 - customer_response: concise, natural, customer-facing recommendation prose.
   Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
-  matching process.
+  matching process. Briefly connect the shortlist to the customer's most important
+  stated requirements using 'you' and 'your', then present the properties as a
+  scannable bullet list. State unresolved hard requirements alongside each relevant
+  property, including pet policy, facing/view, and commute or walking time when the
+  customer specified them and the listing data does not verify them.
 
 For every recommended listing, reco_summary must be a short, personalised
 one- or two-sentence explanation of why this listing suits this home seeker.
@@ -1731,6 +1743,11 @@ def chat_stream():
                 if tool_call.name == "match_lead":
                     tool_result = yield from stream_match_lead(folio_id, bubble_env)
                     has_match_results = True
+                    # match_lead already returns the final answer generated solely from
+                    # the current listing snapshot. Send that grounded answer immediately;
+                    # the continuation is still completed below to preserve the Responses
+                    # API chain and its reusable previous_response_id.
+                    direct_customer_response = tool_result
                     follow_up_instructions = (
                         "The tool output already contains the final customer-facing answer. "
                         "Return it faithfully. Do not add, remove, reinterpret, embellish, "
@@ -1770,6 +1787,7 @@ def chat_stream():
                             "here's what I'd recommend now:\n\n"
                             f"{recommendations}"
                         )
+                        direct_customer_response = tool_result
                         follow_up_instructions = (
                             "The tool output already contains the final customer-facing "
                             "recommendations. Return it faithfully without adding, removing, "
