@@ -246,6 +246,58 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
 
+    @patch("app.stream_match_lead")
+    def test_current_match_answer_is_sent_directly_while_continuity_is_finalized(
+        self, mocked_match
+    ):
+        def grounded_match(*_args):
+            yield "Searching available properties..."
+            return "Given what you’ve told me:\n\n- Grounded current option"
+
+        mocked_match.side_effect = grounded_match
+        tool_call = SimpleNamespace(
+            type="function_call", name="match_lead", call_id="match-call",
+            arguments="{}"
+        )
+        initial = SimpleNamespace(
+            id="initial-response", output=[tool_call], usage=None, output_text=""
+        )
+        final = SimpleNamespace(
+            id="final-response", output=[], usage=None, output_text=""
+        )
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        rewritten_event = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="A delayed model rewrite that must not be shown"
+        )
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial), FakeStream(final, [rewritten_event])
+        ]
+
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": "Show me my best matches", "folio_id": "folio-1"}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertIn("Grounded current option", body)
+        self.assertNotIn("delayed model rewrite", body)
+        self.assertIn('"response_id": "final-response"', body)
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertEqual(continuation["previous_response_id"], "initial-response")
+        self.assertEqual(continuation["input"][0]["call_id"], "match-call")
+        self.assertIn("Grounded current option", continuation["input"][0]["output"])
+
     def test_additive_preference_merge_preserves_old_and_new_constraints(self):
         existing = (
             "Bedrooms: 3 or 4\n"
