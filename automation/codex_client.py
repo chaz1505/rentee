@@ -7,6 +7,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+
 
 CODEX_PROVIDER = "codex_local_cli"
 CODEX_REPOSITORY = "chaz1505/rentee"
@@ -18,9 +20,14 @@ WORKSPACE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 900
 GIT_TIMEOUT_SECONDS = 120
 MAX_CLI_DIAGNOSTIC_LENGTH = 2000
+GITHUB_API_URL = "https://api.github.com"
+GITHUB_REQUEST_TIMEOUT_SECONDS = 30
+GIT_AUTOMATION_NAME = "Rentee Codex"
+GIT_AUTOMATION_EMAIL = "codex@rentee.asia"
 CODEX_CHILD_STRIPPED_ENV_VARS = (
     "BENCHMARK_API_KEY",
     "BUBBLE_API_TOKEN",
+    "GITHUB_TOKEN",
 )
 
 EXECUTION_WRAPPER = """You are operating autonomously on the Rentee repository.
@@ -124,7 +131,7 @@ def _execution_timeout():
 def _reject_configured_secrets(prompt):
     for name in (
         "BUBBLE_API_TOKEN", "BENCHMARK_API_KEY", "OPENAI_API_KEY",
-        "CODEX_ACCESS_TOKEN",
+        "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN",
     ):
         secret = os.environ.get(name)
         if secret and secret in prompt:
@@ -139,7 +146,7 @@ def _sanitize_cli_output(value, sensitive_values=()):
         os.environ.get(name)
         for name in (
             "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "BENCHMARK_API_KEY",
-            "BUBBLE_API_TOKEN",
+            "BUBBLE_API_TOKEN", "GITHUB_TOKEN",
         )
     ]
     secrets.extend(sensitive_values)
@@ -344,8 +351,193 @@ def _verify_disposable_workspace(workspace, task_id):
     return resolved_workspace
 
 
+def _verify_publish_branch(branch):
+    if branch == CODEX_BASE_BRANCH or not branch.startswith("codex/benchmark-"):
+        raise CodexSubmissionError("Refusing to publish an unsafe Git branch.")
+
+
+def _git_publish_environment(github_token):
+    environment = os.environ.copy()
+    for name in (
+        "OPENAI_API_KEY", "BENCHMARK_API_KEY", "BUBBLE_API_TOKEN",
+        "CODEX_ACCESS_TOKEN", "GITHUB_TOKEN",
+    ):
+        environment.pop(name, None)
+    environment.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {github_token}",
+    })
+    return environment
+
+
+def _github_headers(github_token):
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {github_token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def _github_error(action, response, github_token):
+    body = _sanitize_cli_output(response.text, (github_token,))
+    return CodexSubmissionError(
+        f"GitHub {action} failed: HTTP {response.status_code}: {body}"
+    )
+
+
+def _pull_request_body(
+    run_id, environment, task_id, base_commit, fix_commit,
+    changed_files, final_summary,
+):
+    files = "\n".join(f"- {path}" for path in changed_files)
+    summary = _sanitize_cli_output(final_summary)
+    return f"""Automated Rentee benchmark fix
+
+Benchmark Run:
+{run_id}
+
+Environment:
+{environment.upper()}
+
+Human reviewed:
+Yes
+
+Codex task:
+{task_id}
+
+Base commit:
+{base_commit}
+
+Fix commit:
+{fix_commit}
+
+Changed files:
+{files}
+
+Codex summary:
+{summary or 'No final summary was returned.'}
+
+This PR was generated automatically from a human-reviewed Rentee benchmark failure.
+
+Auto-merge is NOT enabled.
+"""
+
+
+def _find_or_create_pull_request(
+    github_token, branch, run_id, body
+):
+    endpoint = f"{GITHUB_API_URL}/repos/{CODEX_REPOSITORY}/pulls"
+    headers = _github_headers(github_token)
+    existing = requests.get(
+        endpoint,
+        headers=headers,
+        params={
+            "state": "open", "head": f"chaz1505:{branch}",
+            "base": CODEX_BASE_BRANCH,
+        },
+        timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not existing.ok:
+        raise _github_error("pull request lookup", existing, github_token)
+    existing_pulls = existing.json()
+    if existing_pulls:
+        pull = existing_pulls[0]
+        print(f"[CODEX] Reusing existing GitHub PR #{pull['number']}.", flush=True)
+        return pull
+    created = requests.post(
+        endpoint,
+        headers=headers,
+        json={
+            "title": f"Codex benchmark fix: {run_id}",
+            "head": branch,
+            "base": CODEX_BASE_BRANCH,
+            "body": body,
+        },
+        timeout=GITHUB_REQUEST_TIMEOUT_SECONDS,
+    )
+    if not created.ok:
+        raise _github_error("pull request creation", created, github_token)
+    return created.json()
+
+
+def persist_codex_changes_to_github(
+    git_path, workspace, branch, run_id, environment, task_id,
+    base_commit, changed_files, final_summary, progress_callback=None,
+):
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        raise CodexSubmissionError(
+            "GITHUB_TOKEN is required to persist Codex changes."
+        )
+    resolved_workspace = _verify_disposable_workspace(workspace, task_id)
+    _verify_publish_branch(branch)
+    commit_message = (
+        f"Codex fix for benchmark {_safe_identifier(run_id)}"
+    )
+    add = _run([git_path, "add", "-A"], cwd=resolved_workspace)
+    _require_success(add, "Git staging", (github_token,))
+    staged = _run(
+        [git_path, "diff", "--cached", "--quiet"],
+        cwd=resolved_workspace,
+    )
+    if staged.returncode not in (0, 1):
+        _require_success(staged, "Git staged-change lookup", (github_token,))
+    if staged.returncode == 1:
+        commit = _run([
+            git_path,
+            "-c", f"user.name={GIT_AUTOMATION_NAME}",
+            "-c", f"user.email={GIT_AUTOMATION_EMAIL}",
+            "commit", "-m", commit_message,
+        ], cwd=resolved_workspace)
+        _require_success(commit, "Git commit", (github_token,))
+    revision = _run([git_path, "rev-parse", "HEAD"], cwd=resolved_workspace)
+    _require_success(revision, "Fix commit lookup", (github_token,))
+    fix_commit = revision.stdout.strip()
+    if not fix_commit:
+        raise CodexSubmissionError("Fix commit lookup returned no commit.")
+    if progress_callback:
+        progress_callback("pushing", {
+            "branch": branch,
+            "fix_commit": fix_commit,
+        })
+
+    _verify_publish_branch(branch)
+    git_environment = _git_publish_environment(github_token)
+    remote = _run(
+        [git_path, "ls-remote", "--heads", "origin", branch],
+        cwd=resolved_workspace,
+        env=git_environment,
+    )
+    _require_success(remote, "Remote branch lookup", (github_token,))
+    remote_commit = (remote.stdout.strip().split() or [None])[0]
+    if remote_commit == fix_commit:
+        print("[CODEX] Remote branch already has the expected commit.", flush=True)
+    else:
+        push = _run(
+            [git_path, "push", "origin", branch],
+            cwd=resolved_workspace,
+            env=git_environment,
+        )
+        _require_success(push, "Git branch push", (github_token,))
+    body = _pull_request_body(
+        run_id, environment, task_id, base_commit, fix_commit,
+        changed_files, final_summary,
+    )
+    pull = _find_or_create_pull_request(
+        github_token, branch, run_id, body
+    )
+    return {
+        "fix_commit": fix_commit,
+        "pr_number": pull["number"],
+        "pr_url": pull["html_url"],
+    }
+
+
 def submit_codex_fix(
-    prompt, run_id, benchmark_run_id, environment, task_id=None
+    prompt, run_id, benchmark_run_id, environment, task_id=None,
+    progress_callback=None,
 ):
     codex_path = shutil.which("codex")
     git_path = shutil.which("git")
@@ -450,7 +642,7 @@ def submit_codex_fix(
     )
     if changed_files:
         print(f"[CODEX] Changed files: {', '.join(changed_files)}", flush=True)
-    return {
+    metadata = {
         "task_id": task_id,
         "task_id_source": "rentee_generated",
         "status": "completed",
@@ -465,3 +657,18 @@ def submit_codex_fix(
         "benchmark_run_id": benchmark_run_id,
         "environment": environment,
     }
+    if not changed_files:
+        return metadata
+
+    if progress_callback:
+        progress_callback("codex_completed", {
+            "branch": branch,
+        })
+    published = persist_codex_changes_to_github(
+        git_path, workspace, branch, run_id, environment, task_id,
+        base_commit, changed_files, safe_final_output,
+        progress_callback=progress_callback,
+    )
+    metadata.update(published)
+    metadata["status"] = "pr_created"
+    return metadata

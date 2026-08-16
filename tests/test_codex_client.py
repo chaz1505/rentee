@@ -57,6 +57,7 @@ class CodexClientTests(unittest.TestCase):
             "OPENAI_API_KEY": "openai-key",
             "BENCHMARK_API_KEY": "benchmark-key",
             "BUBBLE_API_TOKEN": "bubble-token",
+            "GITHUB_TOKEN": "github-token",
             "SAFE_RUNTIME_VALUE": "retained",
         }, clear=True):
             child_environment = codex_client._codex_environment(self.auth_root)
@@ -64,6 +65,7 @@ class CodexClientTests(unittest.TestCase):
             self.assertEqual(os.environ["BUBBLE_API_TOKEN"], "bubble-token")
         self.assertNotIn("BENCHMARK_API_KEY", child_environment)
         self.assertNotIn("BUBBLE_API_TOKEN", child_environment)
+        self.assertNotIn("GITHUB_TOKEN", child_environment)
         self.assertEqual(child_environment["OPENAI_API_KEY"], "openai-key")
         self.assertEqual(child_environment["SAFE_RUNTIME_VALUE"], "retained")
 
@@ -103,7 +105,14 @@ class CodexClientTests(unittest.TestCase):
     def test_local_clone_branch_exec_and_change_detection(self, mocked_which):
         mocked_which.side_effect = lambda name: f"/usr/bin/{name}"
         calls, fake_run = self._successful_run()
-        with patch("automation.codex_client._run", side_effect=fake_run), patch.dict(
+        published = {
+            "fix_commit": "fix123", "pr_number": 12,
+            "pr_url": "https://github.com/chaz1505/rentee/pull/12",
+        }
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.persist_codex_changes_to_github",
+            return_value=published,
+        ) as mocked_publish, patch.dict(
             os.environ, {
                 "OPENAI_API_KEY": "api-key",
                 "BENCHMARK_API_KEY": "benchmark-key",
@@ -145,6 +154,8 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(result["base_commit"], "abc123def456")
         self.assertEqual(result["changed_files"], ["app.py", "tests/test_new.py"])
         self.assertTrue(result["changes_detected"])
+        self.assertEqual(result["status"], "pr_created")
+        mocked_publish.assert_called_once()
         self.assertTrue(Path(result["workspace"]).exists())
 
     def test_unsandboxed_execution_requires_workspace_inside_root(self):
@@ -179,7 +190,13 @@ class CodexClientTests(unittest.TestCase):
         final_output = f"Completed {secret} {prompt} " + ("x" * 3000)
         _calls, fake_run = self._successful_run(codex_stdout=final_output)
         output = io.StringIO()
-        with patch("automation.codex_client._run", side_effect=fake_run), patch.dict(
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.persist_codex_changes_to_github",
+            return_value={
+                "fix_commit": "fix123", "pr_number": 12,
+                "pr_url": "https://github.com/chaz1505/rentee/pull/12",
+            },
+        ), patch.dict(
             os.environ, {"OPENAI_API_KEY": secret}, clear=True
         ), redirect_stdout(output):
             result = codex_client.submit_codex_fix(
@@ -194,11 +211,197 @@ class CodexClientTests(unittest.TestCase):
         self.assertNotIn(prompt, logs)
         self.assertTrue(result["changes_detected"])
 
+    def _publish_workspace(self):
+        workspace = self.workspace_root / "task-id"
+        (workspace / ".git").mkdir(parents=True)
+        return workspace
+
+    def _github_response(self, body, status=200):
+        response = Mock(ok=200 <= status < 300, status_code=status)
+        response.json.return_value = body
+        response.text = str(body)
+        return response
+
+    def test_publish_commits_pushes_and_creates_pull_request(self):
+        workspace = self._publish_workspace()
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+            if command[1:] == ["diff", "--cached", "--quiet"]:
+                return completed(returncode=1)
+            if command[1:] == ["rev-parse", "HEAD"]:
+                return completed(stdout="fix123\n")
+            return completed()
+
+        created_pr = {
+            "number": 42,
+            "html_url": "https://github.com/chaz1505/rentee/pull/42",
+        }
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response([]),
+        ) as mocked_get, patch(
+            "automation.codex_client.requests.post",
+            return_value=self._github_response(created_pr, 201),
+        ) as mocked_post, patch.dict(os.environ, {
+            "GITHUB_TOKEN": "github-secret",
+            "OPENAI_API_KEY": "openai-secret",
+            "BENCHMARK_API_KEY": "benchmark-secret",
+            "BUBBLE_API_TOKEN": "bubble-secret",
+        }, clear=True):
+            result = codex_client.persist_codex_changes_to_github(
+                "/usr/bin/git", workspace, "codex/benchmark-run-unique",
+                "run-id", "live", "task-id", "base123",
+                ["app.py"], "safe summary",
+            )
+
+        commands = [call[0] for call in calls]
+        self.assertIn(["/usr/bin/git", "add", "-A"], commands)
+        commit = next(command for command in commands if "commit" in command)
+        self.assertIn("user.name=Rentee Codex", commit)
+        self.assertIn("user.email=codex@rentee.asia", commit)
+        push_call = next(call for call in calls if call[0][1] == "push")
+        self.assertEqual(push_call[0], [
+            "/usr/bin/git", "push", "origin",
+            "codex/benchmark-run-unique",
+        ])
+        flattened_commands = "\n".join(" ".join(command) for command in commands)
+        self.assertNotIn(" merge ", f" {flattened_commands} ")
+        self.assertNotIn("deploy", flattened_commands)
+        self.assertNotIn("run_benchmark", flattened_commands)
+        self.assertNotIn("OPENAI_API_KEY", push_call[1]["env"])
+        self.assertNotIn("BENCHMARK_API_KEY", push_call[1]["env"])
+        self.assertNotIn("BUBBLE_API_TOKEN", push_call[1]["env"])
+        self.assertEqual(result["fix_commit"], "fix123")
+        self.assertEqual(result["pr_number"], 42)
+        self.assertEqual(mocked_get.call_args.kwargs["params"], {
+            "state": "open", "head": "chaz1505:codex/benchmark-run-unique",
+            "base": "main",
+        })
+        pr_payload = mocked_post.call_args.kwargs["json"]
+        self.assertEqual(pr_payload["head"], "codex/benchmark-run-unique")
+        self.assertEqual(pr_payload["base"], "main")
+        self.assertNotIn("github-secret", pr_payload["body"])
+        self.assertNotIn("benchmark-secret", pr_payload["body"])
+
+    def test_existing_pull_request_is_reused(self):
+        existing_pr = {
+            "number": 9,
+            "html_url": "https://github.com/chaz1505/rentee/pull/9",
+        }
+        with patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response([existing_pr]),
+        ), patch("automation.codex_client.requests.post") as mocked_post:
+            result = codex_client._find_or_create_pull_request(
+                "token", "codex/benchmark-existing", "run", "body"
+            )
+        self.assertEqual(result, existing_pr)
+        mocked_post.assert_not_called()
+
+    def test_existing_remote_commit_skips_push_and_duplicate_commit(self):
+        workspace = self._publish_workspace()
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[1:] == ["diff", "--cached", "--quiet"]:
+                return completed(returncode=0)
+            if command[1:] == ["rev-parse", "HEAD"]:
+                return completed(stdout="fix123\n")
+            if command[1] == "ls-remote":
+                return completed(
+                    stdout="fix123\trefs/heads/codex/benchmark-existing\n"
+                )
+            return completed()
+
+        existing_pr = {
+            "number": 9,
+            "html_url": "https://github.com/chaz1505/rentee/pull/9",
+        }
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response([existing_pr]),
+        ), patch("automation.codex_client.requests.post") as mocked_post, patch.dict(
+            os.environ, {"GITHUB_TOKEN": "token"}, clear=True
+        ):
+            result = codex_client.persist_codex_changes_to_github(
+                "git", workspace, "codex/benchmark-existing", "run", "live",
+                "task-id", "base", ["app.py"], "summary",
+            )
+        self.assertFalse(any("commit" in command for command in calls))
+        self.assertFalse(any(command[1] == "push" for command in calls))
+        mocked_post.assert_not_called()
+        self.assertEqual(result["pr_number"], 9)
+
+    def test_pull_request_creation_failure_is_distinct(self):
+        with patch(
+            "automation.codex_client.requests.get",
+            return_value=self._github_response([]),
+        ), patch(
+            "automation.codex_client.requests.post",
+            return_value=self._github_response({"message": "denied"}, 403),
+        ), self.assertRaisesRegex(
+            codex_client.CodexSubmissionError,
+            "GitHub pull request creation failed: HTTP 403",
+        ):
+            codex_client._find_or_create_pull_request(
+                "token", "codex/benchmark-branch", "run", "body"
+            )
+
+    def test_publish_rejects_unsafe_branches_and_requires_token(self):
+        for branch in ("main", "feature/not-codex"):
+            with self.assertRaisesRegex(
+                codex_client.CodexSubmissionError, "unsafe Git branch"
+            ):
+                codex_client._verify_publish_branch(branch)
+        workspace = self._publish_workspace()
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+            codex_client.CodexSubmissionError, "GITHUB_TOKEN is required"
+        ):
+            codex_client.persist_codex_changes_to_github(
+                "git", workspace, "codex/benchmark-safe", "run", "live",
+                "task-id", "base", ["app.py"], "summary",
+            )
+
+    def test_push_failure_is_sanitized_and_stops_before_pull_request(self):
+        workspace = self._publish_workspace()
+        token = "github-secret"
+
+        def fake_run(command, **kwargs):
+            if command[1:] == ["diff", "--cached", "--quiet"]:
+                return completed(returncode=1)
+            if command[1:] == ["rev-parse", "HEAD"]:
+                return completed(stdout="fix123\n")
+            if command[1] == "push":
+                return completed(1, stderr=f"push rejected {token}")
+            return completed()
+
+        output = io.StringIO()
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.requests.get"
+        ) as mocked_get, patch.dict(
+            os.environ, {"GITHUB_TOKEN": token}, clear=True
+        ), redirect_stdout(output), self.assertRaisesRegex(
+            codex_client.CodexSubmissionError, "Git branch push failed"
+        ):
+            codex_client.persist_codex_changes_to_github(
+                "git", workspace, "codex/benchmark-safe", "run", "live",
+                "task-id", "base", ["app.py"], "summary",
+            )
+        mocked_get.assert_not_called()
+        self.assertNotIn(token, output.getvalue())
+
     @patch("automation.codex_client.shutil.which")
     def test_noop_is_success_without_changes(self, mocked_which):
         mocked_which.side_effect = lambda name: f"/usr/bin/{name}"
-        _calls, fake_run = self._successful_run(status="")
-        with patch("automation.codex_client._run", side_effect=fake_run), patch.dict(
+        calls, fake_run = self._successful_run(status="")
+        with patch("automation.codex_client._run", side_effect=fake_run), patch(
+            "automation.codex_client.requests.get"
+        ) as mocked_get, patch(
+            "automation.codex_client.requests.post"
+        ) as mocked_post, patch.dict(
             os.environ, {"OPENAI_API_KEY": "api-key"}, clear=True
         ):
             result = codex_client.submit_codex_fix(
@@ -206,6 +409,11 @@ class CodexClientTests(unittest.TestCase):
             )
         self.assertFalse(result["changes_detected"])
         self.assertEqual(result["changed_files"], [])
+        commands = [call[0] for call in calls]
+        self.assertFalse(any("commit" in command for command in commands))
+        self.assertFalse(any("push" in command for command in commands))
+        mocked_get.assert_not_called()
+        mocked_post.assert_not_called()
 
     @patch("automation.codex_client.shutil.which")
     def test_codex_failure_surfaces_sanitized_error(self, mocked_which):
