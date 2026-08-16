@@ -18,13 +18,19 @@ class CodexClientTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.workspace_root = Path(self.temp_dir.name) / "rentee-codex"
+        self.auth_root = Path(self.temp_dir.name) / "rentee-codex-auth"
         self.root_patch = patch.object(
             codex_client, "WORKSPACE_ROOT", self.workspace_root
         )
+        self.auth_root_patch = patch.object(
+            codex_client, "AUTH_ROOT", self.auth_root
+        )
         self.root_patch.start()
+        self.auth_root_patch.start()
 
     def tearDown(self):
         self.root_patch.stop()
+        self.auth_root_patch.stop()
         self.temp_dir.cleanup()
 
     def test_wrapper_preserves_complete_prompt_and_safety_instructions(self):
@@ -34,7 +40,10 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("Do not push directly to main.", prompt)
         self.assertIn("EXACT HUMAN-REVIEWED PROMPT", prompt)
 
-    def _successful_run(self, status=" M app.py\n?? tests/test_new.py\n"):
+    def _successful_run(
+        self, status=" M app.py\n?? tests/test_new.py\n",
+        codex_stdout="Codex finished", codex_stderr="",
+    ):
         calls = []
 
         def fake_run(command, **kwargs):
@@ -47,8 +56,16 @@ class CodexClientTests(unittest.TestCase):
                 return completed(stdout="abc123def456\n")
             if command[1:3] == ["checkout", "-b"]:
                 return completed()
+            if command[1:] == ["--version"]:
+                return completed(stdout="codex-cli 0.147.0")
+            if command[1:] == ["login", "--help"]:
+                return completed(stdout="--with-api-key")
+            if command[1:] == ["login", "--with-api-key"]:
+                return completed(stdout="Login successful")
+            if command[1:] == ["login", "status"]:
+                return completed(stdout="Logged in using an API key")
             if command[1] == "exec":
-                return completed(stdout="Codex finished")
+                return completed(stdout=codex_stdout, stderr=codex_stderr)
             if command[1:3] == ["status", "--porcelain"]:
                 return completed(stdout=status)
             raise AssertionError(f"Unexpected command: {command}")
@@ -75,14 +92,14 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(clone[6], "https://github.com/chaz1505/rentee.git")
         self.assertTrue(str(self.workspace_root) in clone[7])
         self.assertFalse(any("cloud" in command for command in commands))
-        self.assertFalse(any("login" in command for command in commands))
         self.assertFalse(any("push" in command or "pr" in command for command in commands))
         checkout = next(command for command in commands if command[1:3] == ["checkout", "-b"])
         self.assertTrue(checkout[3].startswith("codex/benchmark-run-live-"))
         self.assertNotEqual(checkout[3], "main")
         codex_call = next(call for call in calls if call[0][1] == "exec")
         self.assertEqual(codex_call[0], [
-            "/usr/bin/codex", "exec", "--sandbox", "workspace-write", "-"
+            "/usr/bin/codex", "exec", "--ignore-user-config", "--ephemeral",
+            "--sandbox", "workspace-write", "-"
         ])
         self.assertEqual(Path(codex_call[1]["cwd"]), Path(result["workspace"]))
         self.assertIn("human-reviewed fix", codex_call[1]["input_text"])
@@ -92,6 +109,29 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(result["changed_files"], ["app.py", "tests/test_new.py"])
         self.assertTrue(result["changes_detected"])
         self.assertTrue(Path(result["workspace"]).exists())
+
+    @patch("automation.codex_client.shutil.which")
+    def test_success_output_is_sanitized_and_truncated(self, mocked_which):
+        mocked_which.side_effect = lambda name: f"/usr/bin/{name}"
+        secret = "test-secret-key"
+        prompt = "PRIVATE BENCHMARK PROMPT"
+        final_output = f"Completed {secret} {prompt} " + ("x" * 3000)
+        _calls, fake_run = self._successful_run(codex_stdout=final_output)
+        output = io.StringIO()
+        with patch("automation.codex_client._run", side_effect=fake_run), patch.dict(
+            os.environ, {"OPENAI_API_KEY": secret}, clear=True
+        ), redirect_stdout(output):
+            result = codex_client.submit_codex_fix(
+                prompt, "run", "bubble", "development",
+                task_id="codex_success_output",
+            )
+        logs = output.getvalue()
+        self.assertIn("[CODEX] Final response:", logs)
+        self.assertIn("[REDACTED]", logs)
+        self.assertIn("…[truncated]", logs)
+        self.assertNotIn(secret, logs)
+        self.assertNotIn(prompt, logs)
+        self.assertTrue(result["changes_detected"])
 
     @patch("automation.codex_client.shutil.which")
     def test_noop_is_success_without_changes(self, mocked_which):
