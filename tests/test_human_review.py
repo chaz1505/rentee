@@ -119,6 +119,23 @@ class HumanReviewHelperTests(unittest.TestCase):
     def test_missing_fix_prompt_fails(self):
         self._assert_validation("has no generated fix prompt", fixPrompt="")
 
+    @patch("tests.human_review.requests.get")
+    def test_active_codex_is_rejected_but_failed_can_retry(self, mocked_get):
+        mocked_get.return_value = response({"response": self.record(
+            codexStatus="working", codexTaskID="task-id"
+        )})
+        with self.assertRaises(human_review.CodexAlreadyActive) as caught:
+            human_review.update_fix_prompt_with_human_review("id", "development")
+        self.assertEqual(caught.exception.codex_task_id, "task-id")
+        with patch("tests.human_review.requests.patch", return_value=response(status=204)):
+            mocked_get.return_value = response({"response": self.record(
+                codexStatus="failed"
+            )})
+            result = human_review.update_fix_prompt_with_human_review(
+                "id", "development"
+            )
+        self.assertTrue(result["fix_prompt_updated"])
+
     @patch("tests.human_review.requests.patch")
     @patch("tests.human_review.requests.get")
     def test_bubble_failure_is_safe_and_redacts_secrets(self, mocked_get, mocked_patch):
@@ -157,20 +174,37 @@ class HumanReviewEndpointTests(unittest.TestCase):
             )
         self.assertEqual(result.status_code, 400)
 
+    @patch("tests.human_review.patch_codex_state")
+    @patch("automation.codex_client.submit_codex_fix")
     @patch("tests.human_review.update_fix_prompt_with_human_review")
-    def test_success_response_and_default_development(self, mocked_update):
+    def test_success_response_and_default_development(
+        self, mocked_update, mocked_codex, mocked_state
+    ):
         mocked_update.return_value = {
             "benchmark_run_id": "bubble-id", "run_id": "run-id",
             "environment": "development", "fix_prompt_updated": True,
+            "updated_fix_prompt": "automatic prompt\n<!-- HUMAN_REVIEW_START -->human review<!-- HUMAN_REVIEW_END -->",
         }
+        mocked_codex.return_value = {"task_id": "codex-task-1"}
         with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
             result = self.client.post(
                 "/admin/benchmark/bubble-id/fix",
                 headers={"X-Benchmark-Key": "right"},
             )
         self.assertEqual(result.status_code, 200)
-        self.assertEqual(result.get_json()["status"], "ready")
+        self.assertEqual(result.get_json()["status"], "submitted")
+        self.assertTrue(result.get_json()["codex_submitted"])
+        self.assertEqual(result.get_json()["codex_task_id"], "codex-task-1")
         mocked_update.assert_called_once_with("bubble-id", "development")
+        submitted_prompt = mocked_codex.call_args.args[0]
+        self.assertIn("automatic prompt", submitted_prompt)
+        self.assertIn("human review", submitted_prompt)
+        self.assertEqual(mocked_state.call_args_list[0].args[2], {"codexStatus": "working"})
+        final_state = mocked_state.call_args_list[1].args[2]
+        self.assertTrue(final_state["codexSubmitted"])
+        self.assertEqual(final_state["codexStatus"], "submitted")
+        self.assertEqual(final_state["codexTaskID"], "codex-task-1")
+        self.assertRegex(final_state["codexSubmittedAt"], r"Z$")
 
     @patch("tests.human_review.update_fix_prompt_with_human_review")
     def test_not_found_and_bubble_failure_use_safe_statuses(self, mocked_update):
@@ -204,6 +238,69 @@ class HumanReviewEndpointTests(unittest.TestCase):
         self.assertEqual(result.status_code, 401)
         self.assertNotIn("admin-secret", output.getvalue())
         self.assertNotIn("wrong-secret", output.getvalue())
+
+    @patch("tests.human_review.patch_codex_state")
+    @patch("automation.codex_client.submit_codex_fix")
+    @patch("tests.human_review.update_fix_prompt_with_human_review")
+    def test_codex_failure_keeps_prompt_and_marks_failed(
+        self, mocked_update, mocked_codex, mocked_state
+    ):
+        from automation.codex_client import CodexSubmissionError
+        mocked_update.return_value = {
+            "benchmark_run_id": "bubble-id", "run_id": "run-id",
+            "environment": "development", "fix_prompt_updated": True,
+            "updated_fix_prompt": "updated prompt with human review",
+        }
+        mocked_codex.side_effect = CodexSubmissionError("safe failure")
+        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
+            result = self.client.post(
+                "/admin/benchmark/bubble-id/fix",
+                headers={"X-Benchmark-Key": "right"},
+            )
+        self.assertEqual(result.status_code, 502)
+        self.assertTrue(result.get_json()["fix_prompt_updated"])
+        self.assertFalse(result.get_json()["codex_submitted"])
+        mocked_codex.assert_called_once_with(
+            "updated prompt with human review", "run-id", "bubble-id", "development"
+        )
+        self.assertEqual(
+            mocked_state.call_args_list[-1].args[2],
+            {"codexSubmitted": False, "codexStatus": "failed"},
+        )
+
+    @patch("tests.human_review.update_fix_prompt_with_human_review")
+    def test_duplicate_submission_returns_409(self, mocked_update):
+        mocked_update.side_effect = human_review.CodexAlreadyActive(
+            "submitted", "task-id"
+        )
+        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
+            result = self.client.post(
+                "/admin/benchmark/bubble-id/fix",
+                headers={"X-Benchmark-Key": "right"},
+            )
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.get_json()["codex_status"], "submitted")
+        self.assertEqual(result.get_json()["codex_task_id"], "task-id")
+
+    def test_status_endpoint_requires_auth(self):
+        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
+            result = self.client.get("/admin/benchmark/id/fix_status")
+        self.assertEqual(result.status_code, 401)
+
+    @patch("tests.human_review.get_benchmark_run_codex_status")
+    def test_status_endpoint_returns_bubble_state(self, mocked_status):
+        mocked_status.return_value = {
+            "benchmark_run_id": "id", "codex_status": "submitted",
+            "codex_submitted": True, "codex_task_id": "task-id",
+        }
+        with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
+            result = self.client.get(
+                "/admin/benchmark/id/fix_status?environment=live",
+                headers={"X-Benchmark-Key": "right"},
+            )
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.get_json()["codex_task_id"], "task-id")
+        mocked_status.assert_called_once_with("id", "live")
 
 
 if __name__ == "__main__":

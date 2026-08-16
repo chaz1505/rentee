@@ -363,8 +363,11 @@ def admin_benchmark_fix(benchmark_run_id):
 
     from tests.human_review import (
         BenchmarkReviewError,
+        CodexAlreadyActive,
+        patch_codex_state,
         update_fix_prompt_with_human_review,
     )
+    from automation.codex_client import CodexSubmissionError, submit_codex_fix
 
     print(f"[BENCHMARK FIX] Loading BenchmarkRun {benchmark_run_id}", flush=True)
     print(f"[BENCHMARK FIX] Environment: {environment.upper()}", flush=True)
@@ -372,6 +375,12 @@ def admin_benchmark_fix(benchmark_run_id):
         result = update_fix_prompt_with_human_review(
             benchmark_run_id, environment
         )
+    except CodexAlreadyActive as error:
+        return jsonify({
+            "error": str(error),
+            "codex_status": error.codex_status,
+            "codex_task_id": error.codex_task_id,
+        }), 409
     except BenchmarkReviewError as error:
         print(f"[BENCHMARK FIX] Failed: {error}", flush=True)
         return jsonify({"error": str(error)}), error.status_code
@@ -387,7 +396,88 @@ def admin_benchmark_fix(benchmark_run_id):
         "[BENCHMARK FIX] BenchmarkRun fixPrompt updated successfully.",
         flush=True,
     )
-    return jsonify({"status": "ready", **result}), 200
+    updated_prompt = result.pop("updated_fix_prompt")
+    print(f"[CODEX] Preparing fix task for BenchmarkRun {benchmark_run_id}", flush=True)
+    print(f"[CODEX] Run ID: {result.get('run_id')}", flush=True)
+    try:
+        patch_codex_state(
+            benchmark_run_id, environment, {"codexStatus": "working"}
+        )
+        print("[CODEX] Starting Codex task...", flush=True)
+        codex = submit_codex_fix(
+            updated_prompt,
+            result.get("run_id"),
+            benchmark_run_id,
+            environment,
+        )
+    except Exception as error:
+        safe_error = (
+            str(error)
+            if isinstance(error, (CodexSubmissionError, BenchmarkReviewError))
+            else type(error).__name__
+        )
+        print(f"[CODEX] Submission failed: {safe_error}", flush=True)
+        try:
+            patch_codex_state(benchmark_run_id, environment, {
+                "codexSubmitted": False,
+                "codexStatus": "failed",
+            })
+        except Exception:
+            print("[CODEX] Failed to persist Codex failure state.", flush=True)
+        return jsonify({
+            "error": "Codex submission failed.",
+            "fix_prompt_updated": True,
+            "codex_submitted": False,
+        }), 502
+    submitted_at = datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+    try:
+        patch_codex_state(benchmark_run_id, environment, {
+            "codexSubmitted": True,
+            "codexSubmittedAt": submitted_at,
+            "codexStatus": "submitted",
+            "codexTaskID": codex["task_id"],
+        })
+    except BenchmarkReviewError as error:
+        print(f"[CODEX] Task started but metadata update failed: {error}", flush=True)
+        return jsonify({
+            "error": "Codex task started but its metadata could not be saved.",
+            "fix_prompt_updated": True,
+            "codex_submitted": True,
+            "codex_task_id": codex["task_id"],
+        }), 502
+    print("[CODEX] Codex task submitted successfully.", flush=True)
+    print(f"[CODEX] Task ID: {codex['task_id']}", flush=True)
+    return jsonify({
+        "status": "submitted",
+        **result,
+        "codex_submitted": True,
+        "codex_status": "submitted",
+        "codex_task_id": codex["task_id"],
+    }), 200
+
+
+@app.route("/admin/benchmark/<benchmark_run_id>/fix_status", methods=["GET"])
+def admin_benchmark_fix_status(benchmark_run_id):
+    auth_error = _benchmark_auth_error()
+    if auth_error:
+        return auth_error
+    environment = request.args.get("environment", "development")
+    if environment not in ("development", "live"):
+        return jsonify({"error": "environment must be development or live"}), 400
+    from tests.human_review import (
+        BenchmarkReviewError,
+        get_benchmark_run_codex_status,
+    )
+    try:
+        status = get_benchmark_run_codex_status(
+            benchmark_run_id, environment
+        )
+    except BenchmarkReviewError as error:
+        print(f"[CODEX] Status lookup failed: {error}", flush=True)
+        return jsonify({"error": str(error)}), error.status_code
+    return jsonify(status), 200
 
 
 def build_response_args(user_message, previous_response_id=None):

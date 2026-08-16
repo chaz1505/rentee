@@ -118,3 +118,22 @@ curl -X POST \
 ```
 
 The endpoint does not accept Lead or Folio IDs. It only uses the dedicated IDs stored internally for the selected benchmark case.
+
+## Human review to Codex handoff
+
+`POST /admin/benchmark/<benchmark_run_id>/fix` incorporates the authoritative Bubble human review into `fixPrompt`, then submits the complete prompt to an asynchronous Codex cloud task. `GET /admin/benchmark/<benchmark_run_id>/fix_status?environment=development|live` returns the Codex metadata currently stored on that BenchmarkRun. Both endpoints require `X-Benchmark-Key`.
+
+The integration uses the officially documented Codex CLI `codex cloud exec` command. Render must have the Codex CLI installed and available as `codex`. Configure `CODEX_CLOUD_ENV_ID` with a Codex cloud environment linked to `chaz1505/rentee` whose base branch is `main`. The cloud environment is the writable, isolated coding workspace; the deployed Render checkout is not modified.
+
+Codex CLI authentication uses its existing authenticated state when available. Otherwise the adapter uses `CODEX_ACCESS_TOKEN` with `codex login --with-access-token`, or the existing `OPENAI_API_KEY` with `codex login --with-api-key`. Credentials are sent through stdin and are never placed in the task prompt, Bubble, or logs.
+
+The BenchmarkRun must expose these fields:
+
+```text
+codexSubmitted
+codexSubmittedAt
+codexStatus
+codexTaskID
+```
+
+`working` and `submitted` prevent duplicate submissions; `failed` allows a retry. The CLI returns after cloud task acceptance, so the endpoint does not wait for the coding task to finish. If the installed CLI output exposes a native cloud task ID, that ID is stored. Otherwise the adapter clearly labels and stores a Rentee-generated correlation ID; it is not represented as an official Codex ID.
