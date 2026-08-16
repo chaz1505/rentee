@@ -1,5 +1,7 @@
 import os
+import io
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import Mock, patch
 
 from automation import codex_client
@@ -34,8 +36,9 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(command[:5], [
             "/usr/bin/codex", "cloud", "exec", "--env", "env_rentee"
         ])
-        self.assertEqual(command[5:7], ["--branch", "main"])
-        self.assertIn("fix prompt", command[7])
+        self.assertNotIn("--branch", command)
+        self.assertIn("fix prompt", command[5])
+        self.assertIn("--- BEGIN COMPLETE BENCHMARK FIX PROMPT ---", command[5])
 
     @patch("automation.codex_client._ensure_authenticated")
     @patch("automation.codex_client._run")
@@ -62,6 +65,41 @@ class CodexClientTests(unittest.TestCase):
                 codex_client._reject_configured_secrets(
                     "prompt containing never-submit-me"
                 )
+
+    @patch("automation.codex_client._ensure_authenticated")
+    @patch("automation.codex_client._run")
+    @patch("automation.codex_client.shutil.which", return_value="/usr/bin/codex")
+    def test_nonzero_exit_surfaces_sanitized_bounded_cli_output(
+        self, _mocked_which, mocked_run, _mocked_auth
+    ):
+        secret = "super-secret-token"
+        prompt = "COMPLETE PRIVATE BENCHMARK PROMPT"
+        mocked_run.return_value = Mock(
+            returncode=2,
+            stdout=f"command rejected {prompt}",
+            stderr=f"invalid option; token={secret} " + ("x" * 2500),
+        )
+        output = io.StringIO()
+        with patch.dict(os.environ, {
+            "CODEX_CLOUD_ENV_ID": "env_rentee",
+            "OPENAI_API_KEY": secret,
+        }, clear=False), redirect_stdout(output):
+            with self.assertRaises(codex_client.CodexSubmissionError) as caught:
+                codex_client.submit_codex_fix(
+                    prompt, "run-id", "bubble-id", "live"
+                )
+        logs = output.getvalue()
+        error = str(caught.exception)
+        self.assertIn("Codex CLI exited with code 2", logs)
+        self.assertIn("stderr: invalid option", logs)
+        self.assertIn("Codex cloud task submission failed: invalid option", error)
+        self.assertNotIn(secret, logs)
+        self.assertNotIn(secret, error)
+        self.assertNotIn(prompt, logs)
+        self.assertLessEqual(
+            len(codex_client._sanitize_cli_output("x" * 2500)),
+            codex_client.MAX_CLI_DIAGNOSTIC_LENGTH + len("…[truncated]"),
+        )
 
 
 if __name__ == "__main__":
