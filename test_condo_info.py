@@ -245,6 +245,55 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["properties"])
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
+        self.assertEqual(args["reasoning"], {"effort": "minimal"})
+        self.assertIn("every saved hard constraint", args["instructions"])
+        self.assertIn("pet permission", args["instructions"])
+
+    @patch("app.stream_match_lead")
+    @patch("app.update_preferences", return_value="Saved.")
+    def test_mixed_update_uses_exact_user_message_as_persistence_source(
+        self, mocked_update, mocked_match
+    ):
+        message = "Avoid car-park views, and show me suitable homes."
+        tool_call = SimpleNamespace(
+            type="function_call", name="update_preferences", call_id="update-call",
+            arguments=json.dumps({
+                # Simulate a lossy model-generated argument.
+                "preference_update": "Show suitable homes",
+                "recommendations_requested": True
+            })
+        )
+        initial = SimpleNamespace(
+            id="initial-response", output=[tool_call], usage=None, output_text=""
+        )
+        final = SimpleNamespace(id="final-response", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        def matched():
+            if False:
+                yield None
+            return "Current grounded option."
+
+        mocked_match.side_effect = lambda *_args: matched()
+        responses = MagicMock()
+        responses.stream.side_effect = [FakeStream(initial), FakeStream(final)]
+
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": message, "folio_id": "folio-1"}
+            )
+            response.get_data(as_text=True)
+
+        mocked_update.assert_called_once_with("folio-1", message, "live")
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertEqual(continuation["reasoning"], {"effort": "minimal"})
 
     def test_additive_preference_merge_preserves_old_and_new_constraints(self):
         existing = (

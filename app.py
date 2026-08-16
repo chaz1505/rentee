@@ -33,6 +33,7 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
 MATCH_LISTING_LIMIT = 600
+FAST_REASONING = {"effort": "minimal"}
 CONDO_SHEET_CSV_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1wnXHS6cHoUmAVXFpkzZ9PhBKmEgG6g-n8n0jcyodYig/export?format=csv&gid=0"
@@ -537,6 +538,7 @@ def admin_benchmark_fix_status(benchmark_run_id):
 def build_response_args(user_message, previous_response_id=None):
     args = {
         "model": "gpt-5-mini",
+        "reasoning": FAST_REASONING,
         "input": user_message,
         "instructions": (
             "You are Rentee, a friendly and highly capable personal property "
@@ -625,6 +627,12 @@ def build_response_args(user_message, previous_response_id=None):
             "viewings, sending photos, obtaining a floorplan, confirming information "
             "privately, or checking exact commute times. "
             "Explain recommendations in clear, customer-friendly language. "
+            "Before presenting recommendations, account for every saved hard constraint. "
+            "For important requirements the listing data does not verify, such as pet "
+            "permission or a unit's view/facing, state that uncertainty prominently rather "
+            "than implying a match. After a requested shortlist, ask at most one useful "
+            "unresolved trade-off question that would materially improve the next search; "
+            "do not delay current grounded recommendations to collect optional details. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
             "or 'the client', or sound like an internal estate-agent assistant. "
@@ -923,6 +931,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
         ]
         resolver_response = client.responses.create(
             model="gpt-5-mini",
+            reasoning=FAST_REASONING,
             input=(
                 "Resolve the customer's property reference against only the supplied current "
                 "recommended listings. Select one listing only if the reference can be matched "
@@ -1183,6 +1192,9 @@ For each recommended property:
 - Include the rent and bedroom count when supplied, so the customer can evaluate
   concrete trade-offs rather than choosing between vague categories.
 - Distinguish verified listing facts from requirements that remain unverified.
+- Explicitly account for every hard requirement in the saved profile, either as
+  verified, contradicted, or unverified. Make unverified pet permission and
+  view/facing constraints prominent rather than burying them in generic next steps.
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
@@ -1193,6 +1205,11 @@ For each recommended property:
 
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
+
+After the shortlist, ask at most one concise question about the highest-value
+unresolved trade-off (for example bedroom flexibility, property type, lease length,
+or floor/view preference). Do not ask for information already present in the profile,
+and do not withhold currently grounded recommendations while awaiting optional detail.
 
 Write directly to the property seeker using 'you' and 'your'. Be helpful,
 confident, and conversational, like a highly knowledgeable personal property
@@ -1242,6 +1259,7 @@ in the supplied property information, do not mention it.
     response = client.responses.create(
 
         model="gpt-5-mini",
+        reasoning=FAST_REASONING,
 
         input=prompt,
         text={
@@ -1490,6 +1508,7 @@ REQUESTED PREFERENCE UPDATE:
     extraction_started = time.perf_counter()
     response = client.responses.create(
         model="gpt-5-mini",
+        reasoning=FAST_REASONING,
         input=update_prompt,
         instructions=(
             "Return JSON matching the supplied schema. The confirmation must be a "
@@ -1721,11 +1740,9 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
                     )
-                    preference_text = (
-                        tool_args["preference_update"]
-                        if tool_args.get("recommendations_requested") is True
-                        else message
-                    )
+                    # The user's exact message is authoritative. The model-generated
+                    # tool argument can omit a qualifier on mixed update-and-search turns.
+                    preference_text = message
                     preference_confirmation = update_preferences(
                         folio_id,
                         preference_text,
@@ -1855,6 +1872,7 @@ def chat_stream():
                     )
                 continuation_args = {
                     "model": "gpt-5-mini",
+                    "reasoning": FAST_REASONING,
                     "previous_response_id": original_response_id,
                     "instructions": follow_up_instructions,
                     "input": [{
