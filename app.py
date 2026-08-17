@@ -619,11 +619,13 @@ def build_response_args(user_message, previous_response_id=None):
             "by itself must use update_preferences only; do not run property matching unless "
             "the user explicitly asks to see, find, compare, match, rank, shortlist, or "
             "receive recommendations for properties. "
-            "If a property-search request itself introduces or changes a specific condo, "
-            "building, area, or location preference, you MUST call update_preferences first, "
-            "not match_lead. For example, 'find me units in Serai', 'show me condos in Mont "
-            "Kiara', 'find me One Menerung units', 'show me properties in Bangsar', and 'I "
-            "want to see units in Damansara Heights' are preference updates. General requests "
+            "An immediate request to see properties in a named condo, building, area, or "
+            "location is a scoped recommendation request, not by itself a lasting preference "
+            "change. For example, 'find me units in Serai', 'show me condos in Mont Kiara', "
+            "'find me One Menerung units', and 'show me properties in Bangsar' MUST call "
+            "match_lead directly. Call update_preferences first only when the wording also "
+            "clearly makes a lasting change, such as 'from now on I am only interested in "
+            "Serai; show me units there'. General requests "
             "such as 'what do you have for me?', 'show me my best matches', 'what properties "
             "are available?', or 'find me something suitable' must call match_lead directly. "
             "Never treat property details in previous conversation history as authoritative "
@@ -687,9 +689,10 @@ def build_response_args(user_message, previous_response_id=None):
             "'Anything suitable?', 'Can you find something for me?', 'What are my best "
             "options?', 'Show me what matches', and 'What can "
             "I see?'. The user does not need to explicitly ask to match listings or recommend "
-            "properties. Do not use it for a statement that only changes preferences, or when "
-            "the request introduces or changes a specific condo, building, area, or location; "
-            "use update_preferences first in that case."
+            "properties. Do not use it for a statement that only changes preferences. An "
+            "explicit request to see properties in a named condo, building, area, or location "
+            "should use this tool directly unless its wording also clearly changes the "
+            "persistent profile."
         ),
         "parameters": {
             "type": "object",
@@ -710,10 +713,11 @@ def build_response_args(user_message, previous_response_id=None):
             "information relevant to finding the right home. The user does not need to "
             "explicitly ask to save or update their preferences. If they say 'I'm only "
             "interested in Serai now', you MUST call this tool rather than simply "
-            "acknowledging it in chat. Also use it when a property-search request introduces "
-            "or changes a specific condo, building, area, or location, such as 'find me units "
-            "in Serai' or 'show me condos in Mont Kiara'. Do not use it for ordinary questions "
-            "or general property requests that do not introduce a new preference."
+            "acknowledging it in chat. Do not use it merely because an immediate recommendation "
+            "request is scoped to a named condo, building, area, or location. Such a scope is "
+            "temporary unless the customer's wording clearly expresses a lasting preference "
+            "change. Do not use it for ordinary questions or general property requests that "
+            "do not introduce a new preference."
         ),
         "parameters": {
             "type": "object",
@@ -1098,7 +1102,7 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
     log_timing("Patch Folio", patch_started)
 
 
-def match_lead(folio_id, bubble_env):
+def match_lead(folio_id, bubble_env, current_request=None):
 
     match_started = time.perf_counter()
     yield "Checking your preferences..."
@@ -1160,6 +1164,7 @@ def match_lead(folio_id, bubble_env):
     )
 
     prompt_started = time.perf_counter()
+    current_request_text = (current_request or "").strip()
     prompt = f"""
 
 You are helping a property seeker find their ideal home.
@@ -1172,11 +1177,19 @@ Rank the strongest matches from best to worst.
 
 =========================
 
-HOME SEEKER REQUIREMENTS
+PERSISTENT HOME SEEKER REQUIREMENTS
 
 =========================
 
 {lead["AIsearchtext"]}
+
+=========================
+
+CURRENT CUSTOMER REQUEST
+
+=========================
+
+{current_request_text or "No separate current recommendation request was supplied."}
 
 =========================
 
@@ -1225,6 +1238,21 @@ For each recommended property:
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
+- Treat PERSISTENT HOME SEEKER REQUIREMENTS as the customer's broader profile.
+- Treat CURRENT CUSTOMER REQUEST as the immediate intent for this recommendation
+  turn. If it explicitly asks for recommendations in a named condo, building, or
+  location, that named scope is a hard constraint for this turn. Recommend only
+  supplied listings that are explicitly in that scope, then apply the persistent
+  requirements to rank and filter within it.
+- Never trade off or broaden an explicit current condo, building, or location scope
+  because an out-of-scope listing fits the persistent profile. If no supplied listing
+  is explicitly in the requested scope, return an empty recommendations array and say
+  clearly that no current matching listings were found there. Do not substitute other
+  areas or buildings unless CURRENT CUSTOMER REQUEST explicitly asks for alternatives.
+- A general request such as 'what else do you have?' has no hard location scope and
+  uses the persistent profile. A statement such as 'I'm also open to DC Residensi'
+  does not create a hard scope unless that same current request explicitly asks to see
+  or receive recommendations there.
 - Do not recommend a property that explicitly contradicts a hard requirement such
   as maximum budget or minimum bedrooms. If a different hard requirement cannot be
   verified from the supplied data, identify the exact unresolved requirement
@@ -1387,9 +1415,9 @@ in the supplied property information, do not mention it.
     return result["customer_response"]
 
 
-def stream_match_lead(folio_id, bubble_env):
+def stream_match_lead(folio_id, bubble_env, current_request=None):
 
-    match_flow = match_lead(folio_id, bubble_env)
+    match_flow = match_lead(folio_id, bubble_env, current_request)
 
     while True:
         try:
@@ -1768,7 +1796,9 @@ def chat_stream():
                 direct_customer_response = None
 
                 if tool_call.name == "match_lead":
-                    tool_result = yield from stream_match_lead(folio_id, bubble_env)
+                    tool_result = yield from stream_match_lead(
+                        folio_id, bubble_env, message
+                    )
                     has_match_results = True
                     # match_lead already returns the final answer generated solely from
                     # the current listing snapshot. Send that grounded answer immediately;
@@ -1805,7 +1835,8 @@ def chat_stream():
                         )
                         recommendations = yield from stream_match_lead(
                             folio_id,
-                            bubble_env
+                            bubble_env,
+                            message
                         )
                         print("Automatic rematch complete", flush=True)
                         has_match_results = True

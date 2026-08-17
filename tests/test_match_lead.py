@@ -138,5 +138,96 @@ class MatchLeadStaleFolioItemTests(unittest.TestCase):
             next(generator)
 
 
+class MatchLeadCurrentRequestScopeTests(unittest.TestCase):
+    def capture_matching_prompt(self, current_request, customer_response="No matches."):
+        def bubble_side_effect(url, **_kwargs):
+            if url.endswith("/obj/folio/folio-1"):
+                return {"lead": "lead-1", "folioItems": []}
+            if url.endswith("/obj/lead/lead-1"):
+                return {
+                    "AIsearchtext": (
+                        "Budget: maximum RM8,000; bedrooms: 3; "
+                        "furnishing: fully furnished"
+                    )
+                }
+            raise AssertionError(f"Unexpected Bubble URL: {url}")
+
+        model_response = SimpleNamespace(
+            output_text=json.dumps({
+                "recommendations": [],
+                "customer_response": customer_response,
+            }),
+            usage=None,
+        )
+        listings = [
+            {
+                "_id": "dc-listing", "beds": 3, "priceRent": 7500,
+                "AIsearchtext": "DC Residensi, fully furnished",
+            },
+            {
+                "_id": "other-listing", "beds": 3, "priceRent": 7000,
+                "AIsearchtext": "Unrelated Bangsar condo, fully furnished",
+            },
+        ]
+        with (
+            patch("app.bubble", side_effect=bubble_side_effect),
+            patch("app.get_all_listings", return_value=listings),
+            patch.object(
+                app_module.client.responses, "create", return_value=model_response
+            ) as mocked_match,
+        ):
+            _statuses, result = consume_generator(
+                app_module.match_lead("folio-1", "live", current_request)
+            )
+        return mocked_match.call_args.kwargs["input"], result
+
+    def test_named_condo_requests_are_separate_hard_turn_scopes(self):
+        for request_text, scope in (
+            ("Show me units in DC Residensi", "DC Residensi"),
+            ("Show me units in One Menerung", "One Menerung"),
+            ("Show me condos in Mont Kiara", "Mont Kiara"),
+        ):
+            with self.subTest(scope=scope):
+                prompt, _result = self.capture_matching_prompt(request_text)
+                self.assertIn("CURRENT CUSTOMER REQUEST", prompt)
+                self.assertIn(request_text, prompt)
+                self.assertIn("that named scope is a hard constraint", prompt)
+                self.assertIn("Recommend only", prompt)
+                self.assertIn("explicitly in that scope", prompt)
+
+    def test_persistent_requirements_are_applied_within_current_scope(self):
+        prompt, _result = self.capture_matching_prompt(
+            "Show me units in DC Residensi"
+        )
+        self.assertIn("PERSISTENT HOME SEEKER REQUIREMENTS", prompt)
+        self.assertIn("Budget: maximum RM8,000", prompt)
+        self.assertIn("bedrooms: 3", prompt)
+        self.assertIn("furnishing: fully furnished", prompt)
+        self.assertIn("rank and filter within it", prompt)
+
+    def test_no_scoped_listings_requires_clear_no_match_without_substitution(self):
+        prompt, result = self.capture_matching_prompt(
+            "Show me units in One Menerung",
+            "There are no current matching listings in One Menerung.",
+        )
+        self.assertEqual(
+            result, "There are no current matching listings in One Menerung."
+        )
+        self.assertIn("return an empty recommendations array", prompt)
+        self.assertIn("Do not substitute other", prompt)
+
+    def test_general_follow_up_has_no_inherited_turn_scope(self):
+        prompt, _result = self.capture_matching_prompt("What else do you have?")
+        self.assertIn("What else do you have?", prompt)
+        self.assertIn("has no hard location scope", prompt)
+
+    def test_open_to_statement_is_not_automatically_a_hard_scope(self):
+        prompt, _result = self.capture_matching_prompt(
+            "I'm also open to DC Residensi"
+        )
+        self.assertIn("does not create a hard scope", prompt)
+        self.assertIn("I'm also open to DC Residensi", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

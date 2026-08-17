@@ -293,6 +293,9 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("Grounded current option", body)
         self.assertNotIn("delayed model rewrite", body)
         self.assertIn('"response_id": "final-response"', body)
+        mocked_match.assert_called_once_with(
+            "folio-1", "live", "Show me my best matches"
+        )
         continuation = responses.stream.call_args_list[1].kwargs
         self.assertEqual(continuation["previous_response_id"], "initial-response")
         self.assertEqual(continuation["input"][0]["call_id"], "match-call")
@@ -409,7 +412,9 @@ class CondoInfoTests(unittest.TestCase):
             response.get_data(as_text=True)
 
         mocked_update.assert_called_once_with("folio-1", customer_message, "live")
-        mocked_match.assert_called_once_with("folio-1", "live")
+        mocked_match.assert_called_once_with(
+            "folio-1", "live", customer_message
+        )
 
 
 if __name__ == "__main__":
