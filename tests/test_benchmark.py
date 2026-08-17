@@ -175,6 +175,10 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
         mocked_markdown.assert_called_once_with("partial.json", "evaluation.json")
         mocked_prompt.assert_called_once_with("partial.json", "evaluation.json")
         mocked_persist.assert_called_once()
+        self.assertEqual(
+            mocked_persist.call_args.kwargs["conversation_markdown"],
+            "artifact",
+        )
         self.assertTrue(result["execution"]["result_persisted"])
 
     @patch("tests.run_benchmark.save_benchmark_run", return_value="error-run-id")
@@ -200,6 +204,10 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
         payload_result = mocked_persist.call_args.args[0]
         self.assertEqual(payload_result["run_id"], "canonical-error-run")
         self.assertEqual(payload_result["infrastructure_error"], "setup failed")
+        self.assertEqual(
+            mocked_persist.call_args.kwargs["conversation_markdown"],
+            "artifact",
+        )
 
 
 if __name__ == "__main__":
