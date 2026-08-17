@@ -246,6 +246,58 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
 
+    @patch("app.stream_match_lead")
+    def test_current_match_answer_is_sent_directly_while_continuity_is_finalized(
+        self, mocked_match
+    ):
+        def grounded_match(*_args):
+            yield "Searching available properties..."
+            return "Given what you’ve told me:\n\n- Grounded current option"
+
+        mocked_match.side_effect = grounded_match
+        tool_call = SimpleNamespace(
+            type="function_call", name="match_lead", call_id="match-call",
+            arguments="{}"
+        )
+        initial = SimpleNamespace(
+            id="initial-response", output=[tool_call], usage=None, output_text=""
+        )
+        final = SimpleNamespace(
+            id="final-response", output=[], usage=None, output_text=""
+        )
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        rewritten_event = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="A delayed model rewrite that must not be shown"
+        )
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial), FakeStream(final, [rewritten_event])
+        ]
+
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": "Show me my best matches", "folio_id": "folio-1"}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertIn("Grounded current option", body)
+        self.assertNotIn("delayed model rewrite", body)
+        self.assertIn('"response_id": "final-response"', body)
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertEqual(continuation["previous_response_id"], "initial-response")
+        self.assertEqual(continuation["input"][0]["call_id"], "match-call")
+        self.assertIn("Grounded current option", continuation["input"][0]["output"])
+
     def test_additive_preference_merge_preserves_old_and_new_constraints(self):
         existing = (
             "Bedrooms: 3 or 4\n"
@@ -258,6 +310,16 @@ class CondoInfoTests(unittest.TestCase):
         )
         self.assertIn(existing, merged)
         self.assertIn("Avoid a unit looking over a car park", merged)
+
+    def test_additive_preference_merge_removes_stale_empty_area_placeholder(self):
+        merged = app_module.merge_updated_preference_text(
+            "Bedrooms: 3 or 4\nAreas: No specific neighbourhoods given",
+            "Preferred area: TTDI",
+            "TTDI would be my favourite area if it works for school"
+        )
+        self.assertIn("Bedrooms: 3 or 4", merged)
+        self.assertIn("TTDI would be my favourite area", merged)
+        self.assertNotIn("No specific neighbourhoods given", merged)
 
     def test_replacement_preference_can_use_generated_profile(self):
         merged = app_module.merge_updated_preference_text(
@@ -306,6 +368,48 @@ class CondoInfoTests(unittest.TestCase):
                 "We also have two cats"
             )
         )
+
+    @patch("app.stream_match_lead")
+    @patch("app.update_preferences", return_value="Saved.")
+    def test_combined_update_persists_exact_customer_text_before_rematch(
+        self, mocked_update, mocked_match
+    ):
+        customer_message = (
+            "Please avoid units looking over a car park; show me suitable options."
+        )
+        tool_call = SimpleNamespace(
+            type="function_call", name="update_preferences", call_id="update-call",
+            arguments=json.dumps({
+                # Simulate a lossy model summary to guard the persistence boundary.
+                "preference_update": "Update the view preference",
+                "recommendations_requested": True
+            })
+        )
+        initial = SimpleNamespace(
+            id="initial-response", output=[tool_call], usage=None, output_text=""
+        )
+        final = SimpleNamespace(id="final-response", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response): self.response = response
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(())
+            def get_final_response(self): return self.response
+
+        responses = MagicMock()
+        responses.stream.side_effect = [FakeStream(initial), FakeStream(final)]
+        mocked_match.return_value = iter(())
+
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": customer_message, "folio_id": "folio-1"}
+            )
+            response.get_data(as_text=True)
+
+        mocked_update.assert_called_once_with("folio-1", customer_message, "live")
+        mocked_match.assert_called_once_with("folio-1", "live")
 
 
 if __name__ == "__main__":
