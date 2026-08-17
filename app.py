@@ -1017,7 +1017,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
     return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
-def create_folio_items(recommendations, base_url):
+def create_folio_items(recommendations, folio_id, lead_id, base_url):
 
     create_started = time.perf_counter()
     folio_item_ids = []
@@ -1035,6 +1035,8 @@ def create_folio_items(recommendations, base_url):
                 },
                 json={
                     "listing": listing_id,
+                    "folio": folio_id,
+                    "lead": lead_id,
                     "newlyAdded": True,
                     "RecoSummary": reco_summary
                 },
@@ -1367,7 +1369,9 @@ in the supplied property information, do not mention it.
             return result["customer_response"]
         log_timing("Clear previous newlyAdded flags", clear_started)
 
-        new_folio_item_ids = create_folio_items(new_recommendations, base_url)
+        new_folio_item_ids = create_folio_items(
+            new_recommendations, folio_id, lead_id, base_url
+        )
 
         if new_folio_item_ids is not None:
             final_folio_item_ids = (

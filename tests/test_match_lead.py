@@ -24,6 +24,35 @@ def consume_generator(generator):
 
 
 class MatchLeadStaleFolioItemTests(unittest.TestCase):
+    @patch("app.requests.post")
+    def test_create_folio_items_includes_core_relationships_and_summary(
+        self, mocked_post
+    ):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"id": "folio-item-1"}
+        mocked_post.return_value = response
+        reco_summary = "  Exact personalised summary — unchanged.  "
+
+        result = app_module.create_folio_items(
+            [{
+                "listing_id": "listing-1",
+                "reco_summary": reco_summary,
+            }],
+            "folio-1",
+            "lead-1",
+            "https://www.rentee.asia/api/1.1",
+        )
+
+        self.assertEqual(result, ["folio-item-1"])
+        self.assertEqual(mocked_post.call_args.kwargs["json"], {
+            "listing": "listing-1",
+            "folio": "folio-1",
+            "lead": "lead-1",
+            "newlyAdded": True,
+            "RecoSummary": reco_summary,
+        })
+
     def bubble_side_effect(self, url, **_kwargs):
         if url.endswith("/obj/folio/folio-1"):
             return {
@@ -81,7 +110,15 @@ class MatchLeadStaleFolioItemTests(unittest.TestCase):
             mocked_bubble.call_args_list,
         )
         mocked_match.assert_called_once()
-        mocked_create.assert_called_once()
+        mocked_create.assert_called_once_with(
+            [{
+                "listing_id": "new-listing",
+                "reco_summary": "A strong fit.",
+            }],
+            "folio-1",
+            "lead-1",
+            "https://www.rentee.asia/api/1.1",
+        )
         mocked_update.assert_called_once_with(
             "folio-1", ["valid-item", "new-item"],
             "https://www.rentee.asia/api/1.1",
