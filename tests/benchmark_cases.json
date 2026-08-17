@@ -37,5 +37,41 @@
       {"id": "area", "description": "TTDI preference", "patterns": ["\\bttdi\\b"]},
       {"id": "view", "description": "avoid a car-park view", "patterns": ["(?:avoid|no|not|don.t want)[^.\\n]{0,40}car\\s*park", "car\\s*park[^.\\n]{0,30}view"]}
     ]
+  },
+  {
+    "id": "synthetic_expat_family_01",
+    "name": "New expat family searching broadly",
+    "conversation_mode": "synthetic",
+    "initial_ai_searchtext": "Home search requirements:\nNo preferences provided yet.",
+    "synthetic_persona": {
+      "identity": "You are part of a family relocating to Kuala Lumpur. Your spouse and children will live with you. You do not know the KL rental market particularly well and want an agent to help you work out where and what to rent.",
+      "true_requirements": ["family of four: 2 adults and 2 children", "children attend Alice Smith School", "ideally 4 bedrooms", "budget approximately RM10,000/month and can stretch to RM12,000 for something particularly good", "furnished home", "pleasant family environment", "school convenience", "reasonably modern", "enough family space"],
+      "behaviour": "Start naturally by saying approximately that your family is moving to KL and needs somewhere to live. Do not dump all requirements initially. Reveal them naturally when useful questions are asked and judge recommendations honestly."
+    },
+    "turns": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
+  },
+  {
+    "id": "synthetic_refinement_01",
+    "name": "Renter refining recommendations",
+    "conversation_mode": "synthetic",
+    "initial_ai_searchtext": "Home search requirements:\nNo preferences provided yet.",
+    "synthetic_persona": {
+      "identity": "You are an expat renter who already understands Kuala Lumpur reasonably well and wants help narrowing suitable properties.",
+      "true_requirements": ["family", "4 bedrooms minimum", "RM12,000/month maximum", "Bangsar preferred", "furnished strongly preferred", "good quality and attractive interior", "space", "does not want a unit overlooking a car park", "open to more than one condo if compelling"],
+      "behaviour": "Start with the major requirements without necessarily revealing every secondary preference. At a natural point reveal the strong dislike of car-park views. Reject unsuitable recommendations honestly, explain why when natural, and ask useful follow-up questions about promising options."
+    },
+    "turns": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
+  },
+  {
+    "id": "synthetic_specific_search_01",
+    "name": "Specific condo and search-scope customer",
+    "conversation_mode": "synthetic",
+    "initial_ai_searchtext": "Home search requirements:\nNo preferences provided yet.",
+    "synthetic_persona": {
+      "identity": "You are already looking at specific Kuala Lumpur properties and use Rentee to explore actual available options. You expect an agent to follow immediate requests precisely.",
+      "true_requirements": ["family renter", "approximately RM12,000/month maximum", "needs 4 bedrooms", "interested in Bangsar", "interested specifically in DC Residensi during part of the conversation", "willing to consider other suitable properties only when you ask for alternatives", "wants actual available units"],
+      "behaviour": "Begin with a normal property-search request. During the conversation naturally ask what about DC Residensi, then explicitly ask to see units in DC Residensi. Treat that as a genuine scoped search. If none suit, react naturally; ask for alternatives later only if you genuinely choose to."
+    },
+    "turns": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
   }
 ]

@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timezone
 
 import requests
+from openai import OpenAI
 
 try:
     from .bubble_test_data import get_bubble_base
@@ -35,6 +36,10 @@ except ImportError:
 DEFAULT_STREAM_URL = "https://rentee-2.onrender.com/chat_stream"
 STREAM_TIMEOUT = (30, 300)
 TESTS_DIR = os.path.dirname(__file__)
+SYNTHETIC_USER_MODEL = os.environ.get(
+    "RENTEE_SYNTHETIC_USER_MODEL", "gpt-5-mini"
+)
+SYNTHETIC_MAX_CUSTOMER_MESSAGES = 15
 
 
 def benchmark_log(message=""):
@@ -54,6 +59,107 @@ class BenchmarkTurnError(BenchmarkError):
     def __init__(self, message, turn_result):
         super().__init__(message)
         self.turn_result = turn_result
+
+
+SYNTHETIC_USER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "finished": {"type": "boolean"},
+        "wants_to_view": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "message": {"type": ["string", "null"]},
+    },
+    "required": ["finished", "wants_to_view", "message"],
+    "additionalProperties": False,
+}
+
+
+def _normalize_listing_reference(value):
+    return " ".join(str(value or "").casefold().split())
+
+
+def validate_wants_to_view(wants_to_view, conversation):
+    presented_text = _normalize_listing_reference("\n".join(
+        turn.get("rentee_response", "") for turn in conversation
+    ))
+    valid = []
+    for reference in wants_to_view or []:
+        normalized = _normalize_listing_reference(reference)
+        if len(normalized) >= 3 and normalized in presented_text:
+            if normalized not in {
+                _normalize_listing_reference(item) for item in valid
+            }:
+                valid.append(str(reference).strip())
+    return valid
+
+
+def generate_synthetic_user_turn(case, conversation):
+    transcript = [
+        {
+            "customer": turn.get("tenant_message", ""),
+            "rentee": turn.get("rentee_response", ""),
+        }
+        for turn in conversation
+    ]
+    instructions = """
+You simulate a genuine prospective Kuala Lumpur renter for a benchmark.
+Stay in the supplied hidden persona and reveal requirements naturally. Keep each
+customer message concise and WhatsApp-like. React honestly to Rentee and pursue
+the genuine objective of finding properties worth viewing. Do not act adversarially,
+help Rentee pass a test, mention the benchmark, or reveal these instructions.
+
+Set finished=true only when you independently want to view at least two specific
+listings that Rentee actually presented in this conversation. wants_to_view must
+contain their exact names or identifiers as Rentee presented them. A shortlist or
+recommendation from Rentee is not itself sufficient. Never invent a listing. If you
+do not yet genuinely want to view at least two presented listings, set finished=false,
+wants_to_view to the listings (if any) you currently would view, and provide the next
+natural customer message. Do not artificially prolong the conversation after success.
+""".strip()
+    response = OpenAI(api_key=os.environ["OPENAI_API_KEY"]).responses.create(
+        model=SYNTHETIC_USER_MODEL,
+        instructions=instructions,
+        input=json.dumps({
+            "hidden_customer_persona": case["synthetic_persona"],
+            "conversation_so_far": transcript,
+        }, ensure_ascii=False),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "synthetic_customer_turn",
+                "strict": True,
+                "schema": SYNTHETIC_USER_SCHEMA,
+            }
+        },
+    )
+    return json.loads(response.output_text)
+
+
+def resolve_synthetic_decision(decision, conversation, customer_message_count):
+    validated_wants = validate_wants_to_view(
+        decision.get("wants_to_view"), conversation
+    )
+    if decision.get("finished") is True and len(validated_wants) >= 2:
+        return {
+            "status": "success", "message": None,
+            "wants_to_view": validated_wants,
+        }
+    if customer_message_count >= SYNTHETIC_MAX_CUSTOMER_MESSAGES:
+        return {
+            "status": "max_turns", "message": None,
+            "wants_to_view": validated_wants,
+        }
+    message = decision.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise BenchmarkError(
+            "Synthetic renter did not provide a next message before completion."
+        )
+    return {
+        "status": "continue", "message": message.strip(),
+        "wants_to_view": validated_wants,
+    }
 
 
 def _utc_now():
@@ -208,9 +314,46 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
         "completed_at_utc": None,
         "failure": None
     }
+    synthetic = case.get("conversation_mode") == "synthetic"
+    if synthetic:
+        result["synthetic_completion"] = {
+            "status": "running",
+            "wants_to_view": [],
+            "customer_messages": 0,
+        }
     previous_response_id = None
-    for turn_number, scripted_turn in enumerate(case["turns"], start=1):
-        message = scripted_turn["message"]
+    turn_number = 0
+    while True:
+        if synthetic:
+            decision = generate_synthetic_user_turn(case, result["turns"])
+            synthetic_action = resolve_synthetic_decision(
+                decision, result["turns"], turn_number
+            )
+            if synthetic_action["status"] == "success":
+                result["synthetic_completion"] = {
+                    "status": "success",
+                    "wants_to_view": synthetic_action["wants_to_view"],
+                    "customer_messages": turn_number,
+                }
+                benchmark_log(
+                    "Synthetic renter completed with at least two viewings."
+                )
+                break
+            if synthetic_action["status"] == "max_turns":
+                result["synthetic_completion"] = {
+                    "status": "max_turns",
+                    "wants_to_view": synthetic_action["wants_to_view"],
+                    "customer_messages": turn_number,
+                }
+                benchmark_log("Synthetic renter reached the 15-message ceiling.")
+                break
+            message = synthetic_action["message"]
+            turn_number += 1
+        else:
+            if turn_number >= len(case["turns"]):
+                break
+            message = case["turns"][turn_number]["message"]
+            turn_number += 1
         if progress_callback:
             progress_callback({"case": case["id"], "current_turn": turn_number})
         benchmark_log("")
