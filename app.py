@@ -1105,14 +1105,29 @@ def match_lead(folio_id, bubble_env):
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     log_timing("match_lead - Folio lookup", folio_started)
     existing_folio_item_ids = list(folio.get("folioItems", []) or [])
+    valid_existing_folio_item_ids = []
     existing_listing_ids = set()
     previously_new_folio_item_ids = []
 
     existing_items_started = time.perf_counter()
     for existing_folio_item_id in existing_folio_item_ids:
-        existing_folio_item = bubble(
-            f"{base_url}/obj/folioItem/{existing_folio_item_id}"
-        )
+        try:
+            existing_folio_item = bubble(
+                f"{base_url}/obj/folioItem/{existing_folio_item_id}"
+            )
+        except requests.HTTPError as error:
+            if (
+                error.response is not None
+                and error.response.status_code == 404
+            ):
+                print(
+                    "Skipping stale FolioItem reference: "
+                    f"{existing_folio_item_id}",
+                    flush=True,
+                )
+                continue
+            raise
+        valid_existing_folio_item_ids.append(existing_folio_item_id)
         existing_listing_id = existing_folio_item.get("listing")
 
         if existing_listing_id:
@@ -1343,7 +1358,9 @@ in the supplied property information, do not mention it.
         new_folio_item_ids = create_folio_items(new_recommendations, base_url)
 
         if new_folio_item_ids is not None:
-            final_folio_item_ids = existing_folio_item_ids + new_folio_item_ids
+            final_folio_item_ids = (
+                valid_existing_folio_item_ids + new_folio_item_ids
+            )
             try:
                 update_folio_items(folio_id, final_folio_item_ids, base_url)
             except Exception as error:
