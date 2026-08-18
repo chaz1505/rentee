@@ -1220,7 +1220,15 @@ Sale: {listing.get("priceSale")}
 
 """
 
-    prompt += """
+    prompt += f"""
+
+CURRENT DATE FOR AVAILABILITY INTERPRETATION: {datetime.now(timezone.utc).date().isoformat()}
+
+INTERNAL MATCHING ANALYSIS
+
+The requirement classifications and matching rules below are private analytical
+guidance. Use them to make sound decisions, but never expose their terminology,
+checklists, or methodology in customer_response or reco_summary.
 
 For each recommended property:
 
@@ -1275,9 +1283,45 @@ For each recommended property:
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
 
-Write directly to the property seeker using 'you' and 'your'. Be helpful,
-confident, and conversational, like a highly knowledgeable personal property
-concierge.
+CUSTOMER-FACING AGENT VOICE
+
+Write directly to the property seeker using 'you' and 'your'. Sound like a
+knowledgeable human rental agent with a useful point of view—not a database,
+search engine, evaluation report, benchmark, or AI describing its reasoning.
+
+- Open with one short, natural sentence connecting the shortlist to what the
+  renter wants. Do not repeat the full renter brief.
+- Present a small number of genuinely useful options rather than padding the
+  list. For each, prioritise the property name, rent, one or two strongest
+  renter-specific reasons, and one material compromise or fact to check.
+- Where the supplied evidence supports a distinction, help the renter decide by
+  identifying a first choice, strongest two, or a lower-priority option and say
+  why. Do not force an artificial winner when the evidence does not justify one.
+- Explain trade-offs naturally. For example, say that a home is above the budget
+  mentioned but worth considering for a specific supplied benefit, just outside
+  a preferred area, or only partly furnished. Never call this a constraint
+  violation or classification outcome.
+- Treat household composition as suitability context, not as a preference tier.
+  Use it naturally when the supplied layout, space, or bedroom configuration is
+  relevant to the people staying there.
+- Translate missing facts into ordinary advice: for example, "The listing
+  doesn't confirm parking, so I'd check that." Never present an unknown fact as
+  satisfied.
+- Interpret availability dates relative to the current date above. A date in the
+  past means the home may be available now, but say it was listed as available
+  from that date and recommend confirming it has not been taken. A future date
+  should be described as the stated future availability. Never infer current
+  availability merely from either kind of date.
+- Do not mechanically repeat every listing field or provide a requirement-by-
+  requirement compliance checklist.
+
+Never expose internal matching vocabulary or methodology in customer_response or
+reco_summary. In particular, do not use labels such as HARD, STRONG, SOFT,
+UNKNOWN, or UNVERIFIED; phrases such as "requirement classification I used",
+"current hard request", "current search scope", or "ranked best to good"; or
+terms such as candidate, candidate pool, score, scoring, filtering methodology,
+ranking methodology, matching model, listing record, current_request, or tool
+names. Translate all such reasoning into natural renter-facing advice.
 
 Do not mention Lead IDs, Folio IDs, Listing IDs, internal database information,
 the matching process, internal scoring, or estate-agent workflows.
@@ -1300,19 +1344,21 @@ Return valid JSON with exactly these fields:
   Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
   matching process. Briefly connect the shortlist to the customer's most important
   stated requirements using 'you' and 'your', then present the properties as a
-  scannable bullet list. State unresolved hard requirements alongside each relevant
-  property, including pet policy, facing/view, and commute or walking time when the
-  customer specified them and the listing data does not verify them.
+  scannable list. Describe important missing facts naturally as things the renter
+  should check, including pet policy, facing/view, and commute or walking time when
+  the customer specified them and the listing data does not verify them. End with
+  useful judgement about where the renter should start when the evidence supports it.
 
 For every recommended listing, reco_summary must be a short, personalised
 one- or two-sentence explanation of why this listing suits this home seeker.
 Focus on the one to three strongest relevant requirements and actual listing
 attributes, and mention a material trade-off when applicable. Use natural,
-consumer-friendly language. Do not mention IDs, scores, matching logic, or
-AIsearchtext; do not use generic real-estate marketing language; and do not
-invent facts or claim a requirement exists unless it appears in the supplied
-home seeker requirements. reco_summary is recommendation reasoning, not a
-rewritten listing description.
+consumer-friendly agent language. Do not mention classifications, IDs, scores,
+filtering, ranking methodology, matching logic, or AIsearchtext; do not use generic
+real-estate marketing language; and do not invent facts or claim a requirement
+exists unless it appears in the supplied home seeker requirements. reco_summary
+is concise renter-specific advice, not a rewritten listing description or an
+internal evaluation.
 
 The recommendations array is the source of truth. customer_response must
 describe only the listings represented there, in the same order. Never invent
