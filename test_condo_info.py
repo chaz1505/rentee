@@ -125,7 +125,7 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("specific current Rentee listing or unit", property_tool["description"])
         self.assertIn("general development", property_tool["description"])
 
-    @patch("app.load_front_door_renter_summary", return_value="No stored preferences yet.")
+    @patch("app.load_front_door_renter_context", return_value="No stored preferences yet.")
     @patch("app.get_condo_infos")
     def test_chat_stream_executes_condo_tool_and_continues_same_response(
         self, mocked_condo_infos, _mocked_summary
@@ -187,7 +187,7 @@ class CondoInfoTests(unittest.TestCase):
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
 
-    @patch("app.load_front_door_renter_summary", return_value="Pets: two cats")
+    @patch("app.load_front_door_renter_context", return_value="Pets: two cats")
     @patch("app.stream_match_lead")
     @patch("app.update_preferences", return_value="Saved your cat preference.")
     def test_preference_only_update_does_not_rematch_or_leak_selection_text(
@@ -247,7 +247,7 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
 
-    @patch("app.load_front_door_renter_summary", return_value="Complete renter brief")
+    @patch("app.load_front_door_renter_context", return_value="Complete renter brief")
     @patch("app.stream_match_lead")
     def test_current_match_answer_is_sent_directly_while_continuity_is_finalized(
         self, mocked_match, _mocked_summary
@@ -379,7 +379,7 @@ class CondoInfoTests(unittest.TestCase):
             )
         )
 
-    @patch("app.load_front_door_renter_summary", return_value="Complete renter brief")
+    @patch("app.load_front_door_renter_context", return_value="Complete renter brief")
     @patch("app.stream_match_lead")
     @patch("app.update_preferences", return_value="Saved.")
     def test_combined_update_persists_structured_preference_before_rematch(

@@ -200,6 +200,7 @@ class MatchLeadCurrentRequestScopeTests(unittest.TestCase):
             "Show me units in DC Residensi"
         )
         self.assertIn("PERSISTENT HOME SEEKER REQUIREMENTS", prompt)
+        # This exact content comes from Lead.AIsearchtext in capture_matching_prompt.
         self.assertIn("Budget: maximum RM8,000", prompt)
         self.assertIn("bedrooms: 3", prompt)
         self.assertIn("furnishing: fully furnished", prompt)
