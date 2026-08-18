@@ -551,10 +551,42 @@ def admin_benchmark_fix_status(benchmark_run_id):
     return jsonify(status), 200
 
 
-def build_response_args(user_message, previous_response_id=None):
+def load_front_door_renter_summary(folio_id, bubble_env):
+    if not folio_id:
+        return "No stored preferences yet."
+    lookup_started = time.perf_counter()
+    try:
+        base_url = get_bubble_base_url(bubble_env)
+        folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+        lead = bubble(f"{base_url}/obj/lead/{folio['lead']}")
+        summary = str(lead.get("AIsearchsummary") or "").strip()
+        return summary or "No stored preferences yet."
+    except Exception as error:
+        print(
+            f"Front-door renter context unavailable; continuing safely: {error}",
+            flush=True,
+        )
+        return "Stored preferences are temporarily unavailable."
+    finally:
+        log_timing("Front-door AIsearchsummary lookup", lookup_started)
+
+
+def build_response_args(
+    user_message, previous_response_id=None, renter_summary=None
+):
+    known_preferences = (
+        str(renter_summary).strip()
+        if renter_summary is not None and str(renter_summary).strip()
+        else "No stored preferences yet."
+    )
     args = {
         "model": "gpt-5-mini",
-        "input": user_message,
+        "input": (
+            "KNOWN RENTER PREFERENCES\n\n"
+            f"{known_preferences}\n\n"
+            "CURRENT CUSTOMER MESSAGE\n\n"
+            f"{user_message}"
+        ),
         "instructions": """
 You are Rentee, a friendly, concise personal property assistant for renters in
 Kuala Lumpur. Speak directly to the renter using “you” and “your”. Be proactive
@@ -1196,11 +1228,15 @@ For each recommended property:
 - Include the rent and bedroom count when supplied, so the customer can evaluate
   concrete trade-offs rather than choosing between vague categories.
 - Distinguish verified listing facts from requirements that remain unverified.
-- Before selecting any property, make a complete checklist of every explicit
-  requirement in HOME SEEKER REQUIREMENTS, including negative requirements and
-  quantities (for example, the number of pets). Check each candidate against the
-  supplied property information. Do not silently omit a requirement from this
-  validation merely because the listing data does not mention it.
+- Before selecting properties, interpret the renter's language and classify each
+  requirement as a HARD REQUIREMENT, STRONG PREFERENCE, SOFT PREFERENCE, or
+  UNKNOWN / UNVERIFIED REQUIREMENT. Explicit absolute language such as "must",
+  "absolute maximum", "will not", "only", or a direct rejection creates a hard
+  requirement. Approximate, preferred, desired, flexible, and ideal language does
+  not become hard merely because it appears in the persistent profile.
+- Check every candidate against all four categories, including negative
+  requirements and quantities. Do not silently omit a requirement because the
+  listing data does not mention it.
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
@@ -1219,13 +1255,19 @@ For each recommended property:
   uses the persistent profile. A statement such as 'I'm also open to DC Residensi'
   does not create a hard scope unless that same current request explicitly asks to see
   or receive recommendations there.
-- Do not recommend a property that explicitly contradicts a hard requirement such
-  as maximum budget or minimum bedrooms. If a different hard requirement cannot be
-  verified from the supplied data, identify the exact unresolved requirement
-  prominently for that property rather than presenting it as confirmed. In
-  particular, pet allowance must cover the customer's stated kind and number of
-  pets; a generic claim that a property is pet-friendly is insufficient unless the
-  supplied data supports it.
+- Do not recommend a property that explicitly contradicts a genuine hard
+  requirement. Explicit immediate search scope is always hard for that turn.
+  Explicit absolute constraints such as an absolute budget ceiling, mandatory
+  minimum bedrooms, rejected property type, or prohibited view are also hard.
+- Rank holistically within those boundaries. A compelling property may reasonably
+  miss a strong or soft preference—for example an approximate budget, preferred
+  area, desired furnishing level, ideal bedroom count, or preferred condition—when
+  another benefit makes the trade-off worthwhile. Explain the compromise clearly.
+  Do not use arbitrary stretch percentages and do not recommend random near-misses
+  merely to fill the list.
+- If a requirement is unknown or unverified, identify it prominently instead of
+  treating it as satisfied. In particular, pet allowance must cover the renter's
+  stated kind and number of pets; a generic pet-friendly claim is insufficient.
 
 Do not recommend properties simply to fill a list. If only a few properties
 are genuinely suitable, recommend only those properties.
@@ -1449,8 +1491,62 @@ def merge_updated_preference_text(existing_text, generated_text, preference_upda
         return f"{existing_text}\n\nCustomer-stated preference update:\n{preference_update}"
 
     if preference_update and preference_update.lower() not in generated_text.lower():
-        return f"{generated_text}\n\nCustomer-stated preference update:\n{preference_update}".strip()
-    return generated_text
+        generated_text = (
+            f"{generated_text}\n\nCustomer-stated preference update:\n"
+            f"{preference_update}"
+        ).strip()
+    return preserve_unrelated_profile_lines(
+        existing_text, generated_text, preference_update
+    )
+
+
+def _preference_categories(text):
+    patterns = {
+        "budget": r"\b(?:budget|rent|price|rm\s?\d)",
+        "location": r"\b(?:area|location|condo|development|neighbou?rhood)\b",
+        "bedrooms": r"\b(?:bedroom|\d+\s*bed)\b",
+        "furnishing": r"\b(?:furnish|unfurnish|white goods)\b",
+        "household": r"\b(?:household|family|adult|child|children|people|person)\b",
+        "pets": r"\b(?:pet|cat|dog)\b",
+        "school": r"\b(?:school|education)\b",
+        "commute": r"\b(?:commute|workplace|office|transport|mrt|lrt)\b",
+        "timing": r"\b(?:move[- ]?in|timing|date)\b",
+        "property_type": r"\b(?:property type|condominium|landed|apartment)\b",
+        "facilities": r"\b(?:facilit|pool|gym|balcony|view|car park|parking)\b",
+    }
+    lowered = text or ""
+    return {
+        category for category, pattern in patterns.items()
+        if re.search(pattern, lowered, re.I)
+    }
+
+
+def preserve_unrelated_profile_lines(existing_text, updated_text, preference_update):
+    """Fail closed against a rewrite silently dropping unrelated durable facts."""
+    affected = _preference_categories(preference_update)
+    updated = (updated_text or "").strip()
+    updated_lower = updated.lower()
+    preserved = []
+    for line in (existing_text or "").splitlines():
+        # Profiles may place several categories on one semicolon-delimited line.
+        # Evaluate those clauses separately so changing the budget, for example,
+        # cannot also discard an unrelated location from the same line.
+        for fragment in re.split(r"\s*;\s*|\s+\|\s+", line):
+            cleaned = fragment.strip()
+            if not cleaned or cleaned.lower() in updated_lower:
+                continue
+            categories = _preference_categories(cleaned)
+            if categories and categories & affected:
+                continue
+            if re.match(r"^home search requirements:?$", cleaned, re.I):
+                continue
+            preserved.append(cleaned)
+    if preserved:
+        updated = (
+            f"{updated}\n\nPreserved existing requirements:\n"
+            + "\n".join(preserved)
+        ).strip()
+    return updated
 
 
 def preference_update_requires_rewrite(preference_update):
@@ -1462,14 +1558,36 @@ def preference_update_requires_rewrite(preference_update):
     ))
 
 
-def append_preference_summary(existing_summary, preference_update):
-    existing_summary = (existing_summary or "").strip()
-    preference_update = (preference_update or "").strip()
-    if not existing_summary:
-        return preference_update
-    if preference_update.lower() in existing_summary.lower():
-        return existing_summary
-    return f"{existing_summary}\n{preference_update}"
+def generate_clean_preference_summary(updated_ai_search_text):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=updated_ai_search_text,
+        instructions=(
+            "Create a concise, clean, current renter preference summary from the "
+            "durable home-search profile. Preserve all current requirements and "
+            "meaningful qualifiers, ranges, quantities, and negatives. Exclude "
+            "recommendation requests, conversational filler, history, secret notes, "
+            "internal IDs, and implementation language. Remove duplication and obsolete "
+            "replaced preferences. Return only the required JSON."
+        ),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "clean_renter_preference_summary",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"ai_search_summary": {"type": "string"}},
+                    "required": ["ai_search_summary"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    )
+    summary = json.loads(response.output_text)["ai_search_summary"].strip()
+    if not summary:
+        raise ValueError("The generated AIsearchsummary was empty.")
+    return summary
 
 
 def update_preferences(folio_id, preference_update, bubble_env):
@@ -1493,10 +1611,11 @@ def update_preferences(folio_id, preference_update, bubble_env):
             "Home search requirements:",
             preference_update
         )
-        ai_search_summary = append_preference_summary(
-            lead.get("AIsearchsummary", ""),
-            preference_update
+        summary_started = time.perf_counter()
+        ai_search_summary = generate_clean_preference_summary(
+            updated_ai_search_text
         )
+        log_timing("Preference summary cleanup OpenAI call", summary_started)
         update_lead_ai_searchtext(
             lead_id,
             updated_ai_search_text,
@@ -1587,10 +1706,18 @@ REQUESTED PREFERENCE UPDATE:
         result["updated_ai_search_text"],
         preference_update
     )
-    ai_search_summary = result["ai_search_summary"]
 
     if not updated_ai_search_text.strip():
         raise ValueError("The updated home-search profile was empty.")
+
+    # Generate the concise summary from the guarded final profile. The rewrite
+    # response may have omitted an unrelated requirement that the preservation
+    # guard restored, so its draft summary is not authoritative.
+    summary_started = time.perf_counter()
+    ai_search_summary = generate_clean_preference_summary(
+        updated_ai_search_text
+    )
+    log_timing("Preference summary cleanup OpenAI call", summary_started)
 
     lead_update_started = time.perf_counter()
     update_lead_ai_searchtext(
@@ -1658,6 +1785,9 @@ def chat_stream():
                 first_delta_sent = False
                 initial_first_event_logged = False
                 initial_first_delta_logged = False
+                renter_summary = load_front_door_renter_summary(
+                    folio_id, bubble_env
+                )
 
                 def stream_initial_response(response_args, timing_label):
                     nonlocal initial_first_event_logged
@@ -1707,7 +1837,7 @@ def chat_stream():
                 # the user's existing conversation history.
                 try:
                     response = yield from stream_initial_response(
-                        build_response_args(message, previous),
+                        build_response_args(message, previous, renter_summary),
                         "Initial OpenAI/tool selection"
                     )
                 except Exception as error:
@@ -1719,7 +1849,7 @@ def chat_stream():
                         flush=True
                     )
                     response = yield from stream_initial_response(
-                        build_response_args(message, None),
+                        build_response_args(message, None, renter_summary),
                         "Initial OpenAI/tool selection retry"
                     )
                 if any(
@@ -1782,10 +1912,15 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
                     )
-                    # The tool argument is model-produced and can accidentally compress
-                    # away a qualifier or negative constraint. The original customer text
-                    # is authoritative on both preference-only and combined search turns.
-                    preference_text = message
+                    # Persist only the lasting requirement extracted by the router. The
+                    # raw message still carries current intent and temporary search scope.
+                    preference_text = str(
+                        tool_args.get("preference_update") or ""
+                    ).strip()
+                    if not preference_text:
+                        raise ValueError(
+                            "Preference update tool call contained no lasting preference."
+                        )
                     preference_confirmation = update_preferences(
                         folio_id,
                         preference_text,
