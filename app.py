@@ -222,6 +222,75 @@ def health():
     return jsonify({"status": "ok", "commit": deployed_commit}), 200
 
 
+def _redact_whatsapp_log_payload(value):
+    """Return a log-safe copy without token or credential-like values."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if any(
+                marker in normalized_key
+                for marker in ("token", "authorization", "secret", "api_key")
+            ):
+                safe[key] = "[REDACTED]"
+            else:
+                safe[key] = _redact_whatsapp_log_payload(item)
+        return safe
+    if isinstance(value, list):
+        return [_redact_whatsapp_log_payload(item) for item in value]
+    return value
+
+
+@app.route("/whatsapp/webhook", methods=["GET", "POST"])
+def whatsapp_webhook():
+    if request.method == "GET":
+        expected_token = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+        if not expected_token:
+            print(
+                "WhatsApp webhook verification is not configured: "
+                "WHATSAPP_VERIFY_TOKEN is missing.",
+                flush=True,
+            )
+            return "Forbidden", 403
+
+        mode = request.args.get("hub.mode", "")
+        supplied_token = request.args.get("hub.verify_token", "")
+        if (
+            mode == "subscribe"
+            and hmac.compare_digest(supplied_token, expected_token)
+        ):
+            print("WhatsApp webhook verification succeeded.", flush=True)
+            return Response(
+                request.args.get("hub.challenge", ""),
+                status=200,
+                mimetype="text/plain",
+            )
+
+        print("WhatsApp webhook verification rejected.", flush=True)
+        return "Forbidden", 403
+
+    payload = request.get_json(silent=True)
+    print("WhatsApp webhook received.", flush=True)
+    if payload is None:
+        print("WhatsApp webhook payload was not valid JSON.", flush=True)
+    else:
+        safe_payload = _redact_whatsapp_log_payload(payload)
+        print(
+            "WhatsApp webhook payload:\n"
+            + json.dumps(
+                safe_payload,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ),
+            flush=True,
+        )
+
+    # Acknowledge delivery immediately. Processing will be added separately.
+    return jsonify({"status": "received"}), 200
+
+
 @app.route("/test_condo", methods=["GET"])
 def test_condo():
     condo_name = request.args.get("name", "")
