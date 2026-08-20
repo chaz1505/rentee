@@ -39,6 +39,12 @@ CONDO_SHEET_CSV_URL = (
 )
 CONDO_CACHE_TTL_SECONDS = 300
 CONDO_SHEET_TIMEOUT_SECONDS = 15
+WHATSAPP_ACKNOWLEDGEMENT_TEXT = "Thanks — Rentee received your message."
+WHATSAPP_GRAPH_API_VERSION = os.environ.get(
+    "WHATSAPP_GRAPH_API_VERSION", "v23.0"
+).strip() or "v23.0"
+WHATSAPP_SEND_TIMEOUT_SECONDS = 15
+WHATSAPP_MESSAGE_DEDUP_TTL_SECONDS = 24 * 60 * 60
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
@@ -48,6 +54,8 @@ _benchmark_state_lock = threading.Lock()
 _benchmark_state = {"status": "idle"}
 _codex_task_metadata_lock = threading.Lock()
 _codex_task_metadata = {}
+_whatsapp_message_ids_lock = threading.Lock()
+_whatsapp_message_ids = {}
 
 
 class CondoDataError(RuntimeError):
@@ -241,6 +249,147 @@ def _redact_whatsapp_log_payload(value):
     return value
 
 
+def _extract_inbound_whatsapp_text_messages(payload):
+    """Extract well-formed inbound text messages from an arbitrary Meta payload."""
+    extracted = []
+    if not isinstance(payload, dict):
+        return extracted
+    for entry in payload.get("entry", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes", []) or []:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+            for message in value.get("messages", []) or []:
+                if not isinstance(message, dict):
+                    continue
+                message_id = str(message.get("id") or "").strip()
+                sender = str(message.get("from") or "").strip()
+                message_type = str(message.get("type") or "").strip()
+                text_details = message.get("text")
+                text_body = (
+                    str(text_details.get("body") or "").strip()
+                    if isinstance(text_details, dict)
+                    else ""
+                )
+                if message_id and sender and message_type == "text" and text_body:
+                    extracted.append({
+                        "id": message_id,
+                        "sender": sender,
+                        "type": message_type,
+                        "text": text_body,
+                    })
+    return extracted
+
+
+def _claim_whatsapp_message_id(message_id):
+    """Atomically claim an inbound ID; replace this boundary for persistent dedup."""
+    now = time.monotonic()
+    oldest_allowed = now - WHATSAPP_MESSAGE_DEDUP_TTL_SECONDS
+    with _whatsapp_message_ids_lock:
+        expired_ids = [
+            stored_id
+            for stored_id, seen_at in _whatsapp_message_ids.items()
+            if seen_at < oldest_allowed
+        ]
+        for stored_id in expired_ids:
+            _whatsapp_message_ids.pop(stored_id, None)
+        if message_id in _whatsapp_message_ids:
+            return False
+        _whatsapp_message_ids[message_id] = now
+        return True
+
+
+def _safe_whatsapp_response_text(value, secrets=()):
+    safe_text = str(value or "")
+    for secret in secrets:
+        if secret:
+            safe_text = safe_text.replace(str(secret), "[REDACTED]")
+    safe_text = re.sub(
+        r"(?i)bearer\s+[a-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        safe_text,
+    )
+    return safe_text[:1000] + ("…[truncated]" if len(safe_text) > 1000 else "")
+
+
+def _send_whatsapp_acknowledgement(recipient, message_id):
+    access_token = os.environ.get("WHATSAPP_ACCESS_TOKEN", "").strip()
+    phone_number_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("WHATSAPP_ACCESS_TOKEN", access_token),
+            ("WHATSAPP_PHONE_NUMBER_ID", phone_number_id),
+        )
+        if not value
+    ]
+    if missing:
+        print(
+            "WhatsApp acknowledgement not sent; missing configuration: "
+            + ", ".join(missing),
+            flush=True,
+        )
+        return False
+
+    if not _claim_whatsapp_message_id(message_id):
+        print(
+            f"Skipping duplicate WhatsApp message: {message_id}",
+            flush=True,
+        )
+        return False
+
+    endpoint = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+        f"{phone_number_id}/messages"
+    )
+    try:
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": recipient,
+                "type": "text",
+                "text": {
+                    "preview_url": False,
+                    "body": WHATSAPP_ACKNOWLEDGEMENT_TEXT,
+                },
+            },
+            timeout=WHATSAPP_SEND_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as error:
+        print(
+            "WhatsApp acknowledgement failed: "
+            + _safe_whatsapp_response_text(error, (access_token,)),
+            flush=True,
+        )
+        return False
+
+    if not response.ok:
+        print(
+            f"WhatsApp acknowledgement failed: HTTP {response.status_code}; "
+            "response="
+            + _safe_whatsapp_response_text(response.text, (access_token,)),
+            flush=True,
+        )
+        return False
+
+    print(
+        f"WhatsApp acknowledgement sent for message {message_id}: "
+        f"HTTP {response.status_code}",
+        flush=True,
+    )
+    return True
+
+
 @app.route("/whatsapp/webhook", methods=["GET", "POST"])
 def whatsapp_webhook():
     if request.method == "GET":
@@ -287,7 +436,28 @@ def whatsapp_webhook():
             flush=True,
         )
 
-    # Acknowledge delivery immediately. Processing will be added separately.
+        try:
+            for inbound_message in _extract_inbound_whatsapp_text_messages(payload):
+                print(
+                    "Inbound WhatsApp text message: "
+                    f"id={inbound_message['id']} "
+                    f"sender={inbound_message['sender']} "
+                    f"type={inbound_message['type']} "
+                    f"text={inbound_message['text']!r}",
+                    flush=True,
+                )
+                _send_whatsapp_acknowledgement(
+                    inbound_message["sender"], inbound_message["id"]
+                )
+        except Exception as error:
+            # Meta delivery must still be acknowledged if optional processing fails.
+            print(
+                "WhatsApp webhook processing failed safely: "
+                f"{type(error).__name__}",
+                flush=True,
+            )
+
+    # Always acknowledge delivery so outbound failures do not cause Meta retries.
     return jsonify({"status": "received"}), 200
 
 
