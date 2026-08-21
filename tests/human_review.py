@@ -38,15 +38,6 @@ class BenchmarkReviewValidationError(BenchmarkReviewError):
     status_code = 400
 
 
-class CodexAlreadyActive(BenchmarkReviewError):
-    status_code = 409
-
-    def __init__(self, status, task_id=None):
-        super().__init__("A Codex fix is already active for this BenchmarkRun.")
-        self.codex_status = status
-        self.codex_task_id = task_id
-
-
 def _headers():
     return {
         "Authorization": f"Bearer {os.environ['BUBBLE_API_TOKEN']}",
@@ -153,11 +144,6 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
     if not isinstance(record, dict) or not record:
         raise BenchmarkRunNotFound("BenchmarkRun not found.")
 
-    if record.get("codexStatus") in ("working", "submitted"):
-        raise CodexAlreadyActive(
-            record.get("codexStatus"), record.get("codexTaskID")
-        )
-
     review = {field: record.get(field) for field in HUMAN_REVIEW_FIELDS}
 
     if record.get("environment") != environment:
@@ -195,42 +181,4 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
         "run_id": record.get("runID"),
         "environment": environment,
         "fix_prompt_updated": True,
-        "updated_fix_prompt": updated_prompt,
-    }
-
-
-def patch_codex_state(benchmark_run_id, environment, payload):
-    allowed = {"codexSubmitted", "codexSubmittedAt", "codexStatus", "codexTaskID"}
-    if not payload or not set(payload).issubset(allowed):
-        raise ValueError("Invalid Codex state payload.")
-    url = f"{get_bubble_base(environment)}/obj/benchmarkRun/{benchmark_run_id}"
-    response = requests.patch(
-        url, headers=_headers(), json=payload, timeout=REQUEST_TIMEOUT
-    )
-    if response.status_code == 404:
-        raise BenchmarkRunNotFound("BenchmarkRun not found.")
-    if not response.ok:
-        raise _safe_bubble_error("Codex state update", response)
-
-
-def get_benchmark_run_codex_status(benchmark_run_id, environment):
-    url = f"{get_bubble_base(environment)}/obj/benchmarkRun/{benchmark_run_id}"
-    response = requests.get(url, headers=_headers(), timeout=REQUEST_TIMEOUT)
-    if response.status_code == 404:
-        raise BenchmarkRunNotFound("BenchmarkRun not found.")
-    if not response.ok:
-        raise _safe_bubble_error("read", response)
-    body = _response_body(response)
-    record = body.get("response") if isinstance(body, dict) and "response" in body else body
-    if not isinstance(record, dict) or not record:
-        raise BenchmarkRunNotFound("BenchmarkRun not found.")
-    if record.get("environment") != environment:
-        raise BenchmarkReviewValidationError(
-            "BenchmarkRun environment does not match the requested environment."
-        )
-    return {
-        "benchmark_run_id": benchmark_run_id,
-        "codex_status": record.get("codexStatus"),
-        "codex_submitted": record.get("codexSubmitted") is True,
-        "codex_task_id": record.get("codexTaskID"),
     }
