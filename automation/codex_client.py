@@ -13,7 +13,6 @@ CODEX_REPOSITORY = "chaz1505/rentee"
 CODEX_REPOSITORY_URL = "https://github.com/chaz1505/rentee.git"
 CODEX_BASE_BRANCH = "main"
 WORKSPACE_ROOT = Path("/tmp/rentee-codex")
-AUTH_ROOT = Path("/tmp/rentee-codex-auth")
 WORKSPACE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 900
 GIT_TIMEOUT_SECONDS = 120
@@ -152,103 +151,6 @@ def _require_success(result, action, sensitive_values=()):
     raise CodexSubmissionError(f"{action} failed: {detail}")
 
 
-def _codex_environment(auth_home):
-    environment = os.environ.copy()
-    environment["CODEX_HOME"] = str(auth_home)
-    return environment
-
-
-def _prepare_api_key_authentication(codex_path, task_id):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise CodexSubmissionError("OPENAI_API_KEY is not configured.")
-
-    auth_home = AUTH_ROOT / task_id
-    AUTH_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    AUTH_ROOT.chmod(0o700)
-    auth_home.mkdir(mode=0o700)
-    auth_home.chmod(0o700)
-    codex_env = _codex_environment(auth_home)
-
-    version = _run([codex_path, "--version"], env=codex_env)
-    _require_success(version, "Codex CLI version inspection", (api_key,))
-    safe_version = _sanitize_cli_output(version.stdout or version.stderr, (api_key,))
-    print(f"[CODEX] Codex CLI version: {safe_version}", flush=True)
-    print("[CODEX] OPENAI_API_KEY present: yes", flush=True)
-    print(f"[CODEX] OPENAI_API_KEY length: {len(api_key)}", flush=True)
-
-    login_help = _run([codex_path, "login", "--help"], env=codex_env)
-    _require_success(login_help, "Codex login interface inspection", (api_key,))
-    if "--with-api-key" not in (login_help.stdout or ""):
-        raise CodexSubmissionError(
-            "Installed Codex CLI does not support non-interactive API-key login."
-        )
-
-    print("[CODEX] Preparing API-key authentication...", flush=True)
-    login = _run(
-        [codex_path, "login", "--with-api-key"],
-        input_text=api_key,
-        env=codex_env,
-    )
-    _require_success(login, "Codex API-key login", (api_key,))
-
-    status = _run([codex_path, "login", "status"], env=codex_env)
-    _require_success(status, "Codex login status", (api_key,))
-    safe_status = _sanitize_cli_output(
-        status.stdout or status.stderr, (api_key,)
-    )
-    print(f"[CODEX] Codex login status: {safe_status}", flush=True)
-    normalized_status = safe_status.casefold()
-    if "chatgpt" in normalized_status or "api key" not in normalized_status:
-        raise CodexSubmissionError(
-            "Codex CLI did not confirm API-key authentication."
-        )
-    print("[CODEX] API-key authentication ready.", flush=True)
-    return codex_env, auth_home
-
-
-def _codex_failure_message(stdout, stderr):
-    combined = f"{stderr or ''}\n{stdout or ''}".casefold()
-    if re.search(r"(?:http(?: error)?[: ]+|status(?: code)?[: ]+)401\b|401 unauthorized", combined):
-        return "Codex API-key authentication was rejected by OpenAI."
-    if re.search(r"(?:http(?: error)?[: ]+|status(?: code)?[: ]+)403\b|403 forbidden", combined):
-        return "Codex API access was forbidden by OpenAI (HTTP 403)."
-    if (
-        re.search(r"(?:http(?: error)?[: ]+|status(?: code)?[: ]+)404\b", combined)
-        or "model_not_found" in combined
-        or "model not found" in combined
-    ):
-        return "The configured Codex model is unavailable or was not found."
-    if any(term in combined for term in (
-        "insufficient_quota", "quota exceeded", "billing", "rate limit"
-    )):
-        return "Codex API quota, billing, or rate-limit access was rejected."
-    return None
-
-
-def check_codex_authentication(codex_path, codex_env, timeout=60):
-    """Run an optional read-only API smoke test without touching the repository."""
-    prompt = "Reply with exactly: CODEX_AUTH_OK"
-    result = _run(
-        [
-            codex_path, "exec", "--ignore-user-config", "--ephemeral",
-            "--sandbox", "read-only", "--skip-git-repo-check", "-",
-        ],
-        cwd=codex_env["CODEX_HOME"],
-        timeout=timeout,
-        input_text=prompt,
-        env=codex_env,
-    )
-    if result.returncode != 0:
-        safe_stdout = _sanitize_cli_output(result.stdout, (prompt,))
-        safe_stderr = _sanitize_cli_output(result.stderr, (prompt,))
-        classified = _codex_failure_message(safe_stdout, safe_stderr)
-        raise CodexSubmissionError(
-            classified or "Codex authentication smoke test failed."
-        )
-    return {"authenticated": True, "mode": "api_key"}
-
-
 def cleanup_old_workspaces(active_task_id=None, now=None):
     if not WORKSPACE_ROOT.exists():
         return []
@@ -326,30 +228,15 @@ def submit_codex_fix(
     _require_success(checkout, "Task branch creation")
     print(f"[CODEX] Created branch: {branch}", flush=True)
 
-    codex_env = None
-    auth_home = None
-    try:
-        codex_env, auth_home = _prepare_api_key_authentication(
-            codex_path, task_id
-        )
-        if os.environ.get("CODEX_AUTH_SMOKE_TEST") == "1":
-            print("[CODEX] Running API authentication smoke test...", flush=True)
-            check_codex_authentication(codex_path, codex_env)
-            print("[CODEX] API authentication smoke test succeeded.", flush=True)
-        print("[CODEX] Starting local codex exec...", flush=True)
-        execution = _run(
-            [
-                codex_path, "exec", "--ignore-user-config", "--ephemeral",
-                "--sandbox", "workspace-write", "-",
-            ],
-            cwd=workspace,
-            timeout=_execution_timeout(),
-            input_text=complete_prompt,
-            env=codex_env,
-        )
-    finally:
-        if auth_home is not None:
-            shutil.rmtree(auth_home, ignore_errors=True)
+    codex_env = os.environ.copy()
+    print("[CODEX] Starting local codex exec...", flush=True)
+    execution = _run(
+        [codex_path, "exec", "--sandbox", "workspace-write", "-"],
+        cwd=workspace,
+        timeout=_execution_timeout(),
+        input_text=complete_prompt,
+        env=codex_env,
+    )
     if execution.returncode != 0:
         safe_stdout = _sanitize_cli_output(
             execution.stdout, (complete_prompt, prompt)
@@ -362,11 +249,8 @@ def submit_codex_fix(
             print(f"[CODEX] stdout: {safe_stdout}", flush=True)
         if safe_stderr:
             print(f"[CODEX] stderr: {safe_stderr}", flush=True)
-        classified = _codex_failure_message(safe_stdout, safe_stderr)
         detail = safe_stderr or safe_stdout or "no CLI error output"
-        raise CodexSubmissionError(
-            classified or f"Local Codex execution failed: {detail}"
-        )
+        raise CodexSubmissionError(f"Local Codex execution failed: {detail}")
 
     status = _run([git_path, "status", "--porcelain"], cwd=workspace)
     _require_success(status, "Workspace status lookup")
