@@ -8,47 +8,6 @@ from . import run_benchmark
 
 
 class SyntheticBenchmarkTests(unittest.TestCase):
-    def test_default_suite_contains_only_synthetic_cases(self):
-        self.assertEqual(run_benchmark.get_benchmark_case_ids(), [
-            "synthetic_expat_family_01",
-            "synthetic_refinement_01",
-            "synthetic_specific_search_01",
-        ])
-        selected = run_benchmark._select_cases()
-        self.assertTrue(selected)
-        self.assertTrue(all(
-            case.get("conversation_mode") == "synthetic" for case in selected
-        ))
-
-    @patch("tests.run_benchmark.validate_benchmark_environment")
-    @patch("tests.run_benchmark.run_case")
-    def test_default_batch_does_not_run_sofia(self, run_case, _validate):
-        run_case.side_effect = lambda case, **_kwargs: {
-            "case_id": case["id"], "failure": None
-        }
-        suite = run_benchmark.run_all_benchmarks()
-        run_ids = [call.args[0]["id"] for call in run_case.call_args_list]
-        self.assertNotIn("sofia_01", run_ids)
-        self.assertEqual(run_ids, run_benchmark.get_benchmark_case_ids())
-        self.assertFalse(suite["failed"])
-
-    @patch("tests.run_benchmark.validate_benchmark_environment")
-    @patch("tests.run_benchmark.run_case")
-    def test_sofia_still_exists_and_can_run_explicitly(
-        self, run_case, _validate
-    ):
-        run_case.side_effect = lambda case, **_kwargs: {
-            "case_id": case["id"], "failure": None
-        }
-        suite = run_benchmark.run_all_benchmarks(case_ids=["sofia_01"])
-        selected_case = run_case.call_args.args[0]
-        self.assertEqual(selected_case["id"], "sofia_01")
-        self.assertNotEqual(
-            selected_case.get("conversation_mode"), "synthetic"
-        )
-        self.assertEqual(len(selected_case["turns"]), 5)
-        self.assertEqual(suite["results"][0]["case_id"], "sofia_01")
-
     def test_existing_scripted_case_is_unchanged(self):
         sofia = next(
             case for case in run_benchmark._load_cases()
@@ -57,10 +16,6 @@ class SyntheticBenchmarkTests(unittest.TestCase):
         self.assertNotEqual(sofia.get("conversation_mode"), "synthetic")
         self.assertEqual(len(sofia["turns"]), 5)
         self.assertIn("two cats", sofia["turns"][1]["message"].lower())
-        self.assertIn(
-            "sofia_01",
-            run_benchmark.get_benchmark_case_ids(include_scripted=True),
-        )
 
     def test_three_synthetic_cases_are_available(self):
         cases = {

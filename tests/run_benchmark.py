@@ -12,7 +12,6 @@ try:
     from .evaluate_run import evaluate_run
     from .generate_fix_prompt import generate_fix_prompt
     from .generate_evaluation_markdown import generate_evaluation_markdown
-    from .generate_conversation_markdown import generate_conversation_markdown
     from .save_benchmark_run import (
         get_previous_benchmark_run,
         save_benchmark_run,
@@ -27,7 +26,6 @@ except ImportError:
     from evaluate_run import evaluate_run
     from generate_fix_prompt import generate_fix_prompt
     from generate_evaluation_markdown import generate_evaluation_markdown
-    from generate_conversation_markdown import generate_conversation_markdown
     from save_benchmark_run import (
         get_previous_benchmark_run,
         save_benchmark_run,
@@ -430,17 +428,6 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
             result["failure"]["final_state_error"] = str(error)
     result["completed_at_utc"] = _utc_now()
     output_path = _save_result(case["id"], result, environment)
-    conversation_path = None
-    conversation_artifact_error = None
-    try:
-        conversation_path = generate_conversation_markdown(
-            result, case, os.path.dirname(os.path.abspath(output_path))
-        )
-    except Exception as error:
-        conversation_artifact_error = str(error)
-        benchmark_log(
-            f"Conversation artifact generation failed: {error}"
-        )
     previous_benchmark_run = None
     try:
         previous_benchmark_run = get_previous_benchmark_run(
@@ -509,8 +496,6 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
         benchmark_log("No previous run available.")
     benchmark_log("")
     benchmark_log(f"Raw result: {output_path}")
-    if conversation_path:
-        benchmark_log(f"Conversation: {conversation_path}")
     benchmark_log(f"Evaluation JSON: {evaluation_path}")
     benchmark_log(f"Human evaluation: {evaluation_markdown_path}")
     benchmark_log(f"Codex fix prompt: {prompt_path}")
@@ -529,8 +514,6 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
         "run_id": run_id,
         "benchmark_status": evaluation["overall_status"],
         "result_path": output_path,
-        "conversation_path": conversation_path,
-        "conversation_artifact_error": conversation_artifact_error,
         "evaluation_path": evaluation_path,
         "evaluation_markdown_path": evaluation_markdown_path,
         "fix_prompt_path": prompt_path,
@@ -541,29 +524,8 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
     return result
 
 
-def _default_cases():
-    return [
-        case for case in _load_cases()
-        if case.get("conversation_mode") == "synthetic"
-    ]
-
-
-def get_benchmark_case_ids(include_scripted=False):
-    cases = _load_cases() if include_scripted else _default_cases()
-    return [case["id"] for case in cases]
-
-
-def _select_cases(case_ids=None):
-    if case_ids is None:
-        return _default_cases()
-    requested = list(case_ids)
-    cases_by_id = {case["id"]: case for case in _load_cases()}
-    missing = [case_id for case_id in requested if case_id not in cases_by_id]
-    if missing:
-        raise BenchmarkError(
-            "Unknown benchmark case ID(s): " + ", ".join(missing)
-        )
-    return [cases_by_id[case_id] for case_id in requested]
+def get_benchmark_case_ids():
+    return [case["id"] for case in _load_cases()]
 
 
 def _record_infrastructure_error(case, run_id, environment, error):
@@ -582,17 +544,6 @@ def _record_infrastructure_error(case, run_id, environment, error):
         "infrastructure_error": str(error),
     }
     output_path = _save_result(case["id"], result, environment)
-    conversation_path = None
-    conversation_artifact_error = None
-    try:
-        conversation_path = generate_conversation_markdown(
-            result, case, os.path.dirname(os.path.abspath(output_path))
-        )
-    except Exception as artifact_error:
-        conversation_artifact_error = str(artifact_error)
-        benchmark_log(
-            f"Conversation artifact generation failed: {artifact_error}"
-        )
     evaluation_path, evaluation = evaluate_run(
         output_path, previous_benchmark_run=None
     )
@@ -619,8 +570,6 @@ def _record_infrastructure_error(case, run_id, environment, error):
         "run_id": run_id,
         "benchmark_status": "error",
         "result_path": output_path,
-        "conversation_path": conversation_path,
-        "conversation_artifact_error": conversation_artifact_error,
         "evaluation_path": evaluation_path,
         "evaluation_markdown_path": evaluation_markdown_path,
         "fix_prompt_path": prompt_path,
@@ -645,12 +594,11 @@ def validate_benchmark_environment(environment):
 
 
 def run_all_benchmarks(
-    run_id=None, progress_callback=None, environment="development",
-    case_ids=None,
+    run_id=None, progress_callback=None, environment="development"
 ):
     validate_benchmark_environment(environment)
     results = []
-    for case in _select_cases(case_ids):
+    for case in _load_cases():
         case_run_id = run_id or (
             f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_"
             f"{case['id']}_{environment}"
@@ -678,14 +626,7 @@ def main():
     failed = False
     try:
         environment = os.environ.get("BENCHMARK_ENVIRONMENT", "development")
-        selected_case_id = os.environ.get("BENCHMARK_CASE_ID", "").strip()
-        if selected_case_id:
-            suite = run_all_benchmarks(
-                environment=environment,
-                case_ids=[selected_case_id],
-            )
-        else:
-            suite = run_all_benchmarks(environment=environment)
+        suite = run_all_benchmarks(environment=environment)
         failed = suite["failed"]
     except Exception as error:
         print(f"BENCHMARK FAILED: {error}", file=sys.stderr, flush=True)
