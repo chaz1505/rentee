@@ -47,22 +47,16 @@ The Markdown file is a ready-to-paste Codex task containing evidence, prioritise
 
 After Codex makes a fix, rerun `python tests/run_benchmark.py`. The next evaluation automatically compares the new run with the preceding one. v1 contains only the Sofia case.
 
-## GitHub artifact publishing
+## Optional Git persistence
 
-When `GITHUB_RESULTS_TOKEN` is configured, each run automatically publishes its three generated artifacts to `chaz1505/rentee` on `main`, under `tests/results/`. Publishing uses the GitHub Contents API and does not depend on Render having a usable Git checkout or push remote.
+By default, `python tests/run_benchmark.py` only generates the three artifacts locally and runs no Git commands.
 
-Run normally:
-
-```bash
-python tests/run_benchmark.py
-```
-
-If the token is absent, the benchmark still completes and the artifacts remain local on Render. To explicitly disable publishing even when the token exists:
+To stage, commit, and push the raw result, evaluation, and fix prompt automatically:
 
 ```bash
-BENCHMARK_SKIP_GITHUB=true python tests/run_benchmark.py
+BENCHMARK_COMMIT_RESULTS=true python tests/run_benchmark.py
 ```
 
-The token is used only in the GitHub API authorization header. It requires Contents write access to `chaz1505/rentee`. Before publishing, the helper scans all three artifacts for configured GitHub, Bubble, and OpenAI secret values and refuses the entire run if one is found. `tests/.autotest_state.json` is never eligible for publication.
+Only those three generated files are staged and committed. `tests/.autotest_state.json` remains ignored because it contains environment-specific Bubble test IDs. The helper stays on the current branch, never force-pushes, and uses the branch's configured upstream.
 
-Publishing failures never change the benchmark result. Partial artifacts from failed Rentee conversations are evaluated, turned into a fix prompt, and published through the same flow when credentials are available.
+The Render runtime must have Git credentials with permission to push to the repository. Render may be able to clone for deployment without providing push credentials. If commit or push authentication fails, the benchmark still completes and all artifacts remain on the Render filesystem; the console reports the useful Git error.
