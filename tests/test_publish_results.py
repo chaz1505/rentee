@@ -24,14 +24,13 @@ class PublishResultsTests(unittest.TestCase):
         paths = [
             os.path.join(result_dir, "sofia_01_20260815_095746.json"),
             os.path.join(result_dir, "sofia_01_20260815_095746_evaluation.json"),
-            os.path.join(result_dir, "sofia_01_20260815_095746_evaluation.md"),
             os.path.join(result_dir, "sofia_01_20260815_095746_fix_prompt.md")
         ]
         raw = {
             "case_id": "sofia_01",
             "started_at_utc": "2026-08-15T09:57:46Z"
         }
-        values = contents or [json.dumps(raw), "evaluation", "human evaluation", "fix prompt"]
+        values = contents or [json.dumps(raw), "evaluation", "fix prompt"]
         for path, value in zip(paths, values):
             with open(path, "w", encoding="utf-8") as output:
                 output.write(value)
@@ -60,7 +59,7 @@ class PublishResultsTests(unittest.TestCase):
 
     @patch("tests.publish_results.requests.put")
     @patch("tests.publish_results.requests.get")
-    def test_publishes_exact_four_paths_content_repo_branch_and_auth(
+    def test_publishes_exact_three_paths_content_repo_branch_and_auth(
         self, mocked_get, mocked_put
     ):
         with tempfile.TemporaryDirectory() as root:
@@ -75,12 +74,11 @@ class PublishResultsTests(unittest.TestCase):
                 result = publish_results.publish_benchmark_results(paths)
 
         self.assertEqual(result["status"], "published")
-        self.assertEqual(len(mocked_get.call_args_list), 4)
-        self.assertEqual(len(mocked_put.call_args_list), 4)
+        self.assertEqual(len(mocked_get.call_args_list), 3)
+        self.assertEqual(len(mocked_put.call_args_list), 3)
         expected_paths = [
             "tests/results/sofia_01_20260815_095746.json",
             "tests/results/sofia_01_20260815_095746_evaluation.json",
-            "tests/results/sofia_01_20260815_095746_evaluation.md",
             "tests/results/sofia_01_20260815_095746_fix_prompt.md"
         ]
         for index, call in enumerate(mocked_put.call_args_list):
@@ -142,9 +140,7 @@ class PublishResultsTests(unittest.TestCase):
     @patch("tests.publish_results.requests.get")
     def test_secret_in_any_artifact_blocks_entire_run(self, mocked_get, mocked_put):
         with tempfile.TemporaryDirectory() as root:
-            paths = self._artifacts(
-                root, ["raw", "contains bubble-secret", "human", "prompt"]
-            )
+            paths = self._artifacts(root, ["raw", "contains bubble-secret", "prompt"])
             with patch.dict(os.environ, {
                 "GITHUB_RESULTS_TOKEN": "github-secret",
                 "BUBBLE_API_TOKEN": "bubble-secret",

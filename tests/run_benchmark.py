@@ -10,7 +10,6 @@ try:
     from .bubble_test_data import get_bubble_dev_base
     from .evaluate_run import evaluate_run
     from .generate_fix_prompt import generate_fix_prompt
-    from .generate_evaluation_markdown import generate_evaluation_markdown
     from .publish_results import publish_benchmark_results
     from .test_subject import (
         ensure_test_subject,
@@ -21,7 +20,6 @@ except ImportError:
     from bubble_test_data import get_bubble_dev_base
     from evaluate_run import evaluate_run
     from generate_fix_prompt import generate_fix_prompt
-    from generate_evaluation_markdown import generate_evaluation_markdown
     from publish_results import publish_benchmark_results
     from test_subject import ensure_test_subject, reset_test_subject, snapshot_test_subject
 
@@ -269,12 +267,9 @@ def run_case(case, run_id=None, progress_callback=None):
     result["completed_at_utc"] = _utc_now()
     output_path = _save_result(case["id"], result)
     evaluation_path, evaluation = evaluate_run(output_path)
-    evaluation_markdown_path = generate_evaluation_markdown(
-        output_path, evaluation_path
-    )
     prompt_path = generate_fix_prompt(output_path, evaluation_path)
     publishing_result = publish_benchmark_results([
-        output_path, evaluation_path, evaluation_markdown_path, prompt_path
+        output_path, evaluation_path, prompt_path
     ])
 
     benchmark_log("")
@@ -312,8 +307,7 @@ def run_case(case, run_id=None, progress_callback=None):
         benchmark_log("No previous run available.")
     benchmark_log("")
     benchmark_log(f"Raw result: {output_path}")
-    benchmark_log(f"Evaluation JSON: {evaluation_path}")
-    benchmark_log(f"Human evaluation: {evaluation_markdown_path}")
+    benchmark_log(f"Evaluation: {evaluation_path}")
     benchmark_log(f"Codex fix prompt: {prompt_path}")
     benchmark_log(
         "GitHub publishing: SUCCESS"
@@ -331,7 +325,6 @@ def run_case(case, run_id=None, progress_callback=None):
         "benchmark_status": evaluation["overall_status"],
         "result_path": output_path,
         "evaluation_path": evaluation_path,
-        "evaluation_markdown_path": evaluation_markdown_path,
         "fix_prompt_path": prompt_path,
         "github_published": publishing_result.get("status") == "published",
         "github_publishing": publishing_result

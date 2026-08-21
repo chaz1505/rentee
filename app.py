@@ -260,7 +260,6 @@ def _run_benchmark_background(run_id):
             "benchmark_status": execution.get("benchmark_status", "fail"),
             "result_path": execution.get("result_path"),
             "evaluation_path": execution.get("evaluation_path"),
-            "evaluation_markdown_path": execution.get("evaluation_markdown_path"),
             "fix_prompt_path": execution.get("fix_prompt_path"),
             "github_published": execution.get("github_published", False)
         })

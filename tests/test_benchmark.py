@@ -127,7 +127,6 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
             self.assertIn("Regression constraints", prompt)
 
     @patch("tests.run_benchmark.generate_fix_prompt", return_value="fix.md")
-    @patch("tests.run_benchmark.generate_evaluation_markdown", return_value="evaluation.md")
     @patch("tests.run_benchmark.evaluate_run")
     @patch("tests.run_benchmark._save_result", return_value="partial.json")
     @patch("tests.run_benchmark.snapshot_test_subject")
@@ -137,8 +136,7 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
     @patch("tests.run_benchmark.run_turn")
     def test_failed_turn_is_saved_evaluated_and_gets_fix_prompt(
         self, mocked_turn, _mocked_base, mocked_subject, _mocked_reset,
-        mocked_snapshot, mocked_save, mocked_evaluate, mocked_markdown,
-        mocked_prompt
+        mocked_snapshot, mocked_save, mocked_evaluate, mocked_prompt
     ):
         partial = {
             "text": "", "response_id": None,
@@ -167,7 +165,6 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
         self.assertEqual(result["turns"][0]["errors"], partial["errors"])
         mocked_save.assert_called_once()
         mocked_evaluate.assert_called_once_with("partial.json")
-        mocked_markdown.assert_called_once_with("partial.json", "evaluation.json")
         mocked_prompt.assert_called_once_with("partial.json", "evaluation.json")
 
 

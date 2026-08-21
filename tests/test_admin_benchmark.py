@@ -80,9 +80,7 @@ class AdminBenchmarkTests(unittest.TestCase):
         run_id = "run-success"
         mocked_run.return_value = {"results": [{"execution": {
             "benchmark_status": "pass", "result_path": "raw.json",
-            "evaluation_path": "evaluation.json",
-            "evaluation_markdown_path": "evaluation.md",
-            "fix_prompt_path": "prompt.md",
+            "evaluation_path": "evaluation.json", "fix_prompt_path": "prompt.md",
             "github_published": True
         }}]}
         app_module._benchmark_run_lock.acquire()
@@ -95,7 +93,6 @@ class AdminBenchmarkTests(unittest.TestCase):
             state = dict(app_module._benchmark_state)
         self.assertEqual(state["status"], "complete")
         self.assertEqual(state["result_path"], "raw.json")
-        self.assertEqual(state["evaluation_markdown_path"], "evaluation.md")
         self.assertTrue(state["github_published"])
 
     @patch("tests.run_benchmark.run_all_benchmarks", side_effect=RuntimeError("boom"))
@@ -132,17 +129,12 @@ class AdminBenchmarkTests(unittest.TestCase):
                 app_module._benchmark_state.update({
                     "status": "complete", "completed_at": "later",
                     "benchmark_status": "fail", "result_path": "raw.json",
-                    "evaluation_path": "evaluation.json",
-                    "evaluation_markdown_path": "evaluation.md",
-                    "fix_prompt_path": "prompt.md",
+                    "evaluation_path": "evaluation.json", "fix_prompt_path": "prompt.md",
                     "github_published": True
                 })
             complete = self.client.get("/admin/benchmark_status", headers=self._headers())
             self.assertEqual(complete.get_json()["status"], "complete")
             self.assertEqual(complete.get_json()["fix_prompt_path"], "prompt.md")
-            self.assertEqual(
-                complete.get_json()["evaluation_markdown_path"], "evaluation.md"
-            )
 
     def test_secret_never_appears_in_endpoint_logs(self):
         secret = "do-not-log-this-key"
