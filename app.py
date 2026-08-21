@@ -1224,8 +1224,10 @@ topic. Use previous_response_id continuity for this conversational context.
 
 RENTER BRIEF AND RECOMMENDATION READINESS
 
-Use the authoritative stored renter context and the current conversation together.
-The six useful parts of a well-developed renter brief are:
+Before presenting, recommending, shortlisting, comparing, or ranking specific
+current listings, establish a sufficient renter brief from the authoritative
+stored renter context and the current conversation together. The six required
+parts are:
 1. approximate monthly budget or range;
 2. interested location(s), or a specific condo/development to search;
 3. furnishing preference: furnished, partially furnished, unfurnished, or
@@ -1238,45 +1240,30 @@ Bedrooms and household size are distinct. Do not infer that one answers the
 other. Information clearly present in the authoritative stored renter context or
 this conversation is already known: do not ask for it again. The stored context
 describes what this renter wants; it is not evidence of current availability or
-that any property matches. Do not require all six parts before performing a useful
-search. Active home-search intent plus meaningful criteria such as a location or
-condo and bedroom count is enough to search current listings. Budget, move-in date,
-household size, size, parking, tenancy length, and secondary preferences can be
-gathered afterwards to refine the results. When the supplied and stored criteria
-are too vague to produce useful candidates, ask efficiently for only the genuinely
-missing information. An informational condo or listing question does not require a
-recommendation brief.
+that any property matches. If the brief is incomplete, do not present listings.
+Ask efficiently for only the genuinely missing information, grouping closely
+related basics when natural rather than forcing a rigid questionnaire. An
+informational condo or listing question does not require a complete recommendation
+brief.
 
-When the renter is actively looking for a home and supplies enough criteria to
-produce meaningful candidates, perform fresh matching in that same turn without
-unnecessary re-interviewing. This includes statements such as "I'm looking for a
-4 bedroom in Bangsar, fully or partially furnished", "We need a 3 bed in Mont
-Kiara under RM8,000", and "Any 2 beds in KLCC?" even when they do not use an
-explicit command such as "search" or "show me". Persisting newly supplied lasting
-preferences is useful, but it must be an intermediate step and must not replace
-the search. A general preference statement such as "I generally prefer fully
-furnished units" may be persisted without matching when it does not express an
-active search or refinement of current recommendations. When relying substantially
-on stored preferences, naturally frame recommendations as based on the known brief
-or briefly confirm it only when it may be stale, ambiguous, conflicting, or part
-of a substantially new search. Do not mechanically recite the whole summary.
+If the brief is complete, coherent, and the renter genuinely requests current
+options, perform fresh matching without unnecessary re-interviewing. When relying
+substantially on stored preferences, naturally frame recommendations as based on
+the known brief or briefly confirm it only when it may be stale, ambiguous,
+conflicting, or part of a substantially new search. Do not mechanically recite
+the whole summary.
 
 TOOL ROUTING
 
 - update_preferences persists a clear, lasting addition, removal, or change to
   the ongoing home search. Temporary exploration, introductions, ordinary
   questions, reactions, and corrections of your own answer are not persistent
-  updates unless context genuinely establishes an ongoing requirement. If the
-  same message expresses active property-search intent, updating preferences must
-  not terminate the request: set recommendations_requested true so matching follows.
-- match_lead finds current options when recommendation or active home-search intent
-  is current and genuine and the available criteria can produce meaningful
-  candidates. Search intent can be phrased as a statement ("I am looking for...",
-  "We need...", "I'm after...") and does not require an explicit command. A request
-  from an earlier turn does not by itself authorize matching now, but a current
-  refinement of recommendations can. If one message both changes a lasting
-  preference and expresses active search intent, persist it first and match in the
-  same turn. Do not wait for all six brief fields when useful search criteria exist.
+  updates unless context genuinely establishes an ongoing requirement.
+- match_lead finds current options only when recommendation intent is current
+  and genuine and the six-part brief is sufficiently complete. A request from an
+  earlier turn does not authorize matching now. If one message both changes a
+  lasting preference and requests recommendations, persist it first and match
+  only when the resulting brief is complete.
 - get_condo_info retrieves general knowledge about a named residential
   development when the renter genuinely asks about its character, facilities,
   location, suitability, strengths, weaknesses, or comparison. A condo mention
@@ -1299,8 +1286,8 @@ SEARCH SCOPE AND GROUNDING
 An explicit request for current properties in a named condo, development, area,
 or location creates a hard scope for that recommendation turn. Do not broaden it
 unless the renter asks for alternatives. Immediate scope is not necessarily a
-lasting location preference. A direct scoped search may proceed with the useful
-criteria already supplied; do not require the rest of the six-part brief first.
+lasting location preference. A direct scoped search still requires the rest of
+the minimum brief before listings are presented.
 
 Conversation can be generative; property discovery must be grounded. Every
 specific current recommendation must come from a successful fresh match_lead
@@ -1339,11 +1326,8 @@ phrases such as "stored condo data", "dataset", "renter profile", "tool result",
         "name": "match_lead",
         "description": (
             "Find and rank currently available Rentee listings when the renter "
-            "genuinely asks for current property options or states that they are "
-            "actively looking for a home with enough criteria to produce useful "
-            "candidates. Statements such as 'I'm looking for a 4 bedroom in Bangsar' "
-            "are search requests even without the words search, show, or find. Do not "
-            "require budget or every six-part brief field before searching. Apply any condo, development, "
+            "genuinely asks for current property options and the six-part minimum "
+            "renter brief is sufficiently complete. Apply any condo, development, "
             "area, or location in the immediate request as the current search scope. "
             "Do not use for ordinary conversation, informational questions, isolated "
             "corrections, or a preference change without current recommendation intent."
@@ -1364,9 +1348,7 @@ phrases such as "stored condo data", "dataset", "renter profile", "tool result",
             "preferred areas, schools, commute, pets, furnishing, timing, facilities, "
             "or lifestyle needs. Do not use for temporary exploration, introductions, "
             "ordinary questions, reactions, or corrections of Rentee's previous answer "
-            "unless context genuinely establishes a lasting requirement. When the same "
-            "message also expresses active property-search intent, preference persistence "
-            "is intermediate and must be followed by current listing matching."
+            "unless context genuinely establishes a lasting requirement."
         ),
         "parameters": {
             "type": "object",
@@ -1377,23 +1359,17 @@ phrases such as "stored condo data", "dataset", "renter profile", "tool result",
                         "A concise description of the new, changed, removed, or additional "
                         "home-search information stated by the user. Preserve every supplied "
                         "detail faithfully; do not compress several constraints into a vague "
-                        "summary or omit qualifiers, quantities, ranges, alternatives, or "
-                        "negatives. Preserve 'fully or partially furnished' as two acceptable "
-                        "alternatives, not one value and not a requirement for both at once."
+                        "summary or omit qualifiers, quantities, ranges, or negatives."
                     )
                 },
                 "recommendations_requested": {
                     "type": "boolean",
                     "description": (
-                        "True when this same message expresses active home-search intent or "
-                        "requests/refines current recommendations and the authoritative stored "
-                        "renter context plus current conversation provide enough criteria for "
-                        "useful candidates. This includes 'I am looking for', 'We need', and "
-                        "similar semantic search intent even without an explicit command. It "
-                        "does not require a complete six-part brief or a budget. False for a "
-                        "general preference update alone, unless conversational context shows "
-                        "the user is currently refining recommendations and refreshed results "
-                        "would be useful."
+                        "True only when this same message genuinely requests current "
+                        "recommendations and the authoritative stored renter context plus "
+                        "the current conversation "
+                        "provide the complete six-part renter brief. False for a preference "
+                        "update alone or when discovery information is still missing."
                     )
                 }
             },
@@ -1902,11 +1878,6 @@ For each recommended property:
 - Never claim that pets, furnishing or white goods, view/facing, school transport,
   walking time, exact location, or availability satisfy a requirement unless the
   supplied property information explicitly supports that claim.
-- Interpret explicitly offered alternatives with OR semantics. In particular,
-  "fully or partially furnished" means a listing in either furnishing category is
-  eligible; it never means a listing must somehow satisfy both values. Preserve all
-  alternatives when ranking and distinguish an exact alternative from an unrelated
-  value such as unfurnished.
 - Treat PERSISTENT HOME SEEKER REQUIREMENTS as the customer's broader profile.
 - Treat CURRENT CUSTOMER REQUEST as the immediate intent for this recommendation
   turn. If it explicitly asks for recommendations in a named condo, building, or

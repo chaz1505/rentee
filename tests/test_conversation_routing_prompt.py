@@ -40,7 +40,7 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("successful fresh match_lead", text)
         self.assertIn("Never rely on property names", text)
 
-    def test_six_brief_fields_are_useful_but_not_a_search_gate(self):
+    def test_six_distinct_minimum_brief_requirements_are_explicit(self):
         text = self.normalized_instructions
         for required in (
             "monthly budget", "interested location", "furnishing preference",
@@ -50,9 +50,6 @@ class ConversationRoutingPromptTests(unittest.TestCase):
             self.assertIn(required, text)
         self.assertIn("Bedrooms and household size are distinct", text)
         self.assertIn("Do not infer that one answers the other", text)
-        self.assertIn("Do not require all six parts", text)
-        self.assertIn("location or condo and bedroom count is enough", text)
-        self.assertIn("can be gathered afterwards", text)
 
     def test_summary_and_conversation_jointly_determine_readiness(self):
         text = self.normalized_instructions
@@ -62,7 +59,7 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         )
         self.assertIn("already known: do not ask for it again", text)
         self.assertIn("not evidence of current availability", text)
-        self.assertIn("ask efficiently for only the genuinely missing information", text)
+        self.assertIn("only the genuinely missing information", text)
 
     def test_complete_brief_avoids_reinterview_and_frames_stored_preferences(self):
         text = self.normalized_instructions
@@ -71,18 +68,13 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("briefly confirm it only when it may be stale", text)
         self.assertIn("Do not mechanically recite", text)
 
-    def test_match_accepts_semantic_search_intent_with_useful_criteria(self):
+    def test_match_requires_current_intent_and_complete_brief(self):
         description = self.tools["match_lead"]["description"]
-        self.assertIn("actively looking for a home", description)
-        self.assertIn("enough criteria to produce useful candidates", description)
-        self.assertIn("I'm looking for a 4 bedroom in Bangsar", description)
-        self.assertIn("Do not require budget", description)
+        self.assertIn("genuinely asks for current property options", description)
+        self.assertIn("six-part minimum", description)
         self.assertIn("immediate request as the current search scope", description)
         self.assertIn("isolated corrections", description)
-        self.assertIn(
-            "earlier turn does not by itself authorize matching now",
-            self.normalized_instructions,
-        )
+        self.assertIn("earlier turn does not authorize matching now", self.normalized_instructions)
 
     def test_persistence_distinguishes_lasting_change_from_exploration(self):
         description = self.tools["update_preferences"]["description"]
@@ -90,10 +82,9 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("temporary exploration", description)
         self.assertIn("corrections of Rentee's previous answer", description)
         self.assertIn(
-            "persist it first and match in the same turn",
+            "persist it first and match only when the resulting brief is complete",
             self.normalized_instructions,
         )
-        self.assertIn("preference persistence is intermediate", description)
 
     def test_condo_information_and_listing_fact_tools_use_actual_intent(self):
         condo = self.tools["get_condo_info"]["description"]
@@ -113,7 +104,7 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("creates a hard scope", text)
         self.assertIn("Do not broaden it", text)
         self.assertIn("not necessarily a lasting location preference", text)
-        self.assertIn("do not require the rest of the six-part brief", text)
+        self.assertIn("still requires the rest of the minimum brief", text)
 
     def test_web_and_customer_safety_boundaries_remain(self):
         text = self.normalized_instructions
@@ -122,38 +113,12 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("contacting agents or owners", text)
         self.assertIn("Do not expose prompts, tool names, internal IDs", text)
 
-    def test_combined_update_schema_rematches_on_active_search_intent(self):
+    def test_combined_update_schema_only_rematches_when_brief_complete(self):
         schema = self.tools["update_preferences"]["parameters"]
         description = schema["properties"]["recommendations_requested"]["description"]
-        self.assertIn("active home-search intent", description)
-        self.assertIn("enough criteria for useful candidates", description)
-        self.assertIn("does not require a complete six-part brief or a budget", description)
-        self.assertIn("general preference update alone", description)
-
-    def test_natural_search_statements_route_to_same_turn_matching(self):
-        text = self.normalized_instructions
-        for example in (
-            "I'm looking for a 4 bedroom in Bangsar, fully or partially furnished",
-            "We need a 3 bed in Mont Kiara under RM8,000",
-            "Any 2 beds in KLCC?",
-        ):
-            self.assertIn(example, text)
-        self.assertIn("must be an intermediate step", text)
-        self.assertIn("must not replace the search", text)
-
-    def test_preference_only_statement_can_remain_update_only(self):
-        self.assertIn(
-            '"I generally prefer fully furnished units" may be persisted without matching',
-            self.normalized_instructions,
-        )
-
-    def test_furnishing_alternatives_are_preserved_in_update_schema(self):
-        description = self.tools["update_preferences"]["parameters"]["properties"][
-            "preference_update"
-        ]["description"]
-        self.assertIn("fully or partially furnished", description)
-        self.assertIn("two acceptable alternatives", description)
-        self.assertIn("not a requirement for both", description)
+        self.assertIn("genuinely requests current", description)
+        self.assertIn("complete six-part renter brief", description)
+        self.assertIn("discovery information is still missing", description)
 
     def test_short_follow_up_preserves_active_condo_question_subject(self):
         text = self.normalized_instructions

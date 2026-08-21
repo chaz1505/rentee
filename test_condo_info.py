@@ -439,60 +439,6 @@ class CondoInfoTests(unittest.TestCase):
             "folio-1", "live", customer_message
         )
 
-    @patch("app.load_front_door_renter_context", return_value="No stored preferences yet.")
-    @patch("app.stream_match_lead")
-    @patch("app.update_preferences", return_value="Saved.")
-    def test_active_search_statement_updates_then_matches_in_same_turn(
-        self, mocked_update, mocked_match, _mocked_context
-    ):
-        customer_message = (
-            "I am looking for a 4bedroom in bangsar, fully or partially furnished"
-        )
-        preference_update = (
-            "Location: Bangsar; bedrooms: 4; furnishing: fully furnished OR "
-            "partially furnished."
-        )
-        tool_call = SimpleNamespace(
-            type="function_call", name="update_preferences", call_id="update-call",
-            arguments=json.dumps({
-                "preference_update": preference_update,
-                "recommendations_requested": True,
-            }),
-        )
-        initial = SimpleNamespace(
-            id="initial-response", output=[tool_call], usage=None, output_text=""
-        )
-        final = SimpleNamespace(id="final-response", output=[], usage=None)
-
-        class FakeStream:
-            def __init__(self, response): self.response = response
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
-            def __iter__(self): return iter(())
-            def get_final_response(self): return self.response
-
-        def grounded_match(*_args):
-            yield "Searching available properties..."
-            return "Here are the strongest current 4-bedroom Bangsar matches."
-
-        responses = MagicMock()
-        responses.stream.side_effect = [FakeStream(initial), FakeStream(final)]
-        mocked_match.side_effect = grounded_match
-
-        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
-            response = app_module.app.test_client().post(
-                "/chat_stream",
-                json={"message": customer_message, "folio_id": "folio-1"},
-            )
-            body = response.get_data(as_text=True)
-
-        mocked_update.assert_called_once_with(
-            "folio-1", preference_update, "live"
-        )
-        mocked_match.assert_called_once_with("folio-1", "live", customer_message)
-        self.assertIn("strongest current 4-bedroom Bangsar matches", body)
-        self.assertNotEqual(body.strip(), "Saved.")
-
 
 if __name__ == "__main__":
     unittest.main()
