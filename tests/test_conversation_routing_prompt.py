@@ -53,13 +53,10 @@ class ConversationRoutingPromptTests(unittest.TestCase):
 
     def test_summary_and_conversation_jointly_determine_readiness(self):
         text = self.normalized_instructions
-        self.assertIn(
-            "authoritative stored renter context and the current conversation together",
-            text,
-        )
+        self.assertIn("AIsearchsummary and the current conversation together", text)
         self.assertIn("already known: do not ask for it again", text)
         self.assertIn("not evidence of current availability", text)
-        self.assertIn("only the genuinely missing information", text)
+        self.assertIn("Ask efficiently for only the missing information", text)
 
     def test_complete_brief_avoids_reinterview_and_frames_stored_preferences(self):
         text = self.normalized_instructions

@@ -551,7 +551,7 @@ def admin_benchmark_fix_status(benchmark_run_id):
     return jsonify(status), 200
 
 
-def load_front_door_renter_context(folio_id, bubble_env):
+def load_front_door_renter_summary(folio_id, bubble_env):
     if not folio_id:
         return "No stored preferences yet."
     lookup_started = time.perf_counter()
@@ -559,8 +559,8 @@ def load_front_door_renter_context(folio_id, bubble_env):
         base_url = get_bubble_base_url(bubble_env)
         folio = bubble(f"{base_url}/obj/folio/{folio_id}")
         lead = bubble(f"{base_url}/obj/lead/{folio['lead']}")
-        renter_context = str(lead.get("AIsearchtext") or "").strip()
-        return renter_context or "No stored preferences yet."
+        summary = str(lead.get("AIsearchsummary") or "").strip()
+        return summary or "No stored preferences yet."
     except Exception as error:
         print(
             f"Front-door renter context unavailable; continuing safely: {error}",
@@ -568,21 +568,21 @@ def load_front_door_renter_context(folio_id, bubble_env):
         )
         return "Stored preferences are temporarily unavailable."
     finally:
-        log_timing("Front-door authoritative renter context lookup", lookup_started)
+        log_timing("Front-door AIsearchsummary lookup", lookup_started)
 
 
 def build_response_args(
-    user_message, previous_response_id=None, renter_context=None
+    user_message, previous_response_id=None, renter_summary=None
 ):
     known_preferences = (
-        str(renter_context).strip()
-        if renter_context is not None and str(renter_context).strip()
+        str(renter_summary).strip()
+        if renter_summary is not None and str(renter_summary).strip()
         else "No stored preferences yet."
     )
     args = {
         "model": "gpt-5-mini",
         "input": (
-            "AUTHORITATIVE STORED RENTER CONTEXT\n\n"
+            "KNOWN RENTER PREFERENCES\n\n"
             f"{known_preferences}\n\n"
             "CURRENT CUSTOMER MESSAGE\n\n"
             f"{user_message}"
@@ -611,9 +611,8 @@ lifestyle stereotypes, or general model knowledge.
 RENTER BRIEF AND RECOMMENDATION READINESS
 
 Before presenting, recommending, shortlisting, comparing, or ranking specific
-current listings, establish a sufficient renter brief from the authoritative
-stored renter context and the current conversation together. The six required
-parts are:
+current listings, establish a sufficient renter brief from AIsearchsummary and
+the current conversation together. The six required parts are:
 1. approximate monthly budget or range;
 2. interested location(s), or a specific condo/development to search;
 3. furnishing preference: furnished, partially furnished, unfurnished, or
@@ -623,14 +622,13 @@ parts are:
 6. an opportunity to state other requirements, or confirmation that there are none.
 
 Bedrooms and household size are distinct. Do not infer that one answers the
-other. Information clearly present in the authoritative stored renter context or
-this conversation is already known: do not ask for it again. The stored context
-describes what this renter wants; it is not evidence of current availability or
-that any property matches. If the brief is incomplete, do not present listings.
-Ask efficiently for only the genuinely missing information, grouping closely
-related basics when natural rather than forcing a rigid questionnaire. An
-informational condo or listing question does not require a complete recommendation
-brief.
+other. Information clearly present in AIsearchsummary or this conversation is
+already known: do not ask for it again. AIsearchsummary describes what this
+renter wants; it is not evidence of current availability or that any property
+matches. If the brief is incomplete, do not present listings. Ask efficiently
+for only the missing information, grouping closely related basics when natural
+rather than forcing a rigid questionnaire. An informational condo or listing
+question does not require a complete recommendation brief.
 
 If the brief is complete, coherent, and the renter genuinely requests current
 options, perform fresh matching without unnecessary re-interviewing. When relying
@@ -741,8 +739,7 @@ estate-agent assistant.
                     "type": "boolean",
                     "description": (
                         "True only when this same message genuinely requests current "
-                        "recommendations and the authoritative stored renter context plus "
-                        "the current conversation "
+                        "recommendations and AIsearchsummary plus the current conversation "
                         "provide the complete six-part renter brief. False for a preference "
                         "update alone or when discovery information is still missing."
                     )
@@ -1788,7 +1785,7 @@ def chat_stream():
                 first_delta_sent = False
                 initial_first_event_logged = False
                 initial_first_delta_logged = False
-                renter_context = load_front_door_renter_context(
+                renter_summary = load_front_door_renter_summary(
                     folio_id, bubble_env
                 )
 
@@ -1840,7 +1837,7 @@ def chat_stream():
                 # the user's existing conversation history.
                 try:
                     response = yield from stream_initial_response(
-                        build_response_args(message, previous, renter_context),
+                        build_response_args(message, previous, renter_summary),
                         "Initial OpenAI/tool selection"
                     )
                 except Exception as error:
@@ -1852,7 +1849,7 @@ def chat_stream():
                         flush=True
                     )
                     response = yield from stream_initial_response(
-                        build_response_args(message, None, renter_context),
+                        build_response_args(message, None, renter_summary),
                         "Initial OpenAI/tool selection retry"
                     )
                 if any(

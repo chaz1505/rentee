@@ -11,21 +11,21 @@ import app as app_module
 
 
 class FrontDoorPreferenceContextTests(unittest.TestCase):
-    AUTHORITATIVE_CONTEXT = (
+    SUMMARY = (
         "Budget: RM12,000\nLocation: Bangsar\nBedrooms: 4\n"
         "Household: 2 adults + 2 children\nFurnishing: furnished\n"
         "Other: modern property preferred"
     )
 
-    def test_front_door_input_contains_authoritative_context_and_current_message(self):
+    def test_front_door_input_contains_compact_summary_and_current_message(self):
         args = app_module.build_response_args(
-            "Show me current options", renter_context=self.AUTHORITATIVE_CONTEXT
+            "Show me current options", renter_summary=self.SUMMARY
         )
 
         self.assertEqual(
             args["input"],
-            "AUTHORITATIVE STORED RENTER CONTEXT\n\n"
-            f"{self.AUTHORITATIVE_CONTEXT}\n\n"
+            "KNOWN RENTER PREFERENCES\n\n"
+            f"{self.SUMMARY}\n\n"
             "CURRENT CUSTOMER MESSAGE\n\nShow me current options",
         )
         self.assertNotIn("folio", args["input"].lower())
@@ -33,23 +33,19 @@ class FrontDoorPreferenceContextTests(unittest.TestCase):
 
     @patch("app.log_timing")
     @patch("app.bubble")
-    def test_context_lookup_uses_ai_search_text_and_selected_environment(
+    def test_summary_lookup_uses_selected_bubble_environment(
         self, mocked_bubble, mocked_timing
     ):
         mocked_bubble.side_effect = [
             {"lead": "lead-1"},
-            {
-                "AIsearchtext": self.AUTHORITATIVE_CONTEXT,
-                "AIsearchsummary": "Conflicting customer-facing summary",
-            },
+            {"AIsearchsummary": self.SUMMARY},
         ]
 
-        result = app_module.load_front_door_renter_context(
+        result = app_module.load_front_door_renter_summary(
             "folio-1", "development"
         )
 
-        self.assertEqual(result, self.AUTHORITATIVE_CONTEXT)
-        self.assertNotEqual(result, "Conflicting customer-facing summary")
+        self.assertEqual(result, self.SUMMARY)
         self.assertEqual(mocked_bubble.call_args_list, [
             call("https://www.rentee.asia/version-test/api/1.1/obj/folio/folio-1"),
             call("https://www.rentee.asia/version-test/api/1.1/obj/lead/lead-1"),
@@ -57,39 +53,15 @@ class FrontDoorPreferenceContextTests(unittest.TestCase):
         mocked_timing.assert_called_once()
 
     @patch("app.bubble", side_effect=RuntimeError("temporary Bubble failure"))
-    def test_context_lookup_fails_safe_without_exposing_ids_to_model(self, _bubble):
-        context = app_module.load_front_door_renter_context("folio-secret", "live")
-        args = app_module.build_response_args("Hello", renter_context=context)
+    def test_summary_lookup_fails_safe_without_exposing_ids_to_model(self, _bubble):
+        summary = app_module.load_front_door_renter_summary("folio-secret", "live")
+        args = app_module.build_response_args("Hello", renter_summary=summary)
 
-        self.assertEqual(context, "Stored preferences are temporarily unavailable.")
+        self.assertEqual(summary, "Stored preferences are temporarily unavailable.")
         self.assertNotIn("folio-secret", args["input"])
-
-    def test_readiness_uses_known_context_and_gathers_only_missing_requirements(self):
-        instructions = " ".join(
-            app_module.build_response_args(
-                "Please show me options",
-                renter_context="Budget: RM12,000\nLocation: Bangsar",
-            )["instructions"].split()
-        )
-
-        self.assertIn(
-            "Information clearly present in the authoritative stored renter context",
-            instructions,
-        )
-        self.assertIn("already known: do not ask for it again", instructions)
-        self.assertIn("only the genuinely missing information", instructions)
-        self.assertNotIn("AIsearchsummary", instructions)
 
 
 class PreferencePersistenceTests(unittest.TestCase):
-    def test_customer_facing_summary_role_is_preserved(self):
-        with open(app_module.__file__, encoding="utf-8") as app_file:
-            source = app_file.read()
-
-        self.assertIn("AIsearchtext\": updated_text", source)
-        self.assertIn("AIsearchsummary\": ai_search_summary", source)
-        self.assertIn("clean, current renter preference summary", source)
-
     def test_replacement_preserves_unrelated_requirements(self):
         merged = app_module.merge_updated_preference_text(
             "Location: Bangsar; Budget: RM12,000\nBedrooms: 4",
