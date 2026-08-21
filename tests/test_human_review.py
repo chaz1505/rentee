@@ -170,34 +170,26 @@ class HumanReviewHelperTests(unittest.TestCase):
         self.assertNotIn("admin-secret", message)
 
     @patch("tests.human_review.requests.get")
-    def test_codex_status_reads_merge_metadata(self, mocked_get):
+    def test_codex_status_reads_pull_request_metadata(self, mocked_get):
         mocked_get.return_value = response({"response": self.record(
-            codexStatus="merged",
+            codexStatus="pr_created",
             codexSubmitted=True,
             codexTaskID="task-id",
             codexBranch="codex/benchmark-run-unique",
             codexCommit="fix123",
             codexPRNumber=42,
             codexPRURL="https://github.com/chaz1505/rentee/pull/42",
-            codexMerged=True,
-            codexMergedAt="2026-08-16T12:00:00.000Z",
-            codexMergeCommit="merge123",
         )})
         result = human_review.get_benchmark_run_codex_status(
             "bubble-id", "development"
         )
-        self.assertEqual(result["codex_status"], "merged")
+        self.assertEqual(result["codex_status"], "pr_created")
         self.assertEqual(result["codex_branch"], "codex/benchmark-run-unique")
         self.assertEqual(result["codex_commit"], "fix123")
         self.assertEqual(result["codex_pr_number"], 42)
         self.assertEqual(
             result["codex_pr_url"],
             "https://github.com/chaz1505/rentee/pull/42",
-        )
-        self.assertTrue(result["codex_merged"])
-        self.assertEqual(result["codex_merge_commit"], "merge123")
-        self.assertEqual(
-            result["codex_merged_at"], "2026-08-16T12:00:00.000Z"
         )
 
 
@@ -315,24 +307,20 @@ class HumanReviewEndpointTests(unittest.TestCase):
             {
                 "codexSubmitted": False, "codexStatus": "failed",
                 "codexTaskID": "task-id",
-                "codexMerged": False,
             },
         )
 
     @patch("tests.human_review.patch_codex_state")
     @patch("automation.codex_client.submit_codex_fix")
-    def test_background_success_persists_merge_metadata(
+    def test_background_success_persists_pull_request_metadata(
         self, mocked_codex, mocked_state
     ):
         metadata = {
-            "task_id": "task-id", "status": "merged",
+            "task_id": "task-id", "status": "pr_created",
             "changes_detected": True, "changed_files": ["app.py"],
             "branch": "codex/benchmark-run-unique",
             "fix_commit": "fix123", "pr_number": 42,
             "pr_url": "https://github.com/chaz1505/rentee/pull/42",
-            "merged": True,
-            "merged_at": "2026-08-16T12:00:00.000Z",
-            "merge_commit": "merge123",
         }
         def run_with_progress(*_args, **kwargs):
             kwargs["progress_callback"]("codex_completed", {
@@ -341,12 +329,6 @@ class HumanReviewEndpointTests(unittest.TestCase):
             kwargs["progress_callback"]("pushing", {
                 "branch": "codex/benchmark-run-unique",
                 "fix_commit": "fix123",
-            })
-            kwargs["progress_callback"]("pr_created", {
-                "branch": "codex/benchmark-run-unique",
-                "fix_commit": "fix123",
-                "pr_number": 42,
-                "pr_url": "https://github.com/chaz1505/rentee/pull/42",
             })
             return metadata
         mocked_codex.side_effect = run_with_progress
@@ -361,21 +343,14 @@ class HumanReviewEndpointTests(unittest.TestCase):
             "codexBranch": "codex/benchmark-run-unique",
             "codexCommit": "fix123",
         })
-        self.assertEqual(
-            mocked_state.call_args_list[2].args[2]["codexStatus"],
-            "pr_created",
-        )
         self.assertEqual(mocked_state.call_args.args[2], {
             "codexSubmitted": True,
-            "codexStatus": "merged",
+            "codexStatus": "pr_created",
             "codexTaskID": "task-id",
             "codexBranch": "codex/benchmark-run-unique",
             "codexCommit": "fix123",
             "codexPRNumber": 42,
             "codexPRURL": "https://github.com/chaz1505/rentee/pull/42",
-            "codexMerged": True,
-            "codexMergedAt": "2026-08-16T12:00:00.000Z",
-            "codexMergeCommit": "merge123",
         })
         with app_module._codex_task_metadata_lock:
             self.assertEqual(
