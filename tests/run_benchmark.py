@@ -10,7 +10,6 @@ try:
     from .bubble_test_data import get_bubble_dev_base
     from .evaluate_run import evaluate_run
     from .generate_fix_prompt import generate_fix_prompt
-    from .git_results import persist_benchmark_results
     from .test_subject import (
         ensure_test_subject,
         reset_test_subject,
@@ -20,7 +19,6 @@ except ImportError:
     from bubble_test_data import get_bubble_dev_base
     from evaluate_run import evaluate_run
     from generate_fix_prompt import generate_fix_prompt
-    from git_results import persist_benchmark_results
     from test_subject import ensure_test_subject, reset_test_subject, snapshot_test_subject
 
 
@@ -249,19 +247,10 @@ def run_case(case):
     output_path = _save_result(case["id"], result)
     evaluation_path, evaluation = evaluate_run(output_path)
     prompt_path = generate_fix_prompt(output_path, evaluation_path)
-    git_result = persist_benchmark_results([
-        output_path, evaluation_path, prompt_path
-    ])
 
     print(f"\nBenchmark result:\n{output_path}", flush=True)
     print(f"\nEvaluation:\n{evaluation_path}", flush=True)
     print(f"\nCodex fix prompt:\n{prompt_path}", flush=True)
-    label = (
-        "Git persistence warning"
-        if git_result.get("status") == "warning"
-        else "Git persistence"
-    )
-    print(f"\n{label}:\n{git_result['message']}", flush=True)
     print(f"\nBenchmark: {evaluation['overall_status'].upper()}", flush=True)
     important = [
         issue for issue in evaluation.get("issues", [])

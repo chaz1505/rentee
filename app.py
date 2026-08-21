@@ -6,7 +6,6 @@ import io
 import os
 import requests
 import json
-import re
 import threading
 import time
 
@@ -318,11 +317,6 @@ def build_response_args(user_message, previous_response_id=None):
             "or 'the client', or sound like an internal estate-agent assistant. "
             "If a property has an important limitation or data issue, explain it clearly "
             "and calmly without exposing internal data structures. "
-            "Use information already supplied in this conversation and never ask for the "
-            "same fact again unless the customer contradicted it or the distinction is truly "
-            "necessary; if so, explain the ambiguity briefly. Ask at most one high-value "
-            "clarification question per response unless multiple answers are strictly required "
-            "to complete the customer's explicit request. Do not ask broad intake checklists. "
             "For general questions, answer normally without using the matching tool unless "
             "the user asks for recommendations or which available properties suit them. "
             "When the user asks about a named condo, building, or residential development, you "
@@ -393,9 +387,7 @@ def build_response_args(user_message, previous_response_id=None):
                     "type": "string",
                     "description": (
                         "A concise description of the new, changed, removed, or additional "
-                        "home-search information stated by the user. Preserve every supplied "
-                        "detail faithfully; do not compress several constraints into a vague "
-                        "summary or omit qualifiers, quantities, ranges, or negatives."
+                        "home-search information stated by the user."
                     )
                 },
                 "recommendations_requested": {
@@ -1049,34 +1041,6 @@ def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url
     print("Lead preferences updated successfully", flush=True)
 
 
-def merge_updated_preference_text(existing_text, generated_text, preference_update):
-    existing_text = (existing_text or "").strip()
-    generated_text = (generated_text or "").strip()
-    preference_update = (preference_update or "").strip()
-    empty_profile = re.search(
-        r"\bno preferences? (?:provided|recorded|saved)(?: yet)?\b",
-        existing_text,
-        re.I
-    )
-    replacement_update = re.search(
-        r"\b(?:no longer|instead|replace|remove|delete|change(?:d)?|only interested|"
-        r"budget is now|now want|now need)\b",
-        preference_update,
-        re.I
-    )
-
-    if existing_text and not empty_profile and not replacement_update:
-        # Additive updates are the common path. Preserve the stored profile byte-for-byte
-        # and append the new explicit requirement rather than trusting a model rewrite.
-        if preference_update.lower() in existing_text.lower():
-            return existing_text
-        return f"{existing_text}\n\nCustomer-stated preference update:\n{preference_update}"
-
-    if preference_update and preference_update.lower() not in generated_text.lower():
-        return f"{generated_text}\n\nCustomer-stated preference update:\n{preference_update}".strip()
-    return generated_text
-
-
 def update_preferences(folio_id, preference_update, bubble_env):
 
     preferences_started = time.perf_counter()
@@ -1168,11 +1132,7 @@ REQUESTED PREFERENCE UPDATE:
     parse_started = time.perf_counter()
     result = json.loads(response.output_text)
     log_timing("update_preferences - parse result", parse_started)
-    updated_ai_search_text = merge_updated_preference_text(
-        existing_ai_search_text,
-        result["updated_ai_search_text"],
-        preference_update
-    )
+    updated_ai_search_text = result["updated_ai_search_text"]
     ai_search_summary = result["ai_search_summary"]
 
     if not updated_ai_search_text.strip():
@@ -1345,7 +1305,6 @@ def chat_stream():
                 print(f"Original call_id: {original_call_id}", flush=True)
                 tool_args = json.loads(tool_call.arguments)
                 follow_up_tools = None
-                direct_customer_response = None
 
                 if tool_call.name == "match_lead":
                     tool_result = yield from stream_match_lead(folio_id, bubble_env)
@@ -1395,7 +1354,6 @@ def chat_stream():
                     else:
                         has_match_results = False
                         tool_result = preference_confirmation
-                        direct_customer_response = preference_confirmation
                         follow_up_instructions = (
                             "Return the completed preference-update confirmation naturally. "
                             "Do not mention properties, tools, matching mechanics, or internal "
@@ -1456,12 +1414,6 @@ def chat_stream():
                         f"data: {json.dumps({'status': 'Found some options — putting them together...'})}\n\n"
                     )
 
-                if direct_customer_response:
-                    if not first_delta_sent:
-                        log_timing("FIRST DELTA", request_started)
-                        first_delta_sent = True
-                    yield f"data: {json.dumps({'delta': direct_customer_response})}\n\n"
-
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
                 if tool_call.name == "update_preferences":
@@ -1521,10 +1473,7 @@ def chat_stream():
                                 f"data: {json.dumps({'status': status})}\n\n"
                             )
                             web_search_status_sent = True
-                        if (
-                            event.type == "response.output_text.delta"
-                            and direct_customer_response is None
-                        ):
+                        if event.type == "response.output_text.delta":
                             if not first_delta_sent:
                                 log_timing("FIRST DELTA", request_started)
                                 first_delta_sent = True
