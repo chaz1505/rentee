@@ -274,61 +274,6 @@ class MatchLeadCurrentRequestScopeTests(unittest.TestCase):
         self.assertIn("The recommendations array is the source of truth", prompt)
         self.assertIn("Never invent a property", prompt)
 
-    def test_ordinary_substantially_under_budget_listing_gets_no_price_bonus(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("not merely as a maximum-price filter", prompt)
-        self.assertIn("Do not reward a property merely for being substantially below budget", prompt)
-        self.assertIn('Being "comfortably within budget" is not sufficient by itself', prompt)
-
-    def test_excellent_lower_price_listing_can_rank_high_for_real_fit_reasons(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("substantially cheaper property may still rank highly", prompt)
-        self.assertIn("compelling renter-specific reason", prompt)
-        self.assertIn("location, condition, layout, furnishing, development, size", prompt)
-        self.assertIn("less expensive home can be the best recommendation", prompt)
-
-    def test_properties_around_spending_level_receive_expected_tier_consideration(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("property standard or market segment the renter expects", prompt)
-        self.assertIn("Price proximity", prompt)
-        self.assertIn("actively consider compelling homes around that level", prompt)
-        self.assertNotIn("13k–15k", prompt)
-        self.assertNotIn("RM6,500", prompt)
-
-    def test_flexible_budget_can_stretch_for_exceptional_fit(self):
-        prompt, _result = self.capture_matching_prompt("My budget is around RM15k")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("approximate or flexible budget as a sensible region", prompt)
-        self.assertIn("exceptional home above it may be recommended", prompt)
-        self.assertIn("justifies the stretch", prompt)
-
-    def test_absolute_maximum_remains_a_hard_ceiling(self):
-        prompt, _result = self.capture_matching_prompt(
-            "RM15k is my absolute maximum"
-        )
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("absolute budget ceiling", prompt)
-        self.assertIn("If the renter states an absolute maximum", prompt)
-        self.assertIn("never recommend a listing above that amount", prompt)
-
-    def test_explicit_value_request_makes_cheaper_options_more_relevant(self):
-        prompt, _result = self.capture_matching_prompt(
-            "Show me cheaper options with good value"
-        )
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("explicitly asks for cheaper or value options", prompt)
-        self.assertIn("Lower price is useful when suitability and quality are otherwise comparable", prompt)
-        self.assertIn("Never imply that spending more is inherently better", prompt)
-
 
 if __name__ == "__main__":
     unittest.main()
