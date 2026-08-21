@@ -1,6 +1,6 @@
 # Rentee end-to-end benchmark v1
 
-This benchmark calls Rentee's real `POST /chat_stream` endpoint and follows one scripted tenant conversation: **Sofia - school bus, cats and teenage bedroom**. It captures SSE statuses, assistant text, citations, response IDs, timings, and Bubble state before and after the conversation, then runs deterministic and qualitative evaluation.
+This benchmark calls Rentee's real `POST /chat_stream` endpoint and follows one scripted tenant conversation: **Sofia - school bus, cats and teenage bedroom**. It captures SSE statuses, assistant text, citations, response IDs, timings, and Bubble state before and after the conversation. There is no automated scoring or LLM judge in v1.
 
 ## Test data and reset
 
@@ -20,34 +20,8 @@ The runner refuses any Bubble base URL that does not contain `/version-test/`. I
 - `BUBBLE_API_TOKEN` — required Bubble Data API token.
 - `BUBBLE_DEV_BASE` — optional; defaults to `https://www.rentee.asia/version-test/api/1.1` and must contain `/version-test/`.
 - `RENTEE_STREAM_URL` — optional; defaults to `https://rentee-2.onrender.com/chat_stream`.
-- `BENCHMARK_API_KEY` — required to use the protected HTTP trigger and status endpoints.
-- `GITHUB_RESULTS_TOKEN` — optional; publishes completed artifacts to GitHub when present.
 
 ## Run
-
-### Preferred: protected HTTP trigger
-
-Configure `BENCHMARK_API_KEY` on Render, then start a background run:
-
-```bash
-curl -X POST \
-  -H "X-Benchmark-Key: <key>" \
-  https://rentee-2.onrender.com/admin/run_benchmark
-```
-
-Monitor progress at **Render → Rentee service → Logs**. Every benchmark line is flushed to standard output with a `[BENCHMARK]` prefix.
-
-Query the current process-local status with:
-
-```bash
-curl \
-  -H "X-Benchmark-Key: <key>" \
-  https://rentee-2.onrender.com/admin/benchmark_status
-```
-
-Only one benchmark can run per service process. Status is ephemeral and resets when Render restarts; generated GitHub artifacts are permanent.
-
-### Fallback: command line
 
 From the repository root:
 

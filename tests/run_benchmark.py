@@ -29,15 +29,6 @@ STREAM_TIMEOUT = (30, 300)
 TESTS_DIR = os.path.dirname(__file__)
 
 
-def benchmark_log(message=""):
-    for line in str(message).splitlines() or [""]:
-        print(f"[BENCHMARK] {line}", flush=True)
-
-
-def _format_seconds(value):
-    return "unavailable" if value is None else f"{value}s"
-
-
 class BenchmarkError(RuntimeError):
     pass
 
@@ -162,21 +153,15 @@ def _save_result(case_id, result):
     return path
 
 
-def run_case(case, run_id=None, progress_callback=None):
+def run_case(case):
     # Force development-base validation before any Bubble request or chat turn.
     get_bubble_dev_base()
-    benchmark_log("=" * 40)
-    benchmark_log("Starting benchmark run")
-    if run_id:
-        benchmark_log(f"Run ID: {run_id}")
-    benchmark_log(f"Case: {case['name']}")
-    benchmark_log("=" * 40)
-    benchmark_log("Resetting Bubble test subject...")
+    print(f"\n=== {case['name']} ===\n", flush=True)
     subject = ensure_test_subject(case)
     reset_test_subject(case, subject)
-    benchmark_log("Reset complete.")
-    benchmark_log(f"Using Lead: {subject['lead_id']}")
-    benchmark_log(f"Using Folio: {subject['folio_id']}")
+    print("Reset complete", flush=True)
+    print(f"Using Lead: {subject['lead_id']}", flush=True)
+    print(f"Using Folio: {subject['folio_id']}", flush=True)
 
     result = {
         "case_id": case["id"],
@@ -194,11 +179,7 @@ def run_case(case, run_id=None, progress_callback=None):
     previous_response_id = None
     for turn_number, scripted_turn in enumerate(case["turns"], start=1):
         message = scripted_turn["message"]
-        if progress_callback:
-            progress_callback({"case": case["id"], "current_turn": turn_number})
-        benchmark_log("")
-        benchmark_log(f"TURN {turn_number}")
-        benchmark_log(f"Tenant: {message}")
+        print(f"\nTURN {turn_number}\nTenant: {message}", flush=True)
         try:
             turn_result = run_turn(message, subject["folio_id"], previous_response_id)
         except BenchmarkTurnError as error:
@@ -230,12 +211,10 @@ def run_case(case, run_id=None, progress_callback=None):
             }
         previous_response_id = turn_result["response_id"]
         timing = turn_result["timing"]
-        benchmark_log(f"Turn {turn_number} first event: {_format_seconds(timing['first_event_s'])}")
-        benchmark_log(f"Turn {turn_number} first text: {_format_seconds(timing['first_delta_s'])}")
-        benchmark_log(f"Turn {turn_number} total: {_format_seconds(timing['total_s'])}")
-        benchmark_log("")
-        benchmark_log("Rentee:")
-        benchmark_log(turn_result["text"])
+        print(f"First event: {timing['first_event_s']}s", flush=True)
+        print(f"First text: {timing['first_delta_s']}s", flush=True)
+        print(f"Total: {timing['total_s']}s", flush=True)
+        print(f"\nRentee:\n{turn_result['text']}", flush=True)
         result["turns"].append({
             "turn": turn_number,
             "tenant_message": message,
@@ -249,8 +228,10 @@ def run_case(case, run_id=None, progress_callback=None):
             "done_seen": turn_result["done_seen"]
         })
         if result["failure"]:
-            benchmark_log("")
-            benchmark_log(f"Failure: Turn {turn_number} — {result['failure']['message']}")
+            print(
+                f"\nFailure:\nTurn {turn_number} — {result['failure']['message']}",
+                flush=True
+            )
             break
 
     try:
@@ -272,86 +253,46 @@ def run_case(case, run_id=None, progress_callback=None):
         output_path, evaluation_path, prompt_path
     ])
 
-    benchmark_log("")
-    benchmark_log("=" * 40)
-    benchmark_log("BENCHMARK FAILED" if result["failure"] else "BENCHMARK COMPLETE")
-    benchmark_log(f"Status: {evaluation['overall_status'].upper()}")
-    benchmark_log(
-        f"Average first text: "
-        f"{_format_seconds(evaluation.get('metrics', {}).get('average_first_delta_s'))}"
+    print(f"\nBenchmark result:\n{output_path}", flush=True)
+    print(f"\nEvaluation:\n{evaluation_path}", flush=True)
+    print(f"\nCodex fix prompt:\n{prompt_path}", flush=True)
+    print(
+        f"\nGitHub publishing:\n{publishing_result['message']}",
+        flush=True
     )
-    benchmark_log(
-        f"Average total: "
-        f"{_format_seconds(evaluation.get('metrics', {}).get('average_total_s'))}"
-    )
+    print(f"\nBenchmark: {evaluation['overall_status'].upper()}", flush=True)
     important = [
         issue for issue in evaluation.get("issues", [])
         if issue.get("severity") in ("critical", "high")
     ]
     if important:
-        benchmark_log("")
-        benchmark_log("Critical/high issues:")
+        print("\nCritical/high issues:", flush=True)
         for issue in important:
-            benchmark_log(f"- {issue['id'].replace('_', ' ').title()}")
+            print(f"- {issue['id'].replace('_', ' ').title()}", flush=True)
     comparison = evaluation.get("comparison_to_previous_run", {})
-    benchmark_log("")
-    benchmark_log("Compared with previous run:")
+    print("\nCompared with previous run:", flush=True)
     if comparison.get("available"):
-        benchmark_log(f"First-text latency: {comparison.get('first_delta_change_pct')}%")
+        print(
+            f"First-text latency: {comparison.get('first_delta_change_pct')}%",
+            flush=True
+        )
         unsupported = comparison.get("unsupported_actions", {})
-        benchmark_log(
+        print(
             f"Unsupported actions: {unsupported.get('previous')} -> "
-            f"{unsupported.get('current')}"
+            f"{unsupported.get('current')}",
+            flush=True
         )
     else:
-        benchmark_log("No previous run available.")
-    benchmark_log("")
-    benchmark_log(f"Raw result: {output_path}")
-    benchmark_log(f"Evaluation: {evaluation_path}")
-    benchmark_log(f"Codex fix prompt: {prompt_path}")
-    benchmark_log(
-        "GitHub publishing: SUCCESS"
-        if publishing_result.get("status") == "published"
-        else f"GitHub publishing: {publishing_result.get('status', 'unknown').upper()}"
-    )
-    benchmark_log(publishing_result["message"])
-    if publishing_result.get("published"):
-        benchmark_log("Published:")
-        for path in publishing_result["published"]:
-            benchmark_log(f"- {path}")
-    benchmark_log("=" * 40)
-    result["execution"] = {
-        "run_id": run_id,
-        "benchmark_status": evaluation["overall_status"],
-        "result_path": output_path,
-        "evaluation_path": evaluation_path,
-        "fix_prompt_path": prompt_path,
-        "github_published": publishing_result.get("status") == "published",
-        "github_publishing": publishing_result
-    }
+        print("No previous run available.", flush=True)
     return result
-
-
-def get_benchmark_case_ids():
-    return [case["id"] for case in _load_cases()]
-
-
-def run_all_benchmarks(run_id=None, progress_callback=None):
-    results = []
-    for case in _load_cases():
-        results.append(run_case(case, run_id=run_id, progress_callback=progress_callback))
-    return {
-        "run_id": run_id,
-        "results": results,
-        "failed": any(bool(result.get("failure")) for result in results)
-    }
 
 
 def main():
     failed = False
     try:
-        suite = run_all_benchmarks()
-        failed = suite["failed"]
+        for case in _load_cases():
+            result = run_case(case)
+            failed = failed or bool(result.get("failure"))
     except Exception as error:
         print(f"BENCHMARK FAILED: {error}", file=sys.stderr, flush=True)
         return 1
