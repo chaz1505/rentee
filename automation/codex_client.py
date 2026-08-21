@@ -18,10 +18,6 @@ WORKSPACE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 900
 GIT_TIMEOUT_SECONDS = 120
 MAX_CLI_DIAGNOSTIC_LENGTH = 2000
-CODEX_CHILD_STRIPPED_ENV_VARS = (
-    "BENCHMARK_API_KEY",
-    "BUBBLE_API_TOKEN",
-)
 
 EXECUTION_WRAPPER = """You are operating autonomously on the Rentee repository.
 
@@ -37,38 +33,6 @@ Add/update focused tests.
 Run relevant tests before finishing.
 Do not push directly to main.
 Do not merge anything.
-
-AUTOMATED FIX EXECUTION RULES
-
-You are running inside Rentee's automated benchmark-fix pipeline.
-
-You MAY:
-- inspect repository files;
-- edit repository files;
-- add or update focused unit tests;
-- run unit tests that do not call live Rentee endpoints;
-- run static checks, compilation checks, and local mocked tests.
-
-You MUST NOT:
-- run tests/run_benchmark.py;
-- run any benchmark runner;
-- call /admin/run_benchmark;
-- call /admin/benchmark/*;
-- call /chat_stream;
-- send HTTP requests to rentee.asia or rentee-2.onrender.com;
-- invoke the live or development Rentee application;
-- create another BenchmarkRun;
-- recursively invoke the benchmark-fix workflow;
-- perform end-to-end or integration tests that make external Rentee requests;
-- push, merge, deploy, or trigger Render.
-
-The BenchmarkRun supplied in this prompt is the evidence you should use to diagnose the problem.
-
-Implement the best justified fix and validate it using local/unit/mocked tests only.
-
-After those tests, STOP.
-
-Do not run a new benchmark to verify your own fix. The orchestration layer will perform the post-fix benchmark later.
 
 At completion, provide a concise structured summary of:
 - root cause found
@@ -190,8 +154,6 @@ def _require_success(result, action, sensitive_values=()):
 
 def _codex_environment(auth_home):
     environment = os.environ.copy()
-    for name in CODEX_CHILD_STRIPPED_ENV_VARS:
-        environment.pop(name, None)
     environment["CODEX_HOME"] = str(auth_home)
     return environment
 

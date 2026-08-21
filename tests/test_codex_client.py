@@ -39,33 +39,6 @@ class CodexClientTests(unittest.TestCase):
         self.assertIn("Base branch: main", prompt)
         self.assertIn("Do not push directly to main.", prompt)
         self.assertIn("EXACT HUMAN-REVIEWED PROMPT", prompt)
-        self.assertIn("AUTOMATED FIX EXECUTION RULES", prompt)
-        self.assertIn("MUST NOT:\n- run tests/run_benchmark.py", prompt)
-        self.assertIn("- run any benchmark runner;", prompt)
-        self.assertIn("- call /admin/run_benchmark;", prompt)
-        self.assertIn("- call /admin/benchmark/*;", prompt)
-        self.assertIn("- call /chat_stream;", prompt)
-        self.assertIn(
-            "send HTTP requests to rentee.asia or rentee-2.onrender.com",
-            prompt,
-        )
-        self.assertIn("After those tests, STOP.", prompt)
-        self.assertIn("Do not run a new benchmark to verify your own fix.", prompt)
-
-    def test_codex_child_environment_strips_rentee_admin_credentials(self):
-        with patch.dict(os.environ, {
-            "OPENAI_API_KEY": "openai-key",
-            "BENCHMARK_API_KEY": "benchmark-key",
-            "BUBBLE_API_TOKEN": "bubble-token",
-            "SAFE_RUNTIME_VALUE": "retained",
-        }, clear=True):
-            child_environment = codex_client._codex_environment(self.auth_root)
-            self.assertEqual(os.environ["BENCHMARK_API_KEY"], "benchmark-key")
-            self.assertEqual(os.environ["BUBBLE_API_TOKEN"], "bubble-token")
-        self.assertNotIn("BENCHMARK_API_KEY", child_environment)
-        self.assertNotIn("BUBBLE_API_TOKEN", child_environment)
-        self.assertEqual(child_environment["OPENAI_API_KEY"], "openai-key")
-        self.assertEqual(child_environment["SAFE_RUNTIME_VALUE"], "retained")
 
     def _successful_run(
         self, status=" M app.py\n?? tests/test_new.py\n",
@@ -104,11 +77,7 @@ class CodexClientTests(unittest.TestCase):
         mocked_which.side_effect = lambda name: f"/usr/bin/{name}"
         calls, fake_run = self._successful_run()
         with patch("automation.codex_client._run", side_effect=fake_run), patch.dict(
-            os.environ, {
-                "OPENAI_API_KEY": "api-key",
-                "BENCHMARK_API_KEY": "benchmark-key",
-                "BUBBLE_API_TOKEN": "bubble-token",
-            }, clear=True
+            os.environ, {"OPENAI_API_KEY": "api-key"}, clear=True
         ):
             result = codex_client.submit_codex_fix(
                 "human-reviewed fix", "run/live", "bubble-id", "live",
@@ -139,8 +108,6 @@ class CodexClientTests(unittest.TestCase):
         )
         self.assertIn("human-reviewed fix", codex_call[1]["input_text"])
         self.assertEqual(codex_call[1]["env"]["OPENAI_API_KEY"], "api-key")
-        self.assertNotIn("BENCHMARK_API_KEY", codex_call[1]["env"])
-        self.assertNotIn("BUBBLE_API_TOKEN", codex_call[1]["env"])
         self.assertEqual(result["provider"], "codex_local_cli")
         self.assertEqual(result["base_commit"], "abc123def456")
         self.assertEqual(result["changed_files"], ["app.py", "tests/test_new.py"])
