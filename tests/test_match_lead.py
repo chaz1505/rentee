@@ -329,6 +329,18 @@ class MatchLeadCurrentRequestScopeTests(unittest.TestCase):
         self.assertIn("Lower price is useful when suitability and quality are otherwise comparable", prompt)
         self.assertIn("Never imply that spending more is inherently better", prompt)
 
+    def test_multi_value_furnishing_uses_or_semantics(self):
+        prompt, _result = self.capture_matching_prompt(
+            "4 bedroom Bangsar, either fully furnished or partially furnished"
+        )
+        prompt = " ".join(prompt.split())
+
+        self.assertIn("explicitly offered alternatives with OR semantics", prompt)
+        self.assertIn('"fully or partially furnished"', prompt)
+        self.assertIn("listing in either furnishing category is eligible", prompt)
+        self.assertIn("never means a listing must somehow satisfy both", prompt)
+        self.assertIn("unrelated value such as unfurnished", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
