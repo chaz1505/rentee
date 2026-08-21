@@ -83,8 +83,7 @@ class AdminBenchmarkTests(unittest.TestCase):
             "evaluation_path": "evaluation.json",
             "evaluation_markdown_path": "evaluation.md",
             "fix_prompt_path": "prompt.md",
-            "benchmark_run_id": "bubble-run-id", "result_persisted": True,
-            "persistence_error": None
+            "github_published": True
         }}]}
         app_module._benchmark_run_lock.acquire()
         with app_module._benchmark_state_lock:
@@ -97,8 +96,7 @@ class AdminBenchmarkTests(unittest.TestCase):
         self.assertEqual(state["status"], "complete")
         self.assertEqual(state["result_path"], "raw.json")
         self.assertEqual(state["evaluation_markdown_path"], "evaluation.md")
-        self.assertTrue(state["result_persisted"])
-        self.assertEqual(state["benchmark_run_id"], "bubble-run-id")
+        self.assertTrue(state["github_published"])
 
     @patch("tests.run_benchmark.run_all_benchmarks", side_effect=RuntimeError("boom"))
     def test_background_exception_is_logged_and_lock_clears(self, _mocked_run):
@@ -115,27 +113,6 @@ class AdminBenchmarkTests(unittest.TestCase):
         app_module._benchmark_run_lock.release()
         with app_module._benchmark_state_lock:
             self.assertEqual(app_module._benchmark_state["status"], "failed")
-
-    @patch("tests.run_benchmark.run_all_benchmarks")
-    def test_persistence_failure_is_reported_without_crashing_worker(self, mocked_run):
-        mocked_run.return_value = {"results": [{"execution": {
-            "benchmark_status": "fail", "result_path": "raw.json",
-            "evaluation_path": "evaluation.json",
-            "evaluation_markdown_path": "evaluation.md",
-            "fix_prompt_path": "prompt.md", "benchmark_run_id": None,
-            "result_persisted": False, "persistence_error": "HTTP 400: bad payload"
-        }}]}
-        run_id = "persistence-failure"
-        app_module._benchmark_run_lock.acquire()
-        with app_module._benchmark_state_lock:
-            app_module._benchmark_state.update({"status": "running", "run_id": run_id})
-        app_module._run_benchmark_background(run_id)
-        with app_module._benchmark_state_lock:
-            state = dict(app_module._benchmark_state)
-        self.assertEqual(state["status"], "complete")
-        self.assertFalse(state["result_persisted"])
-        self.assertEqual(state["persistence_error"], "HTTP 400: bad payload")
-        self.assertEqual(state["result_path"], "raw.json")
 
     def test_status_endpoint_idle_running_and_complete(self):
         with patch.dict(os.environ, {"BENCHMARK_API_KEY": "correct-key"}, clear=True):
@@ -158,7 +135,7 @@ class AdminBenchmarkTests(unittest.TestCase):
                     "evaluation_path": "evaluation.json",
                     "evaluation_markdown_path": "evaluation.md",
                     "fix_prompt_path": "prompt.md",
-                    "benchmark_run_id": "bubble-run-id", "result_persisted": True
+                    "github_published": True
                 })
             complete = self.client.get("/admin/benchmark_status", headers=self._headers())
             self.assertEqual(complete.get_json()["status"], "complete")

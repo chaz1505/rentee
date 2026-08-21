@@ -128,8 +128,6 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
 
     @patch("tests.run_benchmark.generate_fix_prompt", return_value="fix.md")
     @patch("tests.run_benchmark.generate_evaluation_markdown", return_value="evaluation.md")
-    @patch("tests.run_benchmark.save_benchmark_run", return_value="benchmark-run-id")
-    @patch("tests.run_benchmark.get_previous_benchmark_run", return_value=None)
     @patch("tests.run_benchmark.evaluate_run")
     @patch("tests.run_benchmark._save_result", return_value="partial.json")
     @patch("tests.run_benchmark.snapshot_test_subject")
@@ -139,8 +137,8 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
     @patch("tests.run_benchmark.run_turn")
     def test_failed_turn_is_saved_evaluated_and_gets_fix_prompt(
         self, mocked_turn, _mocked_base, mocked_subject, _mocked_reset,
-        mocked_snapshot, mocked_save, mocked_evaluate, _mocked_previous,
-        mocked_persist, mocked_markdown, mocked_prompt
+        mocked_snapshot, mocked_save, mocked_evaluate, mocked_markdown,
+        mocked_prompt
     ):
         partial = {
             "text": "", "response_id": None,
@@ -156,50 +154,21 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
         mocked_snapshot.return_value = {"lead": {}, "folio": {}}
         mocked_evaluate.return_value = (
             "evaluation.json",
-            {"overall_status": "fail", "issues": [], "metrics": {}, "comparison_to_previous_run": {"available": False}}
+            {"overall_status": "fail", "issues": [], "comparison_to_previous_run": {"available": False}}
         )
         case = {
             "id": "failure_01", "name": "Failure",
             "initial_ai_searchtext": "none", "turns": [{"message": "hello"}]
         }
 
-        with patch("builtins.open", unittest.mock.mock_open(read_data="artifact")):
-            result = run_benchmark.run_case(case, run_id="canonical-run")
+        result = run_benchmark.run_case(case)
 
         self.assertEqual(result["failure"]["turn"], 1)
         self.assertEqual(result["turns"][0]["errors"], partial["errors"])
         mocked_save.assert_called_once()
-        mocked_evaluate.assert_called_once_with(
-            "partial.json", previous_benchmark_run=None
-        )
+        mocked_evaluate.assert_called_once_with("partial.json")
         mocked_markdown.assert_called_once_with("partial.json", "evaluation.json")
         mocked_prompt.assert_called_once_with("partial.json", "evaluation.json")
-        mocked_persist.assert_called_once()
-        self.assertTrue(result["execution"]["result_persisted"])
-
-    @patch("tests.run_benchmark.save_benchmark_run", return_value="error-run-id")
-    @patch("tests.run_benchmark.generate_fix_prompt", return_value="fix.md")
-    @patch("tests.run_benchmark.generate_evaluation_markdown", return_value="evaluation.md")
-    @patch("tests.run_benchmark.evaluate_run")
-    @patch("tests.run_benchmark._save_result", return_value="raw.json")
-    def test_infrastructure_error_attempts_bubble_persistence(
-        self, _mocked_save, mocked_evaluate, _mocked_markdown,
-        _mocked_prompt, mocked_persist
-    ):
-        mocked_evaluate.return_value = (
-            "evaluation.json",
-            {"overall_status": "fail", "summary": "setup failed", "issues": [], "metrics": {}}
-        )
-        case = {"id": "sofia_01", "name": "Sofia", "turns": []}
-        with patch("builtins.open", unittest.mock.mock_open(read_data="artifact")):
-            result = run_benchmark._record_infrastructure_error(
-                case, "canonical-error-run", "development", RuntimeError("setup failed")
-            )
-        self.assertEqual(result["execution"]["benchmark_status"], "error")
-        self.assertTrue(result["execution"]["result_persisted"])
-        payload_result = mocked_persist.call_args.args[0]
-        self.assertEqual(payload_result["run_id"], "canonical-error-run")
-        self.assertEqual(payload_result["infrastructure_error"], "setup failed")
 
 
 if __name__ == "__main__":

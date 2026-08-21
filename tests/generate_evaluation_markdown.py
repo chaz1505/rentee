@@ -124,7 +124,6 @@ def generate_evaluation_markdown(result_path, evaluation_path):
         f"# Rentee Benchmark Evaluation — {result.get('case_name', result.get('case_id', 'Unknown'))}",
         "",
         f"**Result:** {result_label}  ",
-        f"**Run ID:** {result.get('run_id', 'unavailable')}  ",
         f"**Run:** {_run_time(result)}  ",
         f"**Case:** {result.get('case_name', result.get('case_id', 'Unknown'))}",
         "",

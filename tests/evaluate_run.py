@@ -353,30 +353,19 @@ def _count_issue(issues, issue_id):
     return len(issue.get("evidence", [])) if issue else 0
 
 
-def compare_previous(result_path, case, current_metrics, current_issues, environment="development", previous_benchmark_run=None):
+def compare_previous(result_path, case, current_metrics, current_issues):
     previous_path = _previous_result_path(
-        result_path, case["id"], environment
+        result_path, case["id"], result.get("bubble_env", "development")
     )
-    previous_run_id = None
-    previous_evaluation = None
-    if previous_path:
-        previous = _load_json(previous_path)
-        previous_run_id = previous.get("run_id")
-    elif previous_benchmark_run:
-        try:
-            previous = json.loads(previous_benchmark_run.get("rawResultJSON", ""))
-            previous_evaluation = json.loads(previous_benchmark_run.get("evaluationJSON", ""))
-            previous_run_id = previous_benchmark_run.get("runID")
-        except (TypeError, json.JSONDecodeError):
-            return {"available": False}
-    else:
+    if not previous_path:
         return {"available": False}
+    previous = _load_json(previous_path)
     previous_metrics, previous_issues, _ = deterministic_evaluation(previous, case)
     def percentage(current, prior):
         return round((current - prior) / prior * 100, 1) if isinstance(current, (int, float)) and prior else None
     comparison = {
         "available": True,
-        "previous_run_id": previous_run_id,
+        "previous_result": previous_path,
         "first_delta_change_pct": percentage(current_metrics["average_first_delta_s"], previous_metrics["average_first_delta_s"]),
         "total_latency_change_pct": percentage(current_metrics["average_total_s"], previous_metrics["average_total_s"]),
         "slow_turns": {"previous": len(previous_metrics["slow_turns"]), "current": len(current_metrics["slow_turns"])},
@@ -385,10 +374,9 @@ def compare_previous(result_path, case, current_metrics, current_issues, environ
         "repeated_questions": {"previous": _count_issue(previous_issues, "repeated_questions"), "current": _count_issue(current_issues, "repeated_questions")},
         "preference_persistence_failures": {"previous": previous_metrics["preference_persistence_failures"], "current": current_metrics["preference_persistence_failures"]}
     }
-    previous_evaluation_path = previous_path[:-5] + "_evaluation.json" if previous_path else None
-    if previous_evaluation is None and previous_evaluation_path and os.path.exists(previous_evaluation_path):
+    previous_evaluation_path = previous_path[:-5] + "_evaluation.json"
+    if os.path.exists(previous_evaluation_path):
         previous_evaluation = _load_json(previous_evaluation_path)
-    if previous_evaluation:
         comparison["qualitative_scores"] = {
             "previous": previous_evaluation.get("qualitative_evaluation", {}).get("scores", {}),
             "current": {}
@@ -396,7 +384,7 @@ def compare_previous(result_path, case, current_metrics, current_issues, environ
     return comparison
 
 
-def evaluate_run(result_path, run_qualitative=True, previous_benchmark_run=None):
+def evaluate_run(result_path, run_qualitative=True):
     result_path = os.path.abspath(result_path)
     result = _load_json(result_path)
     case = _load_case(result["case_id"])
@@ -427,10 +415,7 @@ def evaluate_run(result_path, run_qualitative=True, previous_benchmark_run=None)
             "The qualitative judge found weak conversation intelligence, adaptation, question quality, recommendation reasoning, or decision progress.",
             qualitative.get("highest_priority_improvement") or "Address the specific behavioural evidence while preserving tool grounding."
         ))
-    comparison = compare_previous(
-        result_path, case, metrics, issues,
-        result.get("bubble_env", "development"), previous_benchmark_run
-    )
+    comparison = compare_previous(result_path, case, metrics, issues)
     if comparison.get("qualitative_scores") is not None:
         comparison["qualitative_scores"]["current"] = qualitative.get("scores", {})
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -438,7 +423,6 @@ def evaluate_run(result_path, run_qualitative=True, previous_benchmark_run=None)
     status = "fail" if issues else "pass"
     summary = f"{len(issues)} issue groups detected; {sum(1 for issue in issues if issue['severity'] in ('critical', 'high'))} critical/high."
     evaluation = {
-        "run_id": result.get("run_id"),
         "case_id": case["id"],
         "overall_status": status,
         "summary": summary,
