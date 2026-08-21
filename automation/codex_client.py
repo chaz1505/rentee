@@ -368,12 +368,6 @@ def submit_codex_fix(
             classified or f"Local Codex execution failed: {detail}"
         )
 
-    safe_final_output = _sanitize_cli_output(
-        execution.stdout or execution.stderr, (complete_prompt, prompt)
-    )
-    if safe_final_output:
-        print(f"[CODEX] Final response:\n{safe_final_output}", flush=True)
-
     status = _run([git_path, "status", "--porcelain"], cwd=workspace)
     _require_success(status, "Workspace status lookup")
     changed_files = _changed_files(status.stdout)
