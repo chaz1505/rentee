@@ -39,14 +39,9 @@ class BenchmarkRunPersistenceTests(unittest.TestCase):
         }
 
     def test_exact_payload_mapping_and_complete_artifacts(self):
-        conversation_markdown = (
-            "# Rentee Benchmark Conversation\n\n"
-            "CUSTOMER:\nhello\n\nRENTEE:\nhi\n"
-        )
         payload = persistence.build_benchmark_run_payload(
             self.result, self.evaluation,
-            "# Evaluation\n\nTenant: hello\nRentee: hi", "complete fix prompt", "live",
-            conversation_markdown=conversation_markdown,
+            "# Evaluation\n\nTenant: hello\nRentee: hi", "complete fix prompt", "live"
         )
         self.assertEqual(set(payload), persistence.BENCHMARK_RUN_FIELDS - {"decisionProgress"})
         self.assertNotIn("converationIntelligence", payload)
@@ -61,7 +56,6 @@ class BenchmarkRunPersistenceTests(unittest.TestCase):
         self.assertEqual(json.loads(payload["rawResultJSON"]), self.result)
         self.assertEqual(json.loads(payload["evaluationJSON"]), self.evaluation)
         self.assertIn("Tenant: hello", payload["evaluationMarkdown"])
-        self.assertEqual(payload["conversationMarkdown"], conversation_markdown)
         self.assertEqual(payload["fixPrompt"], "complete fix prompt")
         self.assertRegex(payload["startedAt"], r"Z$")
         self.assertRegex(payload["completedAt"], r"Z$")
@@ -103,43 +97,6 @@ class BenchmarkRunPersistenceTests(unittest.TestCase):
             persistence.save_benchmark_run(error_result, self.evaluation, "md", "prompt", "development")
         self.assertEqual(mocked_post.call_args_list[0].kwargs["json"]["status"], "fail")
         self.assertEqual(mocked_post.call_args_list[1].kwargs["json"]["status"], "error")
-
-    @patch("tests.save_benchmark_run.requests.post")
-    def test_complete_synthetic_and_partial_markdown_are_sent_unchanged(
-        self, mocked_post
-    ):
-        response = Mock(ok=True, content=b'{}')
-        response.json.side_effect = [{"id": "synthetic-id"}, {"id": "partial-id"}]
-        mocked_post.return_value = response
-        synthetic_markdown = (
-            "# Rentee Benchmark Conversation\n\n"
-            "## Synthetic Customer Ground Truth\n\n"
-            "Wanted to view:\n- Alpha Residence\n- Beta Heights\n"
-        )
-        partial_markdown = (
-            "# Rentee Benchmark Conversation\n\n"
-            "CUSTOMER:\nExact partial message\n\n"
-            "Errors:\n- SSE failure\n"
-        )
-        with patch.dict(os.environ, {"BUBBLE_API_TOKEN": "secret"}, clear=False):
-            persistence.save_benchmark_run(
-                self.result, self.evaluation, "md", "prompt", "development",
-                conversation_markdown=synthetic_markdown,
-            )
-            persistence.save_benchmark_run(
-                dict(self.result, failure={"turn": 1}),
-                self.evaluation, "md", "prompt", "development",
-                conversation_markdown=partial_markdown,
-            )
-
-        self.assertEqual(
-            mocked_post.call_args_list[0].kwargs["json"]["conversationMarkdown"],
-            synthetic_markdown,
-        )
-        self.assertEqual(
-            mocked_post.call_args_list[1].kwargs["json"]["conversationMarkdown"],
-            partial_markdown,
-        )
 
     @patch("tests.save_benchmark_run.requests.get")
     def test_previous_lookup_is_environment_specific_and_returns_latest(self, mocked_get):

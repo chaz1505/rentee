@@ -431,14 +431,11 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
     result["completed_at_utc"] = _utc_now()
     output_path = _save_result(case["id"], result, environment)
     conversation_path = None
-    conversation_markdown = None
     conversation_artifact_error = None
     try:
         conversation_path = generate_conversation_markdown(
             result, case, os.path.dirname(os.path.abspath(output_path))
         )
-        with open(conversation_path, "r", encoding="utf-8") as source:
-            conversation_markdown = source.read()
     except Exception as error:
         conversation_artifact_error = str(error)
         benchmark_log(
@@ -465,8 +462,7 @@ def run_case(case, run_id=None, progress_callback=None, environment="development
     persistence = {"persisted": False, "benchmark_run_id": None, "error": None}
     try:
         persistence["benchmark_run_id"] = save_benchmark_run(
-            result, evaluation, evaluation_markdown, fix_prompt, environment,
-            conversation_markdown=conversation_markdown,
+            result, evaluation, evaluation_markdown, fix_prompt, environment
         )
         persistence["persisted"] = True
     except Exception as error:
@@ -587,14 +583,11 @@ def _record_infrastructure_error(case, run_id, environment, error):
     }
     output_path = _save_result(case["id"], result, environment)
     conversation_path = None
-    conversation_markdown = None
     conversation_artifact_error = None
     try:
         conversation_path = generate_conversation_markdown(
             result, case, os.path.dirname(os.path.abspath(output_path))
         )
-        with open(conversation_path, "r", encoding="utf-8") as source:
-            conversation_markdown = source.read()
     except Exception as artifact_error:
         conversation_artifact_error = str(artifact_error)
         benchmark_log(
@@ -614,8 +607,7 @@ def _record_infrastructure_error(case, run_id, environment, error):
     persisted, benchmark_run_id, persistence_error = False, None, None
     try:
         benchmark_run_id = save_benchmark_run(
-            result, evaluation, evaluation_markdown, fix_prompt, environment,
-            conversation_markdown=conversation_markdown,
+            result, evaluation, evaluation_markdown, fix_prompt, environment
         )
         persisted = True
     except Exception as persistence_exception:

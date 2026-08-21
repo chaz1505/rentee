@@ -13,8 +13,7 @@ except ImportError:
 REQUEST_TIMEOUT = 30
 BENCHMARK_RUN_FIELDS = {
     "runID", "caseID", "caseName", "environment", "status",
-    "evaluationJSON", "evaluationMarkdown", "conversationMarkdown",
-    "fixPrompt", "previousRunID",
+    "evaluationJSON", "evaluationMarkdown", "fixPrompt", "previousRunID",
     "rawResultJSON", "summary", "averageFirstText", "averageTotal",
     "criticalIssueCount", "maxFirstText", "questionQuality",
     "recommendationReasoning", "adaptiveness", "decisionProgress",
@@ -61,10 +60,7 @@ def _number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def build_benchmark_run_payload(
-    result, evaluation, evaluation_markdown, fix_prompt, environment,
-    conversation_markdown=None,
-):
+def build_benchmark_run_payload(result, evaluation, evaluation_markdown, fix_prompt, environment):
     metrics = evaluation.get("metrics", {})
     first_text_values = [
         turn.get("timing", {}).get("first_delta_s")
@@ -90,7 +86,6 @@ def build_benchmark_run_payload(
         "rawResultJSON": json.dumps(result, ensure_ascii=False),
         "evaluationJSON": json.dumps(evaluation, ensure_ascii=False),
         "evaluationMarkdown": evaluation_markdown,
-        "conversationMarkdown": conversation_markdown,
         "fixPrompt": fix_prompt,
         "summary": evaluation.get("summary")
     }
@@ -109,14 +104,10 @@ def build_benchmark_run_payload(
     return {key: value for key, value in payload.items() if key in BENCHMARK_RUN_FIELDS and value is not None}
 
 
-def save_benchmark_run(
-    result, evaluation, evaluation_markdown, fix_prompt, environment,
-    conversation_markdown=None,
-):
+def save_benchmark_run(result, evaluation, evaluation_markdown, fix_prompt, environment):
     url = f"{get_bubble_base(environment)}/obj/benchmarkRun"
     payload = build_benchmark_run_payload(
-        result, evaluation, evaluation_markdown, fix_prompt, environment,
-        conversation_markdown=conversation_markdown,
+        result, evaluation, evaluation_markdown, fix_prompt, environment
     )
     response = requests.post(
         url, headers=_headers(), json=payload, timeout=REQUEST_TIMEOUT

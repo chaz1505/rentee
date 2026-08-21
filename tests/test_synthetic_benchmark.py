@@ -227,9 +227,7 @@ class SyntheticBenchmarkTests(unittest.TestCase):
             )) as evaluate,
             patch("tests.run_benchmark.generate_evaluation_markdown", return_value="evaluation.md"),
             patch("tests.run_benchmark.generate_fix_prompt", return_value="fix.md"),
-            patch(
-                "tests.run_benchmark.save_benchmark_run", return_value="run-id"
-            ) as persist,
+            patch("tests.run_benchmark.save_benchmark_run", return_value="run-id"),
             patch("builtins.open", mock_open(read_data="artifact")),
         ):
             result = run_benchmark.run_case(case, run_id="synthetic-run")
@@ -242,9 +240,6 @@ class SyntheticBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(result["synthetic_completion"]["status"], "success")
         self.assertEqual(result["synthetic_completion"]["customer_messages"], 1)
-        self.assertEqual(
-            persist.call_args.kwargs["conversation_markdown"], "artifact"
-        )
 
 
 if __name__ == "__main__":
