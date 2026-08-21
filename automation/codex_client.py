@@ -9,7 +9,6 @@ CODEX_PROVIDER = "codex_cloud_cli"
 CODEX_REPOSITORY = "chaz1505/rentee"
 CODEX_BASE_BRANCH = "main"
 SUBMISSION_TIMEOUT_SECONDS = 60
-MAX_CLI_DIAGNOSTIC_LENGTH = 2000
 
 EXECUTION_WRAPPER = """You are operating autonomously on the Rentee repository.
 
@@ -60,30 +59,6 @@ def _reject_configured_secrets(prompt):
             raise CodexSubmissionError(
                 f"Codex prompt contains configured secret material ({name})."
             )
-
-
-def _sanitize_cli_output(value, sensitive_values=()):
-    sanitized = str(value or "")
-    secrets = [
-        os.environ.get(name)
-        for name in (
-            "OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "BENCHMARK_API_KEY",
-            "BUBBLE_API_TOKEN",
-        )
-    ]
-    secrets.extend(sensitive_values)
-    for secret in secrets:
-        if secret:
-            sanitized = sanitized.replace(str(secret), "[REDACTED]")
-    sanitized = re.sub(
-        r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+",
-        r"\1[REDACTED]",
-        sanitized,
-    )
-    sanitized = sanitized.strip()
-    if len(sanitized) > MAX_CLI_DIAGNOSTIC_LENGTH:
-        sanitized = sanitized[:MAX_CLI_DIAGNOSTIC_LENGTH] + "…[truncated]"
-    return sanitized
 
 
 def _run(command, **kwargs):
@@ -154,26 +129,13 @@ def submit_codex_fix(prompt, run_id, benchmark_run_id, environment):
         "exec",
         "--env",
         cloud_environment,
+        "--branch",
+        CODEX_BASE_BRANCH,
         complete_prompt,
     ])
     if submission.returncode != 0:
-        safe_stdout = _sanitize_cli_output(
-            submission.stdout, (complete_prompt, prompt)
-        )
-        safe_stderr = _sanitize_cli_output(
-            submission.stderr, (complete_prompt, prompt)
-        )
-        print(
-            f"[CODEX] Codex CLI exited with code {submission.returncode}",
-            flush=True,
-        )
-        if safe_stdout:
-            print(f"[CODEX] stdout: {safe_stdout}", flush=True)
-        if safe_stderr:
-            print(f"[CODEX] stderr: {safe_stderr}", flush=True)
-        concise_error = safe_stderr or safe_stdout or "no CLI error output"
         raise CodexSubmissionError(
-            f"Codex cloud task submission failed: {concise_error}"
+            "Codex cloud task submission failed."
         )
     output = "\n".join((submission.stdout or "", submission.stderr or ""))
     task_id, task_id_source = _task_id(output)
