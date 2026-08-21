@@ -186,6 +186,16 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
+        self.assertEqual(continuation["tools"], [{"type": "web_search"}])
+        normalized = " ".join(continuation["instructions"].split())
+        self.assertIn("preserving the active subject", normalized)
+        self.assertIn("Tool output is evidence, not a template", normalized)
+        self.assertIn("roughly two to five sentences", normalized)
+        self.assertIn("genuinely broad request", normalized)
+        self.assertIn("use web search", normalized)
+        self.assertIn("without discussing database coverage", normalized)
+        self.assertIn("pool length", normalized)
+        self.assertIn("Never say 'stored condo data'", normalized)
 
     @patch("app.load_front_door_renter_context", return_value="Pets: two cats")
     @patch("app.stream_match_lead")
