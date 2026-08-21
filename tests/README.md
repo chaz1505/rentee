@@ -31,18 +31,4 @@ python tests/run_benchmark.py
 
 On Render, the same command works when `BUBBLE_API_TOKEN` is already configured in the service environment.
 
-After the conversation completes, deterministic evaluation checks latency, stream integrity, unsupported promises, excessive and repeated questions, current-recommendation behaviour, historical-recommendation language, and configured preference persistence. One `gpt-5-mini` evaluator call then assesses genuinely qualitative behaviour: conversation intelligence, recommendation reasoning, adaptiveness, question quality, and decision progress. Set `RENTEE_EVALUATOR_MODEL` to override that model.
-
-The evaluator compares the run with the most recent earlier raw result for the same case. It reports latency changes and changes in the major violation counts; qualitative scores are compared when the prior evaluation file exists.
-
-Each completed run generates three files:
-
-```text
-tests/results/<case>_<timestamp>.json
-tests/results/<case>_<timestamp>_evaluation.json
-tests/results/<case>_<timestamp>_fix_prompt.md
-```
-
-The Markdown file is a ready-to-paste Codex task containing evidence, prioritised fixes, regression constraints, and required verification. Review it before giving it to Codex; the benchmark diagnoses only and never edits application code.
-
-After Codex makes a fix, rerun `python tests/run_benchmark.py`. The next evaluation automatically compares the new run with the preceding one. v1 contains only the Sofia case.
+Completed runs are stored as timestamped JSON files under `tests/results/`. v1 contains only the Sofia case. Recommendation scoring and an LLM judge will be added later.

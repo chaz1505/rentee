@@ -302,9 +302,8 @@ def build_response_args(user_message, previous_response_id=None):
             "bedrooms, bathrooms, size, furnishing, facilities, availability, parking, "
             "addresses, commute times, photos, or floorplans, may only be stated when they "
             "come from the CURRENT successful match_lead tool result. "
-            "After update_preferences succeeds, confirm the saved change concisely. Run "
-            "match_lead afterward only when the same user request explicitly asks for current "
-            "recommendations; only describe properties from that current result, never from "
+            "After update_preferences succeeds, the application refreshes recommendations; "
+            "only describe fresh properties from that current tool result, never from "
             "conversation history. Never claim a property is currently available because it "
             "was mentioned earlier. Conversation history is for normal continuity, not a "
             "database of property facts. Do not offer actions the system "
@@ -339,7 +338,6 @@ def build_response_args(user_message, previous_response_id=None):
             "the supplied data."
         ),
         "tool_choice": "auto",
-        "parallel_tool_calls": False,
         "tools": [
     {
         "type": "function",
@@ -389,17 +387,9 @@ def build_response_args(user_message, previous_response_id=None):
                         "A concise description of the new, changed, removed, or additional "
                         "home-search information stated by the user."
                     )
-                },
-                "recommendations_requested": {
-                    "type": "boolean",
-                    "description": (
-                        "True only when this same user message explicitly asks to see, find, "
-                        "compare, shortlist, or receive current property recommendations. "
-                        "False for a preference update or clarification by itself."
-                    )
                 }
             },
-            "required": ["preference_update", "recommendations_requested"],
+            "required": ["preference_update"],
             "additionalProperties": False
         }
     },
@@ -871,12 +861,6 @@ concierge.
 Do not mention Lead IDs, Folio IDs, Listing IDs, internal database information,
 the matching process, internal scoring, or estate-agent workflows.
 
-Do not offer or promise actions Rentee cannot perform. In particular, do not say
-you will contact or check with agents, owners, or property management; arrange,
-schedule, or book viewings; send photos; obtain floorplans; privately confirm
-availability; or perform exact commute checks. You may suggest what the customer
-should verify themselves, clearly framed as their next step.
-
 Do not invent facts. Only use information in the home seeker requirements and
 supplied property information.
 
@@ -1098,10 +1082,7 @@ REQUESTED PREFERENCE UPDATE:
         instructions=(
             "Return JSON matching the supplied schema. The confirmation must be a "
             "short, natural sentence addressed directly to the customer and must not "
-            "mention internal IDs, fields, APIs, tools, matching mechanics, or future "
-            "tool calls. It must not offer to contact agents or owners, arrange viewings, "
-            "send photos, obtain floorplans, privately confirm availability, or perform "
-            "exact commute checks. ai_search_summary must be "
+            "mention internal IDs, fields, APIs, or tools. ai_search_summary must be "
             "a clean current customer-facing search summary derived from the final "
             "updated_ai_search_text."
         ),
@@ -1206,7 +1187,7 @@ def chat_stream():
                 initial_first_delta_logged = False
 
                 def stream_initial_response(response_args, timing_label):
-                    nonlocal initial_first_event_logged
+                    nonlocal first_delta_sent, initial_first_event_logged
                     nonlocal initial_first_delta_logged, web_search_status_sent
 
                     initial_started = time.perf_counter()
@@ -1237,8 +1218,12 @@ def chat_stream():
                                             initial_started
                                         )
                                         initial_first_delta_logged = True
-                                    # This response selects tools. Do not expose provisional
-                                    # model text before knowing whether it contains a tool call.
+                                    if not first_delta_sent:
+                                        log_timing("FIRST DELTA", request_started)
+                                        first_delta_sent = True
+                                    yield (
+                                        f"data: {json.dumps({'delta': event.delta})}\n\n"
+                                    )
 
                             final_response = stream.get_final_response()
                             log_token_usage("Initial", final_response)
@@ -1284,11 +1269,6 @@ def chat_stream():
 
                 if tool_call is None:
                     print("No tool call requested", flush=True)
-                    if response.output_text:
-                        if not first_delta_sent:
-                            log_timing("FIRST DELTA", request_started)
-                            first_delta_sent = True
-                        yield f"data: {json.dumps({'delta': response.output_text})}\n\n"
                     citations = get_web_citations(response)
 
                     if citations:
@@ -1312,9 +1292,7 @@ def chat_stream():
                     follow_up_instructions = (
                         "The tool output already contains the final customer-facing answer. "
                         "Return it faithfully. Do not add, remove, reinterpret, embellish, "
-                        "or invent property information. Do not mention tools or matching "
-                        "mechanics and do not offer to contact agents or owners, arrange "
-                        "viewings, send photos, obtain floorplans, or privately check facts."
+                        "or invent property information."
                     )
                 elif tool_call.name == "update_preferences":
                     yield (
@@ -1325,9 +1303,9 @@ def chat_stream():
                         tool_args["preference_update"],
                         bubble_env
                     )
-                    if tool_args.get("recommendations_requested") is True:
+                    try:
                         print(
-                            "Preference update complete; recommendation request requires rematch",
+                            "Preference update complete; running automatic rematch",
                             flush=True
                         )
                         yield (
@@ -1347,19 +1325,15 @@ def chat_stream():
                         follow_up_instructions = (
                             "The tool output already contains the final customer-facing "
                             "recommendations. Return it faithfully without adding, removing, "
-                            "or inventing property information. Do not mention tools or matching "
-                            "mechanics and do not offer to contact agents or owners, arrange "
-                            "viewings, send photos, obtain floorplans, or privately check facts."
+                            "or inventing property information."
                         )
-                    else:
+                    except Exception as error:
+                        print(f"Matching after preference update failed: {error}", flush=True)
                         has_match_results = False
                         tool_result = preference_confirmation
                         follow_up_instructions = (
                             "Return the completed preference-update confirmation naturally. "
-                            "Do not mention properties, tools, matching mechanics, or internal "
-                            "errors. Do not ask follow-up questions or offer to contact agents "
-                            "or owners, arrange viewings, send photos, obtain floorplans, or "
-                            "privately check facts."
+                            "Do not mention properties or internal errors."
                         )
                 elif tool_call.name == "get_property_details":
                     has_match_results = False
@@ -1402,9 +1376,7 @@ def chat_stream():
                         "trade-offs accordingly. For comparisons, compare only the returned "
                         "data. Clearly identify condos that were not found and say when the "
                         "requested information is unavailable. Do not invent missing details, "
-                        "claim current listing availability, or expose tool/internal field names. "
-                        "Do not offer to contact agents or owners, arrange viewings, send photos, "
-                        "obtain floorplans, or privately check facts."
+                        "claim current listing availability, or expose tool/internal field names."
                     )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
@@ -1453,8 +1425,6 @@ def chat_stream():
 
                 if follow_up_tools:
                     continuation_args["tools"] = follow_up_tools
-                else:
-                    continuation_args["tools"] = []
 
                 final_openai_started = time.perf_counter()
                 with client.responses.stream(**continuation_args) as stream:
@@ -1482,15 +1452,6 @@ def chat_stream():
                     final = stream.get_final_response()
                 log_token_usage("Final", final)
                 log_timing("Final OpenAI completion", final_openai_started)
-
-                unresolved_calls = [
-                    item for item in final.output if item.type == "function_call"
-                ]
-                if unresolved_calls:
-                    raise RuntimeError(
-                        "OpenAI continuation returned an unresolved function call; "
-                        "the response_id will not be exposed for reuse."
-                    )
 
                 print("Tool lifecycle completed", flush=True)
 
