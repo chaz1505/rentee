@@ -125,10 +125,9 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("specific current Rentee listing or unit", property_tool["description"])
         self.assertIn("general development", property_tool["description"])
 
-    @patch("app.load_front_door_renter_summary", return_value="No stored preferences yet.")
     @patch("app.get_condo_infos")
     def test_chat_stream_executes_condo_tool_and_continues_same_response(
-        self, mocked_condo_infos, _mocked_summary
+        self, mocked_condo_infos
     ):
         requested_names = ["Ken Bangsar", "One Menerung"]
         mocked_condo_infos.return_value = json.dumps({"condos": []})
@@ -187,11 +186,10 @@ class CondoInfoTests(unittest.TestCase):
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
 
-    @patch("app.load_front_door_renter_summary", return_value="Pets: two cats")
     @patch("app.stream_match_lead")
     @patch("app.update_preferences", return_value="Saved your cat preference.")
     def test_preference_only_update_does_not_rematch_or_leak_selection_text(
-        self, _mocked_update, mocked_match, _mocked_summary
+        self, _mocked_update, mocked_match
     ):
         tool_call = SimpleNamespace(
             type="function_call", name="update_preferences", call_id="update-call",
@@ -234,7 +232,7 @@ class CondoInfoTests(unittest.TestCase):
             body = response.get_data(as_text=True)
         mocked_match.assert_not_called()
         _mocked_update.assert_called_once_with(
-            "folio-1", "Two cats", "live"
+            "folio-1", "We also have two cats.", "live"
         )
         self.assertNotIn("Now calling match_lead", body)
         self.assertIn("Saved your cat preference.", body)
@@ -247,10 +245,9 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("recommendations_requested", tool["parameters"]["required"])
         self.assertFalse(args["parallel_tool_calls"])
 
-    @patch("app.load_front_door_renter_summary", return_value="Complete renter brief")
     @patch("app.stream_match_lead")
     def test_current_match_answer_is_sent_directly_while_continuity_is_finalized(
-        self, mocked_match, _mocked_summary
+        self, mocked_match
     ):
         def grounded_match(*_args):
             yield "Searching available properties..."
@@ -337,7 +334,7 @@ class CondoInfoTests(unittest.TestCase):
 
     @patch("app.update_lead_ai_searchtext")
     @patch("app.bubble")
-    def test_additive_update_preserves_profile_and_generates_clean_summary(
+    def test_additive_update_uses_fast_deterministic_path(
         self, mocked_bubble, mocked_update_lead
     ):
         mocked_bubble.side_effect = [
@@ -348,24 +345,19 @@ class CondoInfoTests(unittest.TestCase):
             }
         ]
         fake_client = MagicMock()
-        fake_client.responses.create.return_value = SimpleNamespace(
-            output_text=json.dumps({
-                "ai_search_summary": "Bedrooms: 3 or 4\nPets: two cats"
-            })
-        )
         with patch.object(app_module, "client", fake_client):
             confirmation = app_module.update_preferences(
-                "folio-1", "Two cats", "development"
+                "folio-1", "We also have two cats.", "development"
             )
 
-        fake_client.responses.create.assert_called_once()
+        fake_client.responses.create.assert_not_called()
         mocked_update_lead.assert_called_once()
         updated_text = mocked_update_lead.call_args.args[1]
         updated_summary = mocked_update_lead.call_args.args[2]
         self.assertIn("Bedrooms: 3 or 4", updated_text)
-        self.assertIn("Two cats", updated_text)
-        self.assertEqual(updated_summary, "Bedrooms: 3 or 4\nPets: two cats")
-        self.assertIn("Two cats", confirmation)
+        self.assertIn("We also have two cats.", updated_text)
+        self.assertIn("We also have two cats.", updated_summary)
+        self.assertIn("We also have two cats.", confirmation)
 
     def test_replacement_detection_keeps_model_rewrite_path_available(self):
         self.assertTrue(
@@ -379,11 +371,10 @@ class CondoInfoTests(unittest.TestCase):
             )
         )
 
-    @patch("app.load_front_door_renter_summary", return_value="Complete renter brief")
     @patch("app.stream_match_lead")
     @patch("app.update_preferences", return_value="Saved.")
-    def test_combined_update_persists_structured_preference_before_rematch(
-        self, mocked_update, mocked_match, _mocked_summary
+    def test_combined_update_persists_exact_customer_text_before_rematch(
+        self, mocked_update, mocked_match
     ):
         customer_message = (
             "Please avoid units looking over a car park; show me suitable options."
@@ -391,7 +382,8 @@ class CondoInfoTests(unittest.TestCase):
         tool_call = SimpleNamespace(
             type="function_call", name="update_preferences", call_id="update-call",
             arguments=json.dumps({
-                "preference_update": "Avoid units overlooking a car park.",
+                # Simulate a lossy model summary to guard the persistence boundary.
+                "preference_update": "Update the view preference",
                 "recommendations_requested": True
             })
         )
@@ -418,13 +410,7 @@ class CondoInfoTests(unittest.TestCase):
             )
             response.get_data(as_text=True)
 
-        mocked_update.assert_called_once_with(
-            "folio-1", "Avoid units overlooking a car park.", "live"
-        )
-        self.assertNotIn(
-            "show me suitable options",
-            mocked_update.call_args.args[1].lower(),
-        )
+        mocked_update.assert_called_once_with("folio-1", customer_message, "live")
         mocked_match.assert_called_once_with(
             "folio-1", "live", customer_message
         )
