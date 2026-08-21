@@ -279,33 +279,6 @@ def _changed_files(status_output):
     return files
 
 
-def _verify_disposable_workspace(workspace, task_id):
-    workspace_root = WORKSPACE_ROOT.resolve()
-    resolved_workspace = Path(workspace).resolve()
-    try:
-        inside_workspace_root = (
-            os.path.commonpath((str(workspace_root), str(resolved_workspace)))
-            == str(workspace_root)
-        )
-    except ValueError:
-        inside_workspace_root = False
-    if not inside_workspace_root or resolved_workspace == workspace_root:
-        raise CodexSubmissionError(
-            "Codex execution workspace is outside the disposable workspace root."
-        )
-    if not (resolved_workspace / ".git").is_dir():
-        raise CodexSubmissionError(
-            "Codex execution workspace is not a cloned Git repository."
-        )
-    print(
-        "[CODEX] Render sandbox unavailable; using isolated workspace "
-        "execution mode.",
-        flush=True,
-    )
-    print(f"[CODEX] Verified disposable repo workspace: {task_id}", flush=True)
-    return resolved_workspace
-
-
 def submit_codex_fix(
     prompt, run_id, benchmark_run_id, environment, task_id=None
 ):
@@ -363,14 +336,13 @@ def submit_codex_fix(
             print("[CODEX] Running API authentication smoke test...", flush=True)
             check_codex_authentication(codex_path, codex_env)
             print("[CODEX] API authentication smoke test succeeded.", flush=True)
-        execution_workspace = _verify_disposable_workspace(workspace, task_id)
         print("[CODEX] Starting local codex exec...", flush=True)
         execution = _run(
             [
                 codex_path, "exec", "--ignore-user-config", "--ephemeral",
-                "--dangerously-bypass-approvals-and-sandbox", "-",
+                "--sandbox", "workspace-write", "-",
             ],
-            cwd=execution_workspace,
+            cwd=workspace,
             timeout=_execution_timeout(),
             input_text=complete_prompt,
             env=codex_env,

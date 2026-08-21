@@ -99,13 +99,9 @@ class CodexClientTests(unittest.TestCase):
         codex_call = next(call for call in calls if call[0][1] == "exec")
         self.assertEqual(codex_call[0], [
             "/usr/bin/codex", "exec", "--ignore-user-config", "--ephemeral",
-            "--dangerously-bypass-approvals-and-sandbox", "-"
+            "--sandbox", "workspace-write", "-"
         ])
-        self.assertNotIn("workspace-write", codex_call[0])
-        self.assertEqual(
-            Path(codex_call[1]["cwd"]).resolve(),
-            Path(result["workspace"]).resolve(),
-        )
+        self.assertEqual(Path(codex_call[1]["cwd"]), Path(result["workspace"]))
         self.assertIn("human-reviewed fix", codex_call[1]["input_text"])
         self.assertEqual(codex_call[1]["env"]["OPENAI_API_KEY"], "api-key")
         self.assertEqual(result["provider"], "codex_local_cli")
@@ -113,30 +109,6 @@ class CodexClientTests(unittest.TestCase):
         self.assertEqual(result["changed_files"], ["app.py", "tests/test_new.py"])
         self.assertTrue(result["changes_detected"])
         self.assertTrue(Path(result["workspace"]).exists())
-
-    def test_unsandboxed_execution_requires_workspace_inside_root(self):
-        outside = Path(self.temp_dir.name) / "outside"
-        (outside / ".git").mkdir(parents=True)
-        with self.assertRaisesRegex(
-            codex_client.CodexSubmissionError, "outside the disposable"
-        ):
-            codex_client._verify_disposable_workspace(outside, "task-id")
-
-    def test_unsandboxed_execution_requires_git_repository(self):
-        workspace = self.workspace_root / "task-id"
-        workspace.mkdir(parents=True)
-        with self.assertRaisesRegex(
-            codex_client.CodexSubmissionError, "not a cloned Git repository"
-        ):
-            codex_client._verify_disposable_workspace(workspace, "task-id")
-
-    def test_deployed_render_checkout_is_never_accepted(self):
-        with self.assertRaisesRegex(
-            codex_client.CodexSubmissionError, "outside the disposable"
-        ):
-            codex_client._verify_disposable_workspace(
-                Path("/opt/render/project/src"), "task-id"
-            )
 
     @patch("automation.codex_client.shutil.which")
     def test_success_output_is_sanitized_and_truncated(self, mocked_which):
