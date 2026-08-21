@@ -121,11 +121,11 @@ The endpoint does not accept Lead or Folio IDs. It only uses the dedicated IDs s
 
 ## Human review to Codex handoff
 
-`POST /admin/benchmark/<benchmark_run_id>/fix` incorporates the authoritative Bubble human review into `fixPrompt`, creates a Rentee task ID, records `working` in Bubble, and starts a background local Codex execution. `GET /admin/benchmark/<benchmark_run_id>/fix_status?environment=development|live` returns the Codex metadata currently stored on that BenchmarkRun. Both endpoints require `X-Benchmark-Key`.
+`POST /admin/benchmark/<benchmark_run_id>/fix` incorporates the authoritative Bubble human review into `fixPrompt`, then submits the complete prompt to an asynchronous Codex cloud task. `GET /admin/benchmark/<benchmark_run_id>/fix_status?environment=development|live` returns the Codex metadata currently stored on that BenchmarkRun. Both endpoints require `X-Benchmark-Key`.
 
-The integration uses the officially documented non-interactive `codex exec` command. Render must have the Codex CLI and Git installed. Each task clones the public `chaz1505/rentee` repository from `main` into `/tmp/rentee-codex/<task-id>`, creates an isolated `codex/benchmark-...` branch, and runs Codex with the workspace-write sandbox. The deployed Render checkout is never modified.
+The integration uses the officially documented Codex CLI `codex cloud exec` command. Render must have the Codex CLI installed and available as `codex`. Configure `CODEX_CLOUD_ENV_ID` with a Codex cloud environment linked to `chaz1505/rentee` whose base branch is `main`. The cloud environment is the writable, isolated coding workspace; the deployed Render checkout is not modified.
 
-Local Codex authentication uses the existing `OPENAI_API_KEY` inherited by the subprocess. No ChatGPT OAuth login, Codex Cloud environment, or Codex access token is required. The complete prompt is passed through stdin rather than command arguments. Configure optional `CODEX_EXEC_TIMEOUT_SECONDS` to override the 900-second execution limit.
+Codex CLI authentication uses its existing authenticated state when available. Otherwise the adapter uses `CODEX_ACCESS_TOKEN` with `codex login --with-access-token`, or the existing `OPENAI_API_KEY` with `codex login --with-api-key`. Credentials are sent through stdin and are never placed in the task prompt, Bubble, or logs.
 
 The BenchmarkRun must expose these fields:
 
@@ -136,4 +136,4 @@ codexStatus
 codexTaskID
 ```
 
-`working`, legacy `submitted`, and `completed` prevent duplicate execution; `failed` allows a retry. The HTTP endpoint returns `202` after starting a daemon background thread. Bubble changes to `completed` or `failed` when local execution finishes. `codexTaskID` is a Rentee-generated correlation ID, not an OpenAI cloud-task ID. Workspaces are retained for the later PR phase; workspaces older than 24 hours are removed when a new task starts.
+`working` and `submitted` prevent duplicate submissions; `failed` allows a retry. The CLI returns after cloud task acceptance, so the endpoint does not wait for the coding task to finish. If the installed CLI output exposes a native cloud task ID, that ID is stored. Otherwise the adapter clearly labels and stores a Rentee-generated correlation ID; it is not represented as an official Codex ID.
