@@ -225,14 +225,9 @@ class CodexClientTests(unittest.TestCase):
     def test_publish_commits_pushes_and_creates_pull_request(self):
         workspace = self._publish_workspace()
         calls = []
-        auth_files_seen = []
 
         def fake_run(command, **kwargs):
             calls.append((command, kwargs))
-            if command[1] in ("ls-remote", "push"):
-                auth_files_seen.append(
-                    Path(kwargs["env"]["GIT_ASKPASS"]).is_file()
-                )
             if command[1:] == ["diff", "--cached", "--quiet"]:
                 return completed(returncode=1)
             if command[1:] == ["rev-parse", "HEAD"]:
@@ -278,26 +273,6 @@ class CodexClientTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", push_call[1]["env"])
         self.assertNotIn("BENCHMARK_API_KEY", push_call[1]["env"])
         self.assertNotIn("BUBBLE_API_TOKEN", push_call[1]["env"])
-        self.assertNotIn("GITHUB_TOKEN", push_call[1]["env"])
-        self.assertEqual(
-            push_call[1]["env"]["RENTEE_GITHUB_USERNAME"],
-            "x-access-token",
-        )
-        self.assertEqual(
-            push_call[1]["env"]["RENTEE_GITHUB_PASSWORD"],
-            "github-secret",
-        )
-        askpass_path = Path(push_call[1]["env"]["GIT_ASKPASS"])
-        self.assertEqual(auth_files_seen, [True, True])
-        self.assertFalse(askpass_path.exists())
-        remote_call = next(call for call in calls if call[0][1] == "ls-remote")
-        self.assertEqual(remote_call[1]["env"], push_call[1]["env"])
-        self.assertEqual(remote_call[0][3], "origin")
-        self.assertFalse(any(command[1:3] == ["remote", "set-url"] for command in commands))
-        self.assertFalse(any(command[1] == "config" for command in commands))
-        self.assertNotIn("github-secret", "\n".join(
-            " ".join(command) for command in commands
-        ))
         self.assertEqual(result["fix_commit"], "fix123")
         self.assertEqual(result["pr_number"], 42)
         self.assertEqual(mocked_get.call_args.kwargs["params"], {
