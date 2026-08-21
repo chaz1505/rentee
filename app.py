@@ -360,37 +360,14 @@ def _run_codex_fix_background(
     from tests.human_review import patch_codex_state
 
     try:
-        def persist_progress(status, progress):
-            payload = {
-                "codexSubmitted": True,
-                "codexStatus": status,
-                "codexTaskID": task_id,
-            }
-            if progress.get("branch"):
-                payload["codexBranch"] = progress["branch"]
-            if progress.get("fix_commit"):
-                payload["codexCommit"] = progress["fix_commit"]
-            patch_codex_state(benchmark_run_id, environment, payload)
-
         metadata = submit_codex_fix(
-            prompt, run_id, benchmark_run_id, environment, task_id=task_id,
-            progress_callback=persist_progress,
+            prompt, run_id, benchmark_run_id, environment, task_id=task_id
         )
-        final_status = metadata.get("status", "completed")
-        final_payload = {
+        patch_codex_state(benchmark_run_id, environment, {
             "codexSubmitted": True,
-            "codexStatus": final_status,
+            "codexStatus": "completed",
             "codexTaskID": task_id,
-        }
-        if metadata.get("branch"):
-            final_payload["codexBranch"] = metadata["branch"]
-        if metadata.get("fix_commit"):
-            final_payload["codexCommit"] = metadata["fix_commit"]
-        if metadata.get("pr_number") is not None:
-            final_payload["codexPRNumber"] = metadata["pr_number"]
-        if metadata.get("pr_url"):
-            final_payload["codexPRURL"] = metadata["pr_url"]
-        patch_codex_state(benchmark_run_id, environment, final_payload)
+        })
         with _codex_task_metadata_lock:
             _codex_task_metadata[task_id] = metadata
         print(f"[CODEX] Task completed: {task_id}", flush=True)

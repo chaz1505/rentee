@@ -3,7 +3,7 @@ import json
 import os
 import unittest
 from contextlib import redirect_stdout
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 os.environ.setdefault("BUBBLE_API_TOKEN", "test-bubble-token")
@@ -169,29 +169,6 @@ class HumanReviewHelperTests(unittest.TestCase):
         self.assertNotIn("secret-token", message)
         self.assertNotIn("admin-secret", message)
 
-    @patch("tests.human_review.requests.get")
-    def test_codex_status_reads_pull_request_metadata(self, mocked_get):
-        mocked_get.return_value = response({"response": self.record(
-            codexStatus="pr_created",
-            codexSubmitted=True,
-            codexTaskID="task-id",
-            codexBranch="codex/benchmark-run-unique",
-            codexCommit="fix123",
-            codexPRNumber=42,
-            codexPRURL="https://github.com/chaz1505/rentee/pull/42",
-        )})
-        result = human_review.get_benchmark_run_codex_status(
-            "bubble-id", "development"
-        )
-        self.assertEqual(result["codex_status"], "pr_created")
-        self.assertEqual(result["codex_branch"], "codex/benchmark-run-unique")
-        self.assertEqual(result["codex_commit"], "fix123")
-        self.assertEqual(result["codex_pr_number"], 42)
-        self.assertEqual(
-            result["codex_pr_url"],
-            "https://github.com/chaz1505/rentee/pull/42",
-        )
-
 
 class HumanReviewEndpointTests(unittest.TestCase):
     def setUp(self):
@@ -300,7 +277,6 @@ class HumanReviewEndpointTests(unittest.TestCase):
         mocked_codex.assert_called_once_with(
             "updated prompt with human review", "run-id", "bubble-id",
             "development", task_id="task-id",
-            progress_callback=ANY,
         )
         self.assertEqual(
             mocked_state.call_args_list[-1].args[2],
@@ -312,45 +288,20 @@ class HumanReviewEndpointTests(unittest.TestCase):
 
     @patch("tests.human_review.patch_codex_state")
     @patch("automation.codex_client.submit_codex_fix")
-    def test_background_success_persists_pull_request_metadata(
+    def test_background_success_marks_completed(
         self, mocked_codex, mocked_state
     ):
-        metadata = {
-            "task_id": "task-id", "status": "pr_created",
+        mocked_codex.return_value = {
+            "task_id": "task-id", "status": "completed",
             "changes_detected": True, "changed_files": ["app.py"],
-            "branch": "codex/benchmark-run-unique",
-            "fix_commit": "fix123", "pr_number": 42,
-            "pr_url": "https://github.com/chaz1505/rentee/pull/42",
         }
-        def run_with_progress(*_args, **kwargs):
-            kwargs["progress_callback"]("codex_completed", {
-                "branch": "codex/benchmark-run-unique",
-            })
-            kwargs["progress_callback"]("pushing", {
-                "branch": "codex/benchmark-run-unique",
-                "fix_commit": "fix123",
-            })
-            return metadata
-        mocked_codex.side_effect = run_with_progress
         app_module._run_codex_fix_background(
             "prompt", "run-id", "bubble-id", "live", "task-id"
         )
-        self.assertEqual(mocked_state.call_args_list[0].args[2]["codexStatus"], "codex_completed")
-        self.assertEqual(mocked_state.call_args_list[1].args[2], {
-            "codexSubmitted": True,
-            "codexStatus": "pushing",
-            "codexTaskID": "task-id",
-            "codexBranch": "codex/benchmark-run-unique",
-            "codexCommit": "fix123",
-        })
         self.assertEqual(mocked_state.call_args.args[2], {
             "codexSubmitted": True,
-            "codexStatus": "pr_created",
+            "codexStatus": "completed",
             "codexTaskID": "task-id",
-            "codexBranch": "codex/benchmark-run-unique",
-            "codexCommit": "fix123",
-            "codexPRNumber": 42,
-            "codexPRURL": "https://github.com/chaz1505/rentee/pull/42",
         })
         with app_module._codex_task_metadata_lock:
             self.assertEqual(
@@ -380,11 +331,8 @@ class HumanReviewEndpointTests(unittest.TestCase):
     @patch("tests.human_review.get_benchmark_run_codex_status")
     def test_status_endpoint_returns_bubble_state(self, mocked_status):
         mocked_status.return_value = {
-            "benchmark_run_id": "id", "codex_status": "pr_created",
+            "benchmark_run_id": "id", "codex_status": "submitted",
             "codex_submitted": True, "codex_task_id": "task-id",
-            "codex_branch": "codex/benchmark-run-unique",
-            "codex_commit": "fix123", "codex_pr_number": 42,
-            "codex_pr_url": "https://github.com/chaz1505/rentee/pull/42",
         }
         with patch.dict(os.environ, {"BENCHMARK_API_KEY": "right"}, clear=False):
             result = self.client.get(
@@ -393,11 +341,6 @@ class HumanReviewEndpointTests(unittest.TestCase):
             )
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.get_json()["codex_task_id"], "task-id")
-        self.assertEqual(result.get_json()["codex_pr_number"], 42)
-        self.assertEqual(
-            result.get_json()["codex_pr_url"],
-            "https://github.com/chaz1505/rentee/pull/42",
-        )
         mocked_status.assert_called_once_with("id", "live")
 
 

@@ -153,10 +153,7 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
     if not isinstance(record, dict) or not record:
         raise BenchmarkRunNotFound("BenchmarkRun not found.")
 
-    if record.get("codexStatus") in (
-        "working", "submitted", "codex_completed", "pushing",
-        "completed", "pr_created",
-    ):
+    if record.get("codexStatus") in ("working", "submitted", "completed"):
         raise CodexAlreadyActive(
             record.get("codexStatus"), record.get("codexTaskID")
         )
@@ -203,10 +200,7 @@ def update_fix_prompt_with_human_review(benchmark_run_id, environment):
 
 
 def patch_codex_state(benchmark_run_id, environment, payload):
-    allowed = {
-        "codexSubmitted", "codexSubmittedAt", "codexStatus", "codexTaskID",
-        "codexBranch", "codexCommit", "codexPRNumber", "codexPRURL",
-    }
+    allowed = {"codexSubmitted", "codexSubmittedAt", "codexStatus", "codexTaskID"}
     if not payload or not set(payload).issubset(allowed):
         raise ValueError("Invalid Codex state payload.")
     url = f"{get_bubble_base(environment)}/obj/benchmarkRun/{benchmark_run_id}"
@@ -239,8 +233,4 @@ def get_benchmark_run_codex_status(benchmark_run_id, environment):
         "codex_status": record.get("codexStatus"),
         "codex_submitted": record.get("codexSubmitted") is True,
         "codex_task_id": record.get("codexTaskID"),
-        "codex_branch": record.get("codexBranch"),
-        "codex_commit": record.get("codexCommit"),
-        "codex_pr_number": record.get("codexPRNumber"),
-        "codex_pr_url": record.get("codexPRURL"),
     }
