@@ -244,18 +244,14 @@ def _update_benchmark_state(run_id, updates):
             _benchmark_state.update(updates)
 
 
-def _run_benchmark_background(run_id, environment="development"):
+def _run_benchmark_background(run_id):
     try:
         from tests.run_benchmark import run_all_benchmarks
 
         def progress(update):
             _update_benchmark_state(run_id, update)
 
-        suite = run_all_benchmarks(
-            run_id=run_id,
-            progress_callback=progress,
-            environment=environment
-        )
+        suite = run_all_benchmarks(run_id=run_id, progress_callback=progress)
         first_result = suite.get("results", [{}])[0]
         execution = first_result.get("execution", {})
         _update_benchmark_state(run_id, {
@@ -295,17 +291,6 @@ def admin_run_benchmark():
         }), 409
 
     try:
-        request_data = request.get_json(silent=True) or {}
-        environment = request_data.get("environment", "development")
-        if environment not in ("development", "live"):
-            _benchmark_run_lock.release()
-            return jsonify({"error": "environment must be development or live"}), 400
-        if (
-            environment == "live"
-            and os.environ.get("BENCHMARK_LIVE_ENABLED", "").strip().lower() != "true"
-        ):
-            _benchmark_run_lock.release()
-            return jsonify({"error": "Live benchmark is not enabled."}), 403
         from tests.run_benchmark import get_benchmark_case_ids
         case_ids = get_benchmark_case_ids()
         case_id = case_ids[0] if case_ids else "benchmark"
@@ -317,13 +302,12 @@ def admin_run_benchmark():
                 "status": "running",
                 "run_id": run_id,
                 "case": case_id,
-                "environment": environment,
                 "started_at": started_at,
                 "current_turn": 0
             })
         thread = threading.Thread(
             target=_run_benchmark_background,
-            args=(run_id, environment),
+            args=(run_id,),
             name=f"benchmark-{run_id}",
             daemon=True
         )
@@ -331,10 +315,7 @@ def admin_run_benchmark():
     except Exception:
         _benchmark_run_lock.release()
         raise
-    return jsonify({
-        "status": "started", "run_id": run_id, "case": case_id,
-        "environment": environment
-    }), 202
+    return jsonify({"status": "started", "run_id": run_id, "case": case_id}), 202
 
 
 @app.route("/admin/benchmark_status", methods=["GET"])

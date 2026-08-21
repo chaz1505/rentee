@@ -104,30 +104,3 @@ BENCHMARK_SKIP_GITHUB=true python tests/run_benchmark.py
 The token is used only in the GitHub API authorization header. It requires Contents write access to `chaz1505/rentee`. Before publishing, the helper scans all four artifacts for configured GitHub, Bubble, and OpenAI secret values and refuses the entire run if one is found. `tests/.autotest_state.json` is never eligible for publication.
 
 Publishing failures never change the benchmark result. Partial artifacts from failed Rentee conversations are evaluated, turned into a fix prompt, and published through the same flow when credentials are available.
-
-## Live benchmark safety
-
-Development remains the default. A live run must explicitly request `environment: "live"` and Render must have `BENCHMARK_LIVE_ENABLED=true`.
-
-The live benchmark uses a dedicated synthetic Lead where `Lead.test = true`. Before any live benchmark reset or mutation, the runner verifies:
-
-- the separately saved live Lead exists;
-- `Lead.test` is exactly `true`;
-- the separately saved live Folio exists;
-- `Folio.lead` points to that verified Lead.
-
-If any verification fails, no live data is modified and the runner does not search for or fall back to another record. Reset only touches FolioItems referenced by the verified test Folio. Real customer Leads should have `test = false` or leave the field unset.
-
-Development and live subject IDs are stored separately in `.autotest_state.json`, and live artifact filenames include `_live_` so histories remain separate.
-
-After enabling live mode, trigger it with:
-
-```bash
-curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-Benchmark-Key: <key>" \
-  -d '{"environment":"live"}' \
-  https://rentee-2.onrender.com/admin/run_benchmark
-```
-
-The endpoint does not accept Lead or Folio IDs. It only uses the dedicated IDs stored internally for the selected benchmark case.

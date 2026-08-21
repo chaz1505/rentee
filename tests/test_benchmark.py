@@ -133,7 +133,7 @@ class BenchmarkInfrastructureTests(unittest.TestCase):
     @patch("tests.run_benchmark.snapshot_test_subject")
     @patch("tests.run_benchmark.reset_test_subject")
     @patch("tests.run_benchmark.ensure_test_subject")
-    @patch("tests.run_benchmark.get_bubble_base")
+    @patch("tests.run_benchmark.get_bubble_dev_base")
     @patch("tests.run_benchmark.run_turn")
     def test_failed_turn_is_saved_evaluated_and_gets_fix_prompt(
         self, mocked_turn, _mocked_base, mocked_subject, _mocked_reset,
