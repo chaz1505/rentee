@@ -323,12 +323,6 @@ def qualitative_evaluation(case, result, deterministic_issues):
     }
     instructions = (
         "Judge Rentee's tenant conversation behaviour, not its implementation. Score each requested dimension 0 poor, 1 weak, 2 good, 3 excellent. Assess whether questions were useful, prior supplied information was respected, adaptation and trade-off reasoning were sensible, and the final answer moved the tenant toward a shortlist. Identify asking for already-supplied facts where applicable. Do not invent implementation details or repeat deterministic findings unless qualitative context materially adds value. Return only the required JSON."
-        " Also assess whether each response answered the renter's active conversational "
-        "question without burying the answer in irrelevant information, whether short "
-        "follow-ups preserved their preceding subject, and whether disclosure was concise "
-        "for narrow questions but appropriately broader when requested. Penalise internal "
-        "database/tool/profile language and exhaustive data dumps that do not move the "
-        "renter's current decision forward."
     )
     response = OpenAI(api_key=os.environ["OPENAI_API_KEY"]).responses.create(
         model=EVALUATOR_MODEL,

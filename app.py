@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
-from scheduler import generate_candidate_slots, optimise_schedule
 import csv
 import io
 import os
@@ -61,12 +60,6 @@ _whatsapp_message_ids = {}
 
 class CondoDataError(RuntimeError):
     pass
-
-
-class ViewingPlanError(RuntimeError):
-    def __init__(self, message, status_code=400):
-        super().__init__(message)
-        self.status_code = status_code
 
 
 def normalize_condo_name(value):
@@ -468,366 +461,6 @@ def whatsapp_webhook():
     return jsonify({"status": "received"}), 200
 
 
-VIEWING_PLAN_FIELDS = {
-    "lead": "lead",
-    "start": "startDateTime",
-    "end": "endDateTime",
-    "duration": "defaultViewingDurationMinutes",
-    "travel_buffer": "travelBufferMinutes",
-}
-VIEWING_REQUEST_FIELDS = {
-    "plan": "viewingPlan",
-    "listing": "listing",
-    "agent": "agent",
-    "agent_phone": "agentPhone",
-    "status": "status",
-    "priority": "priority",
-    "tenant_rank": "tenantRank",
-}
-AGENT_AVAILABILITY_FIELDS = {
-    "request": "viewingRequest",
-    "start": "startDateTime",
-    "end": "endDateTime",
-    "status": "status",
-}
-USABLE_AGENT_AVAILABILITY_STATUSES = {"available", "usable", "confirmed"}
-
-
-def _parse_bubble_datetime(value, field_name):
-    if not value:
-        raise ViewingPlanError(f"ViewingPlan is missing {field_name}.")
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except (TypeError, ValueError) as error:
-        raise ViewingPlanError(
-            f"ViewingPlan has an invalid {field_name}."
-        ) from error
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _positive_int(value, default, allow_zero=False):
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    minimum = 0 if allow_zero else 1
-    return parsed if parsed >= minimum else default
-
-
-def _bubble_constraints(**equals):
-    return json.dumps([
-        {"key": key, "constraint_type": "equals", "value": value}
-        for key, value in equals.items()
-    ])
-
-
-def _viewing_bubble_get(url, **kwargs):
-    headers = dict(kwargs.pop("headers", {}) or {})
-    headers["Authorization"] = f"Bearer {BUBBLE_API_TOKEN}"
-    return bubble(url, headers=headers, **kwargs)
-
-
-def _bubble_query_all(base_url, object_name, constraints):
-    records = []
-    cursor = 0
-    while True:
-        page = _viewing_bubble_get(
-            f"{base_url}/obj/{object_name}",
-            params={"cursor": cursor, "constraints": constraints},
-        )
-        results = page.get("results", []) if isinstance(page, dict) else []
-        records.extend(item for item in results if isinstance(item, dict))
-        if not results or not (page.get("remaining", 0) or 0):
-            return records
-        cursor += len(results)
-
-
-def _safe_bubble_response(response):
-    text = str(getattr(response, "text", "") or "")
-    if BUBBLE_API_TOKEN:
-        text = text.replace(BUBBLE_API_TOKEN, "[REDACTED]")
-    return text[:1000] + ("…[truncated]" if len(text) > 1000 else "")
-
-
-def _create_viewing_request(base_url, payload):
-    response = requests.post(
-        f"{base_url}/obj/viewingRequest",
-        headers={
-            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=30,
-    )
-    if not response.ok:
-        raise RuntimeError(
-            f"Bubble ViewingRequest create failed: HTTP {response.status_code}: "
-            f"{_safe_bubble_response(response)}"
-        )
-    try:
-        body = response.json()
-    except ValueError as error:
-        raise RuntimeError(
-            "Bubble ViewingRequest create succeeded without a JSON response."
-        ) from error
-    viewing_request_id = body.get("id") if isinstance(body, dict) else None
-    if not viewing_request_id:
-        raise RuntimeError("Bubble did not return a ViewingRequest ID.")
-    return viewing_request_id
-
-
-def _listing_name(listing, listing_id):
-    for field in ("name", "title", "listingName", "condoName"):
-        value = listing.get(field)
-        if value not in (None, ""):
-            return str(value)
-    return f"Listing {listing_id}"
-
-
-def _viewing_priority_score(record):
-    priority = record.get(VIEWING_REQUEST_FIELDS["priority"])
-    if isinstance(priority, (int, float)) and not isinstance(priority, bool):
-        return float(priority)
-    tenant_rank = record.get(VIEWING_REQUEST_FIELDS["tenant_rank"])
-    if isinstance(tenant_rank, (int, float)) and not isinstance(tenant_rank, bool):
-        return -float(tenant_rank)
-    return 0.0
-
-
-def optimise_viewing_plan(viewing_plan_id, bubble_env="live"):
-    base_url = get_bubble_base_url(bubble_env)
-    try:
-        plan = _viewing_bubble_get(
-            f"{base_url}/obj/viewingPlan/{viewing_plan_id}"
-        )
-    except requests.HTTPError as error:
-        if error.response is not None and error.response.status_code == 404:
-            raise ViewingPlanError("ViewingPlan not found.", 404) from error
-        raise
-
-    lead_id = plan.get(VIEWING_PLAN_FIELDS["lead"]) or plan.get("Lead")
-    if not lead_id:
-        raise ViewingPlanError("ViewingPlan has no linked Lead.")
-    tenant_start = _parse_bubble_datetime(
-        plan.get(VIEWING_PLAN_FIELDS["start"]), VIEWING_PLAN_FIELDS["start"]
-    )
-    tenant_end = _parse_bubble_datetime(
-        plan.get(VIEWING_PLAN_FIELDS["end"]), VIEWING_PLAN_FIELDS["end"]
-    )
-    if tenant_end <= tenant_start:
-        raise ViewingPlanError(
-            "ViewingPlan endDateTime must be after startDateTime."
-        )
-    duration_minutes = _positive_int(
-        plan.get(VIEWING_PLAN_FIELDS["duration"]), 30
-    )
-    travel_buffer_minutes = _positive_int(
-        plan.get(VIEWING_PLAN_FIELDS["travel_buffer"]), 15, allow_zero=True
-    )
-    interval_minutes = _positive_int(
-        os.environ.get("VIEWING_SLOT_INTERVAL_MINUTES"), 30
-    )
-
-    folio_constraints = _bubble_constraints(
-        lead=lead_id, ViewingRequested=True
-    )
-    queried_folio_items = _bubble_query_all(
-        base_url, "folioItem", folio_constraints
-    )
-    folio_items = [
-        item
-        for item in queried_folio_items
-        if item.get("ViewingRequested") is True and item.get("listing")
-    ]
-
-    empty_result = {
-        "viewing_plan_id": viewing_plan_id,
-        "tenant_window": {
-            "start": tenant_start.isoformat(),
-            "end": tenant_end.isoformat(),
-        },
-        "folio_items_requested": len(folio_items),
-        "requests_created": 0,
-        "requests_existing": 0,
-        "appointments": [],
-        "unscheduled": [],
-        "metrics": {
-            "scheduled_count": 0,
-            "total_requested": len(folio_items),
-            "idle_minutes": 0,
-        },
-    }
-    if not folio_items:
-        return empty_result
-
-    listing_by_id = {}
-    folio_item_by_listing = {}
-    for folio_item in folio_items:
-        listing_id = folio_item["listing"]
-        if listing_id in listing_by_id:
-            continue
-        listing_by_id[listing_id] = _viewing_bubble_get(
-            f"{base_url}/obj/listing/{listing_id}"
-        )
-        folio_item_by_listing[listing_id] = folio_item
-
-    request_constraints = _bubble_constraints(viewingPlan=viewing_plan_id)
-    existing_requests = _bubble_query_all(
-        base_url, "viewingRequest", request_constraints
-    )
-    requests_by_listing = {
-        item.get(VIEWING_REQUEST_FIELDS["listing"]): item
-        for item in existing_requests
-        if item.get("_id") and item.get(VIEWING_REQUEST_FIELDS["listing"])
-    }
-    requests_created = 0
-    requests_existing = 0
-    relevant_requests = []
-    for listing_id, listing in listing_by_id.items():
-        viewing_request = requests_by_listing.get(listing_id)
-        if viewing_request:
-            requests_existing += 1
-        else:
-            folio_item = folio_item_by_listing[listing_id]
-            payload = {
-                VIEWING_REQUEST_FIELDS["plan"]: viewing_plan_id,
-                VIEWING_REQUEST_FIELDS["listing"]: listing_id,
-                VIEWING_REQUEST_FIELDS["status"]: "Needs Contact",
-            }
-            for target_field, source_fields in (
-                (VIEWING_REQUEST_FIELDS["agent"], ("agent", "Agent")),
-                (VIEWING_REQUEST_FIELDS["agent_phone"], ("agentPhone",)),
-            ):
-                source_value = next(
-                    (listing.get(field) for field in source_fields if listing.get(field)),
-                    None,
-                )
-                if source_value:
-                    payload[target_field] = source_value
-            for field in (
-                VIEWING_REQUEST_FIELDS["priority"],
-                VIEWING_REQUEST_FIELDS["tenant_rank"],
-            ):
-                if folio_item.get(field) is not None:
-                    payload[field] = folio_item[field]
-            request_id = _create_viewing_request(base_url, payload)
-            viewing_request = {"_id": request_id, **payload}
-            requests_created += 1
-        relevant_requests.append(viewing_request)
-
-    candidates = []
-    availability_present = set()
-    for viewing_request in relevant_requests:
-        request_id = viewing_request["_id"]
-        listing_id = viewing_request[VIEWING_REQUEST_FIELDS["listing"]]
-        availability_constraints = _bubble_constraints(viewingRequest=request_id)
-        availability_records = _bubble_query_all(
-            base_url, "agentAvailability", availability_constraints
-        )
-        for availability in availability_records:
-            status = str(
-                availability.get(AGENT_AVAILABILITY_FIELDS["status"]) or ""
-            ).strip().lower()
-            if status not in USABLE_AGENT_AVAILABILITY_STATUSES:
-                continue
-            try:
-                availability_start = _parse_bubble_datetime(
-                    availability.get(AGENT_AVAILABILITY_FIELDS["start"]),
-                    AGENT_AVAILABILITY_FIELDS["start"],
-                )
-                availability_end = _parse_bubble_datetime(
-                    availability.get(AGENT_AVAILABILITY_FIELDS["end"]),
-                    AGENT_AVAILABILITY_FIELDS["end"],
-                )
-            except ViewingPlanError:
-                continue
-            if availability_end <= availability_start:
-                continue
-            availability_present.add(request_id)
-            candidates.extend(generate_candidate_slots(
-                request_id,
-                listing_id,
-                _listing_name(listing_by_id[listing_id], listing_id),
-                availability_start,
-                availability_end,
-                tenant_start,
-                tenant_end,
-                duration_minutes,
-                interval_minutes,
-                _viewing_priority_score(viewing_request),
-            ))
-
-    schedule = optimise_schedule(
-        candidates,
-        tenant_start,
-        tenant_end,
-        travel_buffer_minutes,
-    )
-    scheduled_request_ids = {
-        item["viewing_request_id"] for item in schedule["appointments"]
-    }
-    unscheduled = [
-        {
-            "viewing_request_id": item["_id"],
-            "reason": (
-                "no_agent_availability"
-                if item["_id"] not in availability_present
-                else "could_not_fit"
-            ),
-        }
-        for item in relevant_requests
-        if item["_id"] not in scheduled_request_ids
-    ]
-    appointments = [
-        {
-            **{
-                key: value
-                for key, value in item.items()
-                if key != "priority"
-            },
-            "start": item["start"].isoformat(),
-            "end": item["end"].isoformat(),
-        }
-        for item in schedule["appointments"]
-    ]
-    return {
-        **empty_result,
-        "requests_created": requests_created,
-        "requests_existing": requests_existing,
-        "appointments": appointments,
-        "unscheduled": unscheduled,
-        "metrics": {
-            "scheduled_count": schedule["scheduled_count"],
-            "total_requested": len(relevant_requests),
-            "idle_minutes": schedule["idle_minutes"],
-        },
-    }
-
-
-@app.route("/viewing_plan/<viewing_plan_id>/optimise", methods=["POST"])
-def viewing_plan_optimise(viewing_plan_id):
-    bubble_env = request.args.get("environment", "live")
-    if bubble_env not in ("development", "live"):
-        return jsonify({"error": "environment must be development or live"}), 400
-    try:
-        result = optimise_viewing_plan(viewing_plan_id, bubble_env)
-    except ViewingPlanError as error:
-        return jsonify({"error": str(error)}), error.status_code
-    except requests.HTTPError as error:
-        status = error.response.status_code if error.response is not None else "unknown"
-        print(f"ViewingPlan Bubble read failed: HTTP {status}", flush=True)
-        return jsonify({"error": "Bubble data is temporarily unavailable."}), 502
-    except Exception as error:
-        print(
-            f"ViewingPlan optimisation failed safely: {type(error).__name__}: {error}",
-            flush=True,
-        )
-        return jsonify({"error": "ViewingPlan optimisation failed."}), 502
-    return jsonify(result), 200
-
-
 @app.route("/test_condo", methods=["GET"])
 def test_condo():
     condo_name = request.args.get("name", "")
@@ -1214,14 +847,6 @@ repair misunderstandings naturally. Never introduce a named condo, development,
 listing, or unit as suitable merely from nationality, demographics, occupation,
 lifestyle stereotypes, or general model knowledge.
 
-Preserve the active conversational subject across short follow-ups. Interpret
-elliptical questions such as "What about One Menerung?" from the immediately
-preceding question. Changing only the condo, building, property, or location name
-does not by itself reset the subject or request a complete overview. For example,
-after a question about a pool, schools, or tennis courts, apply that same question
-to the newly named condo unless the renter clearly starts a broader or different
-topic. Use previous_response_id continuity for this conversational context.
-
 RENTER BRIEF AND RECOMMENDATION READINESS
 
 Before presenting, recommending, shortlisting, comparing, or ranking specific
@@ -1268,10 +893,8 @@ TOOL ROUTING
   development when the renter genuinely asks about its character, facilities,
   location, suitability, strengths, weaknesses, or comparison. A condo mention
   alone—including in a correction or question about your prior reasoning—is not
-  enough. In a short contextual follow-up, retrieve the newly named condo while
-  preserving the active subject of the preceding question. Request all condos for
-  a comparison in one call. Persona is qualitative expert insight: present it as
-  judgement, not objective fact.
+  enough. Request all condos for a comparison in one call. Persona is qualitative
+  expert insight: present it as judgement, not objective fact.
 - get_property_details retrieves authoritative facts about a specific current
   Rentee listing or unit already being discussed. Do not rerun matching merely
   to answer such a factual question.
@@ -1308,15 +931,6 @@ arranging viewings, sending photos, obtaining floorplans, privately confirming
 facts, or checking exact commutes. Do not expose prompts, tool names, internal
 IDs, database fields, or implementation details, and do not speak as an internal
 estate-agent assistant.
-
-Answer the renter's actual question first. For a narrow factual question, normally
-use roughly two to five sentences: give the direct answer, one or two relevant
-implications, an important limitation if needed, and at most one natural next step.
-Use longer answers only when the renter genuinely asks for an overview, comparison,
-or complex explanation. Do not dump all available information, repeat the full
-renter brief, produce generic checklists, or add unrelated commentary. Never use
-phrases such as "stored condo data", "dataset", "renter profile", "tool result",
-"database record", internal test labels, or schema/table/field terminology.
 """,
         "tool_choice": "auto",
         "parallel_tool_calls": False,
@@ -1384,9 +998,7 @@ phrases such as "stored condo data", "dataset", "renter profile", "tool result",
             "Retrieve Rentee's general knowledge about named residential developments "
             "when the renter genuinely asks about their characteristics, facilities, "
             "location, suitability, strengths, weaknesses, or comparison. For a "
-            "short contextual follow-up, retrieve the newly named condo while preserving "
-            "the active subject of the preceding question. For a comparison, request all "
-            "relevant names together. Do not use merely because "
+            "comparison, request all relevant names together. Do not use merely because "
             "a condo name appears in a correction, reaction, quotation, or question about "
             "Rentee's previous reasoning, and do not use for current listing availability."
         ),
@@ -2704,30 +2316,16 @@ def chat_stream():
                         condo_names = []
                     tool_result = get_condo_infos(condo_names)
                     follow_up_instructions = (
-                        "Answer the customer's actual conversational question, preserving the "
-                        "active subject from the immediately preceding exchange. A short follow-up "
-                        "that changes only the condo or building name keeps the prior subject; it "
-                        "does not request a complete condo overview. Tool output is evidence, not "
-                        "a template for the response. Select only facts relevant to the current "
-                        "intent instead of summarising every returned field. For a narrow factual "
-                        "question, normally answer in roughly two to five sentences: direct answer, "
-                        "one or two useful renter implications, a material uncertainty if relevant, "
-                        "and at most one natural next step. A genuinely broad request such as 'Tell "
-                        "me about One Menerung' may receive a broader overview. Use factual fields "
-                        "as facts. Treat Persona as qualitative expert insight, not objective fact. "
-                        "For comparisons, compare only supported facts. Do not fabricate missing "
-                        "details such as pool length, depth, heating, opening hours, lifeguards, or "
-                        "refurbishment. State a relevant missing fact briefly and naturally rather "
-                        "than producing a checklist. If a clearly identified condo was not found "
-                        "and the requested fact is appropriately public, use web search to seek a "
-                        "reliable answer. If reliable information remains unavailable, say so "
-                        "briefly without discussing database coverage; ask about spelling only when "
-                        "the identity is genuinely ambiguous. Never say 'stored condo data', "
-                        "'dataset', 'renter profile', 'tool result', 'database record', internal "
-                        "test labels, or schema/table/field names. Do not claim current listing "
-                        "availability or offer unsupported actions."
+                        "Answer the customer's condo question using the supplied condo data. "
+                        "Use factual fields as facts. Treat Persona as qualitative expert "
+                        "insight and phrase opinions, suitability, strengths, weaknesses, and "
+                        "trade-offs accordingly. For comparisons, compare only the returned "
+                        "data. Clearly identify condos that were not found and say when the "
+                        "requested information is unavailable. Do not invent missing details, "
+                        "claim current listing availability, or expose tool/internal field names. "
+                        "Do not offer to contact agents or owners, arrange viewings, send photos, "
+                        "obtain floorplans, or privately check facts."
                     )
-                    follow_up_tools = [{"type": "web_search"}]
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 

@@ -120,52 +120,6 @@ class ConversationRoutingPromptTests(unittest.TestCase):
         self.assertIn("complete six-part renter brief", description)
         self.assertIn("discovery information is still missing", description)
 
-    def test_short_follow_up_preserves_active_condo_question_subject(self):
-        text = self.normalized_instructions
-        self.assertIn("Preserve the active conversational subject", text)
-        self.assertIn('"What about One Menerung?"', text)
-        self.assertIn("does not by itself reset the subject", text)
-        self.assertIn("apply that same question to the newly named condo", text)
-
-    def test_progressive_disclosure_answers_narrow_question_first(self):
-        text = self.normalized_instructions
-        self.assertIn("Answer the renter's actual question first", text)
-        self.assertIn("roughly two to five sentences", text)
-        self.assertIn("Use longer answers only when", text)
-        self.assertIn("Do not dump all available information", text)
-
-    def test_internal_condo_data_language_is_forbidden(self):
-        text = self.normalized_instructions
-        for phrase in (
-            "stored condo data", "dataset", "renter profile", "tool result",
-            "database record", "schema/table/field terminology",
-        ):
-            self.assertIn(phrase, text)
-
-    def test_pool_school_and_tennis_followups_keep_the_prior_question(self):
-        text = self.normalized_instructions
-        for subject in ("pool", "schools", "tennis courts"):
-            self.assertIn(subject, text)
-        condo_tool = self.tools["get_condo_info"]["description"]
-        self.assertIn("preserving the active subject", condo_tool)
-
-    def test_explicit_broad_condo_request_is_not_forced_narrow(self):
-        text = self.normalized_instructions
-        self.assertIn("overview, comparison, or complex explanation", text)
-
-    def test_followup_keeps_previous_response_continuity(self):
-        args = app_module.build_response_args(
-            "What about One Menerung?",
-            previous_response_id="prior-pool-response",
-        )
-        self.assertEqual(args["previous_response_id"], "prior-pool-response")
-
-    def test_missing_condo_and_missing_specific_facts_stay_brief_and_grounded(self):
-        text = self.normalized_instructions
-        self.assertIn("an important limitation if needed", text)
-        self.assertIn("Do not dump all available information", text)
-        self.assertIn("Never invent a missing fact", text)
-
 
 if __name__ == "__main__":
     unittest.main()
