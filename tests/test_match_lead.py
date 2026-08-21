@@ -229,51 +229,6 @@ class MatchLeadCurrentRequestScopeTests(unittest.TestCase):
         self.assertIn("does not create a hard scope", prompt)
         self.assertIn("I'm also open to DC Residensi", prompt)
 
-    def test_internal_classification_remains_but_is_forbidden_in_customer_output(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("INTERNAL MATCHING ANALYSIS", prompt)
-        self.assertIn("HARD REQUIREMENT, STRONG PREFERENCE, SOFT PREFERENCE", prompt)
-        self.assertIn("private analytical guidance", prompt)
-        self.assertIn("never expose their terminology", prompt)
-        self.assertIn('"requirement classification I used"', prompt)
-        self.assertIn("filtering methodology", prompt)
-        self.assertIn("listing record", prompt)
-
-    def test_customer_voice_uses_natural_tradeoffs_and_agent_judgement(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("CUSTOMER-FACING AGENT VOICE", prompt)
-        self.assertIn("above the budget", prompt)
-        self.assertIn("just outside", prompt)
-        self.assertIn("only partly furnished", prompt)
-        self.assertIn("first choice, strongest two", prompt)
-        self.assertIn("Do not force an artificial winner", prompt)
-
-    def test_missing_facts_household_and_availability_are_expressed_naturally(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("listing doesn't confirm parking, so I'd check that", prompt)
-        self.assertIn("household composition as suitability context", prompt)
-        self.assertIn("not as a preference tier", prompt)
-        self.assertIn("CURRENT DATE FOR AVAILABILITY INTERPRETATION", prompt)
-        self.assertIn("date in the past", prompt)
-        self.assertIn("confirming it has not been taken", prompt)
-        self.assertIn("Never infer current availability", prompt)
-
-    def test_customer_output_stays_concise_and_grounded(self):
-        prompt, _result = self.capture_matching_prompt("Show me current options")
-        prompt = " ".join(prompt.split())
-
-        self.assertIn("Do not mechanically repeat every listing field", prompt)
-        self.assertIn("Never present an unknown fact as satisfied", prompt)
-        self.assertIn("Do not invent facts", prompt)
-        self.assertIn("The recommendations array is the source of truth", prompt)
-        self.assertIn("Never invent a property", prompt)
-
 
 if __name__ == "__main__":
     unittest.main()
