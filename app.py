@@ -295,6 +295,9 @@ def build_response_args(user_message, previous_response_id=None):
             "You are speaking directly to the property seeker, not to an estate agent. "
             "Always address the user naturally using 'you' and 'your'. Be helpful, "
             "conversational, concise, and proactive. "
+            "If you need to call a tool, call the tool immediately. Do not output any "
+            "customer-facing text before making the tool call. If no tool is required, "
+            "answer normally. "
             "When the user asks about properties, recommendations, or suitable listings "
             "based on their current requirements, use the property matching tool to identify "
             "the best available options. "
@@ -1481,9 +1484,10 @@ def chat_stream():
                 def stream_initial_response(response_args, timing_label):
                     nonlocal initial_first_event_logged
                     nonlocal initial_first_delta_logged, web_search_status_sent
+                    nonlocal first_delta_sent
 
                     initial_started = time.perf_counter()
-                    buffered_text_deltas = []
+                    emitted_text = False
                     try:
                         with client.responses.stream(**response_args) as stream:
                             for event in stream:
@@ -1511,7 +1515,13 @@ def chat_stream():
                                             initial_started
                                         )
                                         initial_first_delta_logged = True
-                                    buffered_text_deltas.append(event.delta)
+                                    if not first_delta_sent:
+                                        log_timing("FIRST DELTA", request_started)
+                                        first_delta_sent = True
+                                    emitted_text = True
+                                    yield (
+                                        f"data: {json.dumps({'delta': event.delta})}\n\n"
+                                    )
 
                             final_response = stream.get_final_response()
                             log_token_usage("Initial", final_response)
@@ -1520,12 +1530,12 @@ def chat_stream():
                         raise
 
                     log_timing(f"{timing_label} complete", initial_started)
-                    return final_response, "".join(buffered_text_deltas)
+                    return final_response, emitted_text
 
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 try:
-                    response, buffered_initial_text = yield from stream_initial_response(
+                    response, initial_text_emitted = yield from stream_initial_response(
                         build_response_args(message, previous),
                         "Initial OpenAI/tool selection"
                     )
@@ -1537,7 +1547,7 @@ def chat_stream():
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
-                    response, buffered_initial_text = yield from stream_initial_response(
+                    response, initial_text_emitted = yield from stream_initial_response(
                         build_response_args(message, None),
                         "Initial OpenAI/tool selection retry"
                     )
@@ -1557,13 +1567,6 @@ def chat_stream():
 
                 if tool_call is None:
                     print("No tool call requested", flush=True)
-                    if buffered_initial_text:
-                        if not first_delta_sent:
-                            log_timing("FIRST DELTA", request_started)
-                            first_delta_sent = True
-                        yield (
-                            f"data: {json.dumps({'delta': buffered_initial_text})}\n\n"
-                        )
                     citations = get_web_citations(response)
 
                     if citations:
@@ -1573,6 +1576,14 @@ def chat_stream():
                         f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
                     )
                     return
+
+                if initial_text_emitted:
+                    print(
+                        "WARNING: Initial OpenAI response emitted customer-facing text "
+                        f"before requesting tool {tool_call.name}; the text was already "
+                        "streamed to Bubble.",
+                        flush=True
+                    )
 
                 original_response_id = response.id
                 original_call_id = tool_call.call_id

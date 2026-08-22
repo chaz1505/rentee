@@ -114,6 +114,11 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(tool["parameters"]["required"], ["condo_names"])
         self.assertIn("Persona", args["instructions"])
         self.assertIn("one tool call", args["instructions"])
+        self.assertIn("call the tool immediately", args["instructions"])
+        self.assertIn(
+            "Do not output any customer-facing text before making the tool call",
+            args["instructions"],
+        )
         self.assertIn("MUST call get_condo_info first", args["instructions"])
         self.assertIn("primary source", args["instructions"])
         self.assertIn("Do not use web search instead", args["instructions"])
@@ -162,12 +167,8 @@ class CondoInfoTests(unittest.TestCase):
             type="response.output_text.delta", delta="Comparison answer"
         )
         responses = MagicMock()
-        leaked_initial_event = SimpleNamespace(
-            type="response.output_text.delta",
-            delta='{"query":{}} Now I will call the condo tool',
-        )
         responses.stream.side_effect = [
-            FakeStream(initial, [leaked_initial_event]),
+            FakeStream(initial),
             FakeStream(final, [final_event]),
         ]
         fake_client = SimpleNamespace(responses=responses)
@@ -183,7 +184,6 @@ class CondoInfoTests(unittest.TestCase):
         mocked_condo_infos.assert_called_once_with(requested_names)
         self.assertIn("Checking condo information", body)
         self.assertIn("Comparison answer", body)
-        self.assertNotIn("Now I will call the condo tool", body)
         self.assertIn('"response_id": "final-response"', body)
         self.assertIn('"done": true', body)
         continuation = responses.stream.call_args_list[1].kwargs
@@ -195,7 +195,7 @@ class CondoInfoTests(unittest.TestCase):
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
 
-    def test_chat_stream_releases_buffered_initial_text_when_no_tool_is_called(self):
+    def test_chat_stream_emits_each_initial_delta_when_no_tool_is_called(self):
         initial = SimpleNamespace(
             id="no-tool-response", output=[], usage=None
         )
@@ -226,12 +226,14 @@ class CondoInfoTests(unittest.TestCase):
             body = response.get_data(as_text=True)
 
         self.assertEqual(responses.stream.call_count, 1)
-        self.assertIn('"delta": "Hello there."', body)
+        self.assertIn('data: {"delta": "Hello "}\n\n', body)
+        self.assertIn('data: {"delta": "there."}\n\n', body)
+        self.assertNotIn('"delta": "Hello there."', body)
         self.assertIn('"response_id": "no-tool-response"', body)
         self.assertIn('"done": true', body)
 
     @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
-    def test_broken_previous_response_retry_discards_tool_selection_text(
+    def test_broken_previous_response_retry_warns_if_tool_selection_emits_text(
         self, _mocked_condo_infos
     ):
         tool_call = SimpleNamespace(
@@ -274,7 +276,7 @@ class CondoInfoTests(unittest.TestCase):
 
         with patch.object(
             app_module, "client", SimpleNamespace(responses=responses)
-        ):
+        ), patch("builtins.print") as mocked_print:
             response = app_module.app.test_client().post(
                 "/chat_stream",
                 json={
@@ -292,7 +294,11 @@ class CondoInfoTests(unittest.TestCase):
         self.assertNotIn(
             "previous_response_id", responses.stream.call_args_list[1].kwargs
         )
-        self.assertNotIn("invoke an internal function", body)
+        self.assertIn("invoke an internal function", body)
+        self.assertTrue(any(
+            "WARNING: Initial OpenAI response emitted customer-facing text" in str(call)
+            for call in mocked_print.call_args_list
+        ))
         self.assertIn("Grounded condo answer", body)
         self.assertIn('"response_id": "retry-final"', body)
 
