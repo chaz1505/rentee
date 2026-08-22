@@ -670,7 +670,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
     return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
-def create_folio_items(recommendations, base_url):
+def create_folio_items(recommendations, base_url, message_id):
 
     create_started = time.perf_counter()
     folio_item_ids = []
@@ -690,6 +690,7 @@ def create_folio_items(recommendations, base_url):
                     "listing": listing_id,
                     "newlyAdded": True,
                     "RecoSummary": reco_summary
+                    "message": message_id
                 },
                 timeout=30
             )
@@ -749,7 +750,7 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
     log_timing("Patch Folio", patch_started)
 
 
-def match_lead(folio_id, bubble_env):
+def match_lead(folio_id, bubble_env, message_id):
 
     match_started = time.perf_counter()
     yield "Checking your preferences..."
@@ -977,7 +978,11 @@ in the supplied property information, do not mention it.
             return result["customer_response"]
         log_timing("Clear previous newlyAdded flags", clear_started)
 
-        new_folio_item_ids = create_folio_items(new_recommendations, base_url)
+        new_folio_item_ids = create_folio_items(
+            new_recommendations, 
+            base_url,
+            message_id
+        )
 
         if new_folio_item_ids is not None:
             final_folio_item_ids = existing_folio_item_ids + new_folio_item_ids
