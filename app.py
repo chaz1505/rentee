@@ -689,7 +689,7 @@ def create_folio_items(recommendations, base_url, message_id):
                 json={
                     "listing": listing_id,
                     "newlyAdded": True,
-                    "RecoSummary": reco_summary
+                    "RecoSummary": reco_summary,
                     "message": message_id
                 },
                 timeout=30
@@ -996,9 +996,9 @@ in the supplied property information, do not mention it.
     return result["customer_response"]
 
 
-def stream_match_lead(folio_id, bubble_env):
+def stream_match_lead(folio_id, bubble_env, message_id):
 
-    match_flow = match_lead(folio_id, bubble_env)
+    match_flow = match_lead(folio_id, bubble_env, message_id)
 
     while True:
         try:
@@ -1145,6 +1145,7 @@ def chat_stream():
 
         data = request.get_json(silent=True) or {}
         folio_id = data.get("folio_id")
+        message_id = data.get("message_id")
         bubble_env = data.get("bubble_env", "live")
 
         if bubble_env not in ("development", "live"):
@@ -1292,7 +1293,11 @@ def chat_stream():
                 follow_up_tools = None
 
                 if tool_call.name == "match_lead":
-                    tool_result = yield from stream_match_lead(folio_id, bubble_env)
+                    tool_result = yield from stream_match_lead(
+                        folio_id, 
+                        bubble_env,
+                        message_id
+                    )
                     has_match_results = True
                     follow_up_instructions = (
                         "The tool output already contains the final customer-facing answer. "
@@ -1318,7 +1323,8 @@ def chat_stream():
                         )
                         recommendations = yield from stream_match_lead(
                             folio_id,
-                            bubble_env
+                            bubble_env,
+                            message_id
                         )
                         print("Automatic rematch complete", flush=True)
                         has_match_results = True
