@@ -1504,10 +1504,15 @@ Return the complete updated AIsearchtext and a clean AIsearchsummary after
 applying the requested update.
 
 Rules:
+- Perform only the minimum reasoning needed to apply the explicit update.
+- Apply the change mechanically and concisely. Do not elaborate or add commentary.
 - Preserve all existing relevant home-search information.
 - Change or remove a preference only when the customer explicitly says to do so.
 - Add relevant new information, creating an appropriate structured category when needed.
 - Do not invent or infer preferences.
+- Preserve existing content exactly where required rather than rewriting it stylistically.
+- Do not expand the updated AIsearchtext beyond what is necessary to preserve existing
+  information and apply the requested change.
 - Do not rewrite, summarise, clean up, reorder, or delete any `secret notes` or
   dated conversation/history content. It is immutable and must remain exactly
   as written.
@@ -1517,6 +1522,7 @@ AIsearchsummary rules:
 - Generate it from the FINAL updated AIsearchtext, not only this latest request.
 - It is a concise, customer-facing, easy-to-scan summary of current home-search
   preferences only.
+- Keep it concise; do not elaborate.
 - Include relevant current preferences where available, such as transaction type,
   budget, areas, condos, bedrooms, property type, furnishing, parking, schools,
   commute, family, facilities, and move-in requirements.
@@ -1535,13 +1541,14 @@ REQUESTED PREFERENCE UPDATE:
     extraction_started = time.perf_counter()
     response = client.responses.create(
         model="gpt-5-mini",
+        reasoning={"effort": "minimal"},
         input=update_prompt,
         instructions=(
-            "Return JSON matching the supplied schema. The confirmation must be a "
+            "Return JSON matching the supplied schema. The confirmation must be one "
             "short, natural sentence addressed directly to the customer and must not "
             "mention internal IDs, fields, APIs, or tools. ai_search_summary must be "
-            "a clean current customer-facing search summary derived from the final "
-            "updated_ai_search_text."
+            "a clean, concise current customer-facing search summary derived from the "
+            "final updated_ai_search_text. Do not add commentary."
         ),
         text={
             "format": {
