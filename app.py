@@ -9,6 +9,16 @@ import json
 import threading
 import time
 
+from search_flow import (
+    apply_search_update,
+    dump_search_state,
+    listing_search_scope,
+    load_search_state,
+    next_search_question,
+    search_brief_complete,
+    set_recommended_condos,
+)
+
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
 
@@ -164,6 +174,60 @@ def get_condo_infos(condo_names):
     return json.dumps({"condos": results}, ensure_ascii=False)
 
 
+def recommend_condos_for_search(search_state):
+    """Create a small development shortlist independently of current inventory."""
+    condo_rows = list(_get_condo_lookup().values())
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=(
+            "Recommend 2 to 5 residential developments from CONDO KNOWLEDGE only. "
+            "Use the complete search brief and ordered priorities. Do not consider or "
+            "claim current listing availability. Return only exact Condo name values "
+            "from the supplied rows.\n\n"
+            f"SEARCH BRIEF:\n{dump_search_state(search_state)}\n\n"
+            f"CONDO KNOWLEDGE:\n{json.dumps(condo_rows, ensure_ascii=False)}"
+        ),
+        text={"format": {
+            "type": "json_schema",
+            "name": "condo_recommendations",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "recommendations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "condo_name": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["condo_name", "reason"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "customer_response": {"type": "string"},
+                },
+                "required": ["recommendations", "customer_response"],
+                "additionalProperties": False,
+            },
+        }},
+    )
+    result = json.loads(response.output_text)
+    known_names = {
+        normalize_condo_name(row.get("Condo name")): row.get("Condo name")
+        for row in condo_rows
+    }
+    validated = []
+    for item in result["recommendations"]:
+        canonical = known_names.get(normalize_condo_name(item["condo_name"]))
+        if canonical and canonical not in [entry["condo_name"] for entry in validated]:
+            validated.append({"condo_name": canonical, "reason": item["reason"]})
+    if not validated:
+        raise ValueError("No valid condo recommendations were returned.")
+    return validated, result["customer_response"]
+
+
 def log_timing(label, started, detail=""):
 
     print(
@@ -311,6 +375,16 @@ def build_response_args(user_message, previous_response_id=None):
             "viewings, sending photos, obtaining a floorplan, confirming information "
             "privately, or checking exact commute times. "
             "Explain recommendations in clear, customer-friendly language. "
+            "For a new personalised property search, use advance_property_search. It "
+            "progressively saves every requirement supplied and deterministically asks only "
+            "the next missing question in this order: area, property type, bedrooms, budget, "
+            "other requirements, then ordered priorities. Do not call match_lead before that "
+            "tool reports a complete brief and a condo shortlist exists. Once complete, it "
+            "recommends suitable developments before inventory. A later request selecting "
+            "shortlisted condos, or saying to just show the best units, must use the same tool "
+            "with search_listings true; never bypass the saved shortlist. Direct factual condo "
+            "questions still use get_condo_info and specific inventory questions such as 'Do "
+            "you have any 3 bedrooms at Ken Bangsar?' may use match_lead directly. "
             "Do not expose internal listing IDs, Lead IDs, Folio IDs, database fields, "
             "tool names, or other internal system information. Do not talk about 'the lead' "
             "or 'the client', or sound like an internal estate-agent assistant. "
@@ -339,6 +413,45 @@ def build_response_args(user_message, previous_response_id=None):
         ),
         "tool_choice": "auto",
         "tools": [
+    {
+        "type": "function",
+        "name": "advance_property_search",
+        "description": (
+            "Progress a personalised rental-search journey. Use for new searches, supplied "
+            "requirements, corrections, condo-shortlist choices, and requests to show the best "
+            "units after a condo shortlist. Extract every requirement in the current message. "
+            "This tool saves the structured brief, asks one next question, recommends condos "
+            "before listings, and enforces the saved condo shortlist. Do not use for a simple "
+            "factual condo or specific inventory question."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "area_status": {"type": "string", "enum": ["unchanged", "known", "unknown"]},
+                "areas": {"type": "array", "items": {"type": "string"}},
+                "regular_destinations": {"type": "array", "items": {"type": "string"}},
+                "property_types": {"type": "array", "items": {"type": "string"}},
+                "bedroom_requirement": {"type": "string"},
+                "budget_requirement": {"type": "string"},
+                "other_requirements": {"type": "array", "items": {"type": "string"}},
+                "other_requirements_answered": {"type": "boolean"},
+                "priorities": {
+                    "type": "array", "items": {"type": "string"}, "maxItems": 3
+                },
+                "priorities_answered": {"type": "boolean"},
+                "selected_condos": {"type": "array", "items": {"type": "string"}},
+                "use_full_shortlist": {"type": "boolean"},
+                "search_listings": {"type": "boolean"}
+            },
+            "required": [
+                "area_status", "areas", "regular_destinations", "property_types",
+                "bedroom_requirement", "budget_requirement", "other_requirements",
+                "other_requirements_answered", "priorities", "priorities_answered",
+                "selected_condos", "use_full_shortlist", "search_listings"
+            ],
+            "additionalProperties": False
+        }
+    },
     {
         "type": "function",
         "name": "match_lead",
@@ -750,7 +863,30 @@ def update_folio_items(folio_id, folio_item_ids, base_url):
     log_timing("Patch Folio", patch_started)
 
 
-def match_lead(folio_id, bubble_env, message_id):
+def _listing_is_in_condo_scope(listing, condo_scope, base_url, condo_cache):
+    wanted = {normalize_condo_name(name) for name in condo_scope}
+    candidates = []
+    for field in ("condoName", "building", "development", "name", "title"):
+        if listing.get(field):
+            candidates.append(str(listing[field]))
+    condo_reference = listing.get("condo")
+    if condo_reference:
+        if condo_reference not in condo_cache:
+            try:
+                condo_cache[condo_reference] = bubble(
+                    f"{base_url}/obj/condo/{condo_reference}"
+                )
+            except Exception as error:
+                print(f"Could not resolve listing condo reference: {error}", flush=True)
+                condo_cache[condo_reference] = {}
+        condo = condo_cache[condo_reference]
+        for field in ("name", "Name", "Condo name", "condoName"):
+            if condo.get(field):
+                candidates.append(str(condo[field]))
+    return any(normalize_condo_name(value) in wanted for value in candidates)
+
+
+def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     match_started = time.perf_counter()
     yield "Checking your preferences..."
@@ -789,6 +925,19 @@ def match_lead(folio_id, bubble_env, message_id):
     yield "Searching available properties..."
     listings_started = time.perf_counter()
     listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
+    if condo_scope:
+        condo_cache = {}
+        listings = [
+            listing for listing in listings
+            if _listing_is_in_condo_scope(
+                listing, condo_scope, base_url, condo_cache
+            )
+        ]
+        print(
+            "Constrained listing search to recommended condos: "
+            + ", ".join(condo_scope),
+            flush=True,
+        )
     log_timing("match_lead - load listings", listings_started)
 
     print(
@@ -996,9 +1145,9 @@ in the supplied property information, do not mention it.
     return result["customer_response"]
 
 
-def stream_match_lead(folio_id, bubble_env, message_id):
+def stream_match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
-    match_flow = match_lead(folio_id, bubble_env, message_id)
+    match_flow = match_lead(folio_id, bubble_env, message_id, condo_scope)
 
     while True:
         try:
@@ -1028,6 +1177,143 @@ def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url
     response.raise_for_status()
     log_timing("Update Lead preferences", update_started)
     print("Lead preferences updated successfully", flush=True)
+
+
+def save_search_state(lead_id, search_state, base_url):
+    response = requests.patch(
+        f"{base_url}/obj/lead/{lead_id}",
+        headers={
+            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"searchBriefJSON": dump_search_state(search_state)},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
+def extract_search_update_from_profile(profile_text):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=(
+            "Extract only explicitly recorded current search requirements from this "
+            "existing renter profile. Empty values mean unknown. Preserve bedroom and "
+            "budget nuance. Mark other requirements/priorities answered only when the "
+            "profile explicitly records them or explicitly says none.\n\n"
+            + str(profile_text or "")
+        ),
+        text={"format": {
+            "type": "json_schema",
+            "name": "existing_search_brief",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "area_status": {
+                        "type": "string", "enum": ["unchanged", "known", "unknown"]
+                    },
+                    "areas": {"type": "array", "items": {"type": "string"}},
+                    "regular_destinations": {"type": "array", "items": {"type": "string"}},
+                    "property_types": {"type": "array", "items": {"type": "string"}},
+                    "bedroom_requirement": {"type": "string"},
+                    "budget_requirement": {"type": "string"},
+                    "other_requirements": {"type": "array", "items": {"type": "string"}},
+                    "other_requirements_answered": {"type": "boolean"},
+                    "priorities": {"type": "array", "items": {"type": "string"}},
+                    "priorities_answered": {"type": "boolean"},
+                },
+                "required": [
+                    "area_status", "areas", "regular_destinations", "property_types",
+                    "bedroom_requirement", "budget_requirement", "other_requirements",
+                    "other_requirements_answered", "priorities", "priorities_answered",
+                ],
+                "additionalProperties": False,
+            },
+        }},
+    )
+    return json.loads(response.output_text)
+
+
+def advance_property_search(folio_id, bubble_env, update):
+    """Advance the durable brief and return the next deterministic action."""
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    lead_id = folio["lead"]
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    stored_state = lead.get("searchBriefJSON")
+    state = load_search_state(stored_state)
+    if not stored_state and str(lead.get("AIsearchtext") or "").strip():
+        state = apply_search_update(
+            state, extract_search_update_from_profile(lead["AIsearchtext"])
+        )
+    state = apply_search_update(state, update)
+
+    if not search_brief_complete(state):
+        save_search_state(lead_id, state, base_url)
+        return {
+            "action": "ask", "text": next_search_question(state),
+            "state": state, "lead_id": lead_id,
+        }
+
+    if not state["recommended_condos"]:
+        recommendations, response_text = recommend_condos_for_search(state)
+        state = set_recommended_condos(
+            state, [item["condo_name"] for item in recommendations]
+        )
+        save_search_state(lead_id, state, base_url)
+        return {
+            "action": "condo_shortlist",
+            "text": response_text.rstrip() + "\n\nWhich would you like to explore?",
+            "state": state,
+            "lead_id": lead_id,
+            "recommendations": recommendations,
+        }
+
+    scope = listing_search_scope(
+        state,
+        selected_condos=update.get("selected_condos"),
+        use_full_shortlist=bool(update.get("use_full_shortlist")),
+    )
+    if update.get("search_listings") and scope:
+        state["selected_condos"] = list(scope)
+        state["stage"] = "SEARCH_LISTINGS"
+        save_search_state(lead_id, state, base_url)
+        return {
+            "action": "search_listings", "scope": scope,
+            "state": state, "lead_id": lead_id,
+        }
+
+    save_search_state(lead_id, state, base_url)
+    return {
+        "action": "ask",
+        "text": "Which of these condos would you like to explore?",
+        "state": state,
+        "lead_id": lead_id,
+    }
+
+
+def search_update_preference_text(update):
+    parts = []
+    labels = (
+        ("areas", "Areas"),
+        ("regular_destinations", "Regular destinations"),
+        ("property_types", "Property types"),
+        ("bedroom_requirement", "Bedrooms"),
+        ("budget_requirement", "Budget"),
+        ("other_requirements", "Other requirements"),
+        ("priorities", "Ordered priorities"),
+    )
+    for key, label in labels:
+        value = update.get(key)
+        if isinstance(value, list) and value:
+            parts.append(f"{label}: {', '.join(str(item) for item in value)}")
+        elif isinstance(value, str) and value.strip():
+            parts.append(f"{label}: {value.strip()}")
+    if update.get("other_requirements_answered") and not update.get("other_requirements"):
+        parts.append("Other requirements: none")
+    if update.get("priorities_answered") and not update.get("priorities"):
+        parts.append("Ordered priorities: no particular priorities")
+    return "; ".join(parts)
 
 
 def update_preferences(folio_id, preference_update, bubble_env):
@@ -1295,7 +1581,44 @@ def chat_stream():
                 tool_args = json.loads(tool_call.arguments)
                 follow_up_tools = None
 
-                if tool_call.name == "match_lead":
+                if tool_call.name == "advance_property_search":
+                    has_match_results = False
+                    yield (
+                        f"data: {json.dumps({'status': 'Updating your search brief...'})}\n\n"
+                    )
+                    preference_text = search_update_preference_text(tool_args)
+                    if preference_text:
+                        update_preferences(folio_id, preference_text, bubble_env)
+                    search_result = advance_property_search(
+                        folio_id, bubble_env, tool_args
+                    )
+                    if search_result["action"] == "search_listings":
+                        recommendations = yield from stream_match_lead(
+                            folio_id,
+                            bubble_env,
+                            message_id,
+                            search_result["scope"],
+                        )
+                        completed_state = dict(search_result["state"])
+                        completed_state["stage"] = "AWAITING_INTEREST"
+                        save_search_state(
+                            search_result["lead_id"], completed_state,
+                            get_bubble_base_url(bubble_env),
+                        )
+                        has_match_results = True
+                        tool_result = (
+                            f"{recommendations}\n\nI've put together a curated selection "
+                            "based on your requirements. Please click INTERESTED on the "
+                            "properties you'd like to view."
+                        )
+                    else:
+                        tool_result = search_result["text"]
+                    follow_up_instructions = (
+                        "Return the supplied customer-facing search-flow response faithfully. "
+                        "Ask no more than the single question it contains. Do not invent "
+                        "listings, condos, requirements, or internal state."
+                    )
+                elif tool_call.name == "match_lead":
                     tool_result = yield from stream_match_lead(
                         folio_id, 
                         bubble_env,
@@ -1316,39 +1639,13 @@ def chat_stream():
                         tool_args["preference_update"],
                         bubble_env
                     )
-                    try:
-                        print(
-                            "Preference update complete; running automatic rematch",
-                            flush=True
-                        )
-                        yield (
-                            f"data: {json.dumps({'status': 'Preferences updated — refreshing your recommendations...'})}\n\n"
-                        )
-                        recommendations = yield from stream_match_lead(
-                            folio_id,
-                            bubble_env,
-                            message_id
-                        )
-                        print("Automatic rematch complete", flush=True)
-                        has_match_results = True
-                        tool_result = (
-                            "Absolutely — I've updated your preferences. Based on that, "
-                            "here's what I'd recommend now:\n\n"
-                            f"{recommendations}"
-                        )
-                        follow_up_instructions = (
-                            "The tool output already contains the final customer-facing "
-                            "recommendations. Return it faithfully without adding, removing, "
-                            "or inventing property information."
-                        )
-                    except Exception as error:
-                        print(f"Matching after preference update failed: {error}", flush=True)
-                        has_match_results = False
-                        tool_result = preference_confirmation
-                        follow_up_instructions = (
-                            "Return the completed preference-update confirmation naturally. "
-                            "Do not mention properties or internal errors."
-                        )
+                    has_match_results = False
+                    tool_result = preference_confirmation
+                    follow_up_instructions = (
+                        "Return the completed preference-update confirmation naturally. "
+                        "Do not mention properties or internal errors. A personalised search "
+                        "journey must be advanced through advance_property_search instead."
+                    )
                 elif tool_call.name == "get_property_details":
                     has_match_results = False
                     yield (
@@ -1402,7 +1699,13 @@ def chat_stream():
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
-                if tool_call.name == "update_preferences":
+                if tool_call.name == "advance_property_search":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"advance_property_search call {original_call_id}",
+                        flush=True
+                    )
+                elif tool_call.name == "update_preferences":
                     print(
                         "Submitting function_call_output for original "
                         f"update_preferences call {original_call_id}",
