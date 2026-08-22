@@ -1193,10 +1193,11 @@ def chat_stream():
                 initial_first_delta_logged = False
 
                 def stream_initial_response(response_args, timing_label):
-                    nonlocal first_delta_sent, initial_first_event_logged
+                    nonlocal initial_first_event_logged
                     nonlocal initial_first_delta_logged, web_search_status_sent
 
                     initial_started = time.perf_counter()
+                    buffered_text_deltas = []
                     try:
                         with client.responses.stream(**response_args) as stream:
                             for event in stream:
@@ -1224,12 +1225,7 @@ def chat_stream():
                                             initial_started
                                         )
                                         initial_first_delta_logged = True
-                                    if not first_delta_sent:
-                                        log_timing("FIRST DELTA", request_started)
-                                        first_delta_sent = True
-                                    yield (
-                                        f"data: {json.dumps({'delta': event.delta})}\n\n"
-                                    )
+                                    buffered_text_deltas.append(event.delta)
 
                             final_response = stream.get_final_response()
                             log_token_usage("Initial", final_response)
@@ -1238,12 +1234,12 @@ def chat_stream():
                         raise
 
                     log_timing(f"{timing_label} complete", initial_started)
-                    return final_response
+                    return final_response, "".join(buffered_text_deltas)
 
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 try:
-                    response = yield from stream_initial_response(
+                    response, buffered_initial_text = yield from stream_initial_response(
                         build_response_args(message, previous),
                         "Initial OpenAI/tool selection"
                     )
@@ -1255,7 +1251,7 @@ def chat_stream():
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
-                    response = yield from stream_initial_response(
+                    response, buffered_initial_text = yield from stream_initial_response(
                         build_response_args(message, None),
                         "Initial OpenAI/tool selection retry"
                     )
@@ -1275,6 +1271,13 @@ def chat_stream():
 
                 if tool_call is None:
                     print("No tool call requested", flush=True)
+                    if buffered_initial_text:
+                        if not first_delta_sent:
+                            log_timing("FIRST DELTA", request_started)
+                            first_delta_sent = True
+                        yield (
+                            f"data: {json.dumps({'delta': buffered_initial_text})}\n\n"
+                        )
                     citations = get_web_citations(response)
 
                     if citations:

@@ -162,8 +162,13 @@ class CondoInfoTests(unittest.TestCase):
             type="response.output_text.delta", delta="Comparison answer"
         )
         responses = MagicMock()
+        leaked_initial_event = SimpleNamespace(
+            type="response.output_text.delta",
+            delta='{"query":{}} Now I will call the condo tool',
+        )
         responses.stream.side_effect = [
-            FakeStream(initial), FakeStream(final, [final_event])
+            FakeStream(initial, [leaked_initial_event]),
+            FakeStream(final, [final_event]),
         ]
         fake_client = SimpleNamespace(responses=responses)
 
@@ -178,6 +183,9 @@ class CondoInfoTests(unittest.TestCase):
         mocked_condo_infos.assert_called_once_with(requested_names)
         self.assertIn("Checking condo information", body)
         self.assertIn("Comparison answer", body)
+        self.assertNotIn("Now I will call the condo tool", body)
+        self.assertIn('"response_id": "final-response"', body)
+        self.assertIn('"done": true', body)
         continuation = responses.stream.call_args_list[1].kwargs
         self.assertEqual(continuation["previous_response_id"], "initial-response")
         self.assertEqual(
@@ -186,6 +194,107 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
+
+    def test_chat_stream_releases_buffered_initial_text_when_no_tool_is_called(self):
+        initial = SimpleNamespace(
+            id="no-tool-response", output=[], usage=None
+        )
+
+        class FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(
+                        type="response.output_text.delta", delta="Hello "
+                    ),
+                    SimpleNamespace(
+                        type="response.output_text.delta", delta="there."
+                    ),
+                ])
+            def get_final_response(self): return initial
+
+        responses = MagicMock()
+        responses.stream.return_value = FakeStream()
+
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ):
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "Hello"}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(responses.stream.call_count, 1)
+        self.assertIn('"delta": "Hello there."', body)
+        self.assertIn('"response_id": "no-tool-response"', body)
+        self.assertIn('"done": true', body)
+
+    @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
+    def test_broken_previous_response_retry_discards_tool_selection_text(
+        self, _mocked_condo_infos
+    ):
+        tool_call = SimpleNamespace(
+            type="function_call",
+            name="get_condo_info",
+            call_id="retry-condo-call",
+            arguments=json.dumps({"condo_names": ["One Menerung"]}),
+        )
+        retry_initial = SimpleNamespace(
+            id="retry-initial", output=[tool_call], usage=None
+        )
+        final = SimpleNamespace(id="retry-final", output=[], usage=None)
+
+        class BrokenStream:
+            def __enter__(self):
+                raise RuntimeError("No tool output found for function call")
+            def __exit__(self, *_args): return None
+
+        class FakeStream:
+            def __init__(self, response, events):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        retry_leak = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="I will now invoke an internal function",
+        )
+        final_delta = SimpleNamespace(
+            type="response.output_text.delta", delta="Grounded condo answer"
+        )
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            BrokenStream(),
+            FakeStream(retry_initial, [retry_leak]),
+            FakeStream(final, [final_delta]),
+        ]
+
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={
+                    "message": "What about One Menerung?",
+                    "previous_response_id": "broken-response",
+                },
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(responses.stream.call_count, 3)
+        self.assertEqual(
+            responses.stream.call_args_list[0].kwargs["previous_response_id"],
+            "broken-response",
+        )
+        self.assertNotIn(
+            "previous_response_id", responses.stream.call_args_list[1].kwargs
+        )
+        self.assertNotIn("invoke an internal function", body)
+        self.assertIn("Grounded condo answer", body)
+        self.assertIn('"response_id": "retry-final"', body)
 
 
 if __name__ == "__main__":
