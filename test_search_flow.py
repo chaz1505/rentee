@@ -33,6 +33,62 @@ def complete_state():
 
 
 class SearchFlowStateTests(unittest.TestCase):
+    @patch("app.update_preferences")
+    @patch("app.advance_property_search")
+    def test_chat_guided_search_skips_preference_rewrite_call(
+        self, mocked_advance, mocked_update_preferences
+    ):
+        tool_args = {
+            "area_status": "unchanged", "areas": [],
+            "regular_destinations": [], "property_types": [],
+            "bedroom_requirement": "4 bedrooms", "budget_requirement": "",
+            "other_requirements": [], "other_requirements_answered": False,
+            "priorities": [], "priorities_answered": False,
+            "selected_condos": [], "use_full_shortlist": False,
+            "search_listings": False,
+        }
+        tool_call = SimpleNamespace(
+            type="function_call", name="advance_property_search",
+            call_id="search-call", arguments=json.dumps(tool_args),
+        )
+        initial = SimpleNamespace(id="initial", output=[tool_call], usage=None)
+        final = SimpleNamespace(id="final", output=[], usage=None)
+        mocked_advance.return_value = {
+            "action": "ask", "text": "What's your monthly rental budget?",
+            "state": {}, "lead_id": "lead-1",
+        }
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial),
+            FakeStream(final, [SimpleNamespace(
+                type="response.output_text.delta", delta="What's your budget?"
+            )]),
+        ]
+
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={"message": "I need 4 bedrooms", "folio_id": "folio-1"},
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("What's your budget?", body)
+        mocked_advance.assert_called_once_with("folio-1", "live", tool_args)
+        mocked_update_preferences.assert_not_called()
+        responses.create.assert_not_called()
+
     def test_new_lead_starts_with_area_question(self):
         state = empty_search_state()
         self.assertFalse(search_brief_complete(state))
@@ -115,6 +171,57 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("match_lead", tools)
         self.assertIn("asks one next question", tools["advance_property_search"]["description"])
 
+    def test_personalised_search_routing_prompt_covers_area_intent(self):
+        instructions = app_module.build_response_args(
+            "I am looking to rent. Which area would you recommend?"
+        )["instructions"]
+        self.assertIn(
+            "Any message that starts or continues a personalised home search MUST use "
+            "advance_property_search",
+            instructions,
+        )
+        self.assertIn("'Which area would you recommend for me?' MUST use", instructions)
+        self.assertIn("set area_status to unknown and areas to an empty list", instructions)
+        self.assertIn(
+            "do not independently recommend an area before collecting the user's regular "
+            "destinations",
+            instructions,
+        )
+
+    def test_personalised_search_routing_prompt_captures_named_area(self):
+        args = app_module.build_response_args("I want to rent in Bangsar")
+        tool = next(
+            item for item in args["tools"]
+            if item.get("name") == "advance_property_search"
+        )
+        self.assertIn(
+            "set area_status to known and include it in areas",
+            tool["description"],
+        )
+        self.assertIn("starting or continuing", tool["description"])
+
+    def test_general_area_question_is_excluded_from_personalised_search(self):
+        instructions = app_module.build_response_args(
+            "What is Bangsar like?"
+        )["instructions"]
+        self.assertIn(
+            "'What is Bangsar like?' is a general factual question and must not start a "
+            "personalised search",
+            instructions,
+        )
+
+    def test_named_condo_question_still_routes_to_condo_knowledge(self):
+        args = app_module.build_response_args("What is Ken Bangsar like?")
+        instructions = args["instructions"]
+        condo_tool = next(
+            item for item in args["tools"] if item.get("name") == "get_condo_info"
+        )
+        self.assertIn(
+            "'What is Ken Bangsar like?' MUST use get_condo_info",
+            instructions,
+        )
+        self.assertIn("MUST be called first", condo_tool["description"])
+
     @patch("app.requests.patch")
     @patch("app.bubble")
     def test_incomplete_brief_is_saved_without_listing_search(
@@ -137,6 +244,87 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("condo, landed", result["text"])
         payload = mocked_patch.call_args.kwargs["json"]
         self.assertIn("searchBriefJSON", payload)
+        self.assertEqual(payload["AIsearchtext"], "Areas: Bangsar\nBedrooms: 4 bedrooms")
+        self.assertEqual(payload["AIsearchsummary"], "Area: Bangsar\nBedrooms: 4 bedrooms")
+
+    @patch("app.requests.patch")
+    @patch("app.bubble")
+    def test_multiple_structured_requirements_are_persisted_without_llm_rewrite(
+        self, mocked_bubble, mocked_patch
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"}, {"searchBriefJSON": ""}
+        ]
+        mocked_patch.return_value.raise_for_status.return_value = None
+
+        with patch("app.update_preferences") as mocked_update_preferences, patch.object(
+            app_module.client.responses, "create"
+        ) as mocked_create:
+            result = app_module.advance_property_search("folio-1", "live", {
+                "area_status": "known", "areas": ["Bangsar"],
+                "regular_destinations": [], "property_types": ["Condo"],
+                "bedroom_requirement": "4 bedrooms",
+                "budget_requirement": "up to RM12k",
+                "other_requirements": [], "other_requirements_answered": False,
+                "priorities": [], "priorities_answered": False,
+                "selected_condos": [], "use_full_shortlist": False,
+                "search_listings": False,
+            })
+
+        self.assertEqual(result["state"]["bedroom_requirement"], "4 bedrooms")
+        mocked_update_preferences.assert_not_called()
+        mocked_create.assert_not_called()
+        payload = mocked_patch.call_args.kwargs["json"]
+        self.assertEqual(
+            payload["AIsearchtext"],
+            "Areas: Bangsar\nProperty types: Condo\nBedrooms: 4 bedrooms\n"
+            "Budget: up to RM12k",
+        )
+        self.assertIn('"bedroom_requirement":"4 bedrooms"', payload["searchBriefJSON"])
+
+    @patch("app.save_search_state")
+    @patch("app.extract_search_update_from_profile")
+    @patch("app.bubble")
+    def test_existing_structured_lead_does_not_run_profile_extraction(
+        self, mocked_bubble, mocked_extract, _mocked_save
+    ):
+        state = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+        })
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"AIsearchtext": "legacy profile", "searchBriefJSON": json.dumps(state)},
+        ]
+
+        app_module.advance_property_search("folio-1", "live", {})
+
+        mocked_extract.assert_not_called()
+
+    def test_structured_profile_text_remains_complete_for_matching(self):
+        text = app_module.search_state_to_requirements_text(complete_state())
+        self.assertIn("Areas: Bangsar", text)
+        self.assertIn("Property types: Condo", text)
+        self.assertIn("Bedrooms: exactly 4 bedrooms", text)
+        self.assertIn("Budget: maximum RM12,000", text)
+        self.assertIn("Other requirements: furnished, balcony", text)
+        self.assertIn("Ordered priorities: location, bedrooms, balcony", text)
+
+    @patch("app.requests.patch")
+    def test_structured_save_logs_bubble_error_body(self, mocked_patch):
+        response = mocked_patch.return_value
+        response.status_code = 400
+        response.text = '{"error":"invalid field"}'
+        response.raise_for_status.side_effect = app_module.requests.HTTPError("bad request")
+
+        with patch("builtins.print") as mocked_print, self.assertRaises(
+            app_module.requests.HTTPError
+        ):
+            app_module.save_search_state("lead-1", empty_search_state(), "https://bubble.test")
+
+        self.assertTrue(any(
+            'HTTP 400 body={"error":"invalid field"}' in str(call)
+            for call in mocked_print.call_args_list
+        ))
 
     @patch("app.save_search_state")
     @patch("app.extract_search_update_from_profile")

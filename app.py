@@ -378,8 +378,28 @@ def build_response_args(user_message, previous_response_id=None):
             "viewings, sending photos, obtaining a floorplan, confirming information "
             "privately, or checking exact commute times. "
             "Explain recommendations in clear, customer-friendly language. "
-            "For a new personalised property search, use advance_property_search. It "
-            "progressively saves every requirement supplied and deterministically asks only "
+            "Any message that starts or continues a personalised home search MUST use "
+            "advance_property_search, even when the user is asking Rentee to recommend an "
+            "area or does not yet know their preferred area. This includes statements or "
+            "questions such as 'I am looking to rent', 'I am looking for a home', 'Can you "
+            "help me find somewhere to live?', 'Which area would you recommend for me?', "
+            "'Where should I live?', 'I don't know which area to choose', 'Can you recommend "
+            "an area?', 'I'm looking for a 3 bedroom condo', and 'I need a place near my "
+            "children's school'. Do not answer these as generic property or neighbourhood "
+            "advice and do not independently recommend an area before collecting the user's "
+            "regular destinations. When a personalised search names an area, set area_status "
+            "to known and include every named area in areas. When the user does not know the "
+            "area or asks Rentee to recommend or suggest one for them, set area_status to "
+            "unknown and areas to an empty list. Extract every search requirement supplied in "
+            "the current message before the deterministic flow asks the next missing question. "
+            "Personalised area guidance is different from a general factual area question: "
+            "'Which area would you recommend for me?' MUST use advance_property_search, while "
+            "'What is Bangsar like?' is a general factual question and must not start a "
+            "personalised search. 'What is Ken Bangsar like?' MUST use get_condo_info, and "
+            "'Do you have any 3 bedrooms at Ken Bangsar?' uses the existing specific-current-"
+            "inventory path rather than starting a new guided search. "
+            "advance_property_search progressively saves every requirement supplied and "
+            "deterministically asks only "
             "the next missing question in this order: area, property type, bedrooms, budget, "
             "other requirements, then ordered priorities. Do not call match_lead before that "
             "tool reports a complete brief and a condo shortlist exists. Once complete, it "
@@ -420,12 +440,17 @@ def build_response_args(user_message, previous_response_id=None):
         "type": "function",
         "name": "advance_property_search",
         "description": (
-            "Progress a personalised rental-search journey. Use for new searches, supplied "
-            "requirements, corrections, condo-shortlist choices, and requests to show the best "
-            "units after a condo shortlist. Extract every requirement in the current message. "
-            "This tool saves the structured brief, asks one next question, recommends condos "
-            "before listings, and enforces the saved condo shortlist. Do not use for a simple "
-            "factual condo or specific inventory question."
+            "The primary tool for starting or continuing a personalised property-finding or "
+            "rental-search journey. Always use it when a user starts looking for a home, "
+            "including when they do not yet know the area or ask Rentee for a personalised "
+            "area recommendation. Also use it for supplied search requirements, corrections "
+            "and refinements, condo-shortlist choices, and requests to show listings from the "
+            "saved shortlist. Extract every requirement in the current message. If an area is "
+            "named, set area_status to known and include it in areas. If the user does not know "
+            "the area or asks for an area recommendation, set area_status to unknown and areas "
+            "to []. This tool saves the structured brief, asks one next question, recommends "
+            "condos before listings, and enforces the saved condo shortlist. Do not use it for "
+            "a simple factual area or condo question, or a specific current-inventory question."
         ),
         "parameters": {
             "type": "object",
@@ -1183,16 +1208,70 @@ def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url
 
 
 def save_search_state(lead_id, search_state, base_url):
+    save_started = time.perf_counter()
+    payload = {
+        "searchBriefJSON": dump_search_state(search_state),
+        "AIsearchtext": search_state_to_requirements_text(search_state),
+        "AIsearchsummary": search_state_to_summary(search_state),
+    }
     response = requests.patch(
         f"{base_url}/obj/lead/{lead_id}",
         headers={
             "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
             "Content-Type": "application/json",
         },
-        json={"searchBriefJSON": dump_search_state(search_state)},
+        json=payload,
         timeout=30,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.RequestException:
+        print(
+            "Failed to save structured search brief: "
+            f"HTTP {response.status_code} body={response.text}",
+            flush=True,
+        )
+        raise
+    finally:
+        log_timing("Save structured search brief", save_started)
+
+
+def search_state_to_requirements_text(search_state):
+    state = load_search_state(search_state)
+    fields = (
+        ("Areas", state["areas"]),
+        ("Regular destinations", state["regular_destinations"]),
+        ("Property types", state["property_types"]),
+        ("Bedrooms", state["bedroom_requirement"]),
+        ("Budget", state["budget_requirement"]),
+        ("Other requirements", state["other_requirements"]),
+        ("Ordered priorities", state["priorities"]),
+    )
+    return "\n".join(
+        f"{label}: {', '.join(value) if isinstance(value, list) else value}"
+        for label, value in fields
+        if value
+    )
+
+
+def search_state_to_summary(search_state):
+    state = load_search_state(search_state)
+    fields = (
+        ("Area", state["areas"], ", "),
+        ("Regular destinations", state["regular_destinations"], ", "),
+        ("Property type", state["property_types"], ", "),
+        ("Bedrooms", state["bedroom_requirement"], None),
+        ("Budget", state["budget_requirement"], None),
+        ("Other", state["other_requirements"], ", "),
+        ("Priorities", state["priorities"], " → "),
+    )
+    lines = []
+    for label, value, separator in fields:
+        if not value:
+            continue
+        rendered = separator.join(value) if isinstance(value, list) else value
+        lines.append(f"{label}: {rendered}")
+    return "\n".join(lines)
 
 
 def extract_search_update_from_profile(profile_text):
@@ -1597,9 +1676,6 @@ def chat_stream():
                     yield (
                         f"data: {json.dumps({'status': 'Updating your search brief...'})}\n\n"
                     )
-                    preference_text = search_update_preference_text(tool_args)
-                    if preference_text:
-                        update_preferences(folio_id, preference_text, bubble_env)
                     search_result = advance_property_search(
                         folio_id, bubble_env, tool_args
                     )
