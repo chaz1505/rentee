@@ -9,8 +9,11 @@ os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 
 import app as app_module
 from search_flow import (
+    area_recommendation_needed,
     apply_search_update,
+    dump_search_state,
     empty_search_state,
+    load_search_state,
     listing_search_scope,
     next_search_question,
     search_brief_complete,
@@ -121,7 +124,125 @@ class SearchFlowStateTests(unittest.TestCase):
 
     def test_unknown_area_asks_for_regular_destinations(self):
         state = apply_search_update(empty_search_state(), {"area_status": "unknown"})
+        self.assertEqual(state["area_status"], "unknown")
         self.assertIn("need to go regularly", next_search_question(state))
+
+    def test_unknown_area_with_destinations_requires_area_recommendation(self):
+        state = apply_search_update(empty_search_state(), {
+            "area_status": "unknown",
+            "regular_destinations": ["KLCC", "Alice Smith School"],
+        })
+        self.assertTrue(area_recommendation_needed(state))
+        self.assertIsNone(next_search_question(state))
+
+    def test_unchanged_update_preserves_unknown_area_and_destinations(self):
+        state = apply_search_update(empty_search_state(), {
+            "area_status": "unknown",
+            "regular_destinations": ["KLCC", "Alice Smith School"],
+        })
+        state = apply_search_update(state, {
+            "area_status": "unchanged", "property_types": ["Condo"]
+        })
+        self.assertEqual(state["area_status"], "unknown")
+        self.assertEqual(state["regular_destinations"], [
+            "KLCC", "Alice Smith School"
+        ])
+        self.assertEqual(state["property_types"], ["Condo"])
+        self.assertTrue(area_recommendation_needed(state))
+
+    def test_unknown_area_status_survives_persistence(self):
+        state = apply_search_update(empty_search_state(), {
+            "area_status": "unknown", "regular_destinations": ["KLCC"]
+        })
+        restored = load_search_state(dump_search_state(state))
+        self.assertEqual(restored["area_status"], "unknown")
+        self.assertEqual(restored["regular_destinations"], ["KLCC"])
+
+    def test_legacy_area_unknown_state_is_migrated(self):
+        restored = load_search_state({
+            "area_unknown": True, "areas": [],
+            "regular_destinations": ["KLCC"],
+        })
+        self.assertEqual(restored["area_status"], "unknown")
+        self.assertTrue(area_recommendation_needed(restored))
+
+    @patch("app.save_search_state")
+    @patch("app.recommend_areas_for_search")
+    @patch("app.bubble")
+    def test_advance_search_recommends_areas_from_stored_destinations(
+        self, mocked_bubble, mocked_recommend, mocked_save
+    ):
+        stored = apply_search_update(empty_search_state(), {
+            "area_status": "unchanged",
+            "regular_destinations": ["KLCC", "Alice Smith School"],
+            "property_types": ["Condo"],
+        })
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"}, {"searchBriefJSON": dump_search_state(stored)}
+        ]
+        mocked_recommend.return_value = [
+            {"area_name": "Bangsar", "reason": "Practical for both destinations."},
+            {"area_name": "Damansara Heights", "reason": "A quieter alternative."},
+        ]
+
+        result = app_module.advance_property_search("folio-1", "live", {
+            "area_status": "unknown", "areas": [],
+            "regular_destinations": [], "property_types": [],
+        })
+
+        self.assertEqual(result["action"], "recommend_areas")
+        self.assertEqual(result["state"]["area_status"], "unknown")
+        self.assertEqual(
+            result["state"]["regular_destinations"],
+            ["KLCC", "Alice Smith School"],
+        )
+        self.assertIn("Bangsar", result["text"])
+        self.assertNotIn("Do you already know", result["text"])
+        self.assertNotIn("Where do you", result["text"])
+        mocked_save.assert_called_once()
+
+    @patch("app.save_search_state")
+    @patch("app.recommend_areas_for_search")
+    @patch("app.bubble")
+    def test_later_requirement_reuses_saved_area_recommendations(
+        self, mocked_bubble, mocked_recommend, _mocked_save
+    ):
+        stored = apply_search_update(empty_search_state(), {
+            "area_status": "unknown", "regular_destinations": ["KLCC"],
+        })
+        stored["area_recommendations"] = [
+            {"area_name": "Bangsar", "reason": "A balanced option."}
+        ]
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"}, {"searchBriefJSON": dump_search_state(stored)}
+        ]
+
+        result = app_module.advance_property_search("folio-1", "live", {
+            "area_status": "unchanged", "property_types": ["Condo"]
+        })
+
+        self.assertEqual(result["action"], "recommend_areas")
+        self.assertEqual(result["state"]["area_status"], "unknown")
+        self.assertEqual(result["state"]["property_types"], ["Condo"])
+        mocked_recommend.assert_not_called()
+
+    def test_selecting_recommended_area_resolves_area_and_keeps_requirements(self):
+        state = apply_search_update(empty_search_state(), {
+            "area_status": "unknown", "regular_destinations": ["KLCC"],
+            "property_types": ["Condo"], "bedroom_requirement": "4 bedrooms",
+        })
+        state["area_recommendations"] = [
+            {"area_name": "Bangsar", "reason": "A balanced option."}
+        ]
+        state = apply_search_update(state, {
+            "area_status": "known", "areas": ["Bangsar"]
+        })
+        self.assertEqual(state["area_status"], "known")
+        self.assertEqual(state["areas"], ["Bangsar"])
+        self.assertEqual(state["property_types"], ["Condo"])
+        self.assertEqual(state["bedroom_requirement"], "4 bedrooms")
+        self.assertEqual(state["area_recommendations"], [])
+        self.assertEqual(next_search_question(state), "What's your monthly rental budget?")
 
     def test_no_other_requirements_and_no_priorities_are_valid_answers(self):
         state = complete_state()

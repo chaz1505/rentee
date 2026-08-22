@@ -12,9 +12,10 @@ SEARCH_BRIEF_FIELDS = (
 def empty_search_state():
     return {
         "stage": "NEW_PROPERTY_SEARCH",
+        "area_status": "unchanged",
         "areas": [],
-        "area_unknown": False,
         "regular_destinations": [],
+        "area_recommendations": [],
         "property_types": [],
         "bedroom_requirement": "",
         "budget_requirement": "",
@@ -40,6 +41,13 @@ def load_search_state(value):
         for key in state:
             if key in source and isinstance(source[key], type(state[key])):
                 state[key] = source[key]
+        # Migrate briefs saved before area_status became explicit.
+        if "area_status" not in source and source.get("area_unknown") is True:
+            state["area_status"] = "unknown"
+        elif state["areas"]:
+            state["area_status"] = "known"
+    if state["area_status"] not in ("unchanged", "known", "unknown"):
+        state["area_status"] = "known" if state["areas"] else "unchanged"
     return state
 
 
@@ -62,7 +70,9 @@ def search_brief_complete(state):
 def next_search_question(state):
     state = load_search_state(state)
     if not state["areas"]:
-        if state["area_unknown"] and not state["regular_destinations"]:
+        if state["area_status"] == "unknown":
+            if state["regular_destinations"]:
+                return None
             return (
                 "Where do you and your family need to go regularly — for example, "
                 "where do you work or where do your children go to school?"
@@ -97,17 +107,20 @@ def apply_search_update(state, update):
         areas = _unique(update["areas"])
         material_change |= areas != state["areas"]
         state["areas"] = areas
-        state["area_unknown"] = False
+        state["area_status"] = "known"
+        state["area_recommendations"] = []
     elif area_status == "unknown":
         material_change |= bool(state["areas"])
         state["areas"] = []
-        state["area_unknown"] = True
+        state["area_status"] = "unknown"
 
     for key in ("property_types", "regular_destinations"):
         if update.get(key):
             value = _unique(update[key])
             if key == "property_types":
                 material_change |= value != state[key]
+            elif value != state[key]:
+                state["area_recommendations"] = []
             state[key] = value
     for key in ("bedroom_requirement", "budget_requirement"):
         if str(update.get(key) or "").strip():
@@ -138,6 +151,33 @@ def apply_search_update(state, update):
         )
     else:
         state["stage"] = "COLLECTING_REQUIREMENTS"
+    return state
+
+
+def area_recommendation_needed(state):
+    state = load_search_state(state)
+    return (
+        state["area_status"] == "unknown"
+        and bool(state["regular_destinations"])
+        and not state["areas"]
+    )
+
+
+def set_area_recommendations(state, recommendations):
+    state = load_search_state(state)
+    cleaned = []
+    seen = set()
+    for item in recommendations or []:
+        if not isinstance(item, dict):
+            continue
+        area_name = " ".join(str(item.get("area_name") or "").split())
+        reason = " ".join(str(item.get("reason") or "").split())
+        key = area_name.casefold()
+        if area_name and reason and key not in seen:
+            cleaned.append({"area_name": area_name, "reason": reason})
+            seen.add(key)
+    state["area_recommendations"] = cleaned[:4]
+    state["stage"] = "AWAITING_AREA_SELECTION"
     return state
 
 

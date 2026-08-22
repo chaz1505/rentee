@@ -10,12 +10,14 @@ import threading
 import time
 
 from search_flow import (
+    area_recommendation_needed,
     apply_search_update,
     dump_search_state,
     listing_search_scope,
     load_search_state,
     next_search_question,
     search_brief_complete,
+    set_area_recommendations,
     set_recommended_condos,
 )
 
@@ -1316,6 +1318,73 @@ def extract_search_update_from_profile(profile_text):
     return json.loads(response.output_text)
 
 
+def recommend_areas_for_search(search_state):
+    """Recommend areas from Rentee's condo knowledge, never current inventory."""
+    condo_rows = list(_get_condo_lookup().values())
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=(
+            "Recommend 2 to 4 Kuala Lumpur areas for this home seeker using only the "
+            "SEARCH BRIEF and Rentee CONDO KNOWLEDGE below. Prioritise practical access "
+            "to the recorded regular destinations and consider any other collected "
+            "requirements. Give a concise customer-friendly trade-off for each area. Do "
+            "not search current listings, claim availability, invent commute times, or "
+            "recommend individual units. Return distinct area names, not condo names.\n\n"
+            f"SEARCH BRIEF:\n{dump_search_state(search_state)}\n\n"
+            f"CONDO KNOWLEDGE:\n{json.dumps(condo_rows, ensure_ascii=False)}"
+        ),
+        text={"format": {
+            "type": "json_schema",
+            "name": "area_recommendations",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "recommendations": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "area_name": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["area_name", "reason"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["recommendations"],
+                "additionalProperties": False,
+            },
+        }},
+    )
+    recommendations = json.loads(response.output_text)["recommendations"]
+    state_with_recommendations = set_area_recommendations(
+        search_state, recommendations
+    )
+    if not state_with_recommendations["area_recommendations"]:
+        raise ValueError("No valid area recommendations were returned.")
+    return state_with_recommendations["area_recommendations"]
+
+
+def area_recommendation_text(search_state):
+    state = load_search_state(search_state)
+    destinations = ", ".join(state["regular_destinations"])
+    lines = [
+        f"Based on the places you need to reach regularly — {destinations} — "
+        "I'd consider:",
+        "",
+    ]
+    lines.extend(
+        f"{index}. {item['area_name']} — {item['reason']}"
+        for index, item in enumerate(state["area_recommendations"], 1)
+    )
+    lines.extend(["", "Which of those areas sounds closest to what you want?"])
+    return "\n".join(lines)
+
+
 def advance_property_search(folio_id, bubble_env, update):
     """Advance the durable brief and return the next deterministic action."""
     base_url = get_bubble_base_url(bubble_env)
@@ -1329,6 +1398,21 @@ def advance_property_search(folio_id, bubble_env, update):
             state, extract_search_update_from_profile(lead["AIsearchtext"])
         )
     state = apply_search_update(state, update)
+
+    if area_recommendation_needed(state):
+        if not state["area_recommendations"]:
+            recommendations = recommend_areas_for_search(state)
+            state = set_area_recommendations(state, recommendations)
+        else:
+            state["stage"] = "AWAITING_AREA_SELECTION"
+        save_search_state(lead_id, state, base_url)
+        return {
+            "action": "recommend_areas",
+            "text": area_recommendation_text(state),
+            "state": state,
+            "lead_id": lead_id,
+            "recommendations": state["area_recommendations"],
+        }
 
     if not search_brief_complete(state):
         save_search_state(lead_id, state, base_url)
