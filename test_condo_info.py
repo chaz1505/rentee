@@ -131,6 +131,13 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("specific current Rentee listing or unit", property_tool["description"])
         self.assertIn("use get_condo_info instead", property_tool["description"])
 
+        match_tool = next(
+            item for item in args["tools"] if item.get("name") == "match_lead"
+        )
+        self.assertTrue(match_tool["strict"])
+        self.assertEqual(match_tool["parameters"]["required"], [])
+        self.assertFalse(match_tool["parameters"]["additionalProperties"])
+
     @patch("app.get_condo_infos")
     def test_chat_stream_executes_condo_tool_and_continues_same_response(
         self, mocked_condo_infos
@@ -182,7 +189,6 @@ class CondoInfoTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         mocked_condo_infos.assert_called_once_with(requested_names)
-        self.assertIn("Checking condo information", body)
         self.assertIn("Comparison answer", body)
         self.assertIn('"response_id": "final-response"', body)
         self.assertIn('"done": true', body)
@@ -233,7 +239,7 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn('"done": true', body)
 
     @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
-    def test_broken_previous_response_retry_warns_if_tool_selection_emits_text(
+    def test_broken_previous_response_retry_suppresses_tool_selection_text(
         self, _mocked_condo_infos
     ):
         tool_call = SimpleNamespace(
@@ -294,13 +300,121 @@ class CondoInfoTests(unittest.TestCase):
         self.assertNotIn(
             "previous_response_id", responses.stream.call_args_list[1].kwargs
         )
-        self.assertIn("invoke an internal function", body)
+        self.assertNotIn("invoke an internal function", body)
         self.assertTrue(any(
-            "WARNING: Initial OpenAI response emitted customer-facing text" in str(call)
+            "WARNING: Suppressed initial OpenAI text" in str(call)
             for call in mocked_print.call_args_list
         ))
         self.assertIn("Grounded condo answer", body)
         self.assertIn('"response_id": "retry-final"', body)
+
+    @patch("app.execute_match_lead_silently")
+    def test_match_lead_hides_internal_events_and_executes_completed_call_once(
+        self, mocked_match
+    ):
+        mocked_match.return_value = "One matching listing"
+        tool_call = SimpleNamespace(
+            type="function_call", name="match_lead",
+            call_id="match-call", arguments="{}",
+        )
+        initial = SimpleNamespace(id="match-initial", output=[tool_call], usage=None)
+        final = SimpleNamespace(id="match-final", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        internal_events = [
+            SimpleNamespace(
+                type="response.output_text.delta",
+                delta="Calling match_lead tool; awaiting results. # to=functions.match_lead {}",
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta", delta='{"":',
+            ),
+            SimpleNamespace(
+                type="response.function_call_arguments.delta", delta='""}',
+            ),
+            SimpleNamespace(type="response.reasoning.delta", delta="internal"),
+        ]
+        final_events = [SimpleNamespace(
+            type="response.output_text.delta",
+            delta="I found one suitable option at One Menerung.",
+        )]
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial, internal_events),
+            FakeStream(final, final_events),
+        ]
+
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ):
+            response = app_module.app.test_client().post(
+                "/chat_stream",
+                json={
+                    "message": "Yes please", "folio_id": "folio-1",
+                    "message_id": "message-1",
+                },
+            )
+            body = response.get_data(as_text=True)
+
+        mocked_match.assert_called_once_with(
+            "folio-1", "live", "message-1"
+        )
+        self.assertIn("I found one suitable option at One Menerung.", body)
+        self.assertIn('"response_id": "match-final"', body)
+        for leaked in (
+            "# to=functions", "match_lead tool was called", "function_call",
+            "awaiting results", "Searching available properties", '{"": ""}',
+            "response.reasoning.delta",
+        ):
+            self.assertNotIn(leaked, body)
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertEqual(continuation["input"][0]["call_id"], "match-call")
+        self.assertEqual(continuation["input"][0]["output"], "One matching listing")
+
+    def test_match_lead_rejects_invalid_nonempty_arguments(self):
+        tool_call = SimpleNamespace(
+            type="function_call", name="match_lead", arguments='{"":""}'
+        )
+        with self.assertRaisesRegex(ValueError, "does not accept arguments"):
+            app_module.parse_completed_tool_arguments(tool_call)
+
+    def test_invalid_tool_arguments_are_logged_but_not_exposed_in_sse(self):
+        tool_call = SimpleNamespace(
+            type="function_call", name="match_lead", call_id="bad-call",
+            arguments='{"":""}',
+        )
+        initial = SimpleNamespace(id="bad-initial", output=[tool_call], usage=None)
+
+        class FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(())
+            def get_final_response(self): return initial
+
+        responses = MagicMock()
+        responses.stream.return_value = FakeStream()
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ), patch("builtins.print") as mocked_print:
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "Yes please"}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertIn("Sorry, something went wrong", body)
+        self.assertNotIn("match_lead", body)
+        self.assertNotIn('{\"\":\"\"}', body)
+        self.assertTrue(any(
+            "match_lead does not accept arguments" in str(call)
+            for call in mocked_print.call_args_list
+        ))
 
 
 if __name__ == "__main__":

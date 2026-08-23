@@ -485,6 +485,7 @@ def build_response_args(user_message, previous_response_id=None):
     {
         "type": "function",
         "name": "match_lead",
+        "strict": True,
         "description": (
             "Use this whenever the user asks to see, find, recommend, list, show, "
             "shortlist, rank, compare, recall, or discuss currently available properties "
@@ -625,6 +626,24 @@ def get_web_citations(response):
                     seen_urls.add(url)
 
     return citations
+
+
+def parse_completed_tool_arguments(tool_call):
+    """Parse arguments only from the SDK's completed function-call output item."""
+    raw_arguments = getattr(tool_call, "arguments", None)
+    if not isinstance(raw_arguments, str) or not raw_arguments.strip():
+        raise ValueError(f"Tool {tool_call.name} returned incomplete arguments.")
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"Tool {tool_call.name} returned invalid JSON arguments."
+        ) from error
+    if not isinstance(arguments, dict):
+        raise ValueError(f"Tool {tool_call.name} arguments must be a JSON object.")
+    if tool_call.name == "match_lead" and arguments:
+        raise ValueError("match_lead does not accept arguments.")
+    return arguments
 
 
 def bubble(url, **kwargs):
@@ -1188,6 +1207,17 @@ def stream_match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         yield f"data: {json.dumps({'status': status})}\n\n"
 
 
+def execute_match_lead_silently(folio_id, bubble_env, message_id, condo_scope=None):
+    """Run matching while keeping backend progress events out of customer SSE."""
+    match_flow = match_lead(folio_id, bubble_env, message_id, condo_scope)
+    while True:
+        try:
+            status = next(match_flow)
+        except StopIteration as completed:
+            return completed.value
+        print(f"match_lead progress: {status}", flush=True)
+
+
 def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url):
 
     print(f"Updating Lead preferences for lead {lead_id}", flush=True)
@@ -1650,7 +1680,7 @@ def chat_stream():
                     nonlocal first_delta_sent
 
                     initial_started = time.perf_counter()
-                    emitted_text = False
+                    buffered_text_deltas = []
                     try:
                         with client.responses.stream(**response_args) as stream:
                             for event in stream:
@@ -1666,9 +1696,6 @@ def chat_stream():
                                     and not web_search_status_sent
                                 ):
                                     print("Web search used", flush=True)
-                                    yield (
-                                        f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
-                                    )
                                     web_search_status_sent = True
 
                                 if event.type == "response.output_text.delta":
@@ -1678,13 +1705,9 @@ def chat_stream():
                                             initial_started
                                         )
                                         initial_first_delta_logged = True
-                                    if not first_delta_sent:
-                                        log_timing("FIRST DELTA", request_started)
-                                        first_delta_sent = True
-                                    emitted_text = True
-                                    yield (
-                                        f"data: {json.dumps({'delta': event.delta})}\n\n"
-                                    )
+                                    # Initial text is not user-visible until the completed
+                                    # response proves that no function call follows it.
+                                    buffered_text_deltas.append(event.delta)
 
                             final_response = stream.get_final_response()
                             log_token_usage("Initial", final_response)
@@ -1693,12 +1716,12 @@ def chat_stream():
                         raise
 
                     log_timing(f"{timing_label} complete", initial_started)
-                    return final_response, emitted_text
+                    return final_response, buffered_text_deltas
 
                 # The initial turn carries the incoming response ID, preserving
                 # the user's existing conversation history.
                 try:
-                    response, initial_text_emitted = yield from stream_initial_response(
+                    response, buffered_initial_text = stream_initial_response(
                         build_response_args(message, previous),
                         "Initial OpenAI/tool selection"
                     )
@@ -1710,7 +1733,7 @@ def chat_stream():
                         "Broken previous_response_id detected; starting a fresh conversation",
                         flush=True
                     )
-                    response, initial_text_emitted = yield from stream_initial_response(
+                    response, buffered_initial_text = stream_initial_response(
                         build_response_args(message, None),
                         "Initial OpenAI/tool selection retry"
                     )
@@ -1719,9 +1742,6 @@ def chat_stream():
                     for output_item in response.output
                 ) and not web_search_status_sent:
                     print("Web search used", flush=True)
-                    yield (
-                        f"data: {json.dumps({'status': 'Searching the web for the latest information...'})}\n\n"
-                    )
                     web_search_status_sent = True
                 tool_call = next(
                     (x for x in response.output if x.type == "function_call"),
@@ -1730,6 +1750,11 @@ def chat_stream():
 
                 if tool_call is None:
                     print("No tool call requested", flush=True)
+                    for delta in buffered_initial_text:
+                        if not first_delta_sent:
+                            log_timing("FIRST DELTA", request_started)
+                            first_delta_sent = True
+                        yield f"data: {json.dumps({'delta': delta})}\n\n"
                     citations = get_web_citations(response)
 
                     if citations:
@@ -1740,11 +1765,10 @@ def chat_stream():
                     )
                     return
 
-                if initial_text_emitted:
+                if buffered_initial_text:
                     print(
-                        "WARNING: Initial OpenAI response emitted customer-facing text "
-                        f"before requesting tool {tool_call.name}; the text was already "
-                        "streamed to Bubble.",
+                        "WARNING: Suppressed initial OpenAI text emitted before tool "
+                        f"{tool_call.name}; internal orchestration was not sent to Bubble.",
                         flush=True
                     )
 
@@ -1752,19 +1776,16 @@ def chat_stream():
                 original_call_id = tool_call.call_id
                 print(f"Tool selected: {tool_call.name}", flush=True)
                 print(f"Original call_id: {original_call_id}", flush=True)
-                tool_args = json.loads(tool_call.arguments)
+                tool_args = parse_completed_tool_arguments(tool_call)
                 follow_up_tools = None
 
                 if tool_call.name == "advance_property_search":
                     has_match_results = False
-                    yield (
-                        f"data: {json.dumps({'status': 'Updating your search brief...'})}\n\n"
-                    )
                     search_result = advance_property_search(
                         folio_id, bubble_env, tool_args
                     )
                     if search_result["action"] == "search_listings":
-                        recommendations = yield from stream_match_lead(
+                        recommendations = execute_match_lead_silently(
                             folio_id,
                             bubble_env,
                             message_id,
@@ -1790,7 +1811,7 @@ def chat_stream():
                         "listings, condos, requirements, or internal state."
                     )
                 elif tool_call.name == "match_lead":
-                    tool_result = yield from stream_match_lead(
+                    tool_result = execute_match_lead_silently(
                         folio_id, 
                         bubble_env,
                         message_id
@@ -1802,9 +1823,6 @@ def chat_stream():
                         "or invent property information."
                     )
                 elif tool_call.name == "update_preferences":
-                    yield (
-                        f"data: {json.dumps({'status': 'Updating your preferences...'})}\n\n"
-                    )
                     preference_confirmation = update_preferences(
                         folio_id,
                         tool_args["preference_update"],
@@ -1819,9 +1837,6 @@ def chat_stream():
                     )
                 elif tool_call.name == "get_property_details":
                     has_match_results = False
-                    yield (
-                        f"data: {json.dumps({'status': 'Checking property details...'})}\n\n"
-                    )
                     tool_result = get_property_details(
                         folio_id,
                         tool_args["property_reference"],
@@ -1844,9 +1859,6 @@ def chat_stream():
                     follow_up_tools = [{"type": "web_search"}]
                 elif tool_call.name == "get_condo_info":
                     has_match_results = False
-                    yield (
-                        f"data: {json.dumps({'status': 'Checking condo information...'})}\n\n"
-                    )
                     condo_names = tool_args.get("condo_names")
                     if not isinstance(condo_names, list):
                         condo_names = []
@@ -1862,11 +1874,6 @@ def chat_stream():
                     )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
-
-                if has_match_results:
-                    yield (
-                        f"data: {json.dumps({'status': 'Found some options — putting them together...'})}\n\n"
-                    )
 
                 # Continue the same response chain with the function result,
                 # then stream the final assistant answer back to Bubble.
@@ -1922,14 +1929,6 @@ def chat_stream():
                             and not web_search_status_sent
                         ):
                             print("Web search used", flush=True)
-                            status = (
-                                "That detail isn’t in the listing — checking the web..."
-                                if property_details_web_fallback
-                                else "Searching the web for the latest information..."
-                            )
-                            yield (
-                                f"data: {json.dumps({'status': status})}\n\n"
-                            )
                             web_search_status_sent = True
                         if event.type == "response.output_text.delta":
                             if not first_delta_sent:
@@ -1955,7 +1954,7 @@ def chat_stream():
             except Exception as error:
                 print(f"/chat_stream failed: {error}", flush=True)
                 log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
-                yield f"data: {json.dumps({'error': str(error), 'done': True})}\n\n"
+                yield f"data: {json.dumps({'error': 'Sorry, something went wrong. Please try again.', 'done': True})}\n\n"
 
         return Response(
             generate(),
