@@ -8,6 +8,7 @@ import requests
 import json
 import threading
 import time
+import re
 from pathlib import Path
 
 from search_flow import (
@@ -49,10 +50,15 @@ CONDO_SHEET_CSV_URL = (
 )
 CONDO_CACHE_TTL_SECONDS = 300
 CONDO_SHEET_TIMEOUT_SECONDS = 15
+WHATSAPP_GRAPH_API_VERSION = "v23.0"
+WHATSAPP_TEXT_LIMIT = 4096
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
 _condo_cache_lock = threading.Lock()
+_whatsapp_processing_ids = set()
+_whatsapp_processing_lock = threading.Lock()
+_whatsapp_phone_locks = {}
 
 CORE_PROMPT = """You are Rentee, an intelligent rental advisor helping people find a home.
 
@@ -492,6 +498,157 @@ def bubble(url, **kwargs):
     r.raise_for_status()
 
     return r.json()["response"]
+
+
+def normalize_phone(value):
+    """Canonicalize a phone for equality without changing its country code."""
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _bubble_headers():
+    return {
+        "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def _bubble_create(base_url, object_type, payload):
+    response = requests.post(
+        f"{base_url}/obj/{object_type}", headers=_bubble_headers(),
+        json=payload, timeout=30,
+    )
+    response.raise_for_status()
+    object_id = response.json().get("id")
+    if not object_id:
+        raise ValueError(f"Bubble did not return a {object_type} ID.")
+    return object_id
+
+
+def _bubble_records(base_url, object_type, constraints=None):
+    cursor = 0
+    while True:
+        params = {"cursor": cursor}
+        if constraints:
+            params["constraints"] = json.dumps(constraints, separators=(",", ":"))
+        page = bubble(f"{base_url}/obj/{object_type}", params=params)
+        results = page.get("results", []) or []
+        yield from results
+        if not results or not page.get("remaining"):
+            break
+        cursor += len(results)
+
+
+def find_lead_by_phone(phone, bubble_env="live"):
+    canonical = normalize_phone(phone)
+    if not canonical:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    exact = [{"key": "phone", "constraint_type": "equals", "value": canonical}]
+    try:
+        for lead in _bubble_records(base_url, "lead", exact):
+            if normalize_phone(lead.get("phone")) == canonical:
+                return lead
+    except requests.RequestException as error:
+        print(f"Exact Lead phone lookup unavailable; using normalized fallback: {error}", flush=True)
+    phone_fields = ("phone", "Phone", "phoneNumber", "Phone number", "mobile")
+    for lead in _bubble_records(base_url, "lead"):
+        if any(normalize_phone(lead.get(field)) == canonical for field in phone_fields):
+            return lead
+    return None
+
+
+def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
+    canonical = normalize_phone(phone)
+    if not canonical:
+        raise ValueError("WhatsApp sender phone is missing.")
+    lead = find_lead_by_phone(canonical, bubble_env)
+    if lead:
+        return lead, False
+    base_url = get_bubble_base_url(bubble_env)
+    lead_id = _bubble_create(base_url, "lead", {"phone": canonical})
+    # The repository exposes no confirmed Lead name/source field, so do not invent one.
+    return {"_id": lead_id, "phone": canonical, "searchBriefJSON": ""}, True
+
+
+def find_or_create_lead_folio(lead_id, bubble_env="live"):
+    base_url = get_bubble_base_url(bubble_env)
+    constraints = [{"key": "lead", "constraint_type": "equals", "value": lead_id}]
+    for folio in _bubble_records(base_url, "folio", constraints):
+        if folio.get("lead") == lead_id and folio.get("_id"):
+            return folio["_id"], False
+    folio_id = _bubble_create(base_url, "folio", {"lead": lead_id, "folioItems": []})
+    return folio_id, True
+
+
+def _whatsapp_channel_state(lead):
+    try:
+        brief = json.loads(lead.get("searchBriefJSON") or "{}")
+    except (TypeError, ValueError):
+        brief = {}
+    state = brief.get("channel_state")
+    return state if isinstance(state, dict) else {}
+
+
+def _persist_whatsapp_state(lead_id, lead, state, bubble_env="live"):
+    search_state = load_search_state(lead.get("searchBriefJSON"))
+    search_state["channel_state"] = state
+    response = requests.patch(
+        f"{get_bubble_base_url(bubble_env)}/obj/lead/{lead_id}",
+        headers=_bubble_headers(), json={"searchBriefJSON": dump_search_state(search_state)},
+        timeout=30,
+    )
+    response.raise_for_status()
+    lead["searchBriefJSON"] = dump_search_state(search_state)
+
+
+def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts = []
+    while text:
+        if len(text) <= limit:
+            parts.append(text)
+            break
+        boundary = text.rfind("\n\n", 0, limit + 1)
+        if boundary < limit // 2:
+            boundary = text.rfind("\n", 0, limit + 1)
+        if boundary < limit // 2:
+            boundary = text.rfind(" ", 0, limit + 1)
+        if boundary <= 0:
+            boundary = limit
+        parts.append(text[:boundary].strip())
+        text = text[boundary:].strip()
+    return parts
+
+
+def send_whatsapp_text(to_phone, text):
+    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    url = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+        f"{phone_number_id}/messages"
+    )
+    sent_ids = []
+    for part in split_whatsapp_text(text):
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json"},
+            json={"messaging_product": "whatsapp", "to": normalize_phone(to_phone),
+                  "type": "text", "text": {"body": part}},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        message_id = ((payload.get("messages") or [{}])[0]).get("id")
+        sent_ids.append(message_id)
+        safe_phone = normalize_phone(to_phone)
+        print(
+            f"WhatsApp sent to ...{safe_phone[-4:]} status={response.status_code} "
+            f"message_id={message_id}", flush=True,
+        )
+    return sent_ids
 
 
 def get_plausible_listings(
@@ -1883,6 +2040,149 @@ def chat_stream():
 
         log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
         return jsonify({"error": str(e)}), 500
+
+
+def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=None,
+                    bubble_env="live"):
+    """Run the existing customer turn lifecycle and collect its clean final text."""
+    payload = {
+        "message": message, "folio_id": folio_id, "bubble_env": bubble_env,
+        "message_id": message_id,
+    }
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
+    # Keep one implementation of prompts, tools, retries, and event filtering: the
+    # same streaming endpoint is consumed internally and collapsed for WhatsApp.
+    with app.test_client() as test_client:
+        response = test_client.post("/chat_stream", json=payload)
+        if response.status_code != 200:
+            raise RuntimeError(f"Rentee turn returned HTTP {response.status_code}")
+        text_parts = []
+        response_id = None
+        for raw_line in response.get_data(as_text=True).splitlines():
+            if not raw_line.startswith("data: "):
+                continue
+            event = json.loads(raw_line[6:])
+            if event.get("delta"):
+                text_parts.append(str(event["delta"]))
+            if event.get("error"):
+                raise RuntimeError("Rentee turn failed")
+            if event.get("response_id"):
+                response_id = event["response_id"]
+    answer = "".join(text_parts).strip()
+    if not answer:
+        raise RuntimeError("Rentee turn returned no customer-facing text")
+    return answer, response_id
+
+
+def _process_whatsapp_message(message):
+    message_id = str(message["id"])
+    phone = normalize_phone(message["from"])
+    text = str((message.get("text") or {}).get("body") or "").strip()
+    phone_lock = _whatsapp_phone_locks.setdefault(phone, threading.Lock())
+    reply_sent = False
+    try:
+        with phone_lock:
+            lead, _created = find_or_create_whatsapp_lead(
+                phone, message.get("customer_name"), "live"
+            )
+            lead_id = lead["_id"]
+            channel_state = _whatsapp_channel_state(lead)
+            processed_ids = list(channel_state.get("processed_message_ids") or [])
+            if message_id in processed_ids:
+                print(f"Ignoring duplicate WhatsApp message {message_id}", flush=True)
+                return
+
+            previous_response_id = channel_state.get("previous_response_id")
+            processed_ids.append(message_id)
+            channel_state["processed_message_ids"] = processed_ids[-100:]
+            _persist_whatsapp_state(lead_id, lead, channel_state, "live")
+
+            folio_id, _created_folio = find_or_create_lead_folio(lead_id, "live")
+            answer, response_id = run_rentee_turn(
+                text, folio_id, previous_response_id=previous_response_id,
+                # A Meta ID is not a Bubble Message relationship ID.
+                message_id=None, bubble_env="live",
+            )
+            send_whatsapp_text(phone, answer)
+            reply_sent = True
+
+            fresh_lead = bubble(f"{get_bubble_base_url('live')}/obj/lead/{lead_id}")
+            fresh_channel_state = _whatsapp_channel_state(fresh_lead)
+            durable_ids = list(fresh_channel_state.get("processed_message_ids") or [])
+            if message_id not in durable_ids:
+                durable_ids.append(message_id)
+            fresh_channel_state["processed_message_ids"] = durable_ids[-100:]
+            if response_id:
+                fresh_channel_state["previous_response_id"] = response_id
+            _persist_whatsapp_state(lead_id, fresh_lead, fresh_channel_state, "live")
+    except Exception as error:
+        print(f"WhatsApp message {message_id} failed: {error}", flush=True)
+        if not reply_sent:
+            try:
+                send_whatsapp_text(
+                    phone, "Sorry, I had trouble checking that just now. Please try again."
+                )
+            except Exception as send_error:
+                print(f"WhatsApp fallback send failed: {send_error}", flush=True)
+    finally:
+        with _whatsapp_processing_lock:
+            _whatsapp_processing_ids.discard(message_id)
+
+
+def _whatsapp_text_messages(payload):
+    messages = []
+    if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
+        return messages
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            value = change.get("value") or {}
+            contacts = value.get("contacts") or []
+            names = {
+                str(contact.get("wa_id")): (contact.get("profile") or {}).get("name")
+                for contact in contacts if contact.get("wa_id")
+            }
+            for item in value.get("messages", []) or []:
+                if item.get("type") != "text" or not item.get("id") or not item.get("from"):
+                    continue
+                body = (item.get("text") or {}).get("body")
+                if not isinstance(body, str) or not body.strip():
+                    continue
+                clean = dict(item)
+                clean["customer_name"] = names.get(str(item.get("from")))
+                messages.append(clean)
+    return messages
+
+
+@app.route("/whatsapp/webhook", methods=["GET"])
+def verify_whatsapp_webhook():
+    valid = (
+        request.args.get("hub.mode") == "subscribe"
+        and request.args.get("hub.verify_token") == os.environ.get("WHATSAPP_VERIFY_TOKEN")
+        and bool(os.environ.get("WHATSAPP_VERIFY_TOKEN"))
+    )
+    if not valid:
+        return "Forbidden", 403
+    return request.args.get("hub.challenge", ""), 200
+
+
+@app.route("/whatsapp/webhook", methods=["POST"])
+def receive_whatsapp_webhook():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Invalid webhook payload"}), 400
+    for message in _whatsapp_text_messages(payload):
+        message_id = str(message["id"])
+        with _whatsapp_processing_lock:
+            if message_id in _whatsapp_processing_ids:
+                continue
+            _whatsapp_processing_ids.add(message_id)
+        worker = threading.Thread(
+            target=_process_whatsapp_message, args=(message,), daemon=True,
+            name=f"whatsapp-{message_id[-12:]}",
+        )
+        worker.start()
+    return "EVENT_RECEIVED", 200
 
 
 if __name__ == "__main__":

@@ -27,6 +27,9 @@ def empty_search_state():
         "liked_condos": [],
         "disliked_condos": [],
         "preference_notes": [],
+        # Small channel metadata persisted with the existing durable search brief.
+        # It is not customer search criteria and is ignored by recommendation logic.
+        "channel_state": {},
     }
 
 
