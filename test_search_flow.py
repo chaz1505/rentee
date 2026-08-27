@@ -331,6 +331,61 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn(15000, candidate_prices)
         self.assertLess(max(abs(price - 15000) for price in candidate_prices), 1200)
 
+    def test_listing_facts_keep_internal_id_and_add_resolved_condo_name(self):
+        facts = app_module.listing_facts({
+            "_id": "1767955404889x211582",
+            "condo": "condo-id", "beds": 4, "priceRent": 11500,
+            "Sq Ft": 3200, "Furnishing": "Partially furnished",
+        }, {"condo-id": "One Menerung"})
+        self.assertEqual(facts["_id"], "1767955404889x211582")
+        self.assertEqual(facts["condo_name"], "One Menerung")
+        self.assertEqual(facts["property_name"], "One Menerung")
+        self.assertEqual(facts["beds"], 4)
+        self.assertEqual(facts["priceRent"], 11500)
+
+    @patch("app.update_folio_items")
+    @patch("app.create_folio_items", return_value=[])
+    @patch("app.get_plausible_listings")
+    @patch("app.bubble")
+    def test_recommendation_uses_name_and_reason_without_exposing_listing_id(
+        self, mocked_bubble, mocked_listings, _mocked_create, _mocked_update
+    ):
+        listing_id = "1767955404889x211582"
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": []},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 4, "budgetRent": 12000},
+            {"results": [{"_id": "condo-id", "name": "One Menerung"}], "remaining": 0},
+        ]
+        mocked_listings.return_value = ([{
+            "_id": listing_id, "condo": "condo-id", "beds": 4,
+            "priceRent": 11500, "Sq Ft": 3200,
+        }], 1)
+        model_response = SimpleNamespace(
+            output_text=json.dumps({
+                "recommendations": [{
+                    "listing_id": listing_id,
+                    "reco_summary": "It meets the four-bedroom need and budget.",
+                }],
+                "customer_response": (
+                    f"{listing_id} is a strong fit because it has four bedrooms "
+                    "and rents for RM11,500."
+                ),
+            }),
+            usage=None,
+        )
+        with patch.object(app_module.client.responses, "create", return_value=model_response):
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration as completed:
+                    answer = completed.value
+                    break
+        self.assertNotIn(listing_id, answer)
+        self.assertIn("One Menerung", answer)
+        self.assertIn("four bedrooms", answer)
+        self.assertIn("RM11,500", answer)
+
     @patch("app.bubble")
     def test_listing_retrieval_stops_after_plausible_pool_is_large_enough(
         self, mocked_bubble

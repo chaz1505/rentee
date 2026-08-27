@@ -787,7 +787,40 @@ def structured_lead_requirements(lead):
     }
 
 
-def listing_facts(listing):
+def get_relationship_names(base_url, object_type, relationship_ids):
+    """Bulk-resolve Bubble relationship IDs to customer-facing record names."""
+    wanted = {str(value) for value in relationship_ids or [] if value}
+    names = {}
+    cursor = 0
+    while wanted:
+        try:
+            page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
+        except requests.RequestException as error:
+            print(f"Could not resolve {object_type} display names: {error}", flush=True)
+            break
+        results = page.get("results", []) or []
+        for record in results:
+            record_id = str(record.get("_id") or "")
+            if record_id not in wanted:
+                continue
+            name = next(
+                (
+                    record.get(field) for field in
+                    ("name", "Name", "Condo name", "title")
+                    if record.get(field)
+                ),
+                None,
+            )
+            if name:
+                names[record_id] = str(name)
+            wanted.remove(record_id)
+        if not results or not page.get("remaining"):
+            break
+        cursor += len(results)
+    return names
+
+
+def listing_facts(listing, condo_names=None, geo_names=None):
     """Compact grounded listing context; excludes generated listing-search prose."""
     fields = (
         "_id", "name", "title", "beds", "baths", "priceRent", "priceSale",
@@ -795,7 +828,29 @@ def listing_facts(listing):
         "availability", "balcony", "family room", "maid room", "outdoor area",
         "Landed_sqft", "Sq Ft", "keyFacts", "Description", "Notes",
     )
-    return {field: listing[field] for field in fields if listing.get(field) not in (None, "", [])}
+    facts = {
+        field: listing[field]
+        for field in fields
+        if listing.get(field) not in (None, "", [])
+    }
+    condo_name = (condo_names or {}).get(str(listing.get("condo") or ""))
+    listing_name = next(
+        (listing.get(field) for field in ("name", "title", "condoName") if listing.get(field)),
+        None,
+    )
+    if condo_name:
+        facts["condo_name"] = condo_name
+    if listing_name or condo_name:
+        facts["property_name"] = str(listing_name or condo_name)
+    geo_value = listing.get("Geo")
+    geo_ids = geo_value if isinstance(geo_value, list) else [geo_value]
+    resolved_geos = [
+        (geo_names or {}).get(str(geo_id)) for geo_id in geo_ids if geo_id
+    ]
+    resolved_geos = [name for name in resolved_geos if name]
+    if resolved_geos:
+        facts["geo_names"] = resolved_geos
+    return facts
 
 
 def _transaction_modes(value):
@@ -955,15 +1010,28 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     )
 
     prompt_started = time.perf_counter()
+    condo_names = get_relationship_names(
+        base_url, "condo", [listing.get("condo") for listing in listings]
+    )
+    geo_relationship_ids = []
+    for listing in listings:
+        value = listing.get("Geo")
+        geo_relationship_ids.extend(value if isinstance(value, list) else [value])
+    geo_names = get_relationship_names(base_url, "geo", geo_relationship_ids)
+    grounded_listing_facts = [
+        listing_facts(listing, condo_names, geo_names) for listing in listings
+    ]
     matching_input = {
         "customer_requirements": structured_lead_requirements(lead),
-        "available_listings": [listing_facts(listing) for listing in listings],
+        "available_listings": grounded_listing_facts,
     }
     prompt = (
         "Rank the grounded listings for this customer. Use the structured facts and "
         "make sensible trade-offs, including fit with the customer's budget tier. "
         "Recommend only genuine fits and mention material compromises. Never invent "
-        "facts. Return JSON matching the supplied schema.\n\n"
+        "facts. Use property_name or condo_name in customer-facing prose and never expose "
+        "listing_id or other internal IDs. Briefly explain why each option fits. Return JSON "
+        "matching the supplied schema.\n\n"
         + json.dumps(matching_input, ensure_ascii=False)
     )
     print(
@@ -1053,6 +1121,17 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             "We can broaden the area, budget, bedrooms, or preferred condos if you'd like."
         )
 
+    display_names_by_id = {
+        str(facts.get("_id")): facts.get("property_name") or facts.get("condo_name")
+        for facts in grounded_listing_facts
+        if facts.get("_id")
+    }
+    customer_response = result["customer_response"]
+    for listing_id, display_name in display_names_by_id.items():
+        customer_response = customer_response.replace(
+            listing_id, str(display_name or "the property")
+        )
+
     yield "Updating your shortlist..."
 
     if new_recommendations:
@@ -1065,7 +1144,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             print(f"Failed to clear previous Folio Item flags: {error}", flush=True)
             log_timing("Clear previous newlyAdded flags", clear_started)
             log_timing("match_lead TOTAL", match_started)
-            return result["customer_response"]
+            return customer_response
         log_timing("Clear previous newlyAdded flags", clear_started)
 
         new_folio_item_ids = create_folio_items(
@@ -1083,7 +1162,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         log_timing("match_lead - update FolioItems", folio_items_update_started)
 
     log_timing("match_lead TOTAL", match_started)
-    return result["customer_response"]
+    return customer_response
 
 
 def stream_match_lead(folio_id, bubble_env, message_id, condo_scope=None):
