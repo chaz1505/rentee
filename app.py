@@ -9,6 +9,7 @@ import json
 import threading
 import time
 import re
+from types import SimpleNamespace
 from pathlib import Path
 
 from search_flow import (
@@ -1750,45 +1751,97 @@ def chat_stream():
 
                     initial_started = time.perf_counter()
                     buffered_text_deltas = []
+                    event_types = []
+                    tool_call_started = False
+                    response_id_seen = None
+                    iterator_ended_naturally = False
+                    stream_error = None
+                    final_response = None
                     try:
                         with client.responses.stream(**response_args) as stream:
-                            for event in stream:
-                                if not initial_first_event_logged:
-                                    log_timing(
-                                        "Initial OpenAI FIRST EVENT",
-                                        initial_started
+                            try:
+                                for event in stream:
+                                    event_type = str(getattr(event, "type", "unknown"))
+                                    event_types.append(event_type)
+                                    response_object = getattr(event, "response", None)
+                                    response_id_seen = (
+                                        getattr(response_object, "id", None)
+                                        or getattr(event, "response_id", None)
+                                        or response_id_seen
                                     )
-                                    initial_first_event_logged = True
+                                    item = getattr(event, "item", None)
+                                    if (
+                                        "function_call" in event_type
+                                        or "web_search_call" in event_type
+                                        or getattr(item, "type", None)
+                                        in {"function_call", "web_search_call"}
+                                    ):
+                                        tool_call_started = True
+                                    if not initial_first_event_logged:
+                                        log_timing("Initial OpenAI FIRST EVENT", initial_started)
+                                        initial_first_event_logged = True
+                                    if (
+                                        event_type.startswith("response.web_search_call.")
+                                        and not web_search_status_sent
+                                    ):
+                                        print("Web search used", flush=True)
+                                        web_search_status_sent = True
+                                    if event_type == "response.output_text.delta":
+                                        if not initial_first_delta_logged:
+                                            log_timing("Initial OpenAI FIRST DELTA", initial_started)
+                                            initial_first_delta_logged = True
+                                        # Buffer until completion proves no function call follows.
+                                        buffered_text_deltas.append(event.delta)
+                                iterator_ended_naturally = True
+                            except Exception as error:
+                                stream_error = error
+                            if stream_error is None:
+                                try:
+                                    final_response = stream.get_final_response()
+                                except Exception as error:
+                                    stream_error = error
+                    except Exception as error:
+                        stream_error = stream_error or error
 
-                                if (
-                                    event.type.startswith("response.web_search_call.")
-                                    and not web_search_status_sent
-                                ):
-                                    print("Web search used", flush=True)
-                                    web_search_status_sent = True
-
-                                if event.type == "response.output_text.delta":
-                                    if not initial_first_delta_logged:
-                                        log_timing(
-                                            "Initial OpenAI FIRST DELTA",
-                                            initial_started
-                                        )
-                                        initial_first_delta_logged = True
-                                    # Initial text is not user-visible until the completed
-                                    # response proves that no function call follows it.
-                                    buffered_text_deltas.append(event.delta)
-
-                            final_response = stream.get_final_response()
-                            log_token_usage("Initial", final_response)
-                            log_response_output_summary(
-                                "Initial",
-                                final_response,
-                                buffered_text_deltas,
-                                web_search_status_sent,
+                    if stream_error is not None:
+                        elapsed = time.perf_counter() - initial_started
+                        for event_type in event_types:
+                            print(f"[OPENAI STREAM] {event_type}", flush=True)
+                        diagnostic = (
+                            f"exception={type(stream_error).__name__}: {stream_error}; "
+                            f"events={event_types}; text_chars="
+                            f"{sum(len(delta) for delta in buffered_text_deltas)}; "
+                            f"tool_call_started={tool_call_started}; "
+                            f"response_id={response_id_seen}; elapsed={elapsed:.2f}s; "
+                            f"iterator_ended_naturally={iterator_ended_naturally}"
+                        )
+                        print(f"[OPENAI STREAM WARNING] {diagnostic}", flush=True)
+                        if buffered_text_deltas and not tool_call_started:
+                            text_chars = sum(len(delta) for delta in buffered_text_deltas)
+                            print(
+                                "[STREAM WARNING] OpenAI stream ended without "
+                                "response.completed; preserving "
+                                f"{text_chars} chars of customer-facing text",
+                                flush=True,
                             )
-                    except Exception:
-                        log_timing(f"{timing_label} failed", initial_started)
-                        raise
+                            final_response = SimpleNamespace(
+                                id=response_id_seen, output=[], usage=None,
+                            )
+                        else:
+                            if tool_call_started:
+                                print(
+                                    "[OPENAI STREAM WARNING] Interrupted tool selection; "
+                                    "partial tool call will not be executed",
+                                    flush=True,
+                                )
+                            log_timing(f"{timing_label} failed", initial_started)
+                            raise stream_error
+
+                    log_token_usage("Initial", final_response)
+                    log_response_output_summary(
+                        "Initial", final_response, buffered_text_deltas,
+                        web_search_status_sent,
+                    )
 
                     log_timing(f"{timing_label} complete", initial_started)
                     return final_response, buffered_text_deltas

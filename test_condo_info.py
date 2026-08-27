@@ -230,6 +230,78 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn('"response_id": "no-tool-response"', body)
         self.assertIn('"done": true', body)
 
+    def test_interrupted_direct_response_preserves_buffered_customer_text(self):
+        class InterruptedStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.created", response=SimpleNamespace(
+                        id="interrupted-response"
+                    )),
+                    SimpleNamespace(type="response.output_text.delta", delta="A useful "),
+                    SimpleNamespace(type="response.output_text.delta", delta="answer."),
+                ])
+            def get_final_response(self):
+                raise RuntimeError("Didn't receive a `response.completed` event.")
+
+        responses = MagicMock()
+        responses.stream.return_value = InterruptedStream()
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ), patch("builtins.print") as mocked_print:
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "Hello"}
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertIn('"delta": "A useful "', body)
+        self.assertIn('"delta": "answer."', body)
+        self.assertNotIn("Sorry, something went wrong", body)
+        self.assertIn('"response_id": "interrupted-response"', body)
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("[OPENAI STREAM] response.output_text.delta", logs)
+        self.assertIn("RuntimeError", logs)
+        self.assertIn("text_chars=16", logs)
+        self.assertIn("tool_call_started=False", logs)
+        self.assertIn("preserving 16 chars", logs)
+
+    @patch("app.advance_property_search")
+    def test_interrupted_partial_tool_call_is_not_executed(self, mocked_advance):
+        class InterruptedToolStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.output_text.delta", delta="Let me check"),
+                    SimpleNamespace(
+                        type="response.output_item.added",
+                        item=SimpleNamespace(type="function_call", name="advance_property_search"),
+                    ),
+                    SimpleNamespace(
+                        type="response.function_call_arguments.delta", delta='{"beds":'
+                    ),
+                ])
+            def get_final_response(self):
+                raise RuntimeError("Didn't receive a `response.completed` event.")
+
+        responses = MagicMock()
+        responses.stream.return_value = InterruptedToolStream()
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ), patch("builtins.print") as mocked_print:
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "Find me a home"}
+            )
+            body = response.get_data(as_text=True)
+
+        mocked_advance.assert_not_called()
+        self.assertNotIn('"delta": "Let me check"', body)
+        self.assertIn("Sorry, something went wrong", body)
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("tool_call_started=True", logs)
+        self.assertIn("partial tool call will not be executed", logs)
+
     @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
     def test_broken_previous_response_retry_suppresses_tool_selection_text(
         self, _mocked_condo_infos
