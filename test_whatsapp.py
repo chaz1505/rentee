@@ -57,7 +57,13 @@ class WhatsAppTests(unittest.TestCase):
 
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
-    def test_new_whatsapp_phone_creates_one_lead(self, _mocked_find, mocked_create):
+    @patch("app.bubble")
+    def test_new_whatsapp_phone_creates_one_lead(
+        self, mocked_bubble, _mocked_find, mocked_create
+    ):
+        mocked_bubble.return_value = {
+            "_id": "lead-new", "phone": "60123456789", "searchBriefJSON": ""
+        }
         lead, created = app_module.find_or_create_whatsapp_lead("+60 12-345-6789", "Aisha")
         self.assertTrue(created)
         self.assertEqual(lead["_id"], "lead-new")
@@ -128,7 +134,7 @@ class WhatsAppTests(unittest.TestCase):
         mocked_send.assert_called_once_with(
             "60123456789", "Here are two suitable Bangsar homes."
         )
-        self.assertEqual(mocked_persist.call_count, 2)
+        self.assertEqual(mocked_persist.call_count, 3)
         outgoing = mocked_send.call_args.args[1]
         for leaked in ("function_call", "# to=functions", "match_lead tool",
                        "advance_property_search", "awaiting results"):
@@ -182,6 +188,9 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(
             mocked_turn.call_args_list[1].kwargs["previous_response_id"], "response-1"
         )
+        self.assertEqual(
+            _folio.call_args_list[1].args, ("lead-1", "live", "folio-1")
+        )
 
     @patch("app.requests.post")
     def test_send_whatsapp_uses_meta_text_endpoint_and_splits_only_long_text(self, mocked_post):
@@ -195,6 +204,84 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_count, 1)
         self.assertEqual(mocked_post.call_args.kwargs["json"]["to"], "60123456789")
         self.assertEqual(mocked_post.call_args.kwargs["json"]["text"]["body"], "Hello from Rentee")
+
+    @patch("app.bubble")
+    def test_phone_fallback_hydrates_existing_lead_with_persisted_state(self, mocked_bubble):
+        hydrated = {
+            "_id": "lead-a", "phone": "+60 12 345 6789",
+            "searchBriefJSON": json.dumps({
+                "channel_state": {"previous_response_id": "resp-1"}
+            }),
+        }
+        mocked_bubble.side_effect = [
+            {"results": [], "remaining": 0},
+            {"results": [{"_id": "lead-a", "phone": "+60 12 345 6789"}],
+             "remaining": 0},
+            hydrated,
+        ]
+        found = app_module.find_lead_by_phone("60123456789")
+        self.assertEqual(found, hydrated)
+        self.assertEqual(
+            app_module._whatsapp_channel_state(found)["previous_response_id"], "resp-1"
+        )
+
+    @patch("app._bubble_create")
+    @patch("app._bubble_records")
+    def test_existing_folio_is_reused_when_exact_constraint_returns_nothing(
+        self, mocked_records, mocked_create
+    ):
+        mocked_records.side_effect = [iter([]), iter([
+            {"_id": "folio-x", "lead": "lead-a", "Created Date": "2026-01-01"}
+        ])]
+        folio_id, created = app_module.find_or_create_lead_folio("lead-a")
+        self.assertEqual((folio_id, created), ("folio-x", False))
+        mocked_create.assert_not_called()
+
+    @patch("app._bubble_create")
+    @patch("app._bubble_records")
+    def test_duplicate_folios_choose_existing_deterministically_without_creation(
+        self, mocked_records, mocked_create
+    ):
+        mocked_records.return_value = iter([
+            {"_id": "folio-b", "lead": "lead-a", "Created Date": "2026-02-01"},
+            {"_id": "folio-a", "lead": "lead-a", "Created Date": "2026-01-01"},
+        ])
+        with patch("builtins.print") as mocked_print:
+            folio_id, created = app_module.find_or_create_lead_folio("lead-a")
+        self.assertEqual((folio_id, created), ("folio-a", False))
+        mocked_create.assert_not_called()
+        self.assertIn(
+            "duplicate_folios=2",
+            "\n".join(str(call) for call in mocked_print.call_args_list),
+        )
+
+    @patch("app.bubble")
+    def test_persisted_folio_survives_process_memory_restart(self, mocked_bubble):
+        mocked_bubble.return_value = {"_id": "folio-x", "lead": "lead-a"}
+        app_module._whatsapp_phone_locks.clear()
+        app_module._whatsapp_processing_ids.clear()
+        folio_id, created = app_module.find_or_create_lead_folio(
+            "lead-a", preferred_folio_id="folio-x"
+        )
+        self.assertEqual((folio_id, created), ("folio-x", False))
+
+    @patch("app._bubble_records")
+    @patch("app.bubble")
+    def test_different_sender_resolves_only_its_own_lead(
+        self, mocked_bubble, mocked_records
+    ):
+        leads = [
+            {"_id": "lead-a", "phone": "60111111111"},
+            {"_id": "lead-b", "phone": "60222222222"},
+        ]
+        mocked_records.side_effect = [iter([]), iter(leads), iter([]), iter(leads)]
+        mocked_bubble.side_effect = lambda url, **_kwargs: next(
+            lead for lead in leads if url.endswith(lead["_id"])
+        )
+        first = app_module.find_lead_by_phone("+60 11 111 1111")
+        second = app_module.find_lead_by_phone("+60 22 222 2222")
+        self.assertEqual(first["_id"], "lead-a")
+        self.assertEqual(second["_id"], "lead-b")
 
 
 if __name__ == "__main__":

@@ -53,6 +53,10 @@ CONDO_CACHE_TTL_SECONDS = 300
 CONDO_SHEET_TIMEOUT_SECONDS = 15
 WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
+WHATSAPP_LEAD_PHONE_FIELD = "phone"
+WHATSAPP_LEAD_PHONE_FIELDS = (
+    "phone", "Phone", "phoneNumber", "Phone number", "Phone Number", "mobile", "Mobile",
+)
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
@@ -544,17 +548,25 @@ def find_lead_by_phone(phone, bubble_env="live"):
     if not canonical:
         return None
     base_url = get_bubble_base_url(bubble_env)
-    exact = [{"key": "phone", "constraint_type": "equals", "value": canonical}]
+    exact = [{
+        "key": WHATSAPP_LEAD_PHONE_FIELD,
+        "constraint_type": "equals", "value": canonical,
+    }]
     try:
         for lead in _bubble_records(base_url, "lead", exact):
-            if normalize_phone(lead.get("phone")) == canonical:
-                return lead
+            if any(
+                normalize_phone(lead.get(field)) == canonical
+                for field in WHATSAPP_LEAD_PHONE_FIELDS
+            ):
+                return bubble(f"{base_url}/obj/lead/{lead['_id']}")
     except requests.RequestException as error:
         print(f"Exact Lead phone lookup unavailable; using normalized fallback: {error}", flush=True)
-    phone_fields = ("phone", "Phone", "phoneNumber", "Phone number", "mobile")
     for lead in _bubble_records(base_url, "lead"):
-        if any(normalize_phone(lead.get(field)) == canonical for field in phone_fields):
-            return lead
+        if any(
+            normalize_phone(lead.get(field)) == canonical
+            for field in WHATSAPP_LEAD_PHONE_FIELDS
+        ):
+            return bubble(f"{base_url}/obj/lead/{lead['_id']}")
     return None
 
 
@@ -566,17 +578,68 @@ def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
     if lead:
         return lead, False
     base_url = get_bubble_base_url(bubble_env)
-    lead_id = _bubble_create(base_url, "lead", {"phone": canonical})
+    lead_id = _bubble_create(
+        base_url, "lead", {WHATSAPP_LEAD_PHONE_FIELD: canonical}
+    )
     # The repository exposes no confirmed Lead name/source field, so do not invent one.
-    return {"_id": lead_id, "phone": canonical, "searchBriefJSON": ""}, True
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    stored_phone = normalize_phone(lead.get(WHATSAPP_LEAD_PHONE_FIELD))
+    if stored_phone != canonical:
+        raise ValueError("Bubble Lead was created without the expected normalized phone.")
+    return lead, True
 
 
-def find_or_create_lead_folio(lead_id, bubble_env="live"):
+def _select_existing_folio(folios, lead_id):
+    matches = {
+        str(folio["_id"]): folio for folio in folios
+        if folio.get("lead") == lead_id and folio.get("_id")
+    }
+    if not matches:
+        return None
+    ordered = sorted(
+        matches.values(),
+        key=lambda folio: (
+            str(folio.get("Created Date") or folio.get("created_date") or ""),
+            str(folio["_id"]),
+        ),
+    )
+    if len(ordered) > 1:
+        print(
+            f"[WHATSAPP CONVERSATION] duplicate_folios={len(ordered)} "
+            f"lead_id={lead_id} selected_folio_id={ordered[0]['_id']}",
+            flush=True,
+        )
+    return ordered[0]
+
+
+def find_or_create_lead_folio(lead_id, bubble_env="live", preferred_folio_id=None):
     base_url = get_bubble_base_url(bubble_env)
+    if preferred_folio_id:
+        try:
+            preferred = bubble(f"{base_url}/obj/folio/{preferred_folio_id}")
+            if preferred.get("lead") == lead_id:
+                return preferred_folio_id, False
+        except requests.RequestException as error:
+            print(
+                f"[WHATSAPP CONVERSATION] persisted Folio unavailable; "
+                f"falling back to Lead relationship lookup: {error}", flush=True,
+            )
     constraints = [{"key": "lead", "constraint_type": "equals", "value": lead_id}]
-    for folio in _bubble_records(base_url, "folio", constraints):
-        if folio.get("lead") == lead_id and folio.get("_id"):
-            return folio["_id"], False
+    try:
+        folios = list(_bubble_records(base_url, "folio", constraints))
+    except requests.RequestException as error:
+        print(
+            f"[WHATSAPP CONVERSATION] exact Folio lookup unavailable; "
+            f"using relationship fallback: {error}", flush=True,
+        )
+        folios = []
+    selected = _select_existing_folio(folios, lead_id)
+    if selected is None:
+        selected = _select_existing_folio(
+            list(_bubble_records(base_url, "folio")), lead_id
+        )
+    if selected is not None:
+        return selected["_id"], False
     folio_id = _bubble_create(base_url, "folio", {"lead": lead_id, "folioItems": []})
     return folio_id, True
 
@@ -2136,7 +2199,7 @@ def _process_whatsapp_message(message):
     reply_sent = False
     try:
         with phone_lock:
-            lead, _created = find_or_create_whatsapp_lead(
+            lead, lead_created = find_or_create_whatsapp_lead(
                 phone, message.get("customer_name"), "live"
             )
             lead_id = lead["_id"]
@@ -2151,7 +2214,19 @@ def _process_whatsapp_message(message):
             channel_state["processed_message_ids"] = processed_ids[-100:]
             _persist_whatsapp_state(lead_id, lead, channel_state, "live")
 
-            folio_id, _created_folio = find_or_create_lead_folio(lead_id, "live")
+            folio_id, folio_created = find_or_create_lead_folio(
+                lead_id, "live", channel_state.get("folio_id")
+            )
+            channel_state["folio_id"] = folio_id
+            _persist_whatsapp_state(lead_id, lead, channel_state, "live")
+            safe_phone = f"...{phone[-4:]}" if phone else "unknown"
+            print(
+                "[WHATSAPP CONVERSATION] "
+                f"phone={safe_phone} lead_id={lead_id} lead_created={lead_created} "
+                f"folio_id={folio_id} folio_created={folio_created} "
+                f"previous_response_id={previous_response_id}",
+                flush=True,
+            )
             answer, response_id = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 # A Meta ID is not a Bubble Message relationship ID.
@@ -2168,7 +2243,13 @@ def _process_whatsapp_message(message):
             fresh_channel_state["processed_message_ids"] = durable_ids[-100:]
             if response_id:
                 fresh_channel_state["previous_response_id"] = response_id
+            fresh_channel_state["folio_id"] = folio_id
             _persist_whatsapp_state(lead_id, fresh_lead, fresh_channel_state, "live")
+            print(
+                "[WHATSAPP CONVERSATION] "
+                f"saved_response_id={response_id} lead_id={lead_id} folio_id={folio_id}",
+                flush=True,
+            )
     except Exception as error:
         print(f"WhatsApp message {message_id} failed: {error}", flush=True)
         if not reply_sent:
