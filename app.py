@@ -343,11 +343,10 @@ def build_response_args(user_message, previous_response_id=None):
             {
                 "type": "function", "name": "advance_property_search",
                 "description": (
-                    "Save requirements and continue a personalised home search. Useful for "
-                    "new searches, refinements, area or condo recommendations, and listing "
-                    "requests grounded in the saved condo shortlist. Send every requirement "
-                    "stated in the current message; unchanged fields may be empty. Returns the "
-                    "chosen customer-facing result or a grounded listing-search scope."
+                    "Save new or refined search requirements, recommend areas or condos, or "
+                    "search current listings within named or previously recommended condos. "
+                    "Use it when the current message changes the search or constrains listings. "
+                    "Returns a customer response or grounded listing-search scope."
                 ),
                 "parameters": {
                     "type": "object", "properties": search_properties,
@@ -357,9 +356,10 @@ def build_response_args(user_message, previous_response_id=None):
             {
                 "type": "function", "name": "match_lead", "strict": True,
                 "description": (
-                    "Find and rank current Rentee listings for the saved customer profile. "
-                    "Use for a direct request for currently available homes when no guided "
-                    "shortlist needs to constrain the search. Returns grounded recommendations."
+                    "Retrieve and rank actual current Rentee listings for the saved Lead. Use "
+                    "when the customer asks to see properties, listings, matches, options, "
+                    "units, or current availability now. Returns grounded matches or an "
+                    "explicit zero-result response."
                 ),
                 "parameters": {
                     "type": "object", "properties": {}, "required": [],
@@ -870,6 +870,13 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     listings = shortlist_structured_listings(lead, listings)
     log_timing("match_lead - load listings", listings_started)
 
+    if not listings:
+        log_timing("match_lead TOTAL", match_started)
+        return (
+            "I don't have a suitable current property match for that search at the moment. "
+            "We can broaden the area, budget, bedrooms, or preferred condos if you'd like."
+        )
+
     print(
         f"Scoring {len(listings)} listings (test limit: {MATCH_LISTING_LIMIT})",
         flush=True
@@ -959,6 +966,13 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         if recommendation["listing_id"] not in existing_listing_ids
     ]
     log_timing("match_lead - parse/validate", parse_started)
+
+    if not validated_recommendations:
+        log_timing("match_lead TOTAL", match_started)
+        return (
+            "I don't have a suitable current property match for that search at the moment. "
+            "We can broaden the area, budget, bedrooms, or preferred condos if you'd like."
+        )
 
     yield "Updating your shortlist..."
 
@@ -1251,13 +1265,15 @@ def advance_property_search(folio_id, bubble_env, update):
     scope = listing_search_scope(
         state,
         selected_condos=preferred_names or None,
-        use_full_shortlist=bool(update.get("use_full_shortlist")),
+        use_full_shortlist=bool(
+            update.get("use_full_shortlist") or update.get("search_listings")
+        ),
     )
-    if update.get("search_listings") and scope:
-        state["selected_condos"] = list(scope)
+    if update.get("search_listings") and (scope or not state["recommended_condos"]):
+        state["selected_condos"] = list(scope or [])
         save_search_state(lead_id, state, base_url, lead_fields)
         return {
-            "action": "search_listings", "scope": scope,
+            "action": "search_listings", "scope": scope or None,
             "state": state, "lead_id": lead_id,
         }
 
