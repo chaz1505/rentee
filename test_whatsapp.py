@@ -71,6 +71,38 @@ class WhatsAppTests(unittest.TestCase):
             "https://www.rentee.asia/api/1.1", "lead", {"phone": "60123456789"}
         )
 
+    @patch("app._bubble_create", return_value="lead-new")
+    @patch("app.find_lead_by_phone", return_value=None)
+    @patch("app.bubble", return_value={"_id": "lead-new"})
+    def test_new_lead_continues_when_bubble_hides_phone_on_read(
+        self, _mocked_bubble, _mocked_find, _mocked_create
+    ):
+        with patch("builtins.print") as mocked_print:
+            lead, created = app_module.find_or_create_whatsapp_lead("60123456789")
+        self.assertTrue(created)
+        self.assertEqual(lead["_id"], "lead-new")
+        self.assertEqual(lead["phone"], "60123456789")
+        self.assertEqual(lead["searchBriefJSON"], "")
+        self.assertIn(
+            "phone is not readable",
+            "\n".join(str(call) for call in mocked_print.call_args_list),
+        )
+
+    @patch("app.bubble")
+    def test_exact_phone_constraint_reuses_lead_when_phone_is_hidden(self, mocked_bubble):
+        mocked_bubble.side_effect = [
+            {"results": [{"_id": "lead-existing"}], "remaining": 0},
+            {"_id": "lead-existing", "searchBriefJSON": json.dumps({
+                "channel_state": {"previous_response_id": "resp-1"}
+            })},
+        ]
+        lead = app_module.find_lead_by_phone("60123456789")
+        self.assertEqual(lead["_id"], "lead-existing")
+        self.assertEqual(lead["phone"], "60123456789")
+        self.assertEqual(
+            app_module._whatsapp_channel_state(lead)["previous_response_id"], "resp-1"
+        )
+
     @patch("app._bubble_create")
     @patch("app.find_lead_by_phone")
     def test_existing_whatsapp_phone_reuses_lead(self, mocked_find, mocked_create):
@@ -120,7 +152,9 @@ class WhatsAppTests(unittest.TestCase):
             }),
         }
         mocked_lead.return_value = (lead, False)
-        mocked_turn.return_value = ("Here are two suitable Bangsar homes.", "response-2")
+        mocked_turn.return_value = (
+            "Here are two suitable Bangsar homes.", "response-2", False
+        )
         mocked_bubble.return_value = lead
 
         app_module._process_whatsapp_message(
@@ -168,8 +202,8 @@ class WhatsAppTests(unittest.TestCase):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
         mocked_bubble.return_value = lead
-        mocked_turn.side_effect = [("First reply", "response-1"),
-                                   ("Second reply", "response-2")]
+        mocked_turn.side_effect = [("First reply", "response-1", False),
+                                   ("Second reply", "response-2", False)]
 
         def persist(_lead_id, current_lead, channel_state, _env):
             state = app_module.load_search_state(current_lead.get("searchBriefJSON"))
@@ -282,6 +316,74 @@ class WhatsAppTests(unittest.TestCase):
         second = app_module.find_lead_by_phone("+60 22 222 2222")
         self.assertEqual(first["_id"], "lead-a")
         self.assertEqual(second["_id"], "lead-b")
+
+    def test_build_folio_url_uses_customer_folio_route(self):
+        folio_id = "1787842581873x206575709934321660"
+        self.assertEqual(
+            app_module.build_folio_url(folio_id),
+            "https://www.rentee.asia/folio3/1787842581873x206575709934321660",
+        )
+
+    @patch("app.get_current_recommendations")
+    def test_recommendation_summary_shows_top_three_and_links_to_full_folio(
+        self, mocked_current
+    ):
+        listings = []
+        for index, name in enumerate(
+            ("One Menerung", "The Loft", "Ken Bangsar", "Serai", "Nadi Bangsar"), 1
+        ):
+            listings.append({
+                "listing_id": f"listing-internal-{index}",
+                "condo": f"condo-internal-{index}",
+                "property_name": name,
+                "priceRent": 10000 + index * 500,
+                "beds": 4,
+                "recommendation_reason": f"Fits the customer's budget and four-bedroom requirement {index}.",
+            })
+        mocked_current.return_value = json.dumps({"current_recommendations": listings})
+
+        result = app_module.build_whatsapp_recommendation_summary("folio-active")
+
+        for name in ("One Menerung", "The Loft", "Ken Bangsar"):
+            self.assertIn(name, result)
+        self.assertNotIn("Serai", result)
+        self.assertIn("RM10,500/month", result)
+        self.assertIn("4 bed", result)
+        self.assertIn("budget and four-bedroom requirement", result)
+        self.assertIn("See all 5", result)
+        self.assertIn("https://www.rentee.asia/folio3/folio-active", result)
+        for index in range(1, 6):
+            self.assertNotIn(f"listing-internal-{index}", result)
+            self.assertNotIn(f"condo-internal-{index}", result)
+
+    @patch("app._persist_whatsapp_state")
+    @patch("app.bubble")
+    @patch("app.send_whatsapp_text")
+    @patch("app.build_whatsapp_recommendation_summary")
+    @patch("app.run_rentee_turn")
+    @patch("app.find_or_create_lead_folio", return_value=("folio-active", False))
+    @patch("app.find_or_create_whatsapp_lead")
+    def test_recommendation_turn_uses_existing_folio_and_one_coherent_text_message(
+        self, mocked_lead, mocked_folio, mocked_turn, mocked_summary,
+        mocked_send, mocked_bubble, _mocked_persist
+    ):
+        lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
+        mocked_lead.return_value = (lead, False)
+        mocked_bubble.return_value = lead
+        mocked_turn.return_value = ("Model recommendation", "resp-1", True)
+        mocked_summary.return_value = (
+            "Three grounded recommendations\n\n"
+            "https://www.rentee.asia/folio3/folio-active"
+        )
+        item = webhook_payload(text="Show me the properties")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        mocked_folio.assert_called_once_with("lead-1", "live", None)
+        mocked_summary.assert_called_once_with("folio-active", "live")
+        mocked_send.assert_called_once_with(
+            "60123456789", mocked_summary.return_value
+        )
 
 
 if __name__ == "__main__":

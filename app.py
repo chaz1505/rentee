@@ -554,11 +554,13 @@ def find_lead_by_phone(phone, bubble_env="live"):
     }]
     try:
         for lead in _bubble_records(base_url, "lead", exact):
-            if any(
-                normalize_phone(lead.get(field)) == canonical
-                for field in WHATSAPP_LEAD_PHONE_FIELDS
-            ):
-                return bubble(f"{base_url}/obj/lead/{lead['_id']}")
+            # Bubble has already applied an exact constraint to the canonical phone.
+            # Privacy rules may omit that field from the returned object, so do not
+            # reject an otherwise valid constrained match merely because it is hidden.
+            if lead.get("_id"):
+                hydrated = bubble(f"{base_url}/obj/lead/{lead['_id']}")
+                hydrated.setdefault(WHATSAPP_LEAD_PHONE_FIELD, canonical)
+                return hydrated
     except requests.RequestException as error:
         print(f"Exact Lead phone lookup unavailable; using normalized fallback: {error}", flush=True)
     for lead in _bubble_records(base_url, "lead"):
@@ -585,7 +587,14 @@ def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     stored_phone = normalize_phone(lead.get(WHATSAPP_LEAD_PHONE_FIELD))
     if stored_phone != canonical:
-        raise ValueError("Bubble Lead was created without the expected normalized phone.")
+        print(
+            "[WHATSAPP CONVERSATION] Created Lead phone is not readable from "
+            "the Bubble API response; relying on the exact phone constraint for reuse",
+            flush=True,
+        )
+    lead.setdefault("_id", lead_id)
+    lead[WHATSAPP_LEAD_PHONE_FIELD] = canonical
+    lead.setdefault("searchBriefJSON", "")
     return lead, True
 
 
@@ -923,6 +932,8 @@ def get_current_recommendations(folio_id, bubble_env):
                         facts[output_name] = value
                 facts["position"] = position
                 facts["listing_id"] = facts.pop("_id")
+                if folio_item.get("RecoSummary"):
+                    facts["recommendation_reason"] = folio_item["RecoSummary"]
                 listings.append(facts)
         except Exception as error:
             print(f"Failed to load current recommendation: {error}", flush=True)
@@ -936,6 +947,51 @@ def get_current_recommendations(folio_id, bubble_env):
             listing["condo_name"] = condo_name
             listing.setdefault("property_name", condo_name)
     return json.dumps({"current_recommendations": listings}, ensure_ascii=False)
+
+
+def build_folio_url(folio_id):
+    return f"https://www.rentee.asia/folio3/{folio_id}"
+
+
+def build_whatsapp_recommendation_summary(folio_id, bubble_env="live", top_count=3):
+    """Render a compact, grounded subset while leaving the Folio as the full UI."""
+    result = json.loads(get_current_recommendations(folio_id, bubble_env))
+    listings = result.get("current_recommendations") or []
+    if not listings:
+        return None
+    shown = listings[:max(1, min(top_count, 5))]
+    total = len(listings)
+    intro = (
+        f"I've shortlisted {total} properties for you. "
+        f"My top {len(shown)} are:"
+    )
+    sections = [intro]
+    for index, listing in enumerate(shown, start=1):
+        name = listing.get("property_name") or listing.get("condo_name") or f"Property {index}"
+        rent = _as_number(listing.get("priceRent"))
+        sale = _as_number(listing.get("priceSale"))
+        price_label = f"RM{rent:,.0f}/month" if rent is not None else None
+        if price_label is None and sale is not None:
+            price_label = f"RM{sale:,.0f}"
+        beds = _as_number(listing.get("beds"))
+        bed_label = f"{beds:g} bed" if beds is not None else None
+        details = ", ".join(value for value in (price_label, bed_label) if value)
+        heading = f"{index}. {name}" + (f" — {details}" if details else "")
+        reason = str(listing.get("recommendation_reason") or "").strip()
+        for internal_field in ("listing_id", "condo", "Geo"):
+            internal_value = listing.get(internal_field)
+            if internal_value:
+                reason = reason.replace(str(internal_value), str(name))
+        sections.append(heading + (f"\n{reason}" if reason else ""))
+    if total > len(shown):
+        link_intro = f"See all {total} with photos and full details here:"
+    else:
+        link_intro = "See the shortlist with photos and full details here:"
+    sections.extend([
+        f"{link_intro}\n{build_folio_url(folio_id)}",
+        "Tell me which ones you like.",
+    ])
+    return "\n\n".join(sections)
 
 
 def create_folio_items(recommendations, base_url, message_id):
@@ -1952,7 +2008,7 @@ def chat_stream():
                         yield f"data: {json.dumps({'citations': citations})}\n\n"
                     log_timing("TOTAL REQUEST", request_started)
                     yield (
-                        f"data: {json.dumps({'done': True, 'response_id': response.id})}\n\n"
+                        f"data: {json.dumps({'done': True, 'response_id': response.id, 'recommendations_relevant': False})}\n\n"
                     )
                     return
 
@@ -2135,7 +2191,7 @@ def chat_stream():
 
                 log_timing("TOTAL REQUEST", request_started)
                 yield (
-                    f"data: {json.dumps({'done': True, 'response_id': final.id})}\n\n"
+                    f"data: {json.dumps({'done': True, 'response_id': final.id, 'recommendations_relevant': has_match_results})}\n\n"
                 )
             except Exception as error:
                 print(f"/chat_stream failed: {error}", flush=True)
@@ -2175,6 +2231,7 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
             raise RuntimeError(f"Rentee turn returned HTTP {response.status_code}")
         text_parts = []
         response_id = None
+        recommendations_relevant = False
         for raw_line in response.get_data(as_text=True).splitlines():
             if not raw_line.startswith("data: "):
                 continue
@@ -2185,10 +2242,12 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
                 raise RuntimeError("Rentee turn failed")
             if event.get("response_id"):
                 response_id = event["response_id"]
+            if event.get("recommendations_relevant") is True:
+                recommendations_relevant = True
     answer = "".join(text_parts).strip()
     if not answer:
         raise RuntimeError("Rentee turn returned no customer-facing text")
-    return answer, response_id
+    return answer, response_id, recommendations_relevant
 
 
 def _process_whatsapp_message(message):
@@ -2227,11 +2286,17 @@ def _process_whatsapp_message(message):
                 f"previous_response_id={previous_response_id}",
                 flush=True,
             )
-            answer, response_id = run_rentee_turn(
+            answer, response_id, recommendations_relevant = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 # A Meta ID is not a Bubble Message relationship ID.
                 message_id=None, bubble_env="live",
             )
+            if recommendations_relevant:
+                recommendation_summary = build_whatsapp_recommendation_summary(
+                    folio_id, "live"
+                )
+                if recommendation_summary:
+                    answer = recommendation_summary
             send_whatsapp_text(phone, answer)
             reply_sent = True
 
