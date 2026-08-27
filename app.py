@@ -38,7 +38,11 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
-MATCH_LISTING_LIMIT = 600
+RANKING_CANDIDATE_LIMIT = 40
+RETRIEVAL_CANDIDATE_TARGET = 120
+INITIAL_MAX_OUTPUT_TOKENS = 800
+RANKING_MAX_OUTPUT_TOKENS = 1600
+FINAL_MAX_OUTPUT_TOKENS = 1200
 CONDO_SHEET_CSV_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1wnXHS6cHoUmAVXFpkzZ9PhBKmEgG6g-n8n0jcyodYig/export?format=csv&gid=0"
@@ -286,6 +290,31 @@ def log_token_usage(label, response):
     )
 
 
+def log_response_output_summary(label, response, buffered_text=(), web_search_used=False):
+    """Log response shape and sizes without exposing text or tool arguments."""
+    outputs = list(getattr(response, "output", []) or [])
+    function_calls = 0
+    summaries = []
+    for item in outputs:
+        item_type = getattr(item, "type", type(item).__name__)
+        summary = f"type={item_type}"
+        if item_type == "function_call":
+            function_calls += 1
+            arguments = getattr(item, "arguments", "") or ""
+            summary += (
+                f" name={getattr(item, 'name', 'unknown')} "
+                f"argument_chars={len(arguments) if isinstance(arguments, str) else 0}"
+            )
+        summaries.append(summary)
+    buffered_chars = sum(len(str(delta or "")) for delta in buffered_text)
+    print(
+        f"[OUTPUT] {label}: items={len(outputs)} calls={function_calls} "
+        f"buffered_text_chars={buffered_chars} web_search={web_search_used} "
+        f"details=[{'; '.join(summaries)}]",
+        flush=True,
+    )
+
+
 def get_bubble_base_url(bubble_env):
     if bubble_env == "development":
         return "https://www.rentee.asia/version-test/api/1.1"
@@ -338,6 +367,8 @@ def build_response_args(user_message, previous_response_id=None):
         "model": "gpt-5-mini",
         "input": user_message,
         "instructions": rentee_instructions(),
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": INITIAL_MAX_OUTPUT_TOKENS,
         "tool_choice": "auto",
         "tools": [
             {
@@ -452,38 +483,40 @@ def bubble(url, **kwargs):
     return r.json()["response"]
 
 
-def get_all_listings(base_url):
-
-    load_started = time.perf_counter()
-    listings = []
+def get_plausible_listings(
+    base_url, lead, condo_scope=None, target=RETRIEVAL_CANDIDATE_TARGET
+):
+    """Filter each Bubble page and stop once ranking has a healthy candidate pool."""
+    started = time.perf_counter()
+    plausible = []
     cursor = 0
+    pages = 0
+    fetched = 0
+    condo_cache = {}
     seen_cursors = set()
-
-    while cursor not in seen_cursors:
+    while cursor not in seen_cursors and len(plausible) < target:
         seen_cursors.add(cursor)
-        page_started = time.perf_counter()
         page = bubble(f"{base_url}/obj/listing", params={"cursor": cursor})
-        results = page.get("results", [])
-        log_timing(
-            f"Listing page {len(seen_cursors)}",
-            page_started,
-            f" ({len(results)} listings)"
-        )
-        listings.extend(results)
-        remaining = page.get("remaining", 0) or 0
-        print(
-            f"Loaded {len(results)} listings; {remaining} remaining",
-            flush=True
-        )
-
-        if not results or not remaining:
+        raw_results = page.get("results", []) or []
+        results = raw_results
+        pages += 1
+        fetched += len(results)
+        if condo_scope:
+            results = [
+                listing for listing in results
+                if _listing_is_in_condo_scope(
+                    listing, condo_scope, base_url, condo_cache
+                )
+            ]
+        plausible.extend(shortlist_structured_listings(lead, results))
+        if not raw_results or not page.get("remaining"):
             break
-
-        # Bubble's cursor is the current offset, so advance by this page size.
-        cursor += len(results)
-
-    log_timing("Load all listings", load_started, f" ({len(listings)} listings)")
-    return listings
+        cursor += len(raw_results)
+    log_timing(
+        "Load plausible listings", started,
+        f" (pages={pages} fetched={fetched} plausible={len(plausible)})",
+    )
+    return plausible, fetched
 
 
 def get_property_details(folio_id, property_reference, bubble_env):
@@ -815,6 +848,40 @@ def shortlist_structured_listings(lead, listings):
     return shortlisted
 
 
+def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
+    """Bound ranking context while preserving the strongest factual candidates."""
+    if len(listings) <= limit:
+        return list(listings)
+    requirements = structured_lead_requirements(lead)
+    modes = _transaction_modes(requirements["transaction_type"])
+    target_budget = (
+        requirements["budget_buy"] if modes == {"buy"}
+        else requirements["budget_rent"]
+    )
+    bedrooms_min = requirements["bedrooms_min"]
+
+    def candidate_key(listing):
+        price = _as_number(
+            listing.get("priceSale") if modes == {"buy"} else listing.get("priceRent")
+        )
+        beds = _as_number(listing.get("beds"))
+        budget_distance = (
+            abs(price - target_budget) / target_budget
+            if price is not None and target_budget else 0
+        )
+        bedroom_distance = (
+            abs(beds - bedrooms_min)
+            if beds is not None and bedrooms_min is not None else 0
+        )
+        missing_facts = sum(
+            listing.get(field) in (None, "", [])
+            for field in ("beds", "priceRent" if modes != {"buy"} else "priceSale", "condo")
+        )
+        return budget_distance, bedroom_distance, missing_facts
+
+    return sorted(listings, key=candidate_key)[:limit]
+
+
 def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     match_started = time.perf_counter()
@@ -853,21 +920,26 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     yield "Searching available properties..."
     listings_started = time.perf_counter()
-    listings = get_all_listings(base_url)[:MATCH_LISTING_LIMIT]
+    listings, fetched_listing_count = get_plausible_listings(
+        base_url, lead, condo_scope
+    )
     if condo_scope:
-        condo_cache = {}
-        listings = [
-            listing for listing in listings
-            if _listing_is_in_condo_scope(
-                listing, condo_scope, base_url, condo_cache
-            )
-        ]
         print(
             "Constrained listing search to recommended condos: "
             + ", ".join(condo_scope),
             flush=True,
         )
-    listings = shortlist_structured_listings(lead, listings)
+    scoped_listing_count = len(listings)
+    structured_listing_count = len(listings)
+    listings = reduce_listing_candidates(lead, listings)
+    print(
+        "Listing candidates: "
+        f"fetched={fetched_listing_count} "
+        f"after_condo_scope={scoped_listing_count} "
+        f"after_structured_filters={structured_listing_count} "
+        f"sent_to_ranking={len(listings)}",
+        flush=True,
+    )
     log_timing("match_lead - load listings", listings_started)
 
     if not listings:
@@ -878,7 +950,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         )
 
     print(
-        f"Scoring {len(listings)} listings (test limit: {MATCH_LISTING_LIMIT})",
+        f"Ranking {len(listings)} candidates (limit: {RANKING_CANDIDATE_LIMIT})",
         flush=True
     )
 
@@ -894,6 +966,11 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "facts. Return JSON matching the supplied schema.\n\n"
         + json.dumps(matching_input, ensure_ascii=False)
     )
+    print(
+        f"Ranking input size: chars={len(prompt)} "
+        f"approx_tokens={max(1, len(prompt) // 4)}",
+        flush=True,
+    )
     log_timing("match_lead - build matching input", prompt_started)
 
     yield "Ranking the best matches..."
@@ -903,6 +980,8 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         model="gpt-5-mini",
 
         input=prompt,
+        reasoning={"effort": "low"},
+        max_output_tokens=RANKING_MAX_OUTPUT_TOKENS,
         text={
             "format": {
                 "type": "json_schema",
@@ -1410,6 +1489,12 @@ def chat_stream():
 
                             final_response = stream.get_final_response()
                             log_token_usage("Initial", final_response)
+                            log_response_output_summary(
+                                "Initial",
+                                final_response,
+                                buffered_text_deltas,
+                                web_search_status_sent,
+                            )
                     except Exception:
                         log_timing(f"{timing_label} failed", initial_started)
                         raise
@@ -1587,6 +1672,8 @@ def chat_stream():
                     )
                 continuation_args = {
                     "model": "gpt-5-mini",
+                    "reasoning": {"effort": "low"},
+                    "max_output_tokens": FINAL_MAX_OUTPUT_TOKENS,
                     "previous_response_id": original_response_id,
                     "instructions": follow_up_instructions,
                     "input": [{

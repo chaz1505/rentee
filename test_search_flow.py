@@ -312,6 +312,42 @@ class SearchFlowStateTests(unittest.TestCase):
         shortlisted = app_module.shortlist_structured_listings(lead, listings)
         self.assertEqual([item["_id"] for item in shortlisted], ["strong"])
 
+    def test_candidate_reduction_caps_ranking_input_and_keeps_budget_fit(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
+            "budgetRent": 15000,
+        }
+        listings = [
+            {
+                "_id": f"listing-{index}", "beds": 3,
+                "priceRent": 7000 + index * 50,
+                "condo": f"condo-{index % 8}",
+            }
+            for index in range(200)
+        ]
+        candidates = app_module.reduce_listing_candidates(lead, listings)
+        self.assertEqual(len(candidates), app_module.RANKING_CANDIDATE_LIMIT)
+        candidate_prices = [item["priceRent"] for item in candidates]
+        self.assertIn(15000, candidate_prices)
+        self.assertLess(max(abs(price - 15000) for price in candidate_prices), 1200)
+
+    @patch("app.bubble")
+    def test_listing_retrieval_stops_after_plausible_pool_is_large_enough(
+        self, mocked_bubble
+    ):
+        page_one = [{"_id": f"a-{index}"} for index in range(60)]
+        page_two = [{"_id": f"b-{index}"} for index in range(60)]
+        mocked_bubble.side_effect = [
+            {"results": page_one, "remaining": 120},
+            {"results": page_two, "remaining": 60},
+        ]
+        listings, fetched = app_module.get_plausible_listings(
+            "https://bubble.test", {}, target=100
+        )
+        self.assertEqual(fetched, 120)
+        self.assertEqual(len(listings), 120)
+        self.assertEqual(mocked_bubble.call_count, 2)
+
     def test_preferred_condo_relationship_constrains_structured_shortlist(self):
         lead = {"preferredCondos": ["condo-one", "condo-loft"]}
         listings = [
@@ -335,7 +371,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(update["budgetRent"], 12000)
         self.assertNotIn("Geo", update)
 
-    @patch("app.get_all_listings")
+    @patch("app.get_plausible_listings")
     @patch("app.bubble")
     def test_matching_prompt_uses_structured_fields_not_ai_search_text(
         self, mocked_bubble, mocked_listings
@@ -347,11 +383,11 @@ class SearchFlowStateTests(unittest.TestCase):
                 "budgetRent": 12000, "AIsearchtext": "LEGACY GENERATED PROFILE",
             },
         ]
-        mocked_listings.return_value = [{
+        mocked_listings.return_value = ([{
             "_id": "listing-1", "beds": 3, "priceRent": 11500,
             "AIsearchtext": "LEGACY GENERATED LISTING",
             "Description": "A real structured description",
-        }]
+        }], 1)
         model_response = SimpleNamespace(
             output_text=json.dumps({"recommendations": [], "customer_response": "No fit."}),
             usage=None,
@@ -412,6 +448,16 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("use the appropriate listing-search tool immediately", args["instructions"])
         self.assertIn("Do not describe an action instead of performing it", args["instructions"])
 
+    def test_initial_tool_selection_is_bounded_for_compact_updates(self):
+        args = app_module.build_response_args(
+            "15k ringgit, furnished and move in asap"
+        )
+        self.assertEqual(args["reasoning"], {"effort": "low"})
+        self.assertEqual(
+            args["max_output_tokens"], app_module.INITIAL_MAX_OUTPUT_TOKENS
+        )
+        self.assertLessEqual(args["max_output_tokens"], 800)
+
     @patch("app.save_search_state")
     @patch("app.bubble")
     def test_show_matches_uses_entire_saved_condo_shortlist(
@@ -461,7 +507,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(result["action"], "search_listings")
         self.assertEqual(result["scope"], ["One Menerung"])
 
-    @patch("app.get_all_listings", return_value=[])
+    @patch("app.get_plausible_listings", return_value=([], 0))
     @patch("app.bubble")
     def test_zero_inventory_returns_truthful_answer_without_phantom_results(
         self, mocked_bubble, _mocked_listings
