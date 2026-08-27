@@ -112,24 +112,16 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(condo_names["type"], "array")
         self.assertEqual(condo_names["items"], {"type": "string"})
         self.assertEqual(tool["parameters"]["required"], ["condo_names"])
-        self.assertIn("Persona", args["instructions"])
-        self.assertIn("one tool call", args["instructions"])
-        self.assertIn("call the tool immediately", args["instructions"])
-        self.assertIn(
-            "Do not output any customer-facing text before making the tool call",
-            args["instructions"],
-        )
-        self.assertIn("MUST call get_condo_info first", args["instructions"])
-        self.assertIn("primary source", args["instructions"])
-        self.assertIn("Do not use web search instead", args["instructions"])
-        self.assertIn("MUST be called first", tool["description"])
+        self.assertIn("# Condo advice", args["instructions"])
+        self.assertIn("request compared condos together", args["instructions"])
+        self.assertIn("never invent missing facts", args["instructions"])
+        self.assertIn("Rentee's knowledge rows", tool["description"])
 
         property_tool = next(
             item for item in args["tools"]
             if item.get("name") == "get_property_details"
         )
-        self.assertIn("specific current Rentee listing or unit", property_tool["description"])
-        self.assertIn("use get_condo_info instead", property_tool["description"])
+        self.assertIn("one current Rentee listing", property_tool["description"])
 
         match_tool = next(
             item for item in args["tools"] if item.get("name") == "match_lead"

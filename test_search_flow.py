@@ -109,7 +109,8 @@ class SearchFlowStateTests(unittest.TestCase):
             "other_requirements": ["furnished"],
             "other_requirements_answered": False,
         })
-        self.assertIn("anything else", next_search_question(state))
+        self.assertTrue(search_brief_complete(state))
+        self.assertIsNone(next_search_question(state))
 
     def test_questions_are_one_at_a_time_and_in_order(self):
         state = apply_search_update(empty_search_state(), {
@@ -259,6 +260,28 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(changed["recommended_condos"], [])
         self.assertEqual(changed["stage"], "SEARCH_BRIEF_COMPLETE")
 
+    def test_preference_added_later_preserves_existing_requirements(self):
+        state = apply_search_update(empty_search_state(), {
+            "other_requirements": ["furnished", "balcony"],
+            "other_requirements_answered": True,
+        })
+        updated = apply_search_update(state, {
+            "other_requirements": ["dog allowed"],
+            "other_requirements_answered": True,
+        })
+        self.assertEqual(
+            updated["other_requirements"],
+            ["furnished", "balcony", "dog allowed"],
+        )
+
+    def test_active_instructions_are_small_and_skill_based(self):
+        instructions = app_module.build_response_args("Help me find a home")["instructions"]
+        self.assertLess(len(instructions), 5000)
+        self.assertIn("# Property search", instructions)
+        self.assertIn("# Condo advice", instructions)
+        self.assertNotIn("NEW_PROPERTY_SEARCH", instructions)
+        self.assertNotIn("function_call_output", instructions)
+
     def test_selected_condos_are_limited_to_recommended_shortlist(self):
         state = set_recommended_condos(
             complete_state(), ["One Menerung", "Ken Bangsar", "The Loft"]
@@ -290,24 +313,16 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("get_condo_info", tools)
         self.assertIn("get_property_details", tools)
         self.assertIn("match_lead", tools)
-        self.assertIn("asks one next question", tools["advance_property_search"]["description"])
+        self.assertIn("next useful customer-facing result", tools["advance_property_search"]["description"])
 
-    def test_personalised_search_routing_prompt_covers_area_intent(self):
+    def test_property_search_skill_covers_area_intent_without_a_script(self):
         instructions = app_module.build_response_args(
             "I am looking to rent. Which area would you recommend?"
         )["instructions"]
-        self.assertIn(
-            "Any message that starts or continues a personalised home search MUST use "
-            "advance_property_search",
-            instructions,
-        )
-        self.assertIn("'Which area would you recommend for me?' MUST use", instructions)
-        self.assertIn("set area_status to unknown and areas to an empty list", instructions)
-        self.assertIn(
-            "do not independently recommend an area before collecting the user's regular "
-            "destinations",
-            instructions,
-        )
+        self.assertIn("# Property search", instructions)
+        self.assertIn("does not know an area", instructions)
+        self.assertIn("regular destinations", instructions)
+        self.assertNotIn("MUST", instructions)
 
     def test_personalised_search_routing_prompt_captures_named_area(self):
         args = app_module.build_response_args("I want to rent in Bangsar")
@@ -315,21 +330,15 @@ class SearchFlowStateTests(unittest.TestCase):
             item for item in args["tools"]
             if item.get("name") == "advance_property_search"
         )
-        self.assertIn(
-            "set area_status to known and include it in areas",
-            tool["description"],
-        )
-        self.assertIn("starting or continuing", tool["description"])
+        self.assertIn("Save requirements", tool["description"])
+        self.assertIn("every requirement", tool["description"])
 
     def test_general_area_question_is_excluded_from_personalised_search(self):
         instructions = app_module.build_response_args(
             "What is Bangsar like?"
         )["instructions"]
-        self.assertIn(
-            "'What is Bangsar like?' is a general factual question and must not start a "
-            "personalised search",
-            instructions,
-        )
+        self.assertIn("neighbourhood", instructions)
+        self.assertIn("Answer the actual question first", instructions)
 
     def test_named_condo_question_still_routes_to_condo_knowledge(self):
         args = app_module.build_response_args("What is Ken Bangsar like?")
@@ -337,11 +346,8 @@ class SearchFlowStateTests(unittest.TestCase):
         condo_tool = next(
             item for item in args["tools"] if item.get("name") == "get_condo_info"
         )
-        self.assertIn(
-            "'What is Ken Bangsar like?' MUST use get_condo_info",
-            instructions,
-        )
-        self.assertIn("MUST be called first", condo_tool["description"])
+        self.assertIn("Use `get_condo_info` for named developments", instructions)
+        self.assertIn("condo facts", condo_tool["description"])
 
     @patch("app.requests.patch")
     @patch("app.bubble")
@@ -378,9 +384,10 @@ class SearchFlowStateTests(unittest.TestCase):
         ]
         mocked_patch.return_value.raise_for_status.return_value = None
 
-        with patch("app.update_preferences") as mocked_update_preferences, patch.object(
-            app_module.client.responses, "create"
-        ) as mocked_create:
+        with patch("app.update_preferences") as mocked_update_preferences, patch(
+            "app.recommend_condos_for_search",
+            return_value=([{"condo_name": "One Menerung", "reason": "fit"}], "A fit"),
+        ) as mocked_recommend:
             result = app_module.advance_property_search("folio-1", "live", {
                 "area_status": "known", "areas": ["Bangsar"],
                 "regular_destinations": [], "property_types": ["Condo"],
@@ -394,7 +401,7 @@ class SearchFlowStateTests(unittest.TestCase):
 
         self.assertEqual(result["state"]["bedroom_requirement"], "4 bedrooms")
         mocked_update_preferences.assert_not_called()
-        mocked_create.assert_not_called()
+        mocked_recommend.assert_called_once()
         payload = mocked_patch.call_args.kwargs["json"]
         self.assertEqual(
             payload["AIsearchtext"],

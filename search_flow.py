@@ -56,14 +56,17 @@ def dump_search_state(state):
 
 
 def search_brief_complete(state):
+    """Whether there is enough information to make a useful recommendation.
+
+    Extra constraints and ordered priorities improve ranking but are not gates. This keeps
+    the durable state deterministic without turning the conversation into a questionnaire.
+    """
     state = load_search_state(state)
     return all((
         bool(state["areas"]),
         bool(state["property_types"]),
         bool(state["bedroom_requirement"].strip()),
         bool(state["budget_requirement"].strip()),
-        state["other_requirements_answered"],
-        state["priorities_answered"],
     ))
 
 
@@ -84,16 +87,6 @@ def next_search_question(state):
         return "How many bedrooms do you need?"
     if not state["budget_requirement"].strip():
         return "What's your monthly rental budget?"
-    if not state["other_requirements_answered"]:
-        return (
-            "Is there anything else that could be important for your search? For example, "
-            "pets, a pool, balcony, garden, number of car parks, furnishing, or security?"
-        )
-    if not state["priorities_answered"]:
-        return (
-            "Of everything you've told me, what are the 1–3 things that matter most "
-            "to you in your new home, in order of priority?"
-        )
     return None
 
 
@@ -130,7 +123,10 @@ def apply_search_update(state, update):
 
     if update.get("other_requirements_answered"):
         state["other_requirements_answered"] = True
-        state["other_requirements"] = _unique(update.get("other_requirements", []))
+        new_requirements = _unique(update.get("other_requirements", []))
+        combined_requirements = _unique(state["other_requirements"] + new_requirements)
+        material_change |= combined_requirements != state["other_requirements"]
+        state["other_requirements"] = combined_requirements
     if update.get("priorities_answered"):
         state["priorities_answered"] = True
         state["priorities"] = _unique(update.get("priorities", []))[:3]
