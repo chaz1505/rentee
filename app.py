@@ -424,6 +424,17 @@ def build_response_args(user_message, previous_response_id=None):
                     "additionalProperties": False,
                 },
             },
+            {
+                "type": "function", "name": "get_current_recommendations",
+                "description": (
+                    "Read listings already in the active Folio. Use for questions, comparisons, "
+                    "or filters about properties already recommended, such as which is furnished, "
+                    "biggest, cheapest, or has a balcony. This is read-only and does not start a "
+                    "new search or change the shortlist."
+                ),
+                "parameters": {"type": "object", "properties": {}, "required": [],
+                               "additionalProperties": False},
+            },
             {"type": "web_search"},
         ],
     }
@@ -469,8 +480,8 @@ def parse_completed_tool_arguments(tool_call):
         ) from error
     if not isinstance(arguments, dict):
         raise ValueError(f"Tool {tool_call.name} arguments must be a JSON object.")
-    if tool_call.name == "match_lead" and arguments:
-        raise ValueError("match_lead does not accept arguments.")
+    if tool_call.name in {"match_lead", "get_current_recommendations"} and arguments:
+        raise ValueError(f"{tool_call.name} does not accept arguments.")
     return arguments
 
 
@@ -660,6 +671,50 @@ def get_property_details(folio_id, property_reference, bubble_env):
         return "I found the property, but Rentee does not have further details available."
 
     return "Authoritative Rentee property details:\n" + "\n".join(details)
+
+
+def get_current_recommendations(folio_id, bubble_env):
+    """Return grounded details for the active Folio without changing its shortlist."""
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    listings = []
+    for position, folio_item_id in enumerate(folio.get("folioItems", []) or [], start=1):
+        try:
+            folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
+            listing_id = folio_item.get("listing")
+            if not listing_id:
+                continue
+            listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+            if listing.get("_id") and not any(
+                item["listing_id"] == listing["_id"] for item in listings
+            ):
+                facts = listing_facts(listing)
+                for output_name, field_names in (
+                    ("furnishing", ("Furnishing", "furnished")),
+                    ("size", ("Sq Ft", "size")),
+                    ("availability", ("availability", "Availability")),
+                    ("balcony", ("balcony", "Balcony")),
+                    ("maid_room", ("maid room", "maidRoom", "Maid room")),
+                ):
+                    value = next((listing.get(name) for name in field_names
+                                  if listing.get(name) not in (None, "", [])), None)
+                    if value is not None:
+                        facts[output_name] = value
+                facts["position"] = position
+                facts["listing_id"] = facts.pop("_id")
+                listings.append(facts)
+        except Exception as error:
+            print(f"Failed to load current recommendation: {error}", flush=True)
+    if not listings:
+        return "No current recommended listings were found in this Folio."
+    condo_ids = [listing.get("condo") for listing in listings if listing.get("condo")]
+    condo_names = get_relationship_names(base_url, "condo", condo_ids)
+    for listing in listings:
+        condo_name = condo_names.get(str(listing.get("condo") or ""))
+        if condo_name:
+            listing["condo_name"] = condo_name
+            listing.setdefault("property_name", condo_name)
+    return json.dumps({"current_recommendations": listings}, ensure_ascii=False)
 
 
 def create_folio_items(recommendations, base_url, message_id):
@@ -1705,6 +1760,15 @@ def chat_stream():
                     # web-search event below then selects the customer-facing status.
                     property_details_web_fallback = True
                     follow_up_tools = [{"type": "web_search"}]
+                elif tool_call.name == "get_current_recommendations":
+                    has_match_results = False
+                    tool_result = get_current_recommendations(folio_id, bubble_env)
+                    follow_up_instructions = (
+                        "Answer using only the supplied current recommendations. Compare or "
+                        "filter them as requested. Use customer-facing names, never internal "
+                        "IDs. Say when a field is unavailable. Do not start a new search, "
+                        "change requirements, or imply that the shortlist was modified."
+                    )
                 elif tool_call.name == "get_condo_info":
                     has_match_results = False
                     condo_names = tool_args.get("condo_names")
@@ -1742,6 +1806,11 @@ def chat_stream():
                         "Submitting function_call_output for original "
                         f"get_condo_info call {original_call_id}",
                         flush=True
+                    )
+                elif tool_call.name == "get_current_recommendations":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"get_current_recommendations call {original_call_id}", flush=True
                     )
                 else:
                     print(

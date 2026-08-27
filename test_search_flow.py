@@ -33,6 +33,89 @@ def complete_state():
 
 
 class SearchFlowStateTests(unittest.TestCase):
+    @patch("app.get_relationship_names", return_value={"condo-1": "One Menerung"})
+    @patch("app.bubble")
+    def test_current_recommendations_reuse_folio_furnishing_and_size_read_only(
+        self, mocked_bubble, _mocked_names
+    ):
+        records = {
+            "/obj/folio/folio-1": {"folioItems": ["item-1", "item-2"]},
+            "/obj/folioItem/item-1": {"listing": "listing-1"},
+            "/obj/folioItem/item-2": {"listing": "listing-2"},
+            "/obj/listing/listing-1": {
+                "_id": "listing-1", "condo": "condo-1", "beds": 3,
+                "priceRent": 9000, "Furnishing": "Fully furnished", "Sq Ft": 1500,
+            },
+            "/obj/listing/listing-2": {
+                "_id": "listing-2", "condoName": "Ken Bangsar", "beds": 3,
+                "priceRent": 8500, "furnished": "Partly furnished", "size": 1800,
+            },
+        }
+        mocked_bubble.side_effect = lambda url, **_kwargs: next(
+            value for suffix, value in records.items() if url.endswith(suffix)
+        )
+
+        result = json.loads(app_module.get_current_recommendations("folio-1", "live"))
+
+        listings = result["current_recommendations"]
+        self.assertEqual(listings[0]["condo_name"], "One Menerung")
+        self.assertEqual(listings[0]["furnishing"], "Fully furnished")
+        self.assertEqual(listings[1]["furnishing"], "Partly furnished")
+        self.assertEqual(listings[1]["size"], 1800)
+        self.assertEqual([item["position"] for item in listings], [1, 2])
+        self.assertEqual(mocked_bubble.call_count, 5)
+
+    @patch("app.execute_match_lead_silently")
+    @patch("app.get_current_recommendations")
+    def test_furnishing_followup_uses_current_recommendations_not_matching(
+        self, mocked_current, mocked_match
+    ):
+        mocked_current.return_value = json.dumps({"current_recommendations": [{
+            "property_name": "One Menerung", "furnishing": "Fully furnished",
+        }]})
+        tool_call = SimpleNamespace(
+            type="function_call", name="get_current_recommendations",
+            call_id="current-call", arguments="{}",
+        )
+        initial = SimpleNamespace(id="initial", output=[tool_call], usage=None)
+        final = SimpleNamespace(id="final", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial),
+            FakeStream(final, [SimpleNamespace(
+                type="response.output_text.delta",
+                delta="One Menerung is fully furnished.",
+            )]),
+        ]
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post("/chat_stream", json={
+                "message": "which of these are furnished?", "folio_id": "folio-1",
+            })
+
+        self.assertIn("One Menerung is fully furnished", response.get_data(as_text=True))
+        mocked_current.assert_called_once_with("folio-1", "live")
+        mocked_match.assert_not_called()
+        continuation = responses.stream.call_args_list[1].kwargs
+        self.assertIn("current_recommendations", continuation["input"][0]["output"])
+
+    def test_tool_contract_separates_shortlist_questions_from_new_search(self):
+        tools = {tool.get("name"): tool for tool in
+                 app_module.build_response_args("test")["tools"]}
+        current = tools["get_current_recommendations"]["description"]
+        search = tools["advance_property_search"]["description"]
+        self.assertIn("already recommended", current)
+        self.assertIn("read-only", current)
+        self.assertIn("changes the search", search)
+
     @patch("app.advance_property_search")
     def test_chat_guided_search_uses_structured_search_action(self, mocked_advance):
         tool_args = {
