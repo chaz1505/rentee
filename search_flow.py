@@ -1,4 +1,4 @@
-"""Deterministic state transitions for Rentee's guided rental search."""
+"""Small durable memory helpers for Rentee property searches."""
 
 import json
 
@@ -11,7 +11,6 @@ SEARCH_BRIEF_FIELDS = (
 
 def empty_search_state():
     return {
-        "stage": "NEW_PROPERTY_SEARCH",
         "area_status": "unchanged",
         "areas": [],
         "regular_destinations": [],
@@ -56,41 +55,6 @@ def load_search_state(value):
 
 def dump_search_state(state):
     return json.dumps(load_search_state(state), ensure_ascii=False, separators=(",", ":"))
-
-
-def search_brief_complete(state):
-    """Whether there is enough information to make a useful recommendation.
-
-    Extra constraints and ordered priorities improve ranking but are not gates. This keeps
-    the durable state deterministic without turning the conversation into a questionnaire.
-    """
-    state = load_search_state(state)
-    return all((
-        bool(state["areas"]),
-        bool(state["property_types"]),
-        bool(state["bedroom_requirement"].strip()),
-        bool(state["budget_requirement"].strip()),
-    ))
-
-
-def next_search_question(state):
-    state = load_search_state(state)
-    if not state["areas"]:
-        if state["area_status"] == "unknown":
-            if state["regular_destinations"]:
-                return None
-            return (
-                "Where do you and your family need to go regularly — for example, "
-                "where do you work or where do your children go to school?"
-            )
-        return "Do you already know which area you'd like to live in?"
-    if not state["property_types"]:
-        return "Are you looking for a condo, landed property, or would you consider both?"
-    if not state["bedroom_requirement"].strip():
-        return "How many bedrooms do you need?"
-    if not state["budget_requirement"].strip():
-        return "What's your monthly rental budget?"
-    return None
 
 
 def apply_search_update(state, update):
@@ -149,23 +113,7 @@ def apply_search_update(state, update):
         allowed = {name.casefold() for name in state["recommended_condos"]}
         state["selected_condos"] = [name for name in selected if name.casefold() in allowed]
 
-    if search_brief_complete(state):
-        state["stage"] = (
-            "CONDO_SHORTLIST_GENERATED"
-            if state["recommended_condos"] else "SEARCH_BRIEF_COMPLETE"
-        )
-    else:
-        state["stage"] = "COLLECTING_REQUIREMENTS"
     return state
-
-
-def area_recommendation_needed(state):
-    state = load_search_state(state)
-    return (
-        state["area_status"] == "unknown"
-        and bool(state["regular_destinations"])
-        and not state["areas"]
-    )
 
 
 def set_area_recommendations(state, recommendations):
@@ -182,7 +130,6 @@ def set_area_recommendations(state, recommendations):
             cleaned.append({"area_name": area_name, "reason": reason})
             seen.add(key)
     state["area_recommendations"] = cleaned[:4]
-    state["stage"] = "AWAITING_AREA_SELECTION"
     return state
 
 
@@ -190,7 +137,6 @@ def set_recommended_condos(state, condo_names):
     state = load_search_state(state)
     state["recommended_condos"] = _unique(condo_names)
     state["selected_condos"] = []
-    state["stage"] = "CONDO_SHORTLIST_GENERATED"
     return state
 
 

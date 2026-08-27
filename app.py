@@ -11,13 +11,10 @@ import time
 from pathlib import Path
 
 from search_flow import (
-    area_recommendation_needed,
     apply_search_update,
     dump_search_state,
     listing_search_scope,
     load_search_state,
-    next_search_question,
-    search_brief_complete,
     set_area_recommendations,
     set_recommended_condos,
 )
@@ -317,27 +314,25 @@ def test_condo():
 def build_response_args(user_message, previous_response_id=None):
     """Build the deliberately small customer-turn context and stable tool contracts."""
     search_properties = {
-        "area_status": {"type": "string", "enum": ["unchanged", "known", "unknown"]},
-        "areas": {"type": "array", "items": {"type": "string"}},
         "regular_destinations": {"type": "array", "items": {"type": "string"}},
         "property_types": {"type": "array", "items": {"type": "string"}},
-        "bedroom_requirement": {"type": "string"},
-        "budget_requirement": {"type": "string"},
-        "other_requirements": {"type": "array", "items": {"type": "string"}},
-        "other_requirements_answered": {"type": "boolean"},
-        "priorities": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
-        "priorities_answered": {"type": "boolean"},
-        "selected_condos": {"type": "array", "items": {"type": "string"}},
         "liked_condos": {"type": "array", "items": {"type": "string"}},
         "disliked_condos": {"type": "array", "items": {"type": "string"}},
         "preference_notes": {"type": "array", "items": {"type": "string"}},
         "use_full_shortlist": {"type": "boolean"},
         "search_listings": {"type": "boolean"},
+        "recommend_areas": {"type": "boolean"},
         "recommend_condos": {"type": "boolean"},
         "question": {
             "type": "string",
             "description": "One useful question to ask if recommendations are not ready.",
         },
+        "transaction_type": {"type": "string", "enum": ["rent", "buy", "both"]},
+        "bedrooms_min": {"type": "number"},
+        "geo_names": {"type": "array", "items": {"type": "string"}},
+        "preferred_condo_names": {"type": "array", "items": {"type": "string"}},
+        "budget_rent": {"type": "number"},
+        "budget_buy": {"type": "number"},
     }
     args = {
         "model": "gpt-5-mini",
@@ -737,6 +732,89 @@ def _listing_is_in_condo_scope(listing, condo_scope, base_url, condo_cache):
     return any(normalize_condo_name(value) in wanted for value in candidates)
 
 
+def _as_number(value):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    clean = "".join(character for character in str(value or "") if character.isdigit() or character == ".")
+    try:
+        return float(clean) if clean else None
+    except ValueError:
+        return None
+
+
+def structured_lead_requirements(lead):
+    """Return only factual Bubble Lead fields used for listing retrieval and ranking."""
+    return {
+        "transaction_type": lead.get("TransactionType") or [],
+        "bedrooms_min": _as_number(lead.get("bedroomsMin")),
+        "geo_ids": list(lead.get("Geo") or []),
+        "preferred_condo_ids": list(lead.get("preferredCondos") or []),
+        "budget_rent": _as_number(lead.get("budgetRent")),
+        "budget_buy": _as_number(lead.get("budgetBuy")),
+    }
+
+
+def listing_facts(listing):
+    """Compact grounded listing context; excludes generated listing-search prose."""
+    fields = (
+        "_id", "name", "title", "beds", "baths", "priceRent", "priceSale",
+        "propertyType", "condo", "Geo", "Furnishing", "furnished",
+        "availability", "balcony", "family room", "maid room", "outdoor area",
+        "Landed_sqft", "Sq Ft", "keyFacts", "Description", "Notes",
+    )
+    return {field: listing[field] for field in fields if listing.get(field) not in (None, "", [])}
+
+
+def _transaction_modes(value):
+    values = value if isinstance(value, list) else [value]
+    rendered = " ".join(str(item).casefold() for item in values)
+    modes = set()
+    if "rent" in rendered or "let" in rendered:
+        modes.add("rent")
+    if "buy" in rendered or "sale" in rendered or "purchase" in rendered:
+        modes.add("buy")
+    return modes
+
+
+def shortlist_structured_listings(lead, listings):
+    """Remove obvious mismatches while leaving trade-off judgement to the model."""
+    requirements = structured_lead_requirements(lead)
+    modes = _transaction_modes(requirements["transaction_type"])
+    bedrooms_min = requirements["bedrooms_min"]
+    geo_ids = {str(item) for item in requirements["geo_ids"]}
+    condo_ids = {str(item) for item in requirements["preferred_condo_ids"]}
+    budget_rent = requirements["budget_rent"]
+    budget_buy = requirements["budget_buy"]
+    shortlisted = []
+
+    for listing in listings:
+        beds = _as_number(listing.get("beds"))
+        if bedrooms_min is not None and beds is not None and beds < bedrooms_min:
+            continue
+        if condo_ids and str(listing.get("condo")) not in condo_ids:
+            continue
+        listing_geos = listing.get("Geo") or []
+        if not isinstance(listing_geos, list):
+            listing_geos = [listing_geos]
+        if geo_ids and not condo_ids and not geo_ids.intersection(str(item) for item in listing_geos):
+            continue
+
+        rent = _as_number(listing.get("priceRent"))
+        sale = _as_number(listing.get("priceSale"))
+        if modes == {"rent"} and rent is None:
+            continue
+        if modes == {"buy"} and sale is None:
+            continue
+        if budget_rent and "buy" not in modes and rent:
+            if rent > budget_rent * 1.2 or rent < budget_rent * 0.45:
+                continue
+        if budget_buy and "rent" not in modes and sale:
+            if sale > budget_buy * 1.2 or sale < budget_buy * 0.45:
+                continue
+        shortlisted.append(listing)
+    return shortlisted
+
+
 def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     match_started = time.perf_counter()
@@ -789,6 +867,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             + ", ".join(condo_scope),
             flush=True,
         )
+    listings = shortlist_structured_listings(lead, listings)
     log_timing("match_lead - load listings", listings_started)
 
     print(
@@ -797,99 +876,17 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     )
 
     prompt_started = time.perf_counter()
-    prompt = f"""
-
-You are helping a property seeker find their ideal home.
-
-Review the home seeker's requirements and all available properties.
-
-Select only properties you genuinely believe could be a good fit.
-
-Rank the strongest matches from best to worst.
-
-=========================
-
-HOME SEEKER REQUIREMENTS
-
-=========================
-
-{lead["AIsearchtext"]}
-
-=========================
-
-AVAILABLE PROPERTIES
-
-=========================
-
-"""
-
-    for listing in listings:
-
-        prompt += f"""
-
-INTERNAL LISTING ID: {listing.get("_id")}
-
-Bedrooms: {listing.get("beds")}
-
-Bathrooms: {listing.get("baths")}
-
-Rent: {listing.get("priceRent")}
-
-Sale: {listing.get("priceSale")}
-
-{listing.get("AIsearchtext","")}
-
-----------------------------------------
-
-"""
-
-    prompt += """
-
-For each recommended property:
-
-- Give the property or building name where available.
-- Explain briefly why it suits the user's requirements.
-- Mention any important compromise or consideration.
-- Keep the explanation focused on what matters to the user.
-
-Do not recommend properties simply to fill a list. If only a few properties
-are genuinely suitable, recommend only those properties.
-
-Write directly to the property seeker using 'you' and 'your'. Be helpful,
-confident, and conversational, like a highly knowledgeable personal property
-concierge.
-
-Do not mention Lead IDs, Folio IDs, Listing IDs, internal database information,
-the matching process, internal scoring, or estate-agent workflows.
-
-Do not invent facts. Only use information in the home seeker requirements and
-supplied property information.
-
-Return valid JSON with exactly these fields:
-- recommendations: an array in ranking order. Each item must contain the
-  INTERNAL LISTING ID from the supplied properties as listing_id and a
-  personalised reco_summary. Include only properties you genuinely recommend;
-  never invent an ID or add properties to fill a list.
-- customer_response: concise, natural, customer-facing recommendation prose.
-  Never mention internal IDs, Folio IDs, Lead IDs, database fields, or the
-  matching process.
-
-For every recommended listing, reco_summary must be a short, personalised
-one- or two-sentence explanation of why this listing suits this home seeker.
-Focus on the one to three strongest relevant requirements and actual listing
-attributes, and mention a material trade-off when applicable. Use natural,
-consumer-friendly language. Do not mention IDs, scores, matching logic, or
-AIsearchtext; do not use generic real-estate marketing language; and do not
-invent facts or claim a requirement exists unless it appears in the supplied
-home seeker requirements. reco_summary is recommendation reasoning, not a
-rewritten listing description.
-
-The recommendations array is the source of truth. customer_response must
-describe only the listings represented there, in the same order. Never invent
-a property, unit, building name, or property detail. If a name or detail is not
-in the supplied property information, do not mention it.
-
-"""
+    matching_input = {
+        "customer_requirements": structured_lead_requirements(lead),
+        "available_listings": [listing_facts(listing) for listing in listings],
+    }
+    prompt = (
+        "Rank the grounded listings for this customer. Use the structured facts and "
+        "make sensible trade-offs, including fit with the customer's budget tier. "
+        "Recommend only genuine fits and mention material compromises. Never invent "
+        "facts. Return JSON matching the supplied schema.\n\n"
+        + json.dumps(matching_input, ensure_ascii=False)
+    )
     log_timing("match_lead - build matching input", prompt_started)
 
     yield "Ranking the best matches..."
@@ -1020,34 +1017,70 @@ def execute_match_lead_silently(folio_id, bubble_env, message_id, condo_scope=No
         print(f"match_lead progress: {status}", flush=True)
 
 
-def update_lead_ai_searchtext(lead_id, updated_text, ai_search_summary, base_url):
+def get_named_object_ids(base_url, object_type, names):
+    """Resolve user-facing Geo/Condo names to existing Bubble relationship IDs."""
+    wanted = {normalize_condo_name(name) for name in names or [] if str(name).strip()}
+    if not wanted:
+        return []
+    matches = []
+    cursor = 0
+    while wanted:
+        page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
+        results = page.get("results", []) or []
+        for record in results:
+            candidate = next(
+                (record.get(field) for field in ("name", "Name", "Condo name") if record.get(field)),
+                None,
+            )
+            normalized = normalize_condo_name(candidate)
+            if normalized in wanted and record.get("_id"):
+                matches.append(record["_id"])
+                wanted.remove(normalized)
+        if not results or not page.get("remaining"):
+            break
+        cursor += len(results)
+    return matches
 
-    print(f"Updating Lead preferences for lead {lead_id}", flush=True)
-    update_started = time.perf_counter()
-    response = requests.patch(
-        f"{base_url}/obj/lead/{lead_id}",
-        headers={
-            "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "AIsearchtext": updated_text,
-            "AIsearchsummary": ai_search_summary
-        },
-        timeout=30
-    )
-    response.raise_for_status()
-    log_timing("Update Lead preferences", update_started)
-    print("Lead preferences updated successfully", flush=True)
+
+def structured_lead_update(update, base_url):
+    """Translate model-extracted values into Bubble's real structured Lead fields."""
+    payload = {}
+    transaction = update.get("transaction_type")
+    if transaction and transaction != "unchanged":
+        # Rent/Let is the existing Bubble option-set value used by this application.
+        values = []
+        if transaction in ("rent", "both"):
+            values.append("Rent/Let")
+        if transaction in ("buy", "both"):
+            values.append("Sale/Purchase")
+        payload["TransactionType"] = values
+    if update.get("bedrooms_min") is not None:
+        payload["bedroomsMin"] = update["bedrooms_min"]
+    if update.get("budget_rent") is not None:
+        payload["budgetRent"] = update["budget_rent"]
+    if update.get("budget_buy") is not None:
+        payload["budgetBuy"] = update["budget_buy"]
+    if update.get("geo_names"):
+        geo_ids = get_named_object_ids(base_url, "geo", update["geo_names"])
+        if geo_ids:
+            payload["Geo"] = geo_ids
+    if update.get("preferred_condo_names"):
+        condo_ids = get_named_object_ids(
+            base_url, "condo", update["preferred_condo_names"]
+        )
+        if condo_ids:
+            payload["preferredCondos"] = condo_ids
+    return payload
 
 
-def save_search_state(lead_id, search_state, base_url):
+def save_search_state(lead_id, search_state, base_url, lead_fields=None):
     save_started = time.perf_counter()
     payload = {
         "searchBriefJSON": dump_search_state(search_state),
         "AIsearchtext": search_state_to_requirements_text(search_state),
         "AIsearchsummary": search_state_to_summary(search_state),
     }
+    payload.update(lead_fields or {})
     response = requests.patch(
         f"{base_url}/obj/lead/{lead_id}",
         headers={
@@ -1106,48 +1139,6 @@ def search_state_to_summary(search_state):
         rendered = separator.join(value) if isinstance(value, list) else value
         lines.append(f"{label}: {rendered}")
     return "\n".join(lines)
-
-
-def extract_search_update_from_profile(profile_text):
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=(
-            "Extract only explicitly recorded current search requirements from this "
-            "existing renter profile. Empty values mean unknown. Preserve bedroom and "
-            "budget nuance. Mark other requirements/priorities answered only when the "
-            "profile explicitly records them or explicitly says none.\n\n"
-            + str(profile_text or "")
-        ),
-        text={"format": {
-            "type": "json_schema",
-            "name": "existing_search_brief",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "area_status": {
-                        "type": "string", "enum": ["unchanged", "known", "unknown"]
-                    },
-                    "areas": {"type": "array", "items": {"type": "string"}},
-                    "regular_destinations": {"type": "array", "items": {"type": "string"}},
-                    "property_types": {"type": "array", "items": {"type": "string"}},
-                    "bedroom_requirement": {"type": "string"},
-                    "budget_requirement": {"type": "string"},
-                    "other_requirements": {"type": "array", "items": {"type": "string"}},
-                    "other_requirements_answered": {"type": "boolean"},
-                    "priorities": {"type": "array", "items": {"type": "string"}},
-                    "priorities_answered": {"type": "boolean"},
-                },
-                "required": [
-                    "area_status", "areas", "regular_destinations", "property_types",
-                    "bedroom_requirement", "budget_requirement", "other_requirements",
-                    "other_requirements_answered", "priorities", "priorities_answered",
-                ],
-                "additionalProperties": False,
-            },
-        }},
-    )
-    return json.loads(response.output_text)
 
 
 def recommend_areas_for_search(search_state):
@@ -1228,32 +1219,45 @@ def advance_property_search(folio_id, bubble_env, update):
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     stored_state = lead.get("searchBriefJSON")
     state = load_search_state(stored_state)
-    if not stored_state and str(lead.get("AIsearchtext") or "").strip():
-        state = apply_search_update(
-            state, extract_search_update_from_profile(lead["AIsearchtext"])
-        )
+    if update.get("geo_names"):
+        update["area_status"] = "known"
+        update["areas"] = update["geo_names"]
+    if update.get("bedrooms_min") is not None:
+        update["bedroom_requirement"] = str(update["bedrooms_min"])
+    relevant_budget = update.get("budget_rent") or update.get("budget_buy")
+    if relevant_budget is not None:
+        update["budget_requirement"] = str(relevant_budget)
+    transaction = update.get("transaction_type")
+    if transaction and transaction != "unchanged":
+        update["property_types"] = [transaction]
     state = apply_search_update(state, update)
+    preferred_names = [
+        str(name).strip() for name in update.get("preferred_condo_names", [])
+        if str(name).strip()
+    ]
+    if preferred_names:
+        state = set_recommended_condos(state, preferred_names)
+        state["selected_condos"] = list(preferred_names)
+    lead_fields = structured_lead_update(update, base_url)
 
     scope = listing_search_scope(
         state,
-        selected_condos=update.get("selected_condos"),
+        selected_condos=preferred_names or None,
         use_full_shortlist=bool(update.get("use_full_shortlist")),
     )
     if update.get("search_listings") and scope:
         state["selected_condos"] = list(scope)
-        save_search_state(lead_id, state, base_url)
+        save_search_state(lead_id, state, base_url, lead_fields)
         return {
             "action": "search_listings", "scope": scope,
             "state": state, "lead_id": lead_id,
         }
 
-    if area_recommendation_needed(state):
+    if update.get("recommend_areas") and state["regular_destinations"]:
         if not state["area_recommendations"]:
             recommendations = recommend_areas_for_search(state)
             state = set_area_recommendations(state, recommendations)
-        else:
-            state["stage"] = "AWAITING_AREA_SELECTION"
-        save_search_state(lead_id, state, base_url)
+        save_search_state(lead_id, state, base_url, lead_fields)
         return {
             "action": "recommend_areas",
             "text": area_recommendation_text(state),
@@ -1262,14 +1266,12 @@ def advance_property_search(folio_id, bubble_env, update):
             "recommendations": state["area_recommendations"],
         }
 
-    if update.get("recommend_condos") or (
-        search_brief_complete(state) and not state["recommended_condos"]
-    ):
+    if update.get("recommend_condos"):
         recommendations, response_text = recommend_condos_for_search(state)
         state = set_recommended_condos(
             state, [item["condo_name"] for item in recommendations]
         )
-        save_search_state(lead_id, state, base_url)
+        save_search_state(lead_id, state, base_url, lead_fields)
         return {
             "action": "condo_shortlist",
             "text": response_text.rstrip() + "\n\nWhich would you like to explore?",
@@ -1278,10 +1280,8 @@ def advance_property_search(folio_id, bubble_env, update):
             "recommendations": recommendations,
         }
 
-    save_search_state(lead_id, state, base_url)
+    save_search_state(lead_id, state, base_url, lead_fields)
     question = str(update.get("question") or "").strip()
-    if not question:
-        question = next_search_question(state)
     if not question and state["recommended_condos"]:
         question = "Which of these condos would you like to explore?"
     if not question:
@@ -1292,137 +1292,6 @@ def advance_property_search(folio_id, bubble_env, update):
         "state": state,
         "lead_id": lead_id,
     }
-
-
-def search_update_preference_text(update):
-    parts = []
-    labels = (
-        ("areas", "Areas"),
-        ("regular_destinations", "Regular destinations"),
-        ("property_types", "Property types"),
-        ("bedroom_requirement", "Bedrooms"),
-        ("budget_requirement", "Budget"),
-        ("other_requirements", "Other requirements"),
-        ("priorities", "Ordered priorities"),
-    )
-    for key, label in labels:
-        value = update.get(key)
-        if isinstance(value, list) and value:
-            parts.append(f"{label}: {', '.join(str(item) for item in value)}")
-        elif isinstance(value, str) and value.strip():
-            parts.append(f"{label}: {value.strip()}")
-    if update.get("other_requirements_answered") and not update.get("other_requirements"):
-        parts.append("Other requirements: none")
-    if update.get("priorities_answered") and not update.get("priorities"):
-        parts.append("Ordered priorities: no particular priorities")
-    return "; ".join(parts)
-
-
-def update_preferences(folio_id, preference_update, bubble_env):
-
-    preferences_started = time.perf_counter()
-    base_url = get_bubble_base_url(bubble_env)
-    print(f"Updating preferences for folio: {folio_id}", flush=True)
-    folio_started = time.perf_counter()
-    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
-    log_timing("update_preferences - Folio lookup", folio_started)
-    lead_id = folio["lead"]
-    print(f"Resolved lead: {lead_id}", flush=True)
-    lead_started = time.perf_counter()
-    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
-    log_timing("update_preferences - Lead lookup", lead_started)
-    existing_ai_search_text = lead.get("AIsearchtext", "")
-
-    update_prompt = f"""
-You maintain a living home-search profile for one customer.
-
-Return the complete updated AIsearchtext and a clean AIsearchsummary after
-applying the requested update.
-
-Rules:
-- Preserve all existing relevant home-search information.
-- Change or remove a preference only when the customer explicitly says to do so.
-- Add relevant new information, creating an appropriate structured category when needed.
-- Do not invent or infer preferences.
-- Do not rewrite, summarise, clean up, reorder, or delete any `secret notes` or
-  dated conversation/history content. It is immutable and must remain exactly
-  as written.
-- Do not summarise away, delete, or rewrite unrelated preferences.
-
-AIsearchsummary rules:
-- Generate it from the FINAL updated AIsearchtext, not only this latest request.
-- It is a concise, customer-facing, easy-to-scan summary of current home-search
-  preferences only.
-- Include relevant current preferences where available, such as transaction type,
-  budget, areas, condos, bedrooms, property type, furnishing, parking, schools,
-  commute, family, facilities, and move-in requirements.
-- Exclude secret notes, dated conversation/history content, internal IDs, internal
-  implementation notes, and preferences that have been replaced.
-- Use plain structured text with only non-empty categories. Do not use a table,
-  generic introductory prose, or internal terminology.
-
-CURRENT AIsearchtext:
-{existing_ai_search_text}
-
-REQUESTED PREFERENCE UPDATE:
-{preference_update}
-"""
-
-    extraction_started = time.perf_counter()
-    response = client.responses.create(
-        model="gpt-5-mini",
-        input=update_prompt,
-        instructions=(
-            "Return JSON matching the supplied schema. The confirmation must be a "
-            "short, natural sentence addressed directly to the customer and must not "
-            "mention internal IDs, fields, APIs, or tools. ai_search_summary must be "
-            "a clean current customer-facing search summary derived from the final "
-            "updated_ai_search_text."
-        ),
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "updated_home_search_profile",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "updated_ai_search_text": {"type": "string"},
-                        "ai_search_summary": {"type": "string"},
-                        "confirmation": {"type": "string"}
-                    },
-                    "required": [
-                        "updated_ai_search_text",
-                        "ai_search_summary",
-                        "confirmation"
-                    ],
-                    "additionalProperties": False
-                }
-            }
-        }
-    )
-    log_timing("Preference extraction OpenAI call", extraction_started)
-    log_token_usage("Preference", response)
-    parse_started = time.perf_counter()
-    result = json.loads(response.output_text)
-    log_timing("update_preferences - parse result", parse_started)
-    updated_ai_search_text = result["updated_ai_search_text"]
-    ai_search_summary = result["ai_search_summary"]
-
-    if not updated_ai_search_text.strip():
-        raise ValueError("The updated home-search profile was empty.")
-
-    lead_update_started = time.perf_counter()
-    update_lead_ai_searchtext(
-        lead_id,
-        updated_ai_search_text,
-        ai_search_summary,
-        base_url
-    )
-    log_timing("update_preferences - Bubble Lead PATCH", lead_update_started)
-
-    log_timing("update_preferences TOTAL", preferences_started)
-    return result["confirmation"]
 
 
 @app.route("/chat_stream", methods=["POST"])
@@ -1597,10 +1466,8 @@ def chat_stream():
                             message_id,
                             search_result["scope"],
                         )
-                        completed_state = dict(search_result["state"])
-                        completed_state["stage"] = "AWAITING_INTEREST"
                         save_search_state(
-                            search_result["lead_id"], completed_state,
+                            search_result["lead_id"], search_result["state"],
                             get_bubble_base_url(bubble_env),
                         )
                         has_match_results = True
@@ -1627,19 +1494,6 @@ def chat_stream():
                         "The tool output already contains the final customer-facing answer. "
                         "Return it faithfully. Do not add, remove, reinterpret, embellish, "
                         "or invent property information."
-                    )
-                elif tool_call.name == "update_preferences":
-                    preference_confirmation = update_preferences(
-                        folio_id,
-                        tool_args["preference_update"],
-                        bubble_env
-                    )
-                    has_match_results = False
-                    tool_result = preference_confirmation
-                    follow_up_instructions = (
-                        "Return the completed preference-update confirmation naturally. "
-                        "Do not mention properties or internal errors. A personalised search "
-                        "journey must be advanced through advance_property_search instead."
                     )
                 elif tool_call.name == "get_property_details":
                     has_match_results = False
@@ -1687,12 +1541,6 @@ def chat_stream():
                     print(
                         "Submitting function_call_output for original "
                         f"advance_property_search call {original_call_id}",
-                        flush=True
-                    )
-                elif tool_call.name == "update_preferences":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"update_preferences call {original_call_id}",
                         flush=True
                     )
                 elif tool_call.name == "match_lead":

@@ -9,14 +9,11 @@ os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 
 import app as app_module
 from search_flow import (
-    area_recommendation_needed,
     apply_search_update,
     dump_search_state,
     empty_search_state,
     load_search_state,
     listing_search_scope,
-    next_search_question,
-    search_brief_complete,
     set_recommended_condos,
 )
 
@@ -36,11 +33,8 @@ def complete_state():
 
 
 class SearchFlowStateTests(unittest.TestCase):
-    @patch("app.update_preferences")
     @patch("app.advance_property_search")
-    def test_chat_guided_search_skips_preference_rewrite_call(
-        self, mocked_advance, mocked_update_preferences
-    ):
+    def test_chat_guided_search_uses_structured_search_action(self, mocked_advance):
         tool_args = {
             "area_status": "unchanged", "areas": [],
             "regular_destinations": [], "property_types": [],
@@ -89,83 +83,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("What's your budget?", body)
         mocked_advance.assert_called_once_with("folio-1", "live", tool_args)
-        mocked_update_preferences.assert_not_called()
         responses.create.assert_not_called()
-
-    def test_new_lead_starts_with_area_question(self):
-        state = empty_search_state()
-        self.assertFalse(search_brief_complete(state))
-        self.assertEqual(
-            next_search_question(state),
-            "Do you already know which area you'd like to live in?",
-        )
-
-    def test_multiple_first_message_requirements_skip_answered_questions(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "known", "areas": ["Bangsar"],
-            "property_types": ["condo"],
-            "bedroom_requirement": "4 bedrooms",
-            "budget_requirement": "maximum RM12,000",
-            "other_requirements": ["furnished"],
-            "other_requirements_answered": False,
-        })
-        self.assertTrue(search_brief_complete(state))
-        self.assertIsNone(next_search_question(state))
-
-    def test_questions_are_one_at_a_time_and_in_order(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "known", "areas": ["Bangsar"]
-        })
-        question = next_search_question(state)
-        self.assertEqual(
-            question,
-            "Are you looking for a condo, landed property, or would you consider both?",
-        )
-        self.assertEqual(question.count("?"), 1)
-
-    def test_unknown_area_asks_for_regular_destinations(self):
-        state = apply_search_update(empty_search_state(), {"area_status": "unknown"})
-        self.assertEqual(state["area_status"], "unknown")
-        self.assertIn("need to go regularly", next_search_question(state))
-
-    def test_unknown_area_with_destinations_requires_area_recommendation(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "unknown",
-            "regular_destinations": ["KLCC", "Alice Smith School"],
-        })
-        self.assertTrue(area_recommendation_needed(state))
-        self.assertIsNone(next_search_question(state))
-
-    def test_unchanged_update_preserves_unknown_area_and_destinations(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "unknown",
-            "regular_destinations": ["KLCC", "Alice Smith School"],
-        })
-        state = apply_search_update(state, {
-            "area_status": "unchanged", "property_types": ["Condo"]
-        })
-        self.assertEqual(state["area_status"], "unknown")
-        self.assertEqual(state["regular_destinations"], [
-            "KLCC", "Alice Smith School"
-        ])
-        self.assertEqual(state["property_types"], ["Condo"])
-        self.assertTrue(area_recommendation_needed(state))
-
-    def test_unknown_area_status_survives_persistence(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "unknown", "regular_destinations": ["KLCC"]
-        })
-        restored = load_search_state(dump_search_state(state))
-        self.assertEqual(restored["area_status"], "unknown")
-        self.assertEqual(restored["regular_destinations"], ["KLCC"])
-
-    def test_legacy_area_unknown_state_is_migrated(self):
-        restored = load_search_state({
-            "area_unknown": True, "areas": [],
-            "regular_destinations": ["KLCC"],
-        })
-        self.assertEqual(restored["area_status"], "unknown")
-        self.assertTrue(area_recommendation_needed(restored))
 
     @patch("app.save_search_state")
     @patch("app.recommend_areas_for_search")
@@ -187,12 +105,10 @@ class SearchFlowStateTests(unittest.TestCase):
         ]
 
         result = app_module.advance_property_search("folio-1", "live", {
-            "area_status": "unknown", "areas": [],
-            "regular_destinations": [], "property_types": [],
+            "recommend_areas": True,
         })
 
         self.assertEqual(result["action"], "recommend_areas")
-        self.assertEqual(result["state"]["area_status"], "unknown")
         self.assertEqual(
             result["state"]["regular_destinations"],
             ["KLCC", "Alice Smith School"],
@@ -219,7 +135,7 @@ class SearchFlowStateTests(unittest.TestCase):
         ]
 
         result = app_module.advance_property_search("folio-1", "live", {
-            "area_status": "unchanged", "property_types": ["Condo"]
+            "recommend_areas": True, "property_types": ["Condo"]
         })
 
         self.assertEqual(result["action"], "recommend_areas")
@@ -227,38 +143,10 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(result["state"]["property_types"], ["Condo"])
         mocked_recommend.assert_not_called()
 
-    def test_selecting_recommended_area_resolves_area_and_keeps_requirements(self):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "unknown", "regular_destinations": ["KLCC"],
-            "property_types": ["Condo"], "bedroom_requirement": "4 bedrooms",
-        })
-        state["area_recommendations"] = [
-            {"area_name": "Bangsar", "reason": "A balanced option."}
-        ]
-        state = apply_search_update(state, {
-            "area_status": "known", "areas": ["Bangsar"]
-        })
-        self.assertEqual(state["area_status"], "known")
-        self.assertEqual(state["areas"], ["Bangsar"])
-        self.assertEqual(state["property_types"], ["Condo"])
-        self.assertEqual(state["bedroom_requirement"], "4 bedrooms")
-        self.assertEqual(state["area_recommendations"], [])
-        self.assertEqual(next_search_question(state), "What's your monthly rental budget?")
-
-    def test_no_other_requirements_and_no_priorities_are_valid_answers(self):
-        state = complete_state()
-        state = apply_search_update(state, {
-            "other_requirements": [], "other_requirements_answered": True,
-            "priorities": [], "priorities_answered": True,
-        })
-        self.assertTrue(search_brief_complete(state))
-        self.assertIsNone(next_search_question(state))
-
     def test_material_change_invalidates_condo_shortlist(self):
         state = set_recommended_condos(complete_state(), ["One Menerung", "Ken Bangsar"])
         changed = apply_search_update(state, {"budget_requirement": "maximum RM9,000"})
         self.assertEqual(changed["recommended_condos"], [])
-        self.assertEqual(changed["stage"], "SEARCH_BRIEF_COMPLETE")
 
     def test_preference_added_later_preserves_existing_requirements(self):
         state = apply_search_update(empty_search_state(), {
@@ -356,10 +244,72 @@ class SearchFlowStateTests(unittest.TestCase):
     def test_active_instructions_are_small_and_skill_based(self):
         instructions = app_module.build_response_args("Help me find a home")["instructions"]
         self.assertLess(len(instructions), 5000)
-        self.assertIn("# Property search", instructions)
+        self.assertIn("# Property Search", instructions)
         self.assertIn("# Condo advice", instructions)
         self.assertNotIn("NEW_PROPERTY_SEARCH", instructions)
         self.assertNotIn("function_call_output", instructions)
+
+    def test_structured_listing_shortlist_uses_real_fields_and_budget_tier(self):
+        lead = {
+            "TransactionType": ["Rent/Let"],
+            "bedroomsMin": 4,
+            "budgetRent": 15000,
+            "Geo": ["geo-bangsar"],
+            "preferredCondos": [],
+            "AIsearchtext": "This generated prose must not drive matching",
+        }
+        listings = [
+            {"_id": "strong", "beds": 4, "priceRent": 14500, "Geo": "geo-bangsar"},
+            {"_id": "too-small", "beds": 3, "priceRent": 14000, "Geo": "geo-bangsar"},
+            {"_id": "wrong-tier", "beds": 4, "priceRent": 5000, "Geo": "geo-bangsar"},
+            {"_id": "too-far-over", "beds": 4, "priceRent": 19000, "Geo": "geo-bangsar"},
+        ]
+        shortlisted = app_module.shortlist_structured_listings(lead, listings)
+        self.assertEqual([item["_id"] for item in shortlisted], ["strong"])
+
+    def test_preferred_condo_relationship_constrains_structured_shortlist(self):
+        lead = {"preferredCondos": ["condo-one", "condo-loft"]}
+        listings = [
+            {"_id": "one", "condo": "condo-one"},
+            {"_id": "loft", "condo": "condo-loft"},
+            {"_id": "other", "condo": "condo-other"},
+        ]
+        shortlisted = app_module.shortlist_structured_listings(lead, listings)
+        self.assertEqual([item["_id"] for item in shortlisted], ["one", "loft"])
+
+    @patch("app.get_all_listings")
+    @patch("app.bubble")
+    def test_matching_prompt_uses_structured_fields_not_ai_search_text(
+        self, mocked_bubble, mocked_listings
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": []},
+            {
+                "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
+                "budgetRent": 12000, "AIsearchtext": "LEGACY GENERATED PROFILE",
+            },
+        ]
+        mocked_listings.return_value = [{
+            "_id": "listing-1", "beds": 3, "priceRent": 11500,
+            "AIsearchtext": "LEGACY GENERATED LISTING",
+            "Description": "A real structured description",
+        }]
+        model_response = SimpleNamespace(
+            output_text=json.dumps({"recommendations": [], "customer_response": "No fit."}),
+            usage=None,
+        )
+        with patch.object(app_module.client.responses, "create", return_value=model_response) as create:
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration:
+                    break
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn('"bedrooms_min": 3.0', prompt)
+        self.assertIn("A real structured description", prompt)
+        self.assertNotIn("LEGACY GENERATED PROFILE", prompt)
+        self.assertNotIn("LEGACY GENERATED LISTING", prompt)
 
     def test_selected_condos_are_limited_to_recommended_shortlist(self):
         state = set_recommended_condos(
@@ -398,9 +348,9 @@ class SearchFlowStateTests(unittest.TestCase):
         instructions = app_module.build_response_args(
             "I am looking to rent. Which area would you recommend?"
         )["instructions"]
-        self.assertIn("# Property search", instructions)
-        self.assertIn("does not know an area", instructions)
-        self.assertIn("regular destinations", instructions)
+        self.assertIn("# Property Search", instructions)
+        self.assertIn("destinations", instructions)
+        self.assertIn("not a questionnaire", instructions)
         self.assertNotIn("MUST", instructions)
 
     def test_personalised_search_routing_prompt_captures_named_area(self):
@@ -430,7 +380,7 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.requests.patch")
     @patch("app.bubble")
-    def test_incomplete_brief_is_saved_without_listing_search(
+    def test_sparse_search_updates_structured_lead_and_asks_model_question(
         self, mocked_bubble, mocked_patch
     ):
         mocked_bubble.side_effect = [
@@ -438,76 +388,47 @@ class SearchFlowStateTests(unittest.TestCase):
         ]
         mocked_patch.return_value.raise_for_status.return_value = None
         result = app_module.advance_property_search("folio-1", "live", {
-            "area_status": "known", "areas": ["Bangsar"],
-            "property_types": [], "regular_destinations": [],
-            "bedroom_requirement": "4 bedrooms", "budget_requirement": "",
-            "other_requirements": [], "other_requirements_answered": False,
-            "priorities": [], "priorities_answered": False,
-            "selected_condos": [], "use_full_shortlist": False,
-            "search_listings": True,
+            "bedrooms_min": 4,
+            "question": "Are you looking to rent or buy?",
         })
         self.assertEqual(result["action"], "ask")
-        self.assertIn("condo, landed", result["text"])
+        self.assertEqual(result["text"], "Are you looking to rent or buy?")
         payload = mocked_patch.call_args.kwargs["json"]
         self.assertIn("searchBriefJSON", payload)
-        self.assertEqual(payload["AIsearchtext"], "Areas: Bangsar\nBedrooms: 4 bedrooms")
-        self.assertEqual(payload["AIsearchsummary"], "Area: Bangsar\nBedrooms: 4 bedrooms")
+        self.assertEqual(payload["bedroomsMin"], 4)
 
     @patch("app.requests.patch")
+    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
     @patch("app.bubble")
     def test_multiple_structured_requirements_are_persisted_without_llm_rewrite(
-        self, mocked_bubble, mocked_patch
+        self, mocked_bubble, _mocked_resolve, mocked_patch
     ):
         mocked_bubble.side_effect = [
             {"lead": "lead-1"}, {"searchBriefJSON": ""}
         ]
         mocked_patch.return_value.raise_for_status.return_value = None
 
-        with patch("app.update_preferences") as mocked_update_preferences, patch(
-            "app.recommend_condos_for_search",
+        with patch("app.recommend_condos_for_search",
             return_value=([{"condo_name": "One Menerung", "reason": "fit"}], "A fit"),
         ) as mocked_recommend:
             result = app_module.advance_property_search("folio-1", "live", {
-                "area_status": "known", "areas": ["Bangsar"],
-                "regular_destinations": [], "property_types": ["Condo"],
-                "bedroom_requirement": "4 bedrooms",
-                "budget_requirement": "up to RM12k",
-                "other_requirements": [], "other_requirements_answered": False,
-                "priorities": [], "priorities_answered": False,
-                "selected_condos": [], "use_full_shortlist": False,
-                "search_listings": False,
+                "transaction_type": "rent",
+                "geo_names": ["Bangsar"],
+                "property_types": ["Condo"],
+                "bedrooms_min": 4,
+                "budget_rent": 12000,
+                "recommend_condos": True,
             })
 
-        self.assertEqual(result["state"]["bedroom_requirement"], "4 bedrooms")
-        mocked_update_preferences.assert_not_called()
+        self.assertEqual(result["state"]["bedroom_requirement"], "4")
         mocked_recommend.assert_called_once()
         payload = mocked_patch.call_args.kwargs["json"]
-        self.assertEqual(
-            payload["AIsearchtext"],
-            "Areas: Bangsar\nProperty types: Condo\nBedrooms: 4 bedrooms\n"
-            "Budget: up to RM12k",
-        )
-        self.assertIn('"bedroom_requirement":"4 bedrooms"', payload["searchBriefJSON"])
+        self.assertEqual(payload["TransactionType"], ["Rent/Let"])
+        self.assertEqual(payload["bedroomsMin"], 4)
+        self.assertEqual(payload["budgetRent"], 12000)
+        self.assertEqual(payload["Geo"], ["geo-bangsar"])
 
-    @patch("app.save_search_state")
-    @patch("app.extract_search_update_from_profile")
-    @patch("app.bubble")
-    def test_existing_structured_lead_does_not_run_profile_extraction(
-        self, mocked_bubble, mocked_extract, _mocked_save
-    ):
-        state = apply_search_update(empty_search_state(), {
-            "area_status": "known", "areas": ["Bangsar"],
-        })
-        mocked_bubble.side_effect = [
-            {"lead": "lead-1"},
-            {"AIsearchtext": "legacy profile", "searchBriefJSON": json.dumps(state)},
-        ]
-
-        app_module.advance_property_search("folio-1", "live", {})
-
-        mocked_extract.assert_not_called()
-
-    def test_structured_profile_text_remains_complete_for_matching(self):
+    def test_derived_profile_text_remains_available_for_bubble_display(self):
         text = app_module.search_state_to_requirements_text(complete_state())
         self.assertIn("Areas: Bangsar", text)
         self.assertIn("Property types: Condo", text)
@@ -534,27 +455,6 @@ class SearchFlowStateTests(unittest.TestCase):
         ))
 
     @patch("app.save_search_state")
-    @patch("app.extract_search_update_from_profile")
-    @patch("app.bubble")
-    def test_existing_saved_preferences_are_migrated_and_not_reasked(
-        self, mocked_bubble, mocked_extract, _mocked_save
-    ):
-        mocked_bubble.side_effect = [
-            {"lead": "lead-1"},
-            {"AIsearchtext": "Bangsar; condo; 4 bedrooms", "searchBriefJSON": ""},
-        ]
-        mocked_extract.return_value = {
-            "area_status": "known", "areas": ["Bangsar"],
-            "regular_destinations": [], "property_types": ["condo"],
-            "bedroom_requirement": "4 bedrooms", "budget_requirement": "",
-            "other_requirements": [], "other_requirements_answered": False,
-            "priorities": [], "priorities_answered": False,
-        }
-        result = app_module.advance_property_search("folio-1", "live", {})
-        self.assertEqual(result["text"], "What's your monthly rental budget?")
-        mocked_extract.assert_called_once()
-
-    @patch("app.save_search_state")
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
     def test_complete_brief_recommends_condos_before_inventory(
@@ -567,7 +467,9 @@ class SearchFlowStateTests(unittest.TestCase):
             [{"condo_name": "One Menerung", "reason": "Fits the brief"}],
             "I'd focus on One Menerung.",
         )
-        result = app_module.advance_property_search("folio-1", "live", {})
+        result = app_module.advance_property_search(
+            "folio-1", "live", {"recommend_condos": True}
+        )
         self.assertEqual(result["action"], "condo_shortlist")
         self.assertIn("Which would you like to explore?", result["text"])
 
@@ -580,17 +482,6 @@ class SearchFlowStateTests(unittest.TestCase):
             self.assertFalse(app_module._listing_is_in_condo_scope(
                 listing, ["Ken Bangsar"], "https://bubble.test", {}
             ))
-
-    def test_search_update_preserves_nuance_and_multiple_preferences(self):
-        text = app_module.search_update_preference_text({
-            "bedroom_requirement": "minimum 4 bedrooms; 3+1 acceptable",
-            "other_requirements": ["dog allowed", "two car parks", "balcony"],
-            "priorities": ["school commute", "space", "security"],
-        })
-        self.assertIn("minimum 4 bedrooms; 3+1 acceptable", text)
-        self.assertIn("dog allowed, two car parks, balcony", text)
-        self.assertIn("school commute, space, security", text)
-
 
 if __name__ == "__main__":
     unittest.main()
