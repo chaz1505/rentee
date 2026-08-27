@@ -25,6 +25,9 @@ def empty_search_state():
         "priorities_answered": False,
         "recommended_condos": [],
         "selected_condos": [],
+        "liked_condos": [],
+        "disliked_condos": [],
+        "preference_notes": [],
     }
 
 
@@ -131,6 +134,12 @@ def apply_search_update(state, update):
         state["priorities_answered"] = True
         state["priorities"] = _unique(update.get("priorities", []))[:3]
 
+    for key in ("liked_condos", "disliked_condos", "preference_notes"):
+        additions = _unique(update.get(key, []))
+        if additions:
+            combined = _unique(state[key] + additions)
+            state[key] = combined
+
     if material_change:
         state["recommended_condos"] = []
         state["selected_condos"] = []
@@ -188,8 +197,10 @@ def set_recommended_condos(state, condo_names):
 def listing_search_scope(state, selected_condos=None, use_full_shortlist=False):
     state = load_search_state(state)
     shortlist = state["recommended_condos"]
-    if not search_brief_complete(state) or not shortlist:
+    if not shortlist:
         return []
+    disliked = {name.casefold() for name in state["disliked_condos"]}
+    shortlist = [name for name in shortlist if name.casefold() not in disliked]
     selected = _unique(selected_condos or state["selected_condos"])
     if selected and not use_full_shortlist:
         allowed = {name.casefold() for name in shortlist}

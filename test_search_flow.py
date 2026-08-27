@@ -274,6 +274,85 @@ class SearchFlowStateTests(unittest.TestCase):
             ["furnished", "balcony", "dog allowed"],
         )
 
+    def test_customer_reaction_is_retained_and_filters_listing_scope(self):
+        state = set_recommended_condos(
+            complete_state(), ["One Menerung", "Ken Bangsar", "The Loft"]
+        )
+        updated = apply_search_update(state, {
+            "liked_condos": ["One Menerung"],
+            "disliked_condos": ["The Loft"],
+            "preference_notes": ["Does not like dense developments", "Values space"],
+        })
+        self.assertEqual(updated["liked_condos"], ["One Menerung"])
+        self.assertEqual(updated["disliked_condos"], ["The Loft"])
+        self.assertIn("Values space", updated["preference_notes"])
+        self.assertEqual(
+            listing_search_scope(updated, use_full_shortlist=True),
+            ["One Menerung", "Ken Bangsar"],
+        )
+
+    @patch("app.save_search_state")
+    @patch("app.bubble")
+    def test_model_can_choose_a_useful_question(self, mocked_bubble, _mocked_save):
+        mocked_bubble.side_effect = [{"lead": "lead-1"}, {"searchBriefJSON": ""}]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "bedroom_requirement": "3 bedrooms",
+            "question": "Where do you need to travel most days?",
+        })
+        self.assertEqual(result["action"], "ask")
+        self.assertEqual(result["text"], "Where do you need to travel most days?")
+
+    @patch("app.save_search_state")
+    @patch("app.recommend_condos_for_search")
+    @patch("app.bubble")
+    def test_model_can_recommend_before_every_field_is_known(
+        self, mocked_bubble, mocked_recommend, _mocked_save
+    ):
+        mocked_bubble.side_effect = [{"lead": "lead-1"}, {"searchBriefJSON": ""}]
+        mocked_recommend.return_value = (
+            [{"condo_name": "One Menerung", "reason": "Strong family fit"}],
+            "One Menerung is a strong place to start.",
+        )
+        result = app_module.advance_property_search("folio-1", "live", {
+            "regular_destinations": ["Bangsar South", "Garden International School"],
+            "bedroom_requirement": "3 bedrooms",
+            "budget_requirement": "around RM12k",
+            "recommend_condos": True,
+        })
+        self.assertEqual(result["action"], "condo_shortlist")
+        mocked_recommend.assert_called_once()
+
+    @patch("app.save_search_state")
+    @patch("app.recommend_condos_for_search")
+    @patch("app.bubble")
+    def test_just_recommend_uses_saved_context_and_customer_reaction(
+        self, mocked_bubble, mocked_recommend, _mocked_save
+    ):
+        stored = set_recommended_condos(
+            complete_state(), ["One Menerung", "The Loft"]
+        )
+        stored = apply_search_update(stored, {
+            "disliked_condos": ["The Loft"],
+            "preference_notes": ["Prefers lower-density developments"],
+        })
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"}, {"searchBriefJSON": dump_search_state(stored)}
+        ]
+        mocked_recommend.return_value = (
+            [{"condo_name": "Ken Bangsar", "reason": "Better fit"}],
+            "Ken Bangsar is the better next option.",
+        )
+        result = app_module.advance_property_search("folio-1", "live", {
+            "recommend_condos": True,
+        })
+        recommended_state = mocked_recommend.call_args.args[0]
+        self.assertEqual(result["action"], "condo_shortlist")
+        self.assertEqual(recommended_state["disliked_condos"], ["The Loft"])
+        self.assertIn(
+            "Prefers lower-density developments",
+            recommended_state["preference_notes"],
+        )
+
     def test_active_instructions_are_small_and_skill_based(self):
         instructions = app_module.build_response_args("Help me find a home")["instructions"]
         self.assertLess(len(instructions), 5000)
@@ -313,7 +392,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("get_condo_info", tools)
         self.assertIn("get_property_details", tools)
         self.assertIn("match_lead", tools)
-        self.assertIn("next useful customer-facing result", tools["advance_property_search"]["description"])
+        self.assertIn("chosen customer-facing result", tools["advance_property_search"]["description"])
 
     def test_property_search_skill_covers_area_intent_without_a_script(self):
         instructions = app_module.build_response_args(

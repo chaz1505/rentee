@@ -328,8 +328,16 @@ def build_response_args(user_message, previous_response_id=None):
         "priorities": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
         "priorities_answered": {"type": "boolean"},
         "selected_condos": {"type": "array", "items": {"type": "string"}},
+        "liked_condos": {"type": "array", "items": {"type": "string"}},
+        "disliked_condos": {"type": "array", "items": {"type": "string"}},
+        "preference_notes": {"type": "array", "items": {"type": "string"}},
         "use_full_shortlist": {"type": "boolean"},
         "search_listings": {"type": "boolean"},
+        "recommend_condos": {"type": "boolean"},
+        "question": {
+            "type": "string",
+            "description": "One useful question to ask if recommendations are not ready.",
+        },
     }
     args = {
         "model": "gpt-5-mini",
@@ -344,11 +352,11 @@ def build_response_args(user_message, previous_response_id=None):
                     "new searches, refinements, area or condo recommendations, and listing "
                     "requests grounded in the saved condo shortlist. Send every requirement "
                     "stated in the current message; unchanged fields may be empty. Returns the "
-                    "next useful customer-facing result or a listing-search scope."
+                    "chosen customer-facing result or a grounded listing-search scope."
                 ),
                 "parameters": {
                     "type": "object", "properties": search_properties,
-                    "required": list(search_properties), "additionalProperties": False,
+                    "required": [], "additionalProperties": False,
                 },
             },
             {
@@ -1205,12 +1213,15 @@ def area_recommendation_text(search_state):
         f"{index}. {item['area_name']} — {item['reason']}"
         for index, item in enumerate(state["area_recommendations"], 1)
     )
-    lines.extend(["", "Which of those areas sounds closest to what you want?"])
+    lines.extend([
+        "",
+        "These are good starting points; your reaction to them will help me refine the search.",
+    ])
     return "\n".join(lines)
 
 
 def advance_property_search(folio_id, bubble_env, update):
-    """Advance the durable brief and return the next deterministic action."""
+    """Persist search facts and execute the useful action chosen for this turn."""
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
@@ -1222,6 +1233,19 @@ def advance_property_search(folio_id, bubble_env, update):
             state, extract_search_update_from_profile(lead["AIsearchtext"])
         )
     state = apply_search_update(state, update)
+
+    scope = listing_search_scope(
+        state,
+        selected_condos=update.get("selected_condos"),
+        use_full_shortlist=bool(update.get("use_full_shortlist")),
+    )
+    if update.get("search_listings") and scope:
+        state["selected_condos"] = list(scope)
+        save_search_state(lead_id, state, base_url)
+        return {
+            "action": "search_listings", "scope": scope,
+            "state": state, "lead_id": lead_id,
+        }
 
     if area_recommendation_needed(state):
         if not state["area_recommendations"]:
@@ -1238,14 +1262,9 @@ def advance_property_search(folio_id, bubble_env, update):
             "recommendations": state["area_recommendations"],
         }
 
-    if not search_brief_complete(state):
-        save_search_state(lead_id, state, base_url)
-        return {
-            "action": "ask", "text": next_search_question(state),
-            "state": state, "lead_id": lead_id,
-        }
-
-    if not state["recommended_condos"]:
+    if update.get("recommend_condos") or (
+        search_brief_complete(state) and not state["recommended_condos"]
+    ):
         recommendations, response_text = recommend_condos_for_search(state)
         state = set_recommended_condos(
             state, [item["condo_name"] for item in recommendations]
@@ -1259,24 +1278,17 @@ def advance_property_search(folio_id, bubble_env, update):
             "recommendations": recommendations,
         }
 
-    scope = listing_search_scope(
-        state,
-        selected_condos=update.get("selected_condos"),
-        use_full_shortlist=bool(update.get("use_full_shortlist")),
-    )
-    if update.get("search_listings") and scope:
-        state["selected_condos"] = list(scope)
-        state["stage"] = "SEARCH_LISTINGS"
-        save_search_state(lead_id, state, base_url)
-        return {
-            "action": "search_listings", "scope": scope,
-            "state": state, "lead_id": lead_id,
-        }
-
     save_search_state(lead_id, state, base_url)
+    question = str(update.get("question") or "").strip()
+    if not question:
+        question = next_search_question(state)
+    if not question and state["recommended_condos"]:
+        question = "Which of these condos would you like to explore?"
+    if not question:
+        question = "What would make a home feel like the right fit for you?"
     return {
         "action": "ask",
-        "text": "Which of these condos would you like to explore?",
+        "text": question,
         "state": state,
         "lead_id": lead_id,
     }
