@@ -277,6 +277,19 @@ class SearchFlowStateTests(unittest.TestCase):
         shortlisted = app_module.shortlist_structured_listings(lead, listings)
         self.assertEqual([item["_id"] for item in shortlisted], ["one", "loft"])
 
+    @patch("app.bubble", side_effect=app_module.requests.HTTPError("404 geo unavailable"))
+    def test_unavailable_geo_api_does_not_abort_structured_update(self, _mocked_bubble):
+        update = app_module.structured_lead_update({
+            "transaction_type": "rent",
+            "bedrooms_min": 3,
+            "budget_rent": 12000,
+            "geo_names": ["Bangsar"],
+        }, "https://bubble.test")
+        self.assertEqual(update["TransactionType"], ["Rent/Let"])
+        self.assertEqual(update["bedroomsMin"], 3)
+        self.assertEqual(update["budgetRent"], 12000)
+        self.assertNotIn("Geo", update)
+
     @patch("app.get_all_listings")
     @patch("app.bubble")
     def test_matching_prompt_uses_structured_fields_not_ai_search_text(

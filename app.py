@@ -1025,7 +1025,15 @@ def get_named_object_ids(base_url, object_type, names):
     matches = []
     cursor = 0
     while wanted:
-        page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
+        try:
+            page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
+        except requests.RequestException as error:
+            print(
+                f"Bubble {object_type} relationship lookup unavailable; "
+                f"leaving the existing Lead relationship unchanged: {error}",
+                flush=True,
+            )
+            return matches
         results = page.get("results", []) or []
         for record in results:
             candidate = next(
