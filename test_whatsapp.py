@@ -1,6 +1,7 @@
 import json
 import os
 import unittest
+import requests
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -54,6 +55,26 @@ class WhatsAppTests(unittest.TestCase):
     def test_phone_normalization_equates_common_formats(self):
         values = ["+60123456789", "60123456789", "60 12 345 6789", "+60-12-345-6789"]
         self.assertEqual({app_module.normalize_phone(value) for value in values}, {"60123456789"})
+
+    @patch("app.requests.get")
+    def test_bubble_get_authenticates_and_preserves_caller_headers(self, mocked_get):
+        mocked_get.return_value.json.return_value = {"response": {"ok": True}}
+        mocked_get.return_value.raise_for_status.return_value = None
+        result = app_module.bubble(
+            "https://bubble.test/api/1.1/obj/lead",
+            headers={
+                "X-Request-Source": "whatsapp",
+                "Authorization": "Bearer caller-must-not-replace-server-token",
+            },
+            params={"cursor": 0},
+        )
+        self.assertEqual(result, {"ok": True})
+        headers = mocked_get.call_args.kwargs["headers"]
+        self.assertEqual(
+            headers["Authorization"], f"Bearer {app_module.BUBBLE_API_TOKEN}"
+        )
+        self.assertEqual(headers["X-Request-Source"], "whatsapp")
+        self.assertEqual(mocked_get.call_args.kwargs["params"], {"cursor": 0})
 
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
@@ -254,19 +275,32 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_args.kwargs["json"]["text"]["body"], "Hello from Rentee")
 
     @patch("app.bubble")
-    def test_phone_fallback_hydrates_existing_lead(self, mocked_bubble):
-        hydrated = {
-            "_id": "lead-a", "phone": "+60 12 345 6789",
-            "searchBriefJSON": json.dumps({"areas": ["Bangsar"]}),
-        }
-        mocked_bubble.side_effect = [
-            {"results": [], "remaining": 0},
-            {"results": [{"_id": "lead-a", "phone": "+60 12 345 6789"}],
-             "remaining": 0},
-            hydrated,
-        ]
+    @patch("app._bubble_records", return_value=iter([]))
+    def test_exact_phone_lookup_no_match_returns_none_without_enumeration(
+        self, mocked_records, mocked_bubble
+    ):
         found = app_module.find_lead_by_phone("60123456789")
-        self.assertEqual(found, hydrated)
+        self.assertIsNone(found)
+        mocked_records.assert_called_once()
+        constraints = mocked_records.call_args.args[2]
+        self.assertEqual(constraints, [{
+            "key": "phone", "constraint_type": "equals", "value": "60123456789"
+        }])
+        mocked_bubble.assert_not_called()
+
+    @patch("app._bubble_records")
+    def test_exact_phone_lookup_propagates_api_error_without_fallback(
+        self, mocked_records
+    ):
+        mocked_records.side_effect = requests.RequestException("Bubble unavailable")
+        with patch("builtins.print") as mocked_print, self.assertRaises(
+            requests.RequestException
+        ):
+            app_module.find_lead_by_phone("60123456789")
+        mocked_records.assert_called_once()
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("...6789", logs)
+        self.assertNotIn("60123456789", logs)
 
     @patch("app._bubble_records")
     def test_latest_ai_message_is_lead_scoped_filtered_and_newest(self, mocked_records):
@@ -366,23 +400,16 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual((folio_id, created), ("folio-x", False))
         mocked_create.assert_not_called()
 
-    @patch("app._bubble_records")
-    @patch("app.bubble")
-    def test_different_sender_resolves_only_its_own_lead(
-        self, mocked_bubble, mocked_records
+    @patch("app._bubble_create")
+    @patch("app.bubble", return_value={"_id": "lead-existing", "phone": "60123456789"})
+    @patch("app._bubble_records", return_value=iter([{"_id": "lead-existing"}]))
+    def test_exact_lookup_makes_whatsapp_reuse_lead_without_duplicate_creation(
+        self, _mocked_records, _mocked_bubble, mocked_create
     ):
-        leads = [
-            {"_id": "lead-a", "phone": "60111111111"},
-            {"_id": "lead-b", "phone": "60222222222"},
-        ]
-        mocked_records.side_effect = [iter([]), iter(leads), iter([]), iter(leads)]
-        mocked_bubble.side_effect = lambda url, **_kwargs: next(
-            lead for lead in leads if url.endswith(lead["_id"])
-        )
-        first = app_module.find_lead_by_phone("+60 11 111 1111")
-        second = app_module.find_lead_by_phone("+60 22 222 2222")
-        self.assertEqual(first["_id"], "lead-a")
-        self.assertEqual(second["_id"], "lead-b")
+        lead, created = app_module.find_or_create_whatsapp_lead("+60 12 345 6789")
+        self.assertEqual(lead["_id"], "lead-existing")
+        self.assertFalse(created)
+        mocked_create.assert_not_called()
 
     def test_build_folio_url_uses_customer_folio_route(self):
         folio_id = "1787842581873x206575709934321660"

@@ -54,9 +54,6 @@ CONDO_SHEET_TIMEOUT_SECONDS = 15
 WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
-WHATSAPP_LEAD_PHONE_FIELDS = (
-    "phone", "Phone", "phoneNumber", "Phone number", "Phone Number", "mobile", "Mobile",
-)
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
@@ -497,8 +494,13 @@ def parse_completed_tool_arguments(tool_call):
 
 
 def bubble(url, **kwargs):
-
-    r = requests.get(url, timeout=30, **kwargs)
+    caller_headers = dict(kwargs.pop("headers", {}) or {})
+    headers = _bubble_headers()
+    headers.update(caller_headers)
+    # Bubble reads are always privileged server-to-server calls. A caller may add
+    # headers, but cannot accidentally replace the configured API credential.
+    headers["Authorization"] = f"Bearer {BUBBLE_API_TOKEN}"
+    r = requests.get(url, timeout=30, headers=headers, **kwargs)
 
     r.raise_for_status()
 
@@ -563,13 +565,12 @@ def find_lead_by_phone(phone, bubble_env="live"):
                 hydrated.setdefault(WHATSAPP_LEAD_PHONE_FIELD, canonical)
                 return hydrated
     except requests.RequestException as error:
-        print(f"Exact Lead phone lookup unavailable; using normalized fallback: {error}", flush=True)
-    for lead in _bubble_records(base_url, "lead"):
-        if any(
-            normalize_phone(lead.get(field)) == canonical
-            for field in WHATSAPP_LEAD_PHONE_FIELDS
-        ):
-            return bubble(f"{base_url}/obj/lead/{lead['_id']}")
+        print(
+            "Authenticated exact Lead phone lookup failed for "
+            f"...{canonical[-4:]}: {type(error).__name__}",
+            flush=True,
+        )
+        raise
     return None
 
 
