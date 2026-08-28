@@ -145,7 +145,7 @@ class WhatsAppTests(unittest.TestCase):
         mocked_lead.return_value = (lead, False)
         mocked_latest.return_value = {
             "_id": "bubble-message-1", "lead": "lead-1",
-            "own_Sent?": False, "response_ID": "response-1",
+            "own_Sent?": "No", "response_ID": "response-1",
         }
         mocked_turn.return_value = (
             "Here are two suitable Bangsar homes.", "response-2", False
@@ -178,9 +178,9 @@ class WhatsAppTests(unittest.TestCase):
     ])
     @patch("app.find_latest_ai_message", side_effect=[
         None,
-        {"_id": "message-1", "lead": "lead-1", "own_Sent?": False,
+        {"_id": "message-1", "lead": "lead-1", "own_Sent?": "No",
          "response_ID": "response-1", "Created Date": "2026-08-28T01:00:00Z"},
-        {"_id": "message-2", "lead": "lead-1", "own_Sent?": False,
+        {"_id": "message-2", "lead": "lead-1", "own_Sent?": "No",
          "response_ID": "response-2", "Created Date": "2026-08-28T02:00:00Z"},
     ])
     @patch("app.send_whatsapp_text")
@@ -232,7 +232,7 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_records")
     def test_response_continuity_survives_python_memory_restart(self, mocked_records):
         mocked_records.return_value = iter([{
-            "_id": "message-previous", "lead": "lead-a", "own_Sent?": False,
+            "_id": "message-previous", "lead": "lead-a", "own_Sent?": "No",
             "response_ID": "resp-durable", "Created Date": "2026-08-28T03:00:00Z",
         }])
         app_module._whatsapp_processing_ids.clear()
@@ -271,36 +271,32 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_records")
     def test_latest_ai_message_is_lead_scoped_filtered_and_newest(self, mocked_records):
         mocked_records.return_value = iter([
-            {"_id": "own", "lead": "lead-a", "own_Sent?": True,
+            {"_id": "own", "lead": "lead-a", "own_Sent?": "Yes",
              "response_ID": "ignore-own", "Created Date": "2026-08-28T05:00:00Z"},
-            {"_id": "empty", "lead": "lead-a", "own_Sent?": False,
+            {"_id": "empty", "lead": "lead-a", "own_Sent?": "No",
              "response_ID": "", "Created Date": "2026-08-28T04:00:00Z"},
-            {"_id": "other", "lead": "lead-b", "own_Sent?": False,
+            {"_id": "other", "lead": "lead-b", "own_Sent?": "No",
              "response_ID": "ignore-other", "Created Date": "2026-08-28T06:00:00Z"},
-            {"_id": "older", "lead": "lead-a", "own_Sent?": False,
+            {"_id": "older", "lead": "lead-a", "own_Sent?": "No",
              "response_ID": "resp-1", "Created Date": "2026-08-28T01:00:00Z"},
-            {"_id": "newer", "lead": "lead-a", "own_Sent?": False,
+            {"_id": "newer", "lead": "lead-a", "own_Sent?": "No",
              "response_ID": "resp-2", "Created Date": "2026-08-28T02:00:00Z"},
         ])
-        latest = app_module.find_latest_ai_message("lead-a")
+        with patch("builtins.print") as mocked_print:
+            latest = app_module.find_latest_ai_message("lead-a")
         self.assertEqual(latest["_id"], "newer")
         self.assertEqual(latest["response_ID"], "resp-2")
         args = mocked_records.call_args.args
         self.assertEqual(args[1], "message")
         constraints = args[2]
-        self.assertIn(
-            {"key": "lead", "constraint_type": "equals", "value": "lead-a"},
-            constraints,
-        )
-        self.assertIn(
-            {"key": "own_Sent?", "constraint_type": "not equal", "value": True},
-            constraints,
-        )
-        self.assertIn(
-            {"key": "response_ID", "constraint_type": "not empty", "value": ""},
-            constraints,
-        )
-        self.assertEqual(args[3], {"sort_field": "Created Date", "descending": True})
+        self.assertEqual(constraints, [
+            {"key": "lead", "constraint_type": "equals", "value": "lead-a"}
+        ])
+        self.assertEqual(len(args), 3)
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("messages_fetched=5", logs)
+        self.assertIn("eligible_messages=2", logs)
+        self.assertIn("own_sent_values=['No', 'Yes']", logs)
 
     @patch("app._bubble_create", return_value="message-current")
     def test_current_ai_message_uses_existing_bubble_semantics(self, mocked_create):
@@ -308,7 +304,7 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message_id, "message-current")
         mocked_create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "message",
-            {"lead": "lead-a", "own_Sent?": False, "messageContent": ""},
+            {"lead": "lead-a", "own_Sent?": "No", "messageContent": ""},
         )
 
     @patch("app.requests.patch")

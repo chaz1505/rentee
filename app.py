@@ -649,17 +649,12 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
     base_url = get_bubble_base_url(bubble_env)
     constraints = [
         {"key": "lead", "constraint_type": "equals", "value": lead_id},
-        {"key": "own_Sent?", "constraint_type": "not equal", "value": True},
-        {"key": "response_ID", "constraint_type": "not empty", "value": ""},
     ]
-    messages = list(_bubble_records(
-        base_url, "message", constraints,
-        {"sort_field": "Created Date", "descending": True},
-    ))
+    messages = list(_bubble_records(base_url, "message", constraints))
     eligible = [
         message for message in messages
         if message.get("lead") == lead_id
-        and message.get("own_Sent?") is not True
+        and str(message.get("own_Sent?") or "").strip().casefold() != "yes"
         and str(message.get("response_ID") or "").strip()
         and message.get("_id")
     ]
@@ -670,13 +665,32 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
         ),
         reverse=True,
     )
-    return eligible[0] if eligible else None
+    previous = eligible[0] if eligible else None
+    previous_response_id = (
+        str(previous.get("response_ID") or "").strip() if previous else None
+    )
+    own_sent_values = sorted({
+        str(message.get("own_Sent?") or "").strip() for message in messages
+    })
+    print(
+        "[WHATSAPP MESSAGE HISTORY] "
+        f"lead_id={lead_id} messages_fetched={len(messages)} "
+        f"eligible_messages={len(eligible)} "
+        f"previous_message_id={previous.get('_id') if previous else None} "
+        f"previous_response_id={previous_response_id}",
+        flush=True,
+    )
+    print(
+        f"[WHATSAPP MESSAGE HISTORY] own_sent_values={own_sent_values}",
+        flush=True,
+    )
+    return previous
 
 
 def create_whatsapp_ai_message(lead_id, bubble_env="live"):
     return _bubble_create(get_bubble_base_url(bubble_env), "message", {
         "lead": lead_id,
-        "own_Sent?": False,
+        "own_Sent?": "No",
         "messageContent": "",
     })
 
@@ -2283,7 +2297,8 @@ def _process_whatsapp_message(message):
             previous_message = find_latest_ai_message(lead_id, "live")
             previous_message_id = previous_message.get("_id") if previous_message else None
             previous_response_id = (
-                previous_message.get("response_ID") if previous_message else None
+                str(previous_message.get("response_ID") or "").strip()
+                if previous_message else None
             )
             current_message_id = create_whatsapp_ai_message(lead_id, "live")
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
