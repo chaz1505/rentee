@@ -450,6 +450,14 @@ class WhatsAppTests(unittest.TestCase):
             self.assertNotIn(f"listing-internal-{index}", result)
             self.assertNotIn(f"condo-internal-{index}", result)
 
+    @patch("app.get_current_recommendations", return_value=json.dumps({
+        "current_recommendations": []
+    }))
+    def test_empty_folio_recommendation_summary_returns_none(self, _mocked_current):
+        self.assertIsNone(
+            app_module.build_whatsapp_recommendation_summary("folio-empty")
+        )
+
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-current")
     @patch("app.find_latest_ai_message", return_value=None)

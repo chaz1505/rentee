@@ -43,7 +43,7 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 RANKING_CANDIDATE_LIMIT = 40
 RETRIEVAL_CANDIDATE_TARGET = 120
 INITIAL_MAX_OUTPUT_TOKENS = 800
-RANKING_MAX_OUTPUT_TOKENS = 1600
+RANKING_MAX_OUTPUT_TOKENS = 3000
 FINAL_MAX_OUTPUT_TOKENS = 1200
 CONDO_SHEET_CSV_URL = (
     "https://docs.google.com/spreadsheets/d/"
@@ -91,6 +91,14 @@ def rentee_instructions():
 
 class CondoDataError(RuntimeError):
     pass
+
+
+class MatchingResult(str):
+    """Customer text with a private signal that grounded Folio matches exist."""
+    def __new__(cls, text, recommendations_available=False):
+        value = super().__new__(cls, text)
+        value.recommendations_available = bool(recommendations_available)
+        return value
 
 
 def normalize_condo_name(value):
@@ -970,7 +978,7 @@ def get_current_recommendations(folio_id, bubble_env):
         except Exception as error:
             print(f"Failed to load current recommendation: {error}", flush=True)
     if not listings:
-        return "No current recommended listings were found in this Folio."
+        return json.dumps({"current_recommendations": []}, ensure_ascii=False)
     condo_ids = [listing.get("condo") for listing in listings if listing.get("condo")]
     condo_names = get_relationship_names(base_url, "condo", condo_ids)
     for listing in listings:
@@ -1392,7 +1400,9 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     prompt = (
         "Rank the grounded listings for this customer. Use the structured facts and "
         "make sensible trade-offs, including fit with the customer's budget tier. "
-        "Recommend only genuine fits and mention material compromises. Never invent "
+        "Return at most the 7 strongest genuine fits rather than exhaustively describing "
+        "every plausible listing. Keep each reco_summary concise and mention material "
+        "compromises. Never invent "
         "facts. Use property_name or condo_name in customer-facing prose and never expose "
         "listing_id or other internal IDs. Briefly explain why each option fits. Return JSON "
         "matching the supplied schema.\n\n"
@@ -1424,11 +1434,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
                     "properties": {
                         "recommendations": {
                             "type": "array",
+                            "maxItems": 7,
                             "items": {
                                 "type": "object",
                                 "properties": {
                                     "listing_id": {"type": "string"},
-                                    "reco_summary": {"type": "string"}
+                                    "reco_summary": {"type": "string", "maxLength": 240}
                                 },
                                 "required": ["listing_id", "reco_summary"],
                                 "additionalProperties": False
@@ -1498,6 +1509,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     yield "Updating your shortlist..."
 
+    recommendations_available = not new_recommendations
     if new_recommendations:
         folio_items_update_started = time.perf_counter()
         clear_started = time.perf_counter()
@@ -1517,16 +1529,17 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             message_id
         )
 
-        if new_folio_item_ids is not None:
+        if new_folio_item_ids:
             final_folio_item_ids = existing_folio_item_ids + new_folio_item_ids
             try:
                 update_folio_items(folio_id, final_folio_item_ids, base_url)
+                recommendations_available = True
             except Exception as error:
                 print(f"Failed to update Folio Items: {error}", flush=True)
         log_timing("match_lead - update FolioItems", folio_items_update_started)
 
     log_timing("match_lead TOTAL", match_started)
-    return customer_response
+    return MatchingResult(customer_response, recommendations_available)
 
 
 def stream_match_lead(folio_id, bubble_env, message_id, condo_scope=None):
@@ -2064,7 +2077,7 @@ def chat_stream():
                         folio_id, bubble_env, tool_args
                     )
                     if search_result["action"] == "search_listings":
-                        recommendations = execute_match_lead_silently(
+                        matching_result = execute_match_lead_silently(
                             folio_id,
                             bubble_env,
                             message_id,
@@ -2074,12 +2087,17 @@ def chat_stream():
                             search_result["lead_id"], search_result["state"],
                             get_bubble_base_url(bubble_env),
                         )
-                        has_match_results = True
-                        tool_result = (
-                            f"{recommendations}\n\nI've put together a curated selection "
-                            "based on your requirements. Please click INTERESTED on the "
-                            "properties you'd like to view."
-                        )
+                        has_match_results = bool(getattr(
+                            matching_result, "recommendations_available", False
+                        ))
+                        if has_match_results:
+                            tool_result = (
+                                f"{matching_result}\n\nI've put together a curated selection "
+                                "based on your requirements. Please click INTERESTED on the "
+                                "properties you'd like to view."
+                            )
+                        else:
+                            tool_result = str(matching_result)
                     else:
                         tool_result = search_result["text"]
                     follow_up_instructions = (
@@ -2088,12 +2106,15 @@ def chat_stream():
                         "listings, condos, requirements, or internal state."
                     )
                 elif tool_call.name == "match_lead":
-                    tool_result = execute_match_lead_silently(
+                    matching_result = execute_match_lead_silently(
                         folio_id, 
                         bubble_env,
                         message_id
                     )
-                    has_match_results = True
+                    has_match_results = bool(getattr(
+                        matching_result, "recommendations_available", False
+                    ))
+                    tool_result = str(matching_result)
                     follow_up_instructions = (
                         "The tool output already contains the final customer-facing answer. "
                         "Return it faithfully. Do not add, remove, reinterpret, embellish, "

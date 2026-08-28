@@ -169,7 +169,10 @@ class SearchFlowStateTests(unittest.TestCase):
         responses.create.assert_not_called()
 
     @patch("app.save_search_state")
-    @patch("app.execute_match_lead_silently", return_value="Grounded current matches")
+    @patch(
+        "app.execute_match_lead_silently",
+        return_value="I’m sorry, I couldn’t prepare your recommendations just now.",
+    )
     @patch("app.advance_property_search")
     def test_chat_listing_action_executes_matching_in_same_turn(
         self, mocked_advance, mocked_match, _mocked_save
@@ -212,6 +215,11 @@ class SearchFlowStateTests(unittest.TestCase):
         mocked_match.assert_called_once_with(
             "folio-1", "live", "message-1", ["One Menerung"]
         )
+        continuation = responses.stream.call_args_list[1].kwargs
+        tool_output = continuation["input"][0]["output"]
+        self.assertIn("couldn’t prepare", tool_output)
+        self.assertNotIn("curated selection", tool_output)
+        self.assertIn('"recommendations_relevant": false', body)
 
     @patch("app.save_search_state")
     @patch("app.recommend_areas_for_search")
@@ -427,7 +435,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(facts["priceRent"], 11500)
 
     @patch("app.update_folio_items")
-    @patch("app.create_folio_items", return_value=[])
+    @patch("app.create_folio_items", return_value=["folio-item-new"])
     @patch("app.get_plausible_listings")
     @patch("app.bubble")
     def test_recommendation_uses_name_and_reason_without_exposing_listing_id(
@@ -468,6 +476,12 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("One Menerung", answer)
         self.assertIn("four bedrooms", answer)
         self.assertIn("RM11,500", answer)
+        self.assertTrue(answer.recommendations_available)
+
+    @patch("app.bubble", return_value={"folioItems": []})
+    def test_empty_current_recommendations_always_return_json(self, _mocked_bubble):
+        result = json.loads(app_module.get_current_recommendations("folio-1", "live"))
+        self.assertEqual(result, {"current_recommendations": []})
 
     @patch("app.bubble")
     def test_listing_retrieval_stops_after_plausible_pool_is_large_enough(
@@ -542,6 +556,45 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("A real structured description", prompt)
         self.assertNotIn("LEGACY GENERATED PROFILE", prompt)
         self.assertNotIn("LEGACY GENERATED LISTING", prompt)
+        self.assertEqual(app_module.RANKING_MAX_OUTPUT_TOKENS, 3000)
+        self.assertEqual(create.call_args.kwargs["max_output_tokens"], 3000)
+        schema = create.call_args.kwargs["text"]["format"]["schema"]
+        recommendations = schema["properties"]["recommendations"]
+        self.assertEqual(recommendations["maxItems"], 7)
+        self.assertEqual(
+            recommendations["items"]["properties"]["reco_summary"]["maxLength"], 240
+        )
+
+    @patch("app.update_folio_items")
+    @patch("app.create_folio_items")
+    @patch("app.get_plausible_listings")
+    @patch("app.bubble")
+    def test_truncated_matching_json_creates_nothing_and_is_not_successful(
+        self, mocked_bubble, mocked_listings, mocked_create, mocked_update
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": []},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 3, "budgetRent": 15000},
+        ]
+        mocked_listings.return_value = ([{
+            "_id": "listing-1", "beds": 3, "priceRent": 12000,
+        }], 1)
+        response = SimpleNamespace(
+            output_text='{"recommendations":[{"listing_id":"listing-1","reco_summary":"unterminated',
+            usage=None,
+        )
+        with patch.object(app_module.client.responses, "create", return_value=response):
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration as completed:
+                    result = completed.value
+                    break
+        self.assertIn("couldn’t prepare your recommendations", result)
+        self.assertFalse(getattr(result, "recommendations_available", False))
+        mocked_create.assert_not_called()
+        mocked_update.assert_not_called()
 
     def test_selected_condos_are_limited_to_recommended_shortlist(self):
         state = set_recommended_condos(

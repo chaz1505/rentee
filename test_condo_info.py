@@ -376,7 +376,9 @@ class CondoInfoTests(unittest.TestCase):
     def test_match_lead_hides_internal_events_and_executes_completed_call_once(
         self, mocked_match
     ):
-        mocked_match.return_value = "One matching listing"
+        mocked_match.return_value = app_module.MatchingResult(
+            "One matching listing", recommendations_available=True
+        )
         tool_call = SimpleNamespace(
             type="function_call", name="match_lead",
             call_id="match-call", arguments="{}",
@@ -432,6 +434,7 @@ class CondoInfoTests(unittest.TestCase):
         )
         self.assertIn("I found one suitable option at One Menerung.", body)
         self.assertIn('"response_id": "match-final"', body)
+        self.assertIn('"recommendations_relevant": true', body)
         for leaked in (
             "# to=functions", "match_lead tool was called", "function_call",
             "awaiting results", "Searching available properties", '{"": ""}',
