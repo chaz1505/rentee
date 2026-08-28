@@ -92,16 +92,11 @@ class WhatsAppTests(unittest.TestCase):
     def test_exact_phone_constraint_reuses_lead_when_phone_is_hidden(self, mocked_bubble):
         mocked_bubble.side_effect = [
             {"results": [{"_id": "lead-existing"}], "remaining": 0},
-            {"_id": "lead-existing", "searchBriefJSON": json.dumps({
-                "channel_state": {"previous_response_id": "resp-1"}
-            })},
+            {"_id": "lead-existing", "searchBriefJSON": ""},
         ]
         lead = app_module.find_lead_by_phone("60123456789")
         self.assertEqual(lead["_id"], "lead-existing")
         self.assertEqual(lead["phone"], "60123456789")
-        self.assertEqual(
-            app_module._whatsapp_channel_state(lead)["previous_response_id"], "resp-1"
-        )
 
     @patch("app._bubble_create")
     @patch("app.find_lead_by_phone")
@@ -135,27 +130,26 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message["text"]["body"], "Hi")
         self.assertEqual(message["customer_name"], "Aisha")
 
-    @patch("app._persist_whatsapp_state")
-    @patch("app.bubble")
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="bubble-message-2")
+    @patch("app.find_latest_ai_message")
     @patch("app.send_whatsapp_text")
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.find_or_create_whatsapp_lead")
     def test_message_reuses_lead_context_and_sends_only_clean_final_answer(
         self, mocked_lead, _mocked_folio, mocked_turn, mocked_send,
-        mocked_bubble, mocked_persist
+        mocked_latest, _mocked_create, mocked_save
     ):
-        lead = {
-            "_id": "lead-1", "phone": "60123456789",
-            "searchBriefJSON": json.dumps({
-                "channel_state": {"previous_response_id": "response-1"}
-            }),
-        }
+        lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
+        mocked_latest.return_value = {
+            "_id": "bubble-message-1", "lead": "lead-1",
+            "own_Sent?": False, "response_ID": "response-1",
+        }
         mocked_turn.return_value = (
             "Here are two suitable Bangsar homes.", "response-2", False
         )
-        mocked_bubble.return_value = lead
 
         app_module._process_whatsapp_message(
             webhook_payload(text="Find me a 3-bed in Bangsar")["entry"][0]["changes"][0]["value"]["messages"][0]
@@ -163,68 +157,88 @@ class WhatsAppTests(unittest.TestCase):
 
         mocked_turn.assert_called_once_with(
             "Find me a 3-bed in Bangsar", "folio-1",
-            previous_response_id="response-1", message_id=None, bubble_env="live",
+            previous_response_id="response-1",
+            message_id="bubble-message-2", bubble_env="live",
         )
         mocked_send.assert_called_once_with(
             "60123456789", "Here are two suitable Bangsar homes."
         )
-        self.assertEqual(mocked_persist.call_count, 3)
+        mocked_save.assert_called_once_with(
+            "bubble-message-2", "Here are two suitable Bangsar homes.",
+            "response-2", "live",
+        )
         outgoing = mocked_send.call_args.args[1]
         for leaked in ("function_call", "# to=functions", "match_lead tool",
                        "advance_property_search", "awaiting results"):
             self.assertNotIn(leaked, outgoing)
 
-    @patch("app._persist_whatsapp_state")
-    @patch("app.find_or_create_whatsapp_lead")
-    def test_duplicate_message_does_not_run_ai_or_send_again(self, mocked_lead, _persist):
-        mocked_lead.return_value = ({
-            "_id": "lead-1", "phone": "60123456789",
-            "searchBriefJSON": json.dumps({
-                "channel_state": {"processed_message_ids": ["wamid.1"]}
-            }),
-        }, False)
-        with patch("app.run_rentee_turn") as mocked_turn, patch(
-            "app.send_whatsapp_text"
-        ) as mocked_send:
-            item = webhook_payload()["entry"][0]["changes"][0]["value"]["messages"][0]
-            app_module._process_whatsapp_message(item)
-        mocked_turn.assert_not_called()
-        mocked_send.assert_not_called()
-
-    @patch("app.bubble")
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", side_effect=[
+        "message-1", "message-2", "message-3"
+    ])
+    @patch("app.find_latest_ai_message", side_effect=[
+        None,
+        {"_id": "message-1", "lead": "lead-1", "own_Sent?": False,
+         "response_ID": "response-1", "Created Date": "2026-08-28T01:00:00Z"},
+        {"_id": "message-2", "lead": "lead-1", "own_Sent?": False,
+         "response_ID": "response-2", "Created Date": "2026-08-28T02:00:00Z"},
+    ])
     @patch("app.send_whatsapp_text")
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.find_or_create_whatsapp_lead")
-    def test_two_messages_reuse_persisted_openai_continuation(
-        self, mocked_lead, _folio, mocked_turn, _send, mocked_bubble
+    def test_three_messages_reuse_latest_persisted_openai_continuation(
+        self, mocked_lead, _folio, mocked_turn, _send, _latest, _create, mocked_save
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
-        mocked_bubble.return_value = lead
-        mocked_turn.side_effect = [("First reply", "response-1", False),
-                                   ("Second reply", "response-2", False)]
-
-        def persist(_lead_id, current_lead, channel_state, _env):
-            state = app_module.load_search_state(current_lead.get("searchBriefJSON"))
-            state["channel_state"] = dict(channel_state)
-            current_lead["searchBriefJSON"] = app_module.dump_search_state(state)
+        mocked_turn.side_effect = [
+            ("First reply", "response-1", False),
+            ("Second reply", "response-2", False),
+            ("Third reply", "response-3", False),
+        ]
 
         first = webhook_payload("wamid.1", text="Looking in Bangsar")
         second = webhook_payload("wamid.2", text="Budget is 12k")
-        with patch("app._persist_whatsapp_state", side_effect=persist):
-            app_module._process_whatsapp_message(
-                first["entry"][0]["changes"][0]["value"]["messages"][0])
-            app_module._process_whatsapp_message(
-                second["entry"][0]["changes"][0]["value"]["messages"][0])
+        third = webhook_payload("wamid.3", text="Rent please")
+        app_module._process_whatsapp_message(
+            first["entry"][0]["changes"][0]["value"]["messages"][0])
+        app_module._process_whatsapp_message(
+            second["entry"][0]["changes"][0]["value"]["messages"][0])
+        app_module._process_whatsapp_message(
+            third["entry"][0]["changes"][0]["value"]["messages"][0])
 
         self.assertIsNone(mocked_turn.call_args_list[0].kwargs["previous_response_id"])
         self.assertEqual(
             mocked_turn.call_args_list[1].kwargs["previous_response_id"], "response-1"
         )
         self.assertEqual(
-            _folio.call_args_list[1].args, ("lead-1", "live", "folio-1")
+            mocked_turn.call_args_list[2].kwargs["previous_response_id"], "response-2"
         )
+        self.assertEqual(
+            _folio.call_args_list[1].args, ("lead-1", "live")
+        )
+        self.assertEqual(
+            mocked_turn.call_args_list[0].kwargs["message_id"], "message-1"
+        )
+        self.assertEqual(
+            mocked_turn.call_args_list[1].kwargs["message_id"], "message-2"
+        )
+        self.assertEqual(
+            mocked_turn.call_args_list[2].kwargs["message_id"], "message-3"
+        )
+        self.assertEqual(mocked_save.call_count, 3)
+
+    @patch("app._bubble_records")
+    def test_response_continuity_survives_python_memory_restart(self, mocked_records):
+        mocked_records.return_value = iter([{
+            "_id": "message-previous", "lead": "lead-a", "own_Sent?": False,
+            "response_ID": "resp-durable", "Created Date": "2026-08-28T03:00:00Z",
+        }])
+        app_module._whatsapp_processing_ids.clear()
+        app_module._whatsapp_phone_locks.clear()
+        previous = app_module.find_latest_ai_message("lead-a")
+        self.assertEqual(previous["response_ID"], "resp-durable")
 
     @patch("app.requests.post")
     def test_send_whatsapp_uses_meta_text_endpoint_and_splits_only_long_text(self, mocked_post):
@@ -240,12 +254,10 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_args.kwargs["json"]["text"]["body"], "Hello from Rentee")
 
     @patch("app.bubble")
-    def test_phone_fallback_hydrates_existing_lead_with_persisted_state(self, mocked_bubble):
+    def test_phone_fallback_hydrates_existing_lead(self, mocked_bubble):
         hydrated = {
             "_id": "lead-a", "phone": "+60 12 345 6789",
-            "searchBriefJSON": json.dumps({
-                "channel_state": {"previous_response_id": "resp-1"}
-            }),
+            "searchBriefJSON": json.dumps({"areas": ["Bangsar"]}),
         }
         mocked_bubble.side_effect = [
             {"results": [], "remaining": 0},
@@ -255,9 +267,66 @@ class WhatsAppTests(unittest.TestCase):
         ]
         found = app_module.find_lead_by_phone("60123456789")
         self.assertEqual(found, hydrated)
-        self.assertEqual(
-            app_module._whatsapp_channel_state(found)["previous_response_id"], "resp-1"
+
+    @patch("app._bubble_records")
+    def test_latest_ai_message_is_lead_scoped_filtered_and_newest(self, mocked_records):
+        mocked_records.return_value = iter([
+            {"_id": "own", "lead": "lead-a", "own_Sent?": True,
+             "response_ID": "ignore-own", "Created Date": "2026-08-28T05:00:00Z"},
+            {"_id": "empty", "lead": "lead-a", "own_Sent?": False,
+             "response_ID": "", "Created Date": "2026-08-28T04:00:00Z"},
+            {"_id": "other", "lead": "lead-b", "own_Sent?": False,
+             "response_ID": "ignore-other", "Created Date": "2026-08-28T06:00:00Z"},
+            {"_id": "older", "lead": "lead-a", "own_Sent?": False,
+             "response_ID": "resp-1", "Created Date": "2026-08-28T01:00:00Z"},
+            {"_id": "newer", "lead": "lead-a", "own_Sent?": False,
+             "response_ID": "resp-2", "Created Date": "2026-08-28T02:00:00Z"},
+        ])
+        latest = app_module.find_latest_ai_message("lead-a")
+        self.assertEqual(latest["_id"], "newer")
+        self.assertEqual(latest["response_ID"], "resp-2")
+        args = mocked_records.call_args.args
+        self.assertEqual(args[1], "message")
+        constraints = args[2]
+        self.assertIn(
+            {"key": "lead", "constraint_type": "equals", "value": "lead-a"},
+            constraints,
         )
+        self.assertIn(
+            {"key": "own_Sent?", "constraint_type": "not equal", "value": True},
+            constraints,
+        )
+        self.assertIn(
+            {"key": "response_ID", "constraint_type": "not empty", "value": ""},
+            constraints,
+        )
+        self.assertEqual(args[3], {"sort_field": "Created Date", "descending": True})
+
+    @patch("app._bubble_create", return_value="message-current")
+    def test_current_ai_message_uses_existing_bubble_semantics(self, mocked_create):
+        message_id = app_module.create_whatsapp_ai_message("lead-a")
+        self.assertEqual(message_id, "message-current")
+        mocked_create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "message",
+            {"lead": "lead-a", "own_Sent?": False, "messageContent": ""},
+        )
+
+    @patch("app.requests.patch")
+    def test_completed_ai_message_saves_answer_and_response_id(self, mocked_patch):
+        mocked_patch.return_value.raise_for_status.return_value = None
+        app_module.save_whatsapp_ai_message(
+            "message-current", "Final answer", "resp-2"
+        )
+        self.assertTrue(mocked_patch.call_args.args[0].endswith(
+            "/obj/message/message-current"
+        ))
+        self.assertEqual(mocked_patch.call_args.kwargs["json"], {
+            "messageContent": "Final answer", "response_ID": "resp-2",
+        })
+
+    def test_search_brief_has_no_whatsapp_conversation_state(self):
+        state = app_module.load_search_state("")
+        self.assertNotIn("channel_state", state)
 
     @patch("app._bubble_create")
     @patch("app._bubble_records")
@@ -289,15 +358,17 @@ class WhatsAppTests(unittest.TestCase):
             "\n".join(str(call) for call in mocked_print.call_args_list),
         )
 
-    @patch("app.bubble")
-    def test_persisted_folio_survives_process_memory_restart(self, mocked_bubble):
-        mocked_bubble.return_value = {"_id": "folio-x", "lead": "lead-a"}
+    @patch("app._bubble_create")
+    @patch("app._bubble_records")
+    def test_folio_relationship_survives_process_memory_restart(
+        self, mocked_records, mocked_create
+    ):
+        mocked_records.return_value = iter([{"_id": "folio-x", "lead": "lead-a"}])
         app_module._whatsapp_phone_locks.clear()
         app_module._whatsapp_processing_ids.clear()
-        folio_id, created = app_module.find_or_create_lead_folio(
-            "lead-a", preferred_folio_id="folio-x"
-        )
+        folio_id, created = app_module.find_or_create_lead_folio("lead-a")
         self.assertEqual((folio_id, created), ("folio-x", False))
+        mocked_create.assert_not_called()
 
     @patch("app._bubble_records")
     @patch("app.bubble")
@@ -356,8 +427,9 @@ class WhatsAppTests(unittest.TestCase):
             self.assertNotIn(f"listing-internal-{index}", result)
             self.assertNotIn(f"condo-internal-{index}", result)
 
-    @patch("app._persist_whatsapp_state")
-    @patch("app.bubble")
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="bubble-message-current")
+    @patch("app.find_latest_ai_message", return_value=None)
     @patch("app.send_whatsapp_text")
     @patch("app.build_whatsapp_recommendation_summary")
     @patch("app.run_rentee_turn")
@@ -365,11 +437,10 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.find_or_create_whatsapp_lead")
     def test_recommendation_turn_uses_existing_folio_and_one_coherent_text_message(
         self, mocked_lead, mocked_folio, mocked_turn, mocked_summary,
-        mocked_send, mocked_bubble, _mocked_persist
+        mocked_send, _latest, _create, mocked_save
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
-        mocked_bubble.return_value = lead
         mocked_turn.return_value = ("Model recommendation", "resp-1", True)
         mocked_summary.return_value = (
             "Three grounded recommendations\n\n"
@@ -379,10 +450,13 @@ class WhatsAppTests(unittest.TestCase):
 
         app_module._process_whatsapp_message(item)
 
-        mocked_folio.assert_called_once_with("lead-1", "live", None)
+        mocked_folio.assert_called_once_with("lead-1", "live")
         mocked_summary.assert_called_once_with("folio-active", "live")
         mocked_send.assert_called_once_with(
             "60123456789", mocked_summary.return_value
+        )
+        mocked_save.assert_called_once_with(
+            "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
         )
 
 

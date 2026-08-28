@@ -529,10 +529,11 @@ def _bubble_create(base_url, object_type, payload):
     return object_id
 
 
-def _bubble_records(base_url, object_type, constraints=None):
+def _bubble_records(base_url, object_type, constraints=None, query_params=None):
     cursor = 0
     while True:
         params = {"cursor": cursor}
+        params.update(query_params or {})
         if constraints:
             params["constraints"] = json.dumps(constraints, separators=(",", ":"))
         page = bubble(f"{base_url}/obj/{object_type}", params=params)
@@ -621,18 +622,8 @@ def _select_existing_folio(folios, lead_id):
     return ordered[0]
 
 
-def find_or_create_lead_folio(lead_id, bubble_env="live", preferred_folio_id=None):
+def find_or_create_lead_folio(lead_id, bubble_env="live"):
     base_url = get_bubble_base_url(bubble_env)
-    if preferred_folio_id:
-        try:
-            preferred = bubble(f"{base_url}/obj/folio/{preferred_folio_id}")
-            if preferred.get("lead") == lead_id:
-                return preferred_folio_id, False
-        except requests.RequestException as error:
-            print(
-                f"[WHATSAPP CONVERSATION] persisted Folio unavailable; "
-                f"falling back to Lead relationship lookup: {error}", flush=True,
-            )
     constraints = [{"key": "lead", "constraint_type": "equals", "value": lead_id}]
     try:
         folios = list(_bubble_records(base_url, "folio", constraints))
@@ -653,25 +644,51 @@ def find_or_create_lead_folio(lead_id, bubble_env="live", preferred_folio_id=Non
     return folio_id, True
 
 
-def _whatsapp_channel_state(lead):
-    try:
-        brief = json.loads(lead.get("searchBriefJSON") or "{}")
-    except (TypeError, ValueError):
-        brief = {}
-    state = brief.get("channel_state")
-    return state if isinstance(state, dict) else {}
+def find_latest_ai_message(lead_id, bubble_env="live"):
+    """Mirror Bubble web chat's Lead-scoped previous-response lookup."""
+    base_url = get_bubble_base_url(bubble_env)
+    constraints = [
+        {"key": "lead", "constraint_type": "equals", "value": lead_id},
+        {"key": "own_Sent?", "constraint_type": "not equal", "value": True},
+        {"key": "response_ID", "constraint_type": "not empty", "value": ""},
+    ]
+    messages = list(_bubble_records(
+        base_url, "message", constraints,
+        {"sort_field": "Created Date", "descending": True},
+    ))
+    eligible = [
+        message for message in messages
+        if message.get("lead") == lead_id
+        and message.get("own_Sent?") is not True
+        and str(message.get("response_ID") or "").strip()
+        and message.get("_id")
+    ]
+    eligible.sort(
+        key=lambda message: (
+            str(message.get("Created Date") or message.get("created_date") or ""),
+            str(message["_id"]),
+        ),
+        reverse=True,
+    )
+    return eligible[0] if eligible else None
 
 
-def _persist_whatsapp_state(lead_id, lead, state, bubble_env="live"):
-    search_state = load_search_state(lead.get("searchBriefJSON"))
-    search_state["channel_state"] = state
+def create_whatsapp_ai_message(lead_id, bubble_env="live"):
+    return _bubble_create(get_bubble_base_url(bubble_env), "message", {
+        "lead": lead_id,
+        "own_Sent?": False,
+        "messageContent": "",
+    })
+
+
+def save_whatsapp_ai_message(message_id, answer, response_id, bubble_env="live"):
     response = requests.patch(
-        f"{get_bubble_base_url(bubble_env)}/obj/lead/{lead_id}",
-        headers=_bubble_headers(), json={"searchBriefJSON": dump_search_state(search_state)},
+        f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}",
+        headers=_bubble_headers(),
+        json={"messageContent": answer, "response_ID": response_id},
         timeout=30,
     )
     response.raise_for_status()
-    lead["searchBriefJSON"] = dump_search_state(search_state)
 
 
 def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
@@ -2262,34 +2279,29 @@ def _process_whatsapp_message(message):
                 phone, message.get("customer_name"), "live"
             )
             lead_id = lead["_id"]
-            channel_state = _whatsapp_channel_state(lead)
-            processed_ids = list(channel_state.get("processed_message_ids") or [])
-            if message_id in processed_ids:
-                print(f"Ignoring duplicate WhatsApp message {message_id}", flush=True)
-                return
-
-            previous_response_id = channel_state.get("previous_response_id")
-            processed_ids.append(message_id)
-            channel_state["processed_message_ids"] = processed_ids[-100:]
-            _persist_whatsapp_state(lead_id, lead, channel_state, "live")
-
-            folio_id, folio_created = find_or_create_lead_folio(
-                lead_id, "live", channel_state.get("folio_id")
+            folio_id, folio_created = find_or_create_lead_folio(lead_id, "live")
+            previous_message = find_latest_ai_message(lead_id, "live")
+            previous_message_id = previous_message.get("_id") if previous_message else None
+            previous_response_id = (
+                previous_message.get("response_ID") if previous_message else None
             )
-            channel_state["folio_id"] = folio_id
-            _persist_whatsapp_state(lead_id, lead, channel_state, "live")
+            current_message_id = create_whatsapp_ai_message(lead_id, "live")
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
             print(
                 "[WHATSAPP CONVERSATION] "
                 f"phone={safe_phone} lead_id={lead_id} lead_created={lead_created} "
                 f"folio_id={folio_id} folio_created={folio_created} "
+                f"previous_message_id={previous_message_id} "
                 f"previous_response_id={previous_response_id}",
+                flush=True,
+            )
+            print(
+                f"[WHATSAPP CONVERSATION] current_message_id={current_message_id}",
                 flush=True,
             )
             answer, response_id, recommendations_relevant = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
-                # A Meta ID is not a Bubble Message relationship ID.
-                message_id=None, bubble_env="live",
+                message_id=current_message_id, bubble_env="live",
             )
             if recommendations_relevant:
                 recommendation_summary = build_whatsapp_recommendation_summary(
@@ -2297,22 +2309,15 @@ def _process_whatsapp_message(message):
                 )
                 if recommendation_summary:
                     answer = recommendation_summary
+            save_whatsapp_ai_message(
+                current_message_id, answer, response_id, "live"
+            )
             send_whatsapp_text(phone, answer)
             reply_sent = True
-
-            fresh_lead = bubble(f"{get_bubble_base_url('live')}/obj/lead/{lead_id}")
-            fresh_channel_state = _whatsapp_channel_state(fresh_lead)
-            durable_ids = list(fresh_channel_state.get("processed_message_ids") or [])
-            if message_id not in durable_ids:
-                durable_ids.append(message_id)
-            fresh_channel_state["processed_message_ids"] = durable_ids[-100:]
-            if response_id:
-                fresh_channel_state["previous_response_id"] = response_id
-            fresh_channel_state["folio_id"] = folio_id
-            _persist_whatsapp_state(lead_id, fresh_lead, fresh_channel_state, "live")
             print(
                 "[WHATSAPP CONVERSATION] "
-                f"saved_response_id={response_id} lead_id={lead_id} folio_id={folio_id}",
+                f"current_message_id={current_message_id} "
+                f"saved_response_id={response_id}",
                 flush=True,
             )
     except Exception as error:
