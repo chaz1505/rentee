@@ -139,6 +139,43 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         mocked_process.assert_not_called()
 
+    @patch("app.requests.post")
+    def test_typing_indicator_uses_inbound_wamid_and_native_meta_payload(
+        self, mocked_post
+    ):
+        mocked_post.return_value.status_code = 200
+        mocked_post.return_value.raise_for_status.return_value = None
+
+        app_module.send_whatsapp_typing_indicator("wamid.inbound-1")
+
+        mocked_post.assert_called_once_with(
+            "https://graph.facebook.com/v23.0/phone-number-id/messages",
+            headers={
+                "Authorization": "Bearer wa-token",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": "wamid.inbound-1",
+                "typing_indicator": {"type": "text"},
+            },
+            timeout=30,
+        )
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app._process_whatsapp_message")
+    def test_duplicate_webhook_dispatches_message_only_once(self, mocked_process):
+        client = app_module.app.test_client()
+        payload = webhook_payload(message_id="wamid.duplicate")
+
+        first = client.post("/whatsapp/webhook", json=payload)
+        second = client.post("/whatsapp/webhook", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        mocked_process.assert_called_once()
+
     @patch("app.threading.Thread", ImmediateThread)
     @patch("app._process_whatsapp_message")
     def test_text_webhook_acknowledges_and_dispatches_customer_text(self, mocked_process):
@@ -158,12 +195,15 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_typing_indicator")
     def test_message_reuses_lead_context_and_sends_only_clean_final_answer(
-        self, mocked_lead, _mocked_folio, mocked_turn, mocked_send,
+        self, mocked_typing, mocked_lead, _mocked_folio, mocked_turn, mocked_send,
         mocked_latest, _mocked_create, mocked_save
     ):
+        events = []
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
-        mocked_lead.return_value = (lead, False)
+        mocked_typing.side_effect = lambda _message_id: events.append("typing")
+        mocked_lead.side_effect = lambda *_args: (events.append("lead") or (lead, False))
         mocked_latest.return_value = {
             "_id": "bubble-message-1", "lead": "lead-1",
             "own_Sent?": "No", "response_ID": "response-1",
@@ -176,6 +216,8 @@ class WhatsAppTests(unittest.TestCase):
             webhook_payload(text="Find me a 3-bed in Bangsar")["entry"][0]["changes"][0]["value"]["messages"][0]
         )
 
+        mocked_typing.assert_called_once_with("wamid.1")
+        self.assertEqual(events[:2], ["typing", "lead"])
         mocked_turn.assert_called_once_with(
             "Find me a 3-bed in Bangsar", "folio-1",
             previous_response_id="response-1",
@@ -208,8 +250,10 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_typing_indicator")
     def test_three_messages_reuse_latest_persisted_openai_continuation(
-        self, mocked_lead, _folio, mocked_turn, _send, _latest, _create, mocked_save
+        self, mocked_typing, mocked_lead, _folio, mocked_turn, _send, _latest,
+        _create, mocked_save
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
@@ -249,6 +293,34 @@ class WhatsAppTests(unittest.TestCase):
             mocked_turn.call_args_list[2].kwargs["message_id"], "message-3"
         )
         self.assertEqual(mocked_save.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in mocked_typing.call_args_list],
+            ["wamid.1", "wamid.2", "wamid.3"],
+        )
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.find_latest_ai_message", return_value=None)
+    @patch("app.send_whatsapp_text")
+    @patch("app.run_rentee_turn", return_value=("Reply", "resp-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.find_or_create_whatsapp_lead", return_value=({"_id": "lead-1"}, False))
+    @patch(
+        "app.send_whatsapp_typing_indicator",
+        side_effect=requests.RequestException("Meta unavailable"),
+    )
+    def test_typing_indicator_failure_does_not_block_customer_reply(
+        self, mocked_typing, _lead, _folio, mocked_turn, mocked_send, _latest,
+        _create, mocked_save
+    ):
+        item = webhook_payload(message_id="wamid.failure")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        mocked_typing.assert_called_once_with("wamid.failure")
+        mocked_turn.assert_called_once()
+        mocked_save.assert_called_once()
+        mocked_send.assert_called_once_with("60123456789", "Reply")
 
     @patch("app._bubble_records")
     def test_response_continuity_survives_python_memory_restart(self, mocked_records):
@@ -466,8 +538,9 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-active", False))
     @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_typing_indicator")
     def test_recommendation_turn_uses_existing_folio_and_one_coherent_text_message(
-        self, mocked_lead, mocked_folio, mocked_turn, mocked_summary,
+        self, _typing, mocked_lead, mocked_folio, mocked_turn, mocked_summary,
         mocked_send, _latest, _create, mocked_save
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}

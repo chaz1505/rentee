@@ -764,6 +764,43 @@ def send_whatsapp_text(to_phone, text):
     return sent_ids
 
 
+def send_whatsapp_typing_indicator(whatsapp_message_id):
+    """Mark one inbound Meta message read and show WhatsApp's native typing state."""
+    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    url = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+        f"{phone_number_id}/messages"
+    )
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": whatsapp_message_id,
+            "typing_indicator": {"type": "text"},
+        },
+        timeout=30,
+    )
+    try:
+        response.raise_for_status()
+    except requests.RequestException:
+        print(
+            "[WHATSAPP] Typing indicator failed "
+            f"message_id={whatsapp_message_id} status={response.status_code}",
+            flush=True,
+        )
+        raise
+    print(
+        f"[WHATSAPP] Typing indicator sent message_id={whatsapp_message_id}",
+        flush=True,
+    )
+
+
 def get_plausible_listings(
     base_url, lead, condo_scope=None, target=RETRIEVAL_CANDIDATE_TARGET
 ):
@@ -2305,6 +2342,14 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
 
 def _process_whatsapp_message(message):
     message_id = str(message["id"])
+    try:
+        send_whatsapp_typing_indicator(message_id)
+    except Exception as error:
+        print(
+            "[WHATSAPP] Typing indicator error ignored "
+            f"message_id={message_id} error={type(error).__name__}",
+            flush=True,
+        )
     phone = normalize_phone(message["from"])
     text = str((message.get("text") or {}).get("body") or "").strip()
     phone_lock = _whatsapp_phone_locks.setdefault(phone, threading.Lock())
