@@ -434,6 +434,15 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(facts["beds"], 4)
         self.assertEqual(facts["priceRent"], 11500)
 
+    def test_ranking_facts_use_only_canonical_listing_id(self):
+        facts = app_module.ranking_listing_facts({
+            "_id": "1767955404889x211582", "id": "wrong-id",
+            "listing_id": "also-wrong", "beds": 3,
+        })
+        self.assertEqual(facts["listing_id"], "1767955404889x211582")
+        self.assertNotIn("_id", facts)
+        self.assertNotIn("id", facts)
+
     @patch("app.update_folio_items")
     @patch("app.create_folio_items", return_value=["folio-item-new"])
     @patch("app.get_plausible_listings")
@@ -553,6 +562,8 @@ class SearchFlowStateTests(unittest.TestCase):
                     break
         prompt = create.call_args.kwargs["input"]
         self.assertIn('"bedrooms_min": 3.0', prompt)
+        self.assertIn('"listing_id": "listing-1"', prompt)
+        self.assertNotIn('"_id": "listing-1"', prompt)
         self.assertIn("A real structured description", prompt)
         self.assertNotIn("LEGACY GENERATED PROFILE", prompt)
         self.assertNotIn("LEGACY GENERATED LISTING", prompt)
@@ -563,6 +574,63 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(recommendations["maxItems"], 7)
         self.assertEqual(
             recommendations["items"]["properties"]["reco_summary"]["maxLength"], 240
+        )
+
+    @patch("app.update_folio_items")
+    @patch("app.create_folio_items", return_value=["folio-item-fallback"])
+    @patch("app.get_plausible_listings")
+    @patch("app.bubble")
+    def test_all_invalid_model_ids_fall_back_to_structured_candidates(
+        self, mocked_bubble, mocked_listings, mocked_create, mocked_update
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": []},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 3, "budgetRent": 15000},
+        ]
+        mocked_listings.return_value = ([
+            {"_id": "listing-1", "beds": 3, "priceRent": 14000},
+            {"_id": "listing-2", "beds": 3, "priceRent": 14500},
+        ], 2)
+        response = SimpleNamespace(
+            output_text=json.dumps({
+                "recommendations": [{
+                    "listing_id": "invented-id", "reco_summary": "A fit."
+                }],
+                "customer_response": "Invented response.",
+            }),
+            usage=None,
+        )
+        with patch.object(app_module.client.responses, "create", return_value=response), \
+                patch("builtins.print") as mocked_print:
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration as completed:
+                    answer = completed.value
+                    break
+
+        fallback = mocked_create.call_args.args[0]
+        self.assertEqual(
+            [item["listing_id"] for item in fallback],
+            ["listing-1", "listing-2"],
+        )
+        self.assertIn("match your active search filters", answer)
+        self.assertTrue(answer.recommendations_available)
+        mocked_update.assert_called_once()
+        logs = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("'invented-id'", logs)
+        self.assertIn("valid_candidate_ids=['listing-1', 'listing-2']", logs)
+
+    def test_geo_filter_accepts_listing_relationship_id(self):
+        lead = {"Geo": ["geo-klcc"], "TransactionType": ["Rent/Let"]}
+        listings = [
+            {"_id": "klcc", "Geo": ["geo-klcc"], "priceRent": 12000},
+            {"_id": "bangsar", "Geo": ["geo-bangsar"], "priceRent": 12000},
+        ]
+        self.assertEqual(
+            [item["_id"] for item in app_module.shortlist_structured_listings(lead, listings)],
+            ["klcc"],
         )
 
     @patch("app.update_folio_items")

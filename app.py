@@ -1409,6 +1409,15 @@ def listing_facts(listing, condo_names=None, geo_names=None):
     return facts
 
 
+def ranking_listing_facts(listing, condo_names=None, geo_names=None):
+    """Expose one canonical Bubble Listing identifier to the ranking model."""
+    facts = listing_facts(listing, condo_names, geo_names)
+    listing_id = facts.pop("_id", None)
+    if listing_id:
+        facts["listing_id"] = str(listing_id)
+    return facts
+
+
 def _transaction_modes(value):
     values = value if isinstance(value, list) else [value]
     rendered = " ".join(str(item).casefold() for item in values)
@@ -1576,7 +1585,9 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         geo_relationship_ids.extend(value if isinstance(value, list) else [value])
     geo_names = get_relationship_names(base_url, "geo", geo_relationship_ids)
     grounded_listing_facts = [
-        listing_facts(listing, condo_names, geo_names) for listing in listings
+        ranking_listing_facts(listing, condo_names, geo_names)
+        for listing in listings
+        if listing.get("_id")
     ]
     matching_input = {
         "customer_requirements": structured_lead_requirements(search_lead),
@@ -1588,8 +1599,9 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "Return at most the 7 strongest genuine fits rather than exhaustively describing "
         "every plausible listing. Keep each reco_summary concise and mention material "
         "compromises. Never invent "
-        "facts. Use property_name or condo_name in customer-facing prose and never expose "
-        "listing_id or other internal IDs. Briefly explain why each option fits. Return JSON "
+        "facts. Copy each selected listing_id exactly from available_listings; do not alter, "
+        "shorten, or invent it. Use property_name or condo_name in customer-facing prose and "
+        "never expose listing_id or other internal IDs. Briefly explain why each option fits. Return JSON "
         "matching the supplied schema.\n\n"
         + json.dumps(matching_input, ensure_ascii=False)
     )
@@ -1652,20 +1664,54 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         return "I’m sorry, I couldn’t prepare your recommendations just now."
 
     available_listing_ids = {
-        listing["_id"]
-        for listing in listings
-        if listing.get("_id")
+        facts["listing_id"] for facts in grounded_listing_facts
     }
+    returned_listing_ids = [
+        str(recommendation.get("listing_id"))
+        for recommendation in result["recommendations"]
+    ]
+    print(
+        "[RANK DEBUG] candidate_id_field=listing_id "
+        f"valid_candidate_ids={sorted(available_listing_ids)}",
+        flush=True,
+    )
+    print(
+        f"[RANK DEBUG] returned_listing_ids={returned_listing_ids}",
+        flush=True,
+    )
     validated_recommendations = []
     seen_recommended_listing_ids = set()
 
     for recommendation in result["recommendations"]:
-        listing_id = recommendation["listing_id"]
+        listing_id = str(recommendation["listing_id"])
         if listing_id not in available_listing_ids:
-            print("Ignoring invalid recommended listing ID", flush=True)
+            print(
+                f"Ignoring invalid recommended listing ID: {listing_id!r}",
+                flush=True,
+            )
         elif listing_id not in seen_recommended_listing_ids:
+            recommendation["listing_id"] = listing_id
             validated_recommendations.append(recommendation)
             seen_recommended_listing_ids.add(listing_id)
+
+    if result["recommendations"] and not validated_recommendations:
+        fallback_facts = grounded_listing_facts[:3]
+        validated_recommendations = [
+            {
+                "listing_id": facts["listing_id"],
+                "reco_summary": "Matches the current structured property search filters.",
+            }
+            for facts in fallback_facts
+        ]
+        print(
+            "[RANK DEBUG] all returned IDs were invalid; using structured-candidate "
+            f"fallback listing_ids={[item['listing_id'] for item in validated_recommendations]}",
+            flush=True,
+        )
+        result["customer_response"] = (
+            "I found a few current listings that match your active search filters. "
+            "Here are the strongest available candidates to review."
+        )
 
     new_recommendations = [
         recommendation
@@ -1682,9 +1728,9 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         )
 
     display_names_by_id = {
-        str(facts.get("_id")): facts.get("property_name") or facts.get("condo_name")
+        str(facts.get("listing_id")): facts.get("property_name") or facts.get("condo_name")
         for facts in grounded_listing_facts
-        if facts.get("_id")
+        if facts.get("listing_id")
     }
     customer_response = result["customer_response"]
     for listing_id, display_name in display_names_by_id.items():
