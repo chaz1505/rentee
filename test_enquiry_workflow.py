@@ -671,7 +671,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn("fresh one", result.response_text)
         patch_bubble.assert_not_called()
 
-    def test_invalid_or_unknown_handoff_code_falls_through(self):
+    def test_invalid_code_falls_through_but_unknown_valid_code_is_owned(self):
         records = MagicMock(return_value=iter([]))
         invalid = workflow.handle_external_handoff_message(
             "60123456789", "reference 12345", "https://bubble.test",
@@ -682,7 +682,73 @@ class EnquiryWorkflowTests(unittest.TestCase):
             records, MagicMock(), MagicMock(), normalize_phone,
         )
         self.assertFalse(invalid.handled)
-        self.assertFalse(unknown.handled)
+        self.assertTrue(unknown.handled)
+        self.assertIn("fresh one", unknown.response_text)
+
+    def test_originating_agent_cannot_bind_own_handoff(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(return_value={
+            "_id": "enquiry-1", "Agent": "user-origin", "Listing": "listing-1",
+            "Enquirer Phone": "",
+        })
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, patch_bubble, normalize_phone,
+            sender_user_id="user-origin",
+        )
+        self.assertTrue(result.handled)
+        self.assertIn("for the enquirer", result.response_text)
+        patch_bubble.assert_not_called()
+        self.assertEqual(bubble_get.call_count, 1)
+
+    def test_different_bubble_user_can_complete_handoff(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[
+            {"Agent": "user-origin", "Listing": "listing-1", "Enquirer Phone": ""},
+            {"_id": "listing-1"},
+        ])
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, patch_bubble, normalize_phone,
+            sender_user_id="user-other",
+        )
+        self.assertTrue(result.handled)
+        patch_bubble.assert_called_once_with(
+            "https://bubble.test/obj/enquiry/enquiry-1",
+            {"Enquirer Phone": "60123456789"},
+        )
+
+    def test_broad_portal_fallback_matches_220_records_without_hydrating_all(self):
+        listings = [{
+            "_id": f"listing-{index}", "owner": "user-1",
+            "sourceURL": f"https://www.propertyguru.com.my/l/{900000000 + index}",
+            "condo": "condo-1", "beds": 3, "priceRent": 15000,
+            "availability": True,
+        } for index in range(220)]
+        listings[137]["sourceURL"] = "https://www.iproperty.com.my/l/501124208"
+        records = MagicMock(side_effect=[iter([]), iter(listings), iter([])])
+        bubble_get = MagicMock(return_value={})
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = workflow.handle_internal_user_message(
+            user, "https://www.propertyguru.com.my/l/501124208",
+            "https://bubble.test", self.patch_user, self.now,
+            bubble_create=self.create, bubble_records=records,
+            relationship_names=self.relationship_names, bubble_get=bubble_get,
+            normalize_phone=normalize_phone,
+            rentee_whatsapp_number="60115551234",
+        )
+        self.assertIn("https://wa.me/", result.response_text)
+        listing_gets = [
+            call for call in bubble_get.call_args_list
+            if "/obj/listing/" in call.args[0]
+        ]
+        self.assertEqual(listing_gets, [])
 
     def test_resolved_handoff_missing_listing_does_not_bind(self):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))

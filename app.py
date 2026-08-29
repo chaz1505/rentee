@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from enquiry_workflow import (
+    extract_handoff_code,
     find_internal_user,
     handle_external_handoff_message,
     handle_internal_user_message,
@@ -2730,6 +2731,21 @@ def _process_whatsapp_message(message):
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
+            if extract_handoff_code(text):
+                handoff_result = handle_external_handoff_message(
+                    phone, text, base_url, _bubble_records, bubble,
+                    _bubble_patch, normalize_phone,
+                    sender_user_id=(
+                        internal_user.get("_id") if internal_user else None
+                    ),
+                )
+                send_whatsapp_text(phone, handoff_result.response_text)
+                print(
+                    f"[ENQUIRY WORKFLOW] handoff message handled phone={safe_phone}",
+                    flush=True,
+                )
+                reply_sent = True
+                return
             if internal_user:
                 print(
                     "[ENQUIRY WORKFLOW] internal User matched "
@@ -2759,18 +2775,6 @@ def _process_whatsapp_message(message):
                     f"[ENQUIRY WORKFLOW] no internal User match phone={safe_phone}",
                     flush=True,
                 )
-                handoff_result = handle_external_handoff_message(
-                    phone, text, base_url, _bubble_records, bubble,
-                    _bubble_patch, normalize_phone,
-                )
-                if handoff_result.handled:
-                    send_whatsapp_text(phone, handoff_result.response_text)
-                    print(
-                        f"[ENQUIRY WORKFLOW] external handoff handled phone={safe_phone}",
-                        flush=True,
-                    )
-                    reply_sent = True
-                    return
             lead, lead_created = find_or_create_whatsapp_lead(
                 phone, message.get("customer_name"), "live"
             )
