@@ -617,7 +617,9 @@ def find_lead_by_phone(phone, bubble_env="live"):
     return None
 
 
-def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
+def find_or_create_whatsapp_lead(
+    phone, customer_name=None, bubble_env="live", agent_classification=None
+):
     canonical = normalize_phone(phone)
     if not canonical:
         raise ValueError("WhatsApp sender phone is missing.")
@@ -625,9 +627,10 @@ def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
     if lead:
         return lead, False
     base_url = get_bubble_base_url(bubble_env)
-    lead_id = _bubble_create(
-        base_url, "lead", {WHATSAPP_LEAD_PHONE_FIELD: canonical}
-    )
+    payload = {WHATSAPP_LEAD_PHONE_FIELD: canonical}
+    if agent_classification in {"Yes", "No"}:
+        payload["Agent?"] = agent_classification
+    lead_id = _bubble_create(base_url, "lead", payload)
     # The repository exposes no confirmed Lead name/source field, so do not invent one.
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     stored_phone = normalize_phone(lead.get(WHATSAPP_LEAD_PHONE_FIELD))
@@ -639,6 +642,8 @@ def find_or_create_whatsapp_lead(phone, customer_name=None, bubble_env="live"):
         )
     lead.setdefault("_id", lead_id)
     lead[WHATSAPP_LEAD_PHONE_FIELD] = canonical
+    if agent_classification in {"Yes", "No"}:
+        lead.setdefault("Agent?", agent_classification)
     lead.setdefault("searchBriefJSON", "")
     return lead, True
 
@@ -2738,6 +2743,7 @@ def _process_whatsapp_message(message):
                     sender_user_id=(
                         internal_user.get("_id") if internal_user else None
                     ),
+                    find_or_create_lead=find_or_create_whatsapp_lead,
                 )
                 send_whatsapp_text(phone, handoff_result.response_text)
                 print(

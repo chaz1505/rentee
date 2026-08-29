@@ -103,6 +103,21 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
     @patch("app.bubble", return_value={"_id": "lead-new"})
+    def test_new_handoff_lead_stores_text_agent_classification(
+        self, _bubble, _find, mocked_create
+    ):
+        lead, created = app_module.find_or_create_whatsapp_lead(
+            "+60 12-345-6789", agent_classification="Yes"
+        )
+        self.assertTrue(created)
+        self.assertEqual(lead["Agent?"], "Yes")
+        self.assertEqual(mocked_create.call_args.args[2], {
+            "phone": "60123456789", "Agent?": "Yes",
+        })
+
+    @patch("app._bubble_create", return_value="lead-new")
+    @patch("app.find_lead_by_phone", return_value=None)
+    @patch("app.bubble", return_value={"_id": "lead-new"})
     def test_new_lead_continues_when_bubble_hides_phone_on_read(
         self, _mocked_bubble, _mocked_find, _mocked_create
     ):

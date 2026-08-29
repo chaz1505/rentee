@@ -80,6 +80,7 @@ def build_whatsapp_handoff_link(code, rentee_whatsapp_number, normalize_phone):
 def handle_external_handoff_message(
     sender_phone, message_text, base_url, bubble_records, bubble_get,
     bubble_patch, normalize_phone, sender_user_id=None,
+    find_or_create_lead=None,
 ):
     """Resolve and bind one external WhatsApp sender to an existing Enquiry."""
     code = extract_handoff_code(message_text)
@@ -166,6 +167,75 @@ def handle_external_handoff_message(
             f"enquirer_phone_set phone={safe_incoming}",
             flush=True,
         )
+    if find_or_create_lead:
+        enquiry_classification = (
+            "Yes" if str(enquiry.get("Agent?") or "").strip() == "Yes" else "No"
+        )
+        try:
+            lead, lead_created = find_or_create_lead(
+                incoming_phone,
+                agent_classification=enquiry_classification,
+            )
+            lead_id = lead.get("_id")
+            if not lead_id:
+                raise ValueError("Lead lookup/create returned no ID.")
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} lead lookup "
+                f"phone={safe_incoming} "
+                f"result={'created' if lead_created else 'existing'}",
+                flush=True,
+            )
+            linked_lead_id = enquiry.get("Lead")
+            if linked_lead_id and str(linked_lead_id) != str(lead_id):
+                print(
+                    f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} lead conflict "
+                    f"existing_lead_id={linked_lead_id} resolved_lead_id={lead_id}",
+                    flush=True,
+                )
+                return EnquiryWorkflowResult(
+                    True, "I couldn't connect this enquiry automatically. Please ask "
+                    "the agent who sent you the link to send you a fresh one."
+                )
+
+            existing_classification = str(lead.get("Agent?") or "").strip()
+            action = "kept"
+            if existing_classification != "Yes" and (
+                existing_classification not in {"Yes", "No"}
+                or enquiry_classification == "Yes"
+            ):
+                bubble_patch(
+                    f"{base_url}/obj/lead/{lead_id}",
+                    {"Agent?": enquiry_classification},
+                )
+                lead["Agent?"] = enquiry_classification
+                action = (
+                    "upgraded" if existing_classification == "No" else "set"
+                )
+            final_classification = str(lead.get("Agent?") or enquiry_classification)
+            print(
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                f"agent_classification={final_classification} action={action}",
+                flush=True,
+            )
+            if not linked_lead_id:
+                bubble_patch(
+                    f"{base_url}/obj/enquiry/{enquiry_id}", {"Lead": lead_id}
+                )
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                f"lead_id={lead_id} lead linked",
+                flush=True,
+            )
+        except Exception as error:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} Lead linking failed "
+                f"error={type(error).__name__}",
+                flush=True,
+            )
+            return EnquiryWorkflowResult(
+                True, "I couldn't connect this enquiry automatically. Please ask the "
+                "agent who sent you the link to send you a fresh one."
+            )
     print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff completed", flush=True)
     return EnquiryWorkflowResult(
         True, "Hi — I've got your enquiry for this property. I'll help you from here."

@@ -26,6 +26,21 @@ class EnquiryWorkflowTests(unittest.TestCase):
             rentee_whatsapp_number="60115551234",
         )
 
+    def complete_handoff_with_lead(
+        self, enquiry, lead, created=False, sender_phone="+60 12-345 6789",
+        finder=None, patcher=None,
+    ):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[enquiry, {"_id": "listing-1"}])
+        patch_bubble = patcher or MagicMock()
+        finder = finder or MagicMock(return_value=(lead, created))
+        result = workflow.handle_external_handoff_message(
+            sender_phone, "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, patch_bubble, normalize_phone,
+            find_or_create_lead=finder,
+        )
+        return result, finder, patch_bubble
+
     def test_internal_user_phone_matching_tolerates_common_formatting(self):
         formats = ("+60123456789", "+60 12-345 6789", "+60 (12) 345-6789")
         for stored_phone in formats:
@@ -719,6 +734,124 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "https://bubble.test/obj/enquiry/enquiry-1",
             {"Enquirer Phone": "60123456789"},
         )
+
+    def test_handoff_creates_and_links_agent_lead_with_normalized_phone(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "", "Agent?": "Yes"
+        }
+        result, finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "Yes"}, created=True
+        )
+        self.assertIn("I've got your enquiry", result.response_text)
+        finder.assert_called_once_with(
+            "60123456789", agent_classification="Yes"
+        )
+        self.assertIn(
+            {"Lead": "lead-1"},
+            [call.args[1] for call in patch_bubble.call_args_list],
+        )
+
+    def test_handoff_creates_normal_lead_with_text_no(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No",
+        }
+        _result, finder, _patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "No"}, created=True
+        )
+        finder.assert_called_once_with(
+            "60123456789", agent_classification="No"
+        )
+
+    def test_existing_lead_agent_classification_is_sticky(self):
+        cases = (
+            ("", "No", "No", "set"),
+            ("No", "Yes", "Yes", "upgraded"),
+            ("Yes", "No", "Yes", "kept"),
+            ("Yes", "Yes", "Yes", "kept"),
+        )
+        for existing, enquiry_value, expected, expected_action in cases:
+            with self.subTest(existing=existing, enquiry=enquiry_value):
+                enquiry = {
+                    "Listing": "listing-1", "Enquirer Phone": "60123456789",
+                    "Agent?": enquiry_value,
+                }
+                with patch("builtins.print") as mocked_print:
+                    _result, _finder, patch_bubble = self.complete_handoff_with_lead(
+                        enquiry, {"_id": "lead-1", "Agent?": existing}
+                    )
+                lead_updates = [
+                    call.args[1] for call in patch_bubble.call_args_list
+                    if call.args[0].endswith("/obj/lead/lead-1")
+                ]
+                expected_updates = (
+                    [] if expected_action == "kept" else [{"Agent?": expected}]
+                )
+                self.assertEqual(lead_updates, expected_updates)
+                logs = " ".join(str(call) for call in mocked_print.call_args_list)
+                self.assertIn(
+                    f"agent_classification={expected} action={expected_action}", logs
+                )
+
+    def test_same_linked_lead_is_idempotent(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No", "Lead": "lead-1",
+        }
+        result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "No"}
+        )
+        self.assertIn("I've got your enquiry", result.response_text)
+        self.assertFalse(any(
+            "Lead" in call.args[1] for call in patch_bubble.call_args_list
+        ))
+
+    def test_conflicting_enquiry_lead_is_not_overwritten(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No", "Lead": "lead-other",
+        }
+        result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "No"}
+        )
+        self.assertIn("fresh one", result.response_text)
+        self.assertFalse(any(
+            "Lead" in call.args[1] for call in patch_bubble.call_args_list
+        ))
+
+    def test_lead_creation_failure_does_not_complete_handoff(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "Yes",
+        }
+        finder = MagicMock(side_effect=RuntimeError("Bubble unavailable"))
+        with patch("builtins.print") as mocked_print:
+            result, _finder, patch_bubble = self.complete_handoff_with_lead(
+                enquiry, {}, finder=finder
+            )
+        self.assertIn("fresh one", result.response_text)
+        self.assertFalse(any(
+            "Lead" in call.args[1] for call in patch_bubble.call_args_list
+        ))
+        self.assertNotIn(
+            "handoff completed",
+            " ".join(str(call) for call in mocked_print.call_args_list),
+        )
+
+    def test_lead_link_failure_does_not_report_completed_handoff(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No",
+        }
+        patcher = MagicMock(side_effect=RuntimeError("Bubble patch failed"))
+        with patch("builtins.print") as mocked_print:
+            result, _finder, _patcher = self.complete_handoff_with_lead(
+                enquiry, {"_id": "lead-1", "Agent?": "No"}, patcher=patcher
+            )
+        self.assertIn("fresh one", result.response_text)
+        logs = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("Lead linking failed", logs)
+        self.assertNotIn("handoff completed", logs)
 
     def test_broad_portal_fallback_matches_220_records_without_hydrating_all(self):
         listings = [{
