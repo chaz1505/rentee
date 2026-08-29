@@ -19,6 +19,7 @@ from enquiry_workflow import find_internal_user, handle_internal_user_message
 from search_flow import (
     apply_search_update,
     dump_search_state,
+    empty_search_state,
     listing_search_scope,
     load_search_state,
     set_area_recommendations,
@@ -383,6 +384,20 @@ def build_response_args(user_message, previous_response_id=None):
         "bedrooms_min": {"type": "number"},
         "geo_names": {"type": "array", "items": {"type": "string"}},
         "preferred_condo_names": {"type": "array", "items": {"type": "string"}},
+        "area_update_mode": {
+            "type": "string",
+            "enum": ["unchanged", "replace", "add", "remove", "reset"],
+            "description": "How geo_names changes the current active search areas.",
+        },
+        "condo_update_mode": {
+            "type": "string",
+            "enum": ["unchanged", "replace", "add", "remove", "reset"],
+            "description": "How preferred_condo_names changes active condo restrictions.",
+        },
+        "new_search": {
+            "type": "boolean",
+            "description": "True only when the customer explicitly starts over.",
+        },
         "budget_rent": {"type": "number"},
         "budget_buy": {"type": "number"},
     }
@@ -1509,11 +1524,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     lead_started = time.perf_counter()
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     log_timing("match_lead - Lead lookup", lead_started)
+    search_lead = lead_with_active_search_filters(lead, base_url)
 
     yield "Searching available properties..."
     listings_started = time.perf_counter()
     listings, fetched_listing_count = get_plausible_listings(
-        base_url, lead, condo_scope
+        base_url, search_lead, condo_scope
     )
     if condo_scope:
         print(
@@ -1523,7 +1539,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         )
     scoped_listing_count = len(listings)
     structured_listing_count = len(listings)
-    listings = reduce_listing_candidates(lead, listings)
+    listings = reduce_listing_candidates(search_lead, listings)
     print(
         "Listing candidates: "
         f"fetched={fetched_listing_count} "
@@ -1559,7 +1575,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         listing_facts(listing, condo_names, geo_names) for listing in listings
     ]
     matching_input = {
-        "customer_requirements": structured_lead_requirements(lead),
+        "customer_requirements": structured_lead_requirements(search_lead),
         "available_listings": grounded_listing_facts,
     }
     prompt = (
@@ -1795,13 +1811,17 @@ def structured_lead_update(update, base_url):
     return payload
 
 
-def save_search_state(lead_id, search_state, base_url, lead_fields=None):
+def save_search_state(
+    lead_id, search_state, base_url, lead_fields=None, active_search_state=None
+):
     save_started = time.perf_counter()
     payload = {
         "searchBriefJSON": dump_search_state(search_state),
         "AIsearchtext": search_state_to_requirements_text(search_state),
         "AIsearchsummary": search_state_to_summary(search_state),
     }
+    if active_search_state is not None:
+        payload["searchActive"] = dump_search_state(active_search_state)
     payload.update(lead_fields or {})
     response = requests.patch(
         f"{base_url}/obj/lead/{lead_id}",
@@ -1933,87 +1953,258 @@ def area_recommendation_text(search_state):
     return "\n".join(lines)
 
 
+def load_active_search_state(lead):
+    """Load authoritative current filters, falling back once for existing Leads."""
+    raw = lead.get("searchActive")
+    valid = False
+    if isinstance(raw, dict):
+        valid = bool(raw)
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            valid = isinstance(json.loads(raw), dict)
+        except (TypeError, ValueError):
+            print("[SEARCH ACTIVE] invalid JSON; using safe fallback", flush=True)
+    if valid:
+        state = load_search_state(raw)
+        print(
+            f"[SEARCH ACTIVE] loaded areas={state['areas']} "
+            f"beds={state['bedroom_requirement'] or None} "
+            f"budget={state['budget_requirement'] or None}",
+            flush=True,
+        )
+        return state
+    fallback = load_search_state(lead.get("searchBriefJSON"))
+    print("[SEARCH ACTIVE] missing; initialized from current search brief", flush=True)
+    return fallback
+
+
+def _unique_search_values(values):
+    result = []
+    seen = set()
+    for value in values or []:
+        clean = " ".join(str(value or "").split())
+        key = clean.casefold()
+        if clean and key not in seen:
+            result.append(clean)
+            seen.add(key)
+    return result
+
+
+def _modify_active_values(existing, values, mode, default_mode="replace"):
+    existing = _unique_search_values(existing)
+    values = _unique_search_values(values)
+    mode = mode if mode in {"unchanged", "replace", "add", "remove", "reset"} else default_mode
+    if mode == "unchanged":
+        return existing
+    if mode == "reset":
+        return []
+    if mode == "replace":
+        return values
+    if mode == "add":
+        return _unique_search_values(existing + values)
+    removed = {value.casefold() for value in values}
+    return [value for value in existing if value.casefold() not in removed]
+
+
+def apply_active_search_update(active_state, update):
+    """Apply this turn only to active filters, preserving all unchanged criteria."""
+    state = load_search_state(
+        empty_search_state() if update.get("new_search") else active_state
+    )
+    previous_areas = list(state["areas"])
+    geo_names = update.get("geo_names") or []
+    area_mode = update.get("area_update_mode")
+    if geo_names or area_mode == "reset":
+        state["areas"] = _modify_active_values(
+            state["areas"], geo_names, area_mode, "replace"
+        )
+        state["area_status"] = "known" if state["areas"] else "unknown"
+        state["area_recommendations"] = []
+        if state["areas"] != previous_areas and area_mode in (None, "replace", "reset"):
+            # A replaced area must not inherit condo restrictions from the old area.
+            state["recommended_condos"] = []
+            state["selected_condos"] = []
+
+    scalar_update = dict(update)
+    scalar_update.pop("geo_names", None)
+    scalar_update.pop("areas", None)
+    scalar_update["area_status"] = "unchanged"
+    if scalar_update.get("bedrooms_min") is not None:
+        scalar_update["bedroom_requirement"] = str(scalar_update["bedrooms_min"])
+    relevant_budget = scalar_update.get("budget_rent") or scalar_update.get("budget_buy")
+    if relevant_budget is not None:
+        scalar_update["budget_requirement"] = str(relevant_budget)
+    transaction = scalar_update.get("transaction_type")
+    if transaction and transaction != "unchanged":
+        scalar_update["property_types"] = [transaction]
+    preserved_recommended = list(state["recommended_condos"])
+    preserved_selected = list(state["selected_condos"])
+    state = apply_search_update(state, scalar_update)
+
+    condo_names = update.get("preferred_condo_names") or []
+    condo_mode = update.get("condo_update_mode")
+    if not condo_names and condo_mode not in {"replace", "add", "remove", "reset"}:
+        state["recommended_condos"] = preserved_recommended
+        state["selected_condos"] = preserved_selected
+    if condo_names or condo_mode == "reset":
+        selected = _modify_active_values(
+            state["selected_condos"], condo_names, condo_mode, "replace"
+        )
+        state["recommended_condos"] = list(selected)
+        state["selected_condos"] = list(selected)
+    if state["areas"] != previous_areas:
+        print(
+            f"[SEARCH ACTIVE] areas {previous_areas} -> {state['areas']}", flush=True
+        )
+    return state
+
+
+def apply_cumulative_search_update(cumulative_state, update):
+    """Retain historical search knowledge while accepting this turn's new facts."""
+    cumulative_update = dict(update)
+    new_areas = _unique_search_values(update.get("geo_names") or [])
+    if new_areas:
+        cumulative_update["area_status"] = "known"
+        cumulative_update["areas"] = _unique_search_values(
+            load_search_state(cumulative_state)["areas"] + new_areas
+        )
+    if cumulative_update.get("bedrooms_min") is not None:
+        cumulative_update["bedroom_requirement"] = str(cumulative_update["bedrooms_min"])
+    relevant_budget = cumulative_update.get("budget_rent") or cumulative_update.get("budget_buy")
+    if relevant_budget is not None:
+        cumulative_update["budget_requirement"] = str(relevant_budget)
+    transaction = cumulative_update.get("transaction_type")
+    if transaction and transaction != "unchanged":
+        cumulative_update["property_types"] = [transaction]
+    state = apply_search_update(cumulative_state, cumulative_update)
+    preferred = _unique_search_values(update.get("preferred_condo_names") or [])
+    if preferred:
+        state["recommended_condos"] = _unique_search_values(
+            state["recommended_condos"] + preferred
+        )
+    return state
+
+
+def lead_with_active_search_filters(lead, base_url):
+    """Build an isolated Lead-shaped filter view from searchActive only."""
+    state = load_active_search_state(lead)
+    has_state_filters = bool(
+        state["areas"] or state["selected_condos"]
+        or state["bedroom_requirement"] or state["budget_requirement"]
+        or state["property_types"]
+    )
+    if not has_state_filters:
+        print(
+            "[SEARCH ACTIVE] no usable saved state; using existing Lead filters safely",
+            flush=True,
+        )
+        return dict(lead)
+    active = dict(lead)
+    active["Geo"] = get_named_object_ids(base_url, "geo", state["areas"])
+    active["preferredCondos"] = get_named_object_ids(
+        base_url, "condo", state["selected_condos"]
+    )
+    active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
+    transaction = " ".join(state["property_types"]).casefold()
+    active["TransactionType"] = (
+        ["Rent/Let"] if "rent" in transaction else
+        ["Sale/Purchase"] if "buy" in transaction else []
+    )
+    budget = _as_number(state["budget_requirement"])
+    active["budgetRent"] = budget if "rent" in transaction else None
+    active["budgetBuy"] = budget if "buy" in transaction else None
+    print("[SEARCH ACTIVE] using active filters for recommendation", flush=True)
+    return active
+
+
 def advance_property_search(folio_id, bubble_env, update):
     """Persist search facts and execute the useful action chosen for this turn."""
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
-    stored_state = lead.get("searchBriefJSON")
-    state = load_search_state(stored_state)
-    if update.get("geo_names"):
-        update["area_status"] = "known"
-        update["areas"] = update["geo_names"]
-    if update.get("bedrooms_min") is not None:
-        update["bedroom_requirement"] = str(update["bedrooms_min"])
-    relevant_budget = update.get("budget_rent") or update.get("budget_buy")
-    if relevant_budget is not None:
-        update["budget_requirement"] = str(relevant_budget)
-    transaction = update.get("transaction_type")
-    if transaction and transaction != "unchanged":
-        update["property_types"] = [transaction]
-    state = apply_search_update(state, update)
+    cumulative_state = apply_cumulative_search_update(
+        lead.get("searchBriefJSON"), update
+    )
+    active_state = apply_active_search_update(
+        load_active_search_state(lead), update
+    )
     preferred_names = [
         str(name).strip() for name in update.get("preferred_condo_names", [])
         if str(name).strip()
     ]
     if preferred_names:
-        state = set_recommended_condos(state, preferred_names)
-        state["selected_condos"] = list(preferred_names)
+        cumulative_state = set_recommended_condos(cumulative_state, _unique_search_values(
+            cumulative_state["recommended_condos"] + preferred_names
+        ))
     lead_fields = structured_lead_update(update, base_url)
+    for field in ("Geo", "preferredCondos"):
+        if field in lead_fields:
+            lead_fields[field] = list(dict.fromkeys(
+                list(lead.get(field) or []) + list(lead_fields[field] or [])
+            ))
 
     scope = listing_search_scope(
-        state,
+        active_state,
         selected_condos=preferred_names or None,
         use_full_shortlist=bool(
             update.get("use_full_shortlist") or update.get("search_listings")
         ),
     )
-    if update.get("search_listings") and (scope or not state["recommended_condos"]):
-        state["selected_condos"] = list(scope or [])
-        save_search_state(lead_id, state, base_url, lead_fields)
+    if update.get("search_listings") and (scope or not active_state["recommended_condos"]):
+        active_state["selected_condos"] = list(scope or [])
+        save_search_state(
+            lead_id, cumulative_state, base_url, lead_fields, active_state
+        )
         return {
             "action": "search_listings", "scope": scope or None,
-            "state": state, "lead_id": lead_id,
+            "state": cumulative_state, "active_state": active_state,
+            "lead_id": lead_id,
         }
 
-    if update.get("recommend_areas") and state["regular_destinations"]:
-        if not state["area_recommendations"]:
-            recommendations = recommend_areas_for_search(state)
-            state = set_area_recommendations(state, recommendations)
-        save_search_state(lead_id, state, base_url, lead_fields)
+    if update.get("recommend_areas") and active_state["regular_destinations"]:
+        if not active_state["area_recommendations"]:
+            recommendations = recommend_areas_for_search(active_state)
+            active_state = set_area_recommendations(active_state, recommendations)
+        save_search_state(
+            lead_id, cumulative_state, base_url, lead_fields, active_state
+        )
         return {
             "action": "recommend_areas",
-            "text": area_recommendation_text(state),
-            "state": state,
+            "text": area_recommendation_text(active_state),
+            "state": cumulative_state, "active_state": active_state,
             "lead_id": lead_id,
-            "recommendations": state["area_recommendations"],
+            "recommendations": active_state["area_recommendations"],
         }
 
     if update.get("recommend_condos"):
-        recommendations, response_text = recommend_condos_for_search(state)
-        state = set_recommended_condos(
-            state, [item["condo_name"] for item in recommendations]
+        recommendations, response_text = recommend_condos_for_search(active_state)
+        active_state = set_recommended_condos(
+            active_state, [item["condo_name"] for item in recommendations]
         )
-        save_search_state(lead_id, state, base_url, lead_fields)
+        save_search_state(
+            lead_id, cumulative_state, base_url, lead_fields, active_state
+        )
         return {
             "action": "condo_shortlist",
             "text": response_text.rstrip() + "\n\nWhich would you like to explore?",
-            "state": state,
+            "state": cumulative_state, "active_state": active_state,
             "lead_id": lead_id,
             "recommendations": recommendations,
         }
 
-    save_search_state(lead_id, state, base_url, lead_fields)
+    save_search_state(
+        lead_id, cumulative_state, base_url, lead_fields, active_state
+    )
     question = str(update.get("question") or "").strip()
-    if not question and state["recommended_condos"]:
+    if not question and active_state["recommended_condos"]:
         question = "Which of these condos would you like to explore?"
     if not question:
         question = "What would make a home feel like the right fit for you?"
     return {
         "action": "ask",
         "text": question,
-        "state": state,
+        "state": cumulative_state, "active_state": active_state,
         "lead_id": lead_id,
     }
 
@@ -2500,6 +2691,7 @@ def _process_whatsapp_message(message):
                     bubble_create=_bubble_create,
                     bubble_records=_bubble_records,
                     relationship_names=get_relationship_names,
+                    bubble_get=bubble,
                 )
                 if workflow_result.handled:
                     send_whatsapp_text(phone, workflow_result.response_text)

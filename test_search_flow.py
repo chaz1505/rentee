@@ -944,5 +944,146 @@ class SearchFlowStateTests(unittest.TestCase):
                 listing, ["Ken Bangsar"], "https://bubble.test", {}
             ))
 
+    def test_active_area_modes_preserve_unchanged_requirements(self):
+        active = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000",
+        })
+        active["recommended_condos"] = ["One Menerung"]
+        active["selected_condos"] = ["One Menerung"]
+        replaced = app_module.apply_active_search_update(active, {
+            "geo_names": ["KLCC"], "area_update_mode": "replace",
+        })
+        self.assertEqual(replaced["areas"], ["KLCC"])
+        self.assertEqual(replaced["bedroom_requirement"], "3")
+        self.assertEqual(replaced["budget_requirement"], "15000")
+        self.assertEqual(replaced["property_types"], ["rent"])
+
+        added = app_module.apply_active_search_update(active, {
+            "geo_names": ["KLCC"], "area_update_mode": "add",
+        })
+        self.assertEqual(added["areas"], ["Bangsar", "KLCC"])
+        removed = app_module.apply_active_search_update(added, {
+            "geo_names": ["Bangsar"], "area_update_mode": "remove",
+        })
+        self.assertEqual(removed["areas"], ["KLCC"])
+
+    def test_active_scalar_and_multiple_changes_preserve_other_fields(self):
+        active = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000",
+        })
+        active["recommended_condos"] = ["One Menerung"]
+        active["selected_condos"] = ["One Menerung"]
+        bedrooms = app_module.apply_active_search_update(
+            active, {"bedrooms_min": 4}
+        )
+        self.assertEqual(bedrooms["areas"], ["Bangsar"])
+        self.assertEqual(bedrooms["bedroom_requirement"], "4")
+        self.assertEqual(bedrooms["budget_requirement"], "15000")
+        self.assertEqual(bedrooms["selected_condos"], ["One Menerung"])
+        budget = app_module.apply_active_search_update(
+            active, {"budget_rent": 18000}
+        )
+        self.assertEqual(budget["bedroom_requirement"], "3")
+        self.assertEqual(budget["budget_requirement"], "18000")
+        multiple = app_module.apply_active_search_update(active, {
+            "geo_names": ["KLCC"], "area_update_mode": "replace",
+            "bedrooms_min": 2, "budget_rent": 12000,
+        })
+        self.assertEqual(
+            (multiple["areas"], multiple["bedroom_requirement"],
+             multiple["budget_requirement"], multiple["property_types"]),
+            (["KLCC"], "2", "12000", ["rent"]),
+        )
+
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids", return_value=["geo-klcc"])
+    @patch("app.bubble")
+    def test_klcc_followup_keeps_cumulative_bangsar_but_replaces_active_area(
+        self, mocked_bubble, _resolve, mocked_save
+    ):
+        cumulative = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000",
+        })
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "Geo": ["geo-bangsar"],
+             "searchBriefJSON": dump_search_state(cumulative),
+             "searchActive": dump_search_state(cumulative)},
+        ]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "geo_names": ["KLCC"], "area_update_mode": "replace",
+            "search_listings": True,
+        })
+        self.assertEqual(result["state"]["areas"], ["Bangsar", "KLCC"])
+        self.assertEqual(result["active_state"]["areas"], ["KLCC"])
+        self.assertEqual(result["active_state"]["bedroom_requirement"], "3")
+        self.assertEqual(result["active_state"]["budget_requirement"], "15000")
+        lead_fields = mocked_save.call_args.args[3]
+        self.assertEqual(lead_fields["Geo"], ["geo-bangsar", "geo-klcc"])
+
+    @patch("app.get_named_object_ids")
+    def test_active_filters_ignore_cumulative_geo_and_preferred_condos(self, resolve):
+        resolve.side_effect = lambda _base, object_type, names: (
+            ["geo-klcc"] if object_type == "geo" and names == ["KLCC"] else []
+        )
+        active = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["KLCC"],
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000",
+        })
+        lead = {
+            "Geo": ["geo-bangsar", "geo-klcc"],
+            "preferredCondos": ["condo-one-menerung"],
+            "searchActive": dump_search_state(active),
+        }
+        filtered = app_module.lead_with_active_search_filters(
+            lead, "https://bubble.test"
+        )
+        requirements = app_module.structured_lead_requirements(filtered)
+        self.assertEqual(requirements["geo_ids"], ["geo-klcc"])
+        self.assertEqual(requirements["preferred_condo_ids"], [])
+        self.assertEqual(requirements["bedrooms_min"], 3)
+        self.assertEqual(requirements["budget_rent"], 15000)
+
+    def test_missing_and_malformed_active_state_fall_back_without_crashing(self):
+        cumulative = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+            "bedroom_requirement": "3", "budget_requirement": "15000",
+        })
+        self.assertEqual(
+            app_module.load_active_search_state({
+                "searchBriefJSON": dump_search_state(cumulative)
+            })["areas"],
+            ["Bangsar"],
+        )
+        with patch("builtins.print") as mocked_print:
+            fallback = app_module.load_active_search_state({
+                "searchActive": "{bad json",
+                "searchBriefJSON": dump_search_state(cumulative),
+            })
+        self.assertEqual(fallback["areas"], ["Bangsar"])
+        self.assertIn(
+            "invalid JSON", "\n".join(str(call) for call in mocked_print.call_args_list)
+        )
+
+    def test_explicit_new_search_resets_active_not_cumulative_state(self):
+        active = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+            "bedroom_requirement": "3", "budget_requirement": "15000",
+        })
+        reset = app_module.apply_active_search_update(active, {
+            "new_search": True, "geo_names": ["KLCC"],
+            "area_update_mode": "replace",
+        })
+        self.assertEqual(reset["areas"], ["KLCC"])
+        self.assertEqual(reset["bedroom_requirement"], "")
+        self.assertEqual(reset["budget_requirement"], "")
+
 if __name__ == "__main__":
     unittest.main()

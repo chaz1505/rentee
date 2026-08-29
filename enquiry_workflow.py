@@ -128,17 +128,27 @@ def clear_pending_enquiry(user_id, base_url, bubble_patch):
 
 
 def _extract_urls(text):
-    return [
-        match.rstrip(".,;:!?)\]}>\"'")
-        for match in re.findall(r"https?://[^\s<>()\[\]{}]+", str(text or ""))
-    ]
+    urls = []
+    for match in re.findall(r"https?://[^\s<>()\[\]{}\"']+", str(text or "")):
+        clean = match.rstrip(".,;:!?)\]}>\"'")
+        if clean and clean not in urls:
+            urls.append(clean)
+    return urls
+
+
+def _coerce_url(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    extracted = _extract_urls(value)
+    return extracted[0] if extracted else value.strip().strip("<>[]()\"'")
 
 
 def _normalise_url(value):
-    if not isinstance(value, str) or not value.strip():
+    value = _coerce_url(value)
+    if not value:
         return None
     try:
-        parsed = urlparse(unquote(value.strip().strip("<>[]()")))
+        parsed = urlparse(unquote(value))
     except ValueError:
         return None
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
@@ -148,10 +158,11 @@ def _normalise_url(value):
 
 
 def _portal_reference(value):
-    if not isinstance(value, str):
+    value = _coerce_url(value)
+    if not value:
         return None
     try:
-        parsed = urlparse(unquote(value.strip().strip("<>[]()")))
+        parsed = urlparse(unquote(value))
     except ValueError:
         return None
     host = parsed.netloc.casefold().split(":", 1)[0]
@@ -206,6 +217,34 @@ def match_owned_listing(
     references = {_portal_reference(url) for url in message_urls}
     normalised_urls.discard(None)
     references.discard(None)
+    print(
+        f"[ENQUIRY WORKFLOW] extracted_urls={message_urls} "
+        f"portal_references={sorted(references)}",
+        flush=True,
+    )
+
+    beds = _extract_beds(message_text)
+    rent = _extract_rent(message_text)
+    normalised_message = _normalise_name(message_text)
+    for listing in listings:
+        source_url = _normalise_url(listing.get("sourceURL"))
+        reference = _portal_reference(listing.get("sourceURL"))
+        condo_id = str(listing.get("condo") or "")
+        condo_name = condo_names.get(condo_id)
+        candidate_beds = _as_number(listing.get("beds"))
+        candidate_rent = _as_number(listing.get("priceRent"))
+        print(
+            "[ENQUIRY WORKFLOW] candidate "
+            f"listing_id={listing.get('_id')} source_url={source_url} "
+            f"portal_reference={reference} beds={candidate_beds} "
+            f"priceRent={candidate_rent} condo_id={condo_id or None} "
+            f"condo_name={condo_name} url_match={source_url in normalised_urls} "
+            f"reference_match={bool(reference and reference in references)} "
+            f"condo_match={bool(_normalise_name(condo_name) and _normalise_name(condo_name) in normalised_message)} "
+            f"beds_match={beds is not None and candidate_beds == beds} "
+            f"rent_match={rent is not None and candidate_rent == rent}",
+            flush=True,
+        )
 
     direct = [
         listing for listing in listings
@@ -225,9 +264,6 @@ def match_owned_listing(
     if len(referenced) > 1:
         return None, None, referenced
 
-    beds = _extract_beds(message_text)
-    rent = _extract_rent(message_text)
-    normalised_message = _normalise_name(message_text)
     fallback = []
     if beds is not None and rent is not None:
         for listing in listings:
@@ -259,7 +295,7 @@ def _listing_label(listing, condo_names):
 
 def consume_pending_enquiry(
     user, pending, message_text, base_url, bubble_create, bubble_records,
-    bubble_patch, relationship_names,
+    bubble_patch, relationship_names, bubble_get=None,
 ):
     """Create the Enquiry, deterministically match an owned Listing, and respond."""
     user_id = user["_id"]
@@ -283,10 +319,59 @@ def consume_pending_enquiry(
     clear_pending_enquiry(user_id, base_url, bubble_patch)
 
     constraints = [{"key": "owner", "constraint_type": "equals", "value": user_id}]
-    owned_listings = [
-        listing for listing in bubble_records(base_url, "listing", constraints)
-        if listing.get("_id") and str(listing.get("owner") or "") == str(user_id)
-    ]
+    print(
+        "[ENQUIRY WORKFLOW] retrieving owned Listings "
+        f"object_type=listing constraint_key=owner user_id={user_id}",
+        flush=True,
+    )
+    try:
+        constrained_listings = list(
+            bubble_records(base_url, "listing", constraints)
+        )
+    except Exception as error:
+        print(
+            "[ENQUIRY WORKFLOW] owned Listing retrieval failed "
+            f"error={type(error).__name__}",
+            flush=True,
+        )
+        raise
+    owned_listings = []
+    for listing in constrained_listings:
+        listing_id = listing.get("_id")
+        if not listing_id:
+            print(
+                "[ENQUIRY WORKFLOW] ignored constrained Listing without ID",
+                flush=True,
+            )
+            continue
+        candidate = dict(listing)
+        if bubble_get:
+            try:
+                hydrated = bubble_get(f"{base_url}/obj/listing/{listing_id}")
+                if isinstance(hydrated, dict):
+                    candidate.update(hydrated)
+                    candidate.setdefault("_id", listing_id)
+            except Exception as error:
+                print(
+                    f"[ENQUIRY WORKFLOW] listing_id={listing_id} hydration failed "
+                    f"error={type(error).__name__}; using constrained record",
+                    flush=True,
+                )
+        returned_owner = candidate.get("owner")
+        if returned_owner and str(returned_owner) != str(user_id):
+            print(
+                f"[ENQUIRY WORKFLOW] listing_id={listing_id} rejected owner mismatch",
+                flush=True,
+            )
+            continue
+        # Bubble already applied the exact owner constraint. Privacy rules may omit
+        # owner from the response, so absence is not evidence of an ownership mismatch.
+        owned_listings.append(candidate)
+    print(
+        f"[ENQUIRY WORKFLOW] owned_listings_count={len(owned_listings)} "
+        f"constrained_results={len(constrained_listings)}",
+        flush=True,
+    )
     condo_names = relationship_names(
         base_url, "condo", [listing.get("condo") for listing in owned_listings]
     )
@@ -330,6 +415,7 @@ def consume_pending_enquiry(
 def handle_internal_user_message(
     user, message_text, base_url, bubble_patch, now=None,
     bubble_create=None, bubble_records=None, relationship_names=None,
+    bubble_get=None,
 ):
     """Handle one internal User message without depending on Flask or WhatsApp."""
     user_id = user.get("_id")
@@ -346,7 +432,7 @@ def handle_internal_user_message(
             raise RuntimeError("Pending Enquiry dependencies are not configured.")
         return consume_pending_enquiry(
             user, pending, message_text, base_url, bubble_create, bubble_records,
-            bubble_patch, relationship_names,
+            bubble_patch, relationship_names, bubble_get,
         )
     if pending:
         print(f"[ENQUIRY WORKFLOW] user_id={user_id} pending state expired", flush=True)

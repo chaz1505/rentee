@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import enquiry_workflow as workflow
 
@@ -196,6 +196,81 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertEqual(matched["_id"], "listing-1")
         self.assertEqual(method, "portal_reference")
         self.assertEqual(ambiguous, [])
+
+    def test_markdown_forwarded_urls_extract_recognised_reference(self):
+        text = (
+            '[https://www.propertyguru.com.my/l/501124208]'
+            '(https://www.propertyguru.com.my/l/501124208 '
+            '"https://www.propertyguru.com.my/l/501124208")'
+        )
+        urls = workflow._extract_urls(text)
+        self.assertEqual(urls, ["https://www.propertyguru.com.my/l/501124208"])
+        self.assertEqual(
+            {workflow._portal_reference(url) for url in urls}, {"501124208"}
+        )
+
+    def test_url_normalisation_ignores_scheme_trailing_slash_and_tracking_query(self):
+        listing = {
+            "_id": "listing-1",
+            "sourceURL": "http://www.propertyguru.com.my/l/501124208/?utm_source=test",
+        }
+        matched, method, _ambiguous = workflow.match_owned_listing(
+            "https://www.propertyguru.com.my/l/501124208", [listing], {}
+        )
+        self.assertEqual(matched, listing)
+        self.assertEqual(method, "source_url")
+
+    def test_owner_constrained_listing_without_visible_owner_is_not_discarded(self):
+        listing = {
+            "_id": "listing-1",  # owner intentionally hidden by Bubble privacy
+            "condo": "condo-1", "beds": 3, "priceRent": 15000,
+            "sourceURL": "https://www.iproperty.com.my/l/501124208",
+            "availability": True,
+        }
+        self.records.return_value = iter([listing])
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        with patch("builtins.print") as mocked_print:
+            result = self.consume(
+                user, "https://www.propertyguru.com.my/l/501124208"
+            )
+        self.assertIn("One Menerung", result.response_text)
+        self.assertIn(
+            ("https://bubble.test/obj/enquiry/enquiry-1", {"Listing": "listing-1"}),
+            [call.args for call in self.patch_user.call_args_list],
+        )
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("owned_listings_count=1", logs)
+        self.assertIn("portal_references=['501124208']", logs)
+        self.assertIn("reference_match=True", logs)
+
+    def test_sparse_constrained_listing_is_hydrated_before_matching(self):
+        self.records.return_value = iter([{"_id": "listing-1"}])
+        bubble_get = MagicMock(return_value={
+            "_id": "listing-1", "condo": "condo-1", "beds": 3,
+            "priceRent": 15000, "availability": True,
+            "sourceURL": "https://www.propertyguru.com.my/l/501124208",
+        })
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "No",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = workflow.handle_internal_user_message(
+            user, "https://www.propertyguru.com.my/l/501124208",
+            "https://bubble.test", self.patch_user, self.now,
+            bubble_create=self.create, bubble_records=self.records,
+            relationship_names=self.relationship_names, bubble_get=bubble_get,
+        )
+        self.assertIn("One Menerung", result.response_text)
+        bubble_get.assert_called_once_with(
+            "https://bubble.test/obj/listing/listing-1"
+        )
 
     def test_fallback_condo_beds_and_rent_parsing_matches_exactly(self):
         listing = {
