@@ -2496,7 +2496,10 @@ def _process_whatsapp_message(message):
                     flush=True,
                 )
                 workflow_result = handle_internal_user_message(
-                    internal_user, text, base_url, _bubble_patch
+                    internal_user, text, base_url, _bubble_patch,
+                    bubble_create=_bubble_create,
+                    bubble_records=_bubble_records,
+                    relationship_names=get_relationship_names,
                 )
                 if workflow_result.handled:
                     send_whatsapp_text(phone, workflow_result.response_text)

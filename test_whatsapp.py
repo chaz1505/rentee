@@ -2,6 +2,7 @@ import json
 import os
 import unittest
 import requests
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -242,6 +243,38 @@ class WhatsAppTests(unittest.TestCase):
         mocked_workflow.assert_called_once()
         mocked_send.assert_called_once()
         result.complete.assert_called_once_with()
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app.get_relationship_names", return_value={})
+    @patch("app._bubble_records", return_value=iter([]))
+    @patch("app._bubble_patch")
+    @patch("app._bubble_create", return_value="enquiry-1")
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_duplicate_forwarded_webhook_creates_only_one_enquiry(
+        self, _typing, mocked_send, mocked_create, _patch, _records, _names
+    ):
+        self.mocked_internal_user.return_value = {
+            "_id": "user-1", "phone": "60123456789",
+            "Awaiting Enquiry": True,
+            "Pending Enquirer Agent?": "Yes",
+            "Awaiting Enquiry Since": datetime.now(timezone.utc).isoformat(),
+        }
+        client = app_module.app.test_client()
+        payload = webhook_payload(
+            message_id="wamid.real-forwarded", text="Forwarded enquiry details"
+        )
+
+        first = client.post("/whatsapp/webhook", json=payload)
+        second = client.post("/whatsapp/webhook", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        enquiry_creates = [
+            call for call in mocked_create.call_args_list if call.args[1] == "enquiry"
+        ]
+        self.assertEqual(len(enquiry_creates), 1)
+        mocked_send.assert_called_once()
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-1")

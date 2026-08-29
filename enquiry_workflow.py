@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import re
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 
 AWAITING_ENQUIRY_FIELD = "Awaiting Enquiry"
@@ -126,8 +127,209 @@ def clear_pending_enquiry(user_id, base_url, bubble_patch):
     print(f"[ENQUIRY WORKFLOW] user_id={user_id} pending state cleared", flush=True)
 
 
+def _extract_urls(text):
+    return [
+        match.rstrip(".,;:!?)\]}>\"'")
+        for match in re.findall(r"https?://[^\s<>()\[\]{}]+", str(text or ""))
+    ]
+
+
+def _normalise_url(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = urlparse(unquote(value.strip().strip("<>[]()")))
+    except ValueError:
+        return None
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return None
+    path = parsed.path.rstrip("/") or "/"
+    return f"{parsed.netloc.casefold()}{path}"
+
+
+def _portal_reference(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlparse(unquote(value.strip().strip("<>[]()")))
+    except ValueError:
+        return None
+    host = parsed.netloc.casefold().split(":", 1)[0]
+    if not (
+        host == "propertyguru.com.my" or host.endswith(".propertyguru.com.my")
+        or host == "iproperty.com.my" or host.endswith(".iproperty.com.my")
+    ):
+        return None
+    match = re.search(r"(?:^|/)l/(\d+)(?:/|$)", parsed.path)
+    return match.group(1) if match else None
+
+
+def _normalise_name(value):
+    return " ".join(re.sub(r"[^\w]+", " ", str(value or "").casefold()).split())
+
+
+def _extract_beds(text):
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:beds?|bedrooms?)\b", str(text), re.I)
+    return float(match.group(1)) if match else None
+
+
+def _extract_rent(text):
+    value = str(text or "")
+    patterns = (
+        r"\bRM\s*([\d,]+(?:\.\d+)?)\s*([kK])?",
+        r"\b([\d,]+(?:\.\d+)?)\s*([kK])\s*(?:/\s*mo|per\s+month|monthly)?",
+        r"\b([\d,]{4,})\s*(?:/\s*mo|per\s+month|monthly)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, re.I)
+        if match:
+            amount = float(match.group(1).replace(",", ""))
+            if len(match.groups()) > 1 and match.group(2):
+                amount *= 1000
+            return amount
+    return None
+
+
+def _as_number(value):
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def match_owned_listing(
+    message_text, listings, condo_names
+):
+    """Return (Listing, method, ambiguous candidates) without guessing."""
+    message_urls = _extract_urls(message_text)
+    normalised_urls = {_normalise_url(url) for url in message_urls}
+    references = {_portal_reference(url) for url in message_urls}
+    normalised_urls.discard(None)
+    references.discard(None)
+
+    direct = [
+        listing for listing in listings
+        if _normalise_url(listing.get("sourceURL")) in normalised_urls
+    ]
+    if len(direct) == 1:
+        return direct[0], "source_url", []
+    if len(direct) > 1:
+        return None, None, direct
+
+    referenced = [
+        listing for listing in listings
+        if _portal_reference(listing.get("sourceURL")) in references
+    ]
+    if len(referenced) == 1:
+        return referenced[0], "portal_reference", []
+    if len(referenced) > 1:
+        return None, None, referenced
+
+    beds = _extract_beds(message_text)
+    rent = _extract_rent(message_text)
+    normalised_message = _normalise_name(message_text)
+    fallback = []
+    if beds is not None and rent is not None:
+        for listing in listings:
+            condo_name = condo_names.get(str(listing.get("condo") or ""))
+            normalised_condo = _normalise_name(condo_name)
+            if (
+                normalised_condo
+                and normalised_condo in normalised_message
+                and _as_number(listing.get("beds")) == beds
+                and _as_number(listing.get("priceRent")) == rent
+            ):
+                fallback.append(listing)
+    if len(fallback) == 1:
+        return fallback[0], "condo_beds_price", []
+    return None, None, fallback
+
+
+def _listing_label(listing, condo_names):
+    condo_name = condo_names.get(str(listing.get("condo") or "")) or "listing"
+    beds = _as_number(listing.get("beds"))
+    rent = _as_number(listing.get("priceRent"))
+    parts = [str(condo_name)]
+    if beds is not None:
+        parts.append(f"{beds:g}-bed")
+    if rent is not None:
+        parts.append(f"at RM{rent:,.0f}")
+    return " ".join(parts)
+
+
+def consume_pending_enquiry(
+    user, pending, message_text, base_url, bubble_create, bubble_records,
+    bubble_patch, relationship_names,
+):
+    """Create the Enquiry, deterministically match an owned Listing, and respond."""
+    user_id = user["_id"]
+    agent_value = "Yes" if pending["agent"] else "No"
+    try:
+        enquiry_id = bubble_create(base_url, "enquiry", {
+            "Agent": user_id,
+            "Agent?": agent_value,
+            "Original Enquiry": message_text,
+        })
+    except Exception as error:
+        print(
+            f"[ENQUIRY WORKFLOW] user_id={user_id} Enquiry creation failed "
+            f"error={type(error).__name__}; pending state retained",
+            flush=True,
+        )
+        raise
+    print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} created", flush=True)
+    # Creation is the durable consumption point. A matching failure must not cause
+    # the same forwarded message to create another Enquiry on retry.
+    clear_pending_enquiry(user_id, base_url, bubble_patch)
+
+    constraints = [{"key": "owner", "constraint_type": "equals", "value": user_id}]
+    owned_listings = [
+        listing for listing in bubble_records(base_url, "listing", constraints)
+        if listing.get("_id") and str(listing.get("owner") or "") == str(user_id)
+    ]
+    condo_names = relationship_names(
+        base_url, "condo", [listing.get("condo") for listing in owned_listings]
+    )
+    matched, method, ambiguous = match_owned_listing(
+        message_text, owned_listings, condo_names
+    )
+    if matched:
+        bubble_patch(
+            f"{base_url}/obj/enquiry/{enquiry_id}", {"Listing": matched["_id"]}
+        )
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+            f"listing_id={matched['_id']} match_method={method}",
+            flush=True,
+        )
+        label = _listing_label(matched, condo_names)
+        response = f"Got it — I've matched this to your {label}."
+        if matched.get("availability") is False:
+            response += " It's already marked unavailable."
+        return EnquiryWorkflowResult(True, response)
+    if ambiguous:
+        first = ambiguous[0]
+        label = _listing_label(first, condo_names)
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} ambiguous_matches={len(ambiguous)}",
+            flush=True,
+        )
+        return EnquiryWorkflowResult(
+            True,
+            f"I found {len(ambiguous)} of your {label} listings. "
+            "Which unit is this enquiry for?",
+        )
+    print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} no listing match", flush=True)
+    return EnquiryWorkflowResult(
+        True,
+        "Got it — I've created the enquiry, but I couldn't confidently match it "
+        "to one of your listings. Which listing is this for?",
+    )
+
+
 def handle_internal_user_message(
-    user, message_text, base_url, bubble_patch, now=None
+    user, message_text, base_url, bubble_patch, now=None,
+    bubble_create=None, bubble_records=None, relationship_names=None,
 ):
     """Handle one internal User message without depending on Flask or WhatsApp."""
     user_id = user.get("_id")
@@ -136,15 +338,15 @@ def handle_internal_user_message(
     now = now or datetime.now(timezone.utc)
     pending = get_pending_enquiry_state(user)
     if pending and not is_pending_enquiry_expired(pending, now):
-        kind = "agent" if pending["agent"] else "lead"
         print(
-            f"[ENQUIRY WORKFLOW] user_id={user_id} pending {kind} enquiry consumed",
+            f"[ENQUIRY WORKFLOW] user_id={user_id} pending enquiry consumed",
             flush=True,
         )
-        return EnquiryWorkflowResult(
-            True,
-            f"Got it — I've received the {kind} enquiry.",
-            lambda: clear_pending_enquiry(user_id, base_url, bubble_patch),
+        if not all((bubble_create, bubble_records, relationship_names)):
+            raise RuntimeError("Pending Enquiry dependencies are not configured.")
+        return consume_pending_enquiry(
+            user, pending, message_text, base_url, bubble_create, bubble_records,
+            bubble_patch, relationship_names,
         )
     if pending:
         print(f"[ENQUIRY WORKFLOW] user_id={user_id} pending state expired", flush=True)
