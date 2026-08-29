@@ -192,13 +192,14 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-2")
     @patch("app.find_latest_ai_message")
     @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_recommendation_batch")
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.find_or_create_whatsapp_lead")
     @patch("app.send_whatsapp_typing_indicator")
     def test_message_reuses_lead_context_and_sends_only_clean_final_answer(
-        self, mocked_typing, mocked_lead, _mocked_folio, mocked_turn, mocked_send,
-        mocked_latest, _mocked_create, mocked_save
+        self, mocked_typing, mocked_lead, _mocked_folio, mocked_turn, mocked_batch,
+        mocked_send, mocked_latest, _mocked_create, mocked_save
     ):
         events = []
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
@@ -226,6 +227,7 @@ class WhatsAppTests(unittest.TestCase):
         mocked_send.assert_called_once_with(
             "60123456789", "Here are two suitable Bangsar homes."
         )
+        mocked_batch.assert_not_called()
         mocked_save.assert_called_once_with(
             "bubble-message-2", "Here are two suitable Bangsar homes.",
             "response-2", "live",
@@ -345,6 +347,102 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(mocked_post.call_count, 1)
         self.assertEqual(mocked_post.call_args.kwargs["json"]["to"], "60123456789")
         self.assertEqual(mocked_post.call_args.kwargs["json"]["text"]["body"], "Hello from Rentee")
+
+    def test_listing_image_prefers_cover_photo(self):
+        self.assertEqual(
+            app_module.get_listing_whatsapp_image({
+                "coverPhoto": "https://cdn.test/cover.jpg",
+                "photos": ["https://cdn.test/first.jpg"],
+            }),
+            "https://cdn.test/cover.jpg",
+        )
+
+    def test_listing_image_falls_back_to_first_photo(self):
+        self.assertEqual(
+            app_module.get_listing_whatsapp_image({
+                "photos": ["https://cdn.test/first.jpg", "https://cdn.test/second.jpg"]
+            }),
+            "https://cdn.test/first.jpg",
+        )
+
+    def test_listing_image_missing_or_empty_photos_returns_none(self):
+        for listing in ({}, {"photos": None}, {"photos": []}):
+            with self.subTest(listing=listing):
+                self.assertEqual(
+                    app_module.get_listing_whatsapp_image(listing), None
+                )
+
+    def test_listing_image_malformed_cover_uses_first_valid_photo(self):
+        self.assertEqual(
+            app_module.get_listing_whatsapp_image({
+                "coverPhoto": "not a URL",
+                "photos": ["//cdn.test/first.jpg"],
+            }),
+            "https://cdn.test/first.jpg",
+        )
+
+    @patch("app.requests.post")
+    def test_send_whatsapp_image_uses_meta_image_payload(self, mocked_post):
+        mocked_post.return_value.status_code = 200
+        mocked_post.return_value.raise_for_status.return_value = None
+        app_module.send_whatsapp_image("+60 12 345 6789", "https://cdn.test/a.jpg")
+        payload = mocked_post.call_args.kwargs["json"]
+        self.assertEqual(payload, {
+            "messaging_product": "whatsapp",
+            "to": "60123456789",
+            "type": "image",
+            "image": {"link": "https://cdn.test/a.jpg"},
+        })
+
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_image")
+    def test_recommendation_batch_interleaves_images_and_text_with_cap(
+        self, mocked_image, mocked_text
+    ):
+        events = []
+        mocked_image.side_effect = lambda *_args: (
+            events.append("image") or MagicMock(status_code=200)
+        )
+        mocked_text.side_effect = lambda *_args: events.append("text")
+        listings = [{
+            "listing_id": f"listing-{index}",
+            "property_name": f"Home {index}",
+            "coverPhoto": f"https://cdn.test/{index}.jpg",
+        } for index in range(1, 7)]
+
+        app_module.send_whatsapp_recommendation_batch(
+            "60123456789", "folio-1", listings, top_count=6
+        )
+
+        self.assertEqual(mocked_image.call_count, 4)
+        self.assertEqual(mocked_text.call_count, 6)  # intro + four cards + footer
+        self.assertEqual(events, [
+            "text", "image", "text", "image", "text",
+            "image", "text", "image", "text", "text",
+        ])
+
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_image")
+    def test_missing_and_failed_images_still_send_all_recommendation_text(
+        self, mocked_image, mocked_text
+    ):
+        mocked_image.side_effect = requests.RequestException("Meta rejected image")
+        listings = [
+            {"listing_id": "a", "property_name": "A",
+             "coverPhoto": "https://cdn.test/a.jpg"},
+            {"listing_id": "b", "property_name": "B", "photos": []},
+            {"listing_id": "c", "property_name": "C",
+             "photos": ["https://cdn.test/c.jpg"]},
+        ]
+        with patch("builtins.print") as mocked_print:
+            app_module.send_whatsapp_recommendation_batch(
+                "60123456789", "folio-1", listings
+            )
+        self.assertEqual(mocked_image.call_count, 2)
+        self.assertEqual(mocked_text.call_count, 5)  # intro + three cards + footer
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("failed", logs)
+        self.assertIn("no image available", logs)
 
     @patch("app.bubble")
     @patch("app._bubble_records", return_value=iter([]))
@@ -534,18 +632,22 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-current")
     @patch("app.find_latest_ai_message", return_value=None)
     @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_recommendation_batch")
     @patch("app.build_whatsapp_recommendation_summary")
+    @patch("app.get_current_recommendations")
     @patch("app.run_rentee_turn")
     @patch("app.find_or_create_lead_folio", return_value=("folio-active", False))
     @patch("app.find_or_create_whatsapp_lead")
     @patch("app.send_whatsapp_typing_indicator")
     def test_recommendation_turn_uses_existing_folio_and_one_coherent_text_message(
-        self, _typing, mocked_lead, mocked_folio, mocked_turn, mocked_summary,
-        mocked_send, _latest, _create, mocked_save
+        self, _typing, mocked_lead, mocked_folio, mocked_turn, mocked_current,
+        mocked_summary, mocked_batch, mocked_send, _latest, _create, mocked_save
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
         mocked_turn.return_value = ("Model recommendation", "resp-1", True)
+        listings = [{"listing_id": "listing-1", "property_name": "One Menerung"}]
+        mocked_current.return_value = json.dumps({"current_recommendations": listings})
         mocked_summary.return_value = (
             "Three grounded recommendations\n\n"
             "https://www.rentee.asia/folio3/folio-active"
@@ -555,10 +657,14 @@ class WhatsAppTests(unittest.TestCase):
         app_module._process_whatsapp_message(item)
 
         mocked_folio.assert_called_once_with("lead-1", "live")
-        mocked_summary.assert_called_once_with("folio-active", "live")
-        mocked_send.assert_called_once_with(
-            "60123456789", mocked_summary.return_value
+        mocked_current.assert_called_once_with(
+            "folio-active", "live", include_media=True
         )
+        mocked_summary.assert_called_once_with(
+            "folio-active", "live", listings=listings
+        )
+        mocked_batch.assert_called_once_with("60123456789", "folio-active", listings)
+        mocked_send.assert_not_called()
         mocked_save.assert_called_once_with(
             "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
         )

@@ -9,6 +9,7 @@ import json
 import threading
 import time
 import re
+from urllib.parse import urlparse
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -54,6 +55,7 @@ CONDO_SHEET_TIMEOUT_SECONDS = 15
 WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
+MAX_WHATSAPP_RECOMMENDATION_IMAGES = 4
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
@@ -764,6 +766,57 @@ def send_whatsapp_text(to_phone, text):
     return sent_ids
 
 
+def _usable_whatsapp_image_url(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.startswith("//"):
+        value = f"https:{value}"
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return value
+
+
+def get_listing_whatsapp_image(listing):
+    """Return the Listing's own preferred public image URL, if usable."""
+    cover = _usable_whatsapp_image_url(listing.get("coverPhoto"))
+    if cover:
+        return cover
+    photos = listing.get("photos")
+    if isinstance(photos, list) and photos:
+        first_photo = _usable_whatsapp_image_url(photos[0])
+        if first_photo:
+            return first_photo
+    return None
+
+
+def send_whatsapp_image(to_phone, image_url):
+    """Send one public image URL through the existing WhatsApp Cloud API."""
+    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    url = (
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+        f"{phone_number_id}/messages"
+    )
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": normalize_phone(to_phone),
+            "type": "image",
+            "image": {"link": image_url},
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response
+
+
 def send_whatsapp_typing_indicator(whatsapp_message_id):
     """Mark one inbound Meta message read and show WhatsApp's native typing state."""
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
@@ -980,7 +1033,7 @@ def get_property_details(folio_id, property_reference, bubble_env):
     return "Authoritative Rentee property details:\n" + "\n".join(details)
 
 
-def get_current_recommendations(folio_id, bubble_env):
+def get_current_recommendations(folio_id, bubble_env, include_media=False):
     """Return grounded details for the active Folio without changing its shortlist."""
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
@@ -1009,6 +1062,10 @@ def get_current_recommendations(folio_id, bubble_env):
                         facts[output_name] = value
                 facts["position"] = position
                 facts["listing_id"] = facts.pop("_id")
+                if include_media:
+                    # Retain only the Listing's own media fields for WhatsApp rendering.
+                    facts["coverPhoto"] = listing.get("coverPhoto")
+                    facts["photos"] = listing.get("photos")
                 if folio_item.get("RecoSummary"):
                     facts["recommendation_reason"] = folio_item["RecoSummary"]
                 listings.append(facts)
@@ -1030,19 +1087,14 @@ def build_folio_url(folio_id):
     return f"https://www.rentee.asia/folio3/{folio_id}"
 
 
-def build_whatsapp_recommendation_summary(folio_id, bubble_env="live", top_count=3):
-    """Render a compact, grounded subset while leaving the Folio as the full UI."""
-    result = json.loads(get_current_recommendations(folio_id, bubble_env))
-    listings = result.get("current_recommendations") or []
-    if not listings:
-        return None
-    shown = listings[:max(1, min(top_count, 5))]
+def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
+    shown = listings[:max(1, min(top_count, MAX_WHATSAPP_RECOMMENDATION_IMAGES))]
     total = len(listings)
     intro = (
         f"I've shortlisted {total} properties for you. "
         f"My top {len(shown)} are:"
     )
-    sections = [intro]
+    cards = []
     for index, listing in enumerate(shown, start=1):
         name = listing.get("property_name") or listing.get("condo_name") or f"Property {index}"
         rent = _as_number(listing.get("priceRent"))
@@ -1059,16 +1111,79 @@ def build_whatsapp_recommendation_summary(folio_id, bubble_env="live", top_count
             internal_value = listing.get(internal_field)
             if internal_value:
                 reason = reason.replace(str(internal_value), str(name))
-        sections.append(heading + (f"\n{reason}" if reason else ""))
+        cards.append(heading + (f"\n{reason}" if reason else ""))
     if total > len(shown):
         link_intro = f"See all {total} with photos and full details here:"
     else:
         link_intro = "See the shortlist with photos and full details here:"
-    sections.extend([
-        f"{link_intro}\n{build_folio_url(folio_id)}",
-        "Tell me which ones you like.",
-    ])
-    return "\n\n".join(sections)
+    footer = (
+        f"{link_intro}\n{build_folio_url(folio_id)}\n\n"
+        "Tell me which ones you like."
+    )
+    return intro, cards, footer, shown
+
+
+def build_whatsapp_recommendation_summary(
+    folio_id, bubble_env="live", top_count=3, listings=None
+):
+    """Render a compact, grounded subset while leaving the Folio as the full UI."""
+    if listings is None:
+        result = json.loads(get_current_recommendations(folio_id, bubble_env))
+        listings = result.get("current_recommendations") or []
+    if not listings:
+        return None
+    intro, cards, footer, _shown = _whatsapp_recommendation_sections(
+        listings, folio_id, top_count
+    )
+    return "\n\n".join([intro, *cards, footer])
+
+
+def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3):
+    """Interleave each ranked Listing's own image and grounded recommendation text."""
+    intro, cards, footer, shown = _whatsapp_recommendation_sections(
+        listings, folio_id, top_count
+    )
+    send_whatsapp_text(to_phone, intro)
+    seen_listing_ids = set()
+    for listing, card in zip(shown, cards):
+        listing_id = str(listing.get("listing_id") or "")
+        image_url = get_listing_whatsapp_image(listing)
+        source = (
+            "coverPhoto"
+            if image_url == _usable_whatsapp_image_url(listing.get("coverPhoto"))
+            else "photos[0]"
+        )
+        duplicate = bool(listing_id and listing_id in seen_listing_ids)
+        if listing_id:
+            seen_listing_ids.add(listing_id)
+        if image_url and not duplicate:
+            print(
+                f"[WHATSAPP MEDIA] listing_id={listing_id or 'unknown'} "
+                f"source={source} sending",
+                flush=True,
+            )
+            try:
+                response = send_whatsapp_image(to_phone, image_url)
+                print(
+                    f"[WHATSAPP MEDIA] listing_id={listing_id or 'unknown'} "
+                    f"sent status={response.status_code}",
+                    flush=True,
+                )
+            except Exception as error:
+                status = getattr(getattr(error, "response", None), "status_code", None)
+                print(
+                    f"[WHATSAPP MEDIA] listing_id={listing_id or 'unknown'} "
+                    f"failed status={status or 'unknown'} continuing with text",
+                    flush=True,
+                )
+        elif not image_url:
+            print(
+                f"[WHATSAPP MEDIA] listing_id={listing_id or 'unknown'} "
+                "no image available",
+                flush=True,
+            )
+        send_whatsapp_text(to_phone, card)
+    send_whatsapp_text(to_phone, footer)
 
 
 def create_folio_items(recommendations, base_url, message_id):
@@ -2385,16 +2500,28 @@ def _process_whatsapp_message(message):
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
             )
+            recommendation_listings = []
             if recommendations_relevant:
+                recommendation_result = json.loads(
+                    get_current_recommendations(folio_id, "live", include_media=True)
+                )
+                recommendation_listings = (
+                    recommendation_result.get("current_recommendations") or []
+                )
                 recommendation_summary = build_whatsapp_recommendation_summary(
-                    folio_id, "live"
+                    folio_id, "live", listings=recommendation_listings
                 )
                 if recommendation_summary:
                     answer = recommendation_summary
             save_whatsapp_ai_message(
                 current_message_id, answer, response_id, "live"
             )
-            send_whatsapp_text(phone, answer)
+            if recommendation_listings:
+                send_whatsapp_recommendation_batch(
+                    phone, folio_id, recommendation_listings
+                )
+            else:
+                send_whatsapp_text(phone, answer)
             reply_sent = True
             print(
                 "[WHATSAPP CONVERSATION] "
