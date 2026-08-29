@@ -744,7 +744,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         self.assertIn("I've got your enquiry", result.response_text)
         finder.assert_called_once_with(
-            "60123456789", agent_classification="Yes"
+            "60123456789", customer_name=None, agent_classification="Yes"
         )
         self.assertIn(
             {"Lead": "lead-1"},
@@ -760,8 +760,94 @@ class EnquiryWorkflowTests(unittest.TestCase):
             enquiry, {"_id": "lead-1", "Agent?": "No"}, created=True
         )
         finder.assert_called_once_with(
-            "60123456789", agent_classification="No"
+            "60123456789", customer_name=None, agent_classification="No"
         )
+
+    def test_explicit_enquirer_name_patterns_are_conservative(self):
+        cases = {
+            "Hi Gwen, I'm Sarah Lim and I'm interested in this unit": "Sarah Lim",
+            "Hi Gwen, this is John Tan. Is this available?": "John Tan",
+            "Name: Melissa Wong\nI am interested in this unit": "Melissa Wong",
+            "I spoke to Sarah Lim about this unit": None,
+            "Can you ask Mr Tan whether the owner will accept?": None,
+            "Gwen Delhumeau sent me this property": None,
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(workflow.extract_enquirer_name(message), expected)
+
+    def test_original_name_precedes_profile_and_agent_suffix_is_idempotent(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "Yes",
+            "Original Enquiry": "Hi Gwen, I'm Sarah Lim and I'm interested",
+        }
+        finder = MagicMock(return_value=(
+            {"_id": "lead-1", "Agent?": "Yes", "name": "Sarah Lim (Agent)"},
+            True,
+        ))
+        _result, finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {}, finder=finder
+        )
+        finder.assert_called_once_with(
+            "60123456789", customer_name="Sarah Lim (Agent)",
+            agent_classification="Yes",
+        )
+        name_updates = [
+            call.args[1] for call in patch_bubble.call_args_list
+            if call.args[0].endswith("/obj/lead/lead-1") and "name" in call.args[1]
+        ]
+        self.assertEqual(name_updates, [])
+
+    def test_whatsapp_profile_name_is_fallback_for_blank_original_name(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No", "Original Enquiry": "Is this still available?",
+        }
+        finder = MagicMock(return_value=(
+            {"_id": "lead-1", "Agent?": "No", "name": "Aisha Rahman"}, True
+        ))
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, MagicMock(side_effect=[enquiry, {"_id": "listing-1"}]),
+            MagicMock(), normalize_phone, find_or_create_lead=finder,
+            whatsapp_profile_name="Aisha Rahman",
+        )
+        self.assertTrue(result.handled)
+        finder.assert_called_once_with(
+            "60123456789", customer_name="Aisha Rahman",
+            agent_classification="No",
+        )
+
+    def test_existing_name_is_preserved_but_agent_suffix_is_added(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "Yes", "Original Enquiry": "I'm Different Person",
+        }
+        _result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "No", "name": "Sarah Lim"}
+        )
+        lead_updates = [
+            call.args[1] for call in patch_bubble.call_args_list
+            if call.args[0].endswith("/obj/lead/lead-1")
+        ]
+        self.assertIn({"Agent?": "Yes"}, lead_updates)
+        self.assertIn({"name": "Sarah Lim (Agent)"}, lead_updates)
+        self.assertNotIn({"name": "Different Person (Agent)"}, lead_updates)
+
+    def test_blank_agent_name_does_not_become_suffix_only(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "Yes", "Original Enquiry": "Interested in this unit",
+        }
+        _result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, {"_id": "lead-1", "Agent?": "Yes", "name": ""}
+        )
+        self.assertFalse(any(
+            call.args[0].endswith("/obj/lead/lead-1") and "name" in call.args[1]
+            for call in patch_bubble.call_args_list
+        ))
 
     def test_existing_lead_agent_classification_is_sticky(self):
         cases = (

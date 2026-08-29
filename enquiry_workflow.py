@@ -15,6 +15,7 @@ AWAITING_SINCE_FIELD = "Awaiting Enquiry Since"
 PENDING_ENQUIRY_TTL = timedelta(minutes=30)
 HANDOFF_CODE_PATTERN = re.compile(r"\bRNT-[A-Z0-9]{8}\b", re.I)
 HANDOFF_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+LEAD_NAME_FIELD = "name"
 
 
 @dataclass
@@ -32,6 +33,47 @@ class EnquiryWorkflowResult:
 def extract_handoff_code(message_text):
     match = HANDOFF_CODE_PATTERN.search(str(message_text or ""))
     return match.group(0).upper() if match else None
+
+
+def _clean_person_name(value, minimum_words=1):
+    candidate = " ".join(str(value or "").strip().split())
+    candidate = re.split(
+        r"[.!?\n]|\s+(?:and\s+I|I(?:'m|\s+am)|interested\b|calling\b)",
+        candidate,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ,;:-")
+    words = candidate.split()
+    if not minimum_words <= len(words) <= 4:
+        return None
+    if not all(re.fullmatch(r"[A-Z][A-Za-z'’\-]*", word) for word in words):
+        return None
+    return candidate
+
+
+def extract_enquirer_name(message_text):
+    """Extract only explicit, first-person sender-name declarations."""
+    text = str(message_text or "")
+    patterns = (
+        r"\bName\s*:\s*([^\r\n]+)",
+        r"\b(?:I['’]m|I\s+am|this\s+is)\s+([^\r\n.!?]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            candidate = _clean_person_name(match.group(1), minimum_words=2)
+            if candidate:
+                return candidate
+    return None
+
+
+def _with_agent_suffix(name):
+    value = str(name or "").strip()
+    if not value:
+        return value, "none"
+    if re.search(r"\s*\(agent\)\s*$", value, re.I):
+        return value, "already_present"
+    return f"{value} (Agent)", "appended"
 
 
 def _valid_handoff_code(value):
@@ -80,7 +122,7 @@ def build_whatsapp_handoff_link(code, rentee_whatsapp_number, normalize_phone):
 def handle_external_handoff_message(
     sender_phone, message_text, base_url, bubble_records, bubble_get,
     bubble_patch, normalize_phone, sender_user_id=None,
-    find_or_create_lead=None,
+    find_or_create_lead=None, whatsapp_profile_name=None,
 ):
     """Resolve and bind one external WhatsApp sender to an existing Enquiry."""
     code = extract_handoff_code(message_text)
@@ -171,9 +213,19 @@ def handle_external_handoff_message(
         enquiry_classification = (
             "Yes" if str(enquiry.get("Agent?") or "").strip() == "Yes" else "No"
         )
+        extracted_name = extract_enquirer_name(enquiry.get("Original Enquiry"))
+        profile_name = _clean_person_name(whatsapp_profile_name)
+        candidate_name = extracted_name or profile_name
+        name_source = (
+            "original_enquiry" if extracted_name else
+            "whatsapp_profile" if profile_name else "none"
+        )
+        if enquiry_classification == "Yes" and candidate_name:
+            candidate_name, _suffix_action = _with_agent_suffix(candidate_name)
         try:
             lead, lead_created = find_or_create_lead(
                 incoming_phone,
+                customer_name=candidate_name,
                 agent_classification=enquiry_classification,
             )
             lead_id = lead.get("_id")
@@ -217,6 +269,34 @@ def handle_external_handoff_message(
                 f"agent_classification={final_classification} action={action}",
                 flush=True,
             )
+            existing_name = str(lead.get(LEAD_NAME_FIELD) or "").strip()
+            final_name = existing_name
+            if not final_name and candidate_name:
+                final_name = candidate_name
+                bubble_patch(
+                    f"{base_url}/obj/lead/{lead_id}",
+                    {LEAD_NAME_FIELD: final_name},
+                )
+                lead[LEAD_NAME_FIELD] = final_name
+            elif final_name and not lead_created:
+                name_source = "existing"
+            print(
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} name_source={name_source}",
+                flush=True,
+            )
+            if final_classification == "Yes" and final_name:
+                suffixed_name, suffix_action = _with_agent_suffix(final_name)
+                if suffix_action == "appended":
+                    bubble_patch(
+                        f"{base_url}/obj/lead/{lead_id}",
+                        {LEAD_NAME_FIELD: suffixed_name},
+                    )
+                    lead[LEAD_NAME_FIELD] = suffixed_name
+                print(
+                    f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                    f"agent_suffix={suffix_action}",
+                    flush=True,
+                )
             if not linked_lead_id:
                 bubble_patch(
                     f"{base_url}/obj/enquiry/{enquiry_id}", {"Lead": lead_id}

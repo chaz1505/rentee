@@ -118,6 +118,19 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
     @patch("app.bubble", return_value={"_id": "lead-new"})
+    def test_new_handoff_lead_uses_confirmed_name_field(
+        self, _bubble, _find, mocked_create
+    ):
+        lead, _created = app_module.find_or_create_whatsapp_lead(
+            "60123456789", customer_name="Sarah Lim (Agent)",
+            agent_classification="Yes",
+        )
+        self.assertEqual(lead["name"], "Sarah Lim (Agent)")
+        self.assertEqual(mocked_create.call_args.args[2]["name"], "Sarah Lim (Agent)")
+
+    @patch("app._bubble_create", return_value="lead-new")
+    @patch("app.find_lead_by_phone", return_value=None)
+    @patch("app.bubble", return_value={"_id": "lead-new"})
     def test_new_lead_continues_when_bubble_hides_phone_on_read(
         self, _mocked_bubble, _mocked_find, _mocked_create
     ):

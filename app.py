@@ -64,6 +64,7 @@ CONDO_SHEET_TIMEOUT_SECONDS = 15
 WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
+WHATSAPP_LEAD_NAME_FIELD = "name"
 MAX_WHATSAPP_RECOMMENDATION_IMAGES = 4
 
 _condo_cache = None
@@ -630,6 +631,8 @@ def find_or_create_whatsapp_lead(
     payload = {WHATSAPP_LEAD_PHONE_FIELD: canonical}
     if agent_classification in {"Yes", "No"}:
         payload["Agent?"] = agent_classification
+        if str(customer_name or "").strip():
+            payload[WHATSAPP_LEAD_NAME_FIELD] = str(customer_name).strip()
     lead_id = _bubble_create(base_url, "lead", payload)
     # The repository exposes no confirmed Lead name/source field, so do not invent one.
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
@@ -644,6 +647,8 @@ def find_or_create_whatsapp_lead(
     lead[WHATSAPP_LEAD_PHONE_FIELD] = canonical
     if agent_classification in {"Yes", "No"}:
         lead.setdefault("Agent?", agent_classification)
+        if str(customer_name or "").strip():
+            lead.setdefault(WHATSAPP_LEAD_NAME_FIELD, str(customer_name).strip())
     lead.setdefault("searchBriefJSON", "")
     return lead, True
 
@@ -2744,6 +2749,7 @@ def _process_whatsapp_message(message):
                         internal_user.get("_id") if internal_user else None
                     ),
                     find_or_create_lead=find_or_create_whatsapp_lead,
+                    whatsapp_profile_name=message.get("customer_name"),
                 )
                 send_whatsapp_text(phone, handoff_result.response_text)
                 print(
