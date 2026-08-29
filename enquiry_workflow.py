@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import re
 import secrets
+import time
 from typing import Optional
 from urllib.parse import quote, unquote, urlparse
 
@@ -64,8 +65,13 @@ def ensure_handoff_code(
 
 
 def build_whatsapp_handoff_link(code, rentee_whatsapp_number, normalize_phone):
-    number = normalize_phone(rentee_whatsapp_number)
-    if not number:
+    configured_number = str(rentee_whatsapp_number or "").strip()
+    if not configured_number or not re.fullmatch(
+        r"\+?[0-9\s()\-]+", configured_number
+    ):
+        raise ValueError("Rentee WhatsApp dialable number is not configured.")
+    number = normalize_phone(configured_number)
+    if not number or not number.isdigit():
         raise ValueError("Rentee WhatsApp dialable number is not configured.")
     message = f"Hi, I'm following up on enquiry {code}"
     return f"https://wa.me/{number}?text={quote(message, safe='')}"
@@ -422,6 +428,95 @@ def _listing_label(listing, condo_names):
     return " ".join(parts)
 
 
+def _portal_references(message_text):
+    return sorted({
+        reference for reference in (
+            _portal_reference(url) for url in _extract_urls(message_text)
+        ) if reference
+    })
+
+
+def _fast_portal_listing_match(
+    message_text, user_id, base_url, bubble_records, bubble_get
+):
+    """Return one owner-constrained Listing found by stable portal reference."""
+    references = _portal_references(message_text)
+    if not references:
+        return None
+    print(f"[ENQUIRY WORKFLOW] portal_references={references}", flush=True)
+    candidates = {}
+    for reference in references:
+        started = time.perf_counter()
+        constraints = [
+            {"key": "owner", "constraint_type": "equals", "value": user_id},
+            {
+                "key": "sourceURL", "constraint_type": "text contains",
+                "value": reference,
+            },
+        ]
+        try:
+            results = list(bubble_records(base_url, "listing", constraints))
+        except Exception as error:
+            print(
+                f"[ENQUIRY WORKFLOW] portal fast lookup reference={reference} "
+                f"duration_ms={(time.perf_counter() - started) * 1000:.1f} "
+                f"error={type(error).__name__} falling_back=true",
+                flush=True,
+            )
+            return None
+        print(
+            f"[ENQUIRY WORKFLOW] portal fast lookup reference={reference} "
+            f"duration_ms={(time.perf_counter() - started) * 1000:.1f}",
+            flush=True,
+        )
+        for result in results:
+            listing_id = result.get("_id")
+            returned_owner = result.get("owner")
+            if (
+                listing_id
+                and (not returned_owner or str(returned_owner) == str(user_id))
+            ):
+                candidates[str(listing_id)] = dict(result)
+
+    if len(candidates) != 1:
+        print(
+            "[ENQUIRY WORKFLOW] portal fast lookup no_unique_match "
+            f"references={references} falling_back=true",
+            flush=True,
+        )
+        return None
+
+    listing_id, candidate = next(iter(candidates.items()))
+    if bubble_get:
+        try:
+            hydrated = bubble_get(f"{base_url}/obj/listing/{listing_id}")
+            if isinstance(hydrated, dict):
+                candidate.update(hydrated)
+        except Exception as error:
+            print(
+                f"[ENQUIRY WORKFLOW] listing_id={listing_id} fast-path hydration "
+                f"failed error={type(error).__name__}; falling_back=true",
+                flush=True,
+            )
+            return None
+    candidate.setdefault("_id", listing_id)
+    returned_owner = candidate.get("owner")
+    if returned_owner and str(returned_owner) != str(user_id):
+        print(
+            "[ENQUIRY WORKFLOW] portal fast lookup owner mismatch falling_back=true",
+            flush=True,
+        )
+        return None
+    stored_reference = _portal_reference(candidate.get("sourceURL"))
+    if stored_reference and stored_reference not in references:
+        print(
+            "[ENQUIRY WORKFLOW] portal fast lookup reference mismatch falling_back=true",
+            flush=True,
+        )
+        return None
+    return candidate
+
+
 def consume_pending_enquiry(
     user, pending, message_text, base_url, bubble_create, bubble_records,
     bubble_patch, relationship_names, bubble_get=None, normalize_phone=None,
@@ -448,66 +543,83 @@ def consume_pending_enquiry(
     # the same forwarded message to create another Enquiry on retry.
     clear_pending_enquiry(user_id, base_url, bubble_patch)
 
-    constraints = [{"key": "owner", "constraint_type": "equals", "value": user_id}]
-    print(
-        "[ENQUIRY WORKFLOW] retrieving owned Listings "
-        f"object_type=listing constraint_key=owner user_id={user_id}",
-        flush=True,
+    matched = _fast_portal_listing_match(
+        message_text, user_id, base_url, bubble_records, bubble_get
     )
-    try:
-        constrained_listings = list(
-            bubble_records(base_url, "listing", constraints)
-        )
-    except Exception as error:
+    method = "portal_reference_fast_path" if matched else None
+    ambiguous = []
+    owned_listings = []
+    fallback_started = None
+    if not matched:
+        fallback_started = time.perf_counter()
+        constraints = [
+            {"key": "owner", "constraint_type": "equals", "value": user_id}
+        ]
         print(
-            "[ENQUIRY WORKFLOW] owned Listing retrieval failed "
-            f"error={type(error).__name__}",
+            "[ENQUIRY WORKFLOW] retrieving owned Listings "
+            f"object_type=listing constraint_key=owner user_id={user_id}",
             flush=True,
         )
-        raise
-    owned_listings = []
-    for listing in constrained_listings:
-        listing_id = listing.get("_id")
-        if not listing_id:
+        try:
+            constrained_listings = list(
+                bubble_records(base_url, "listing", constraints)
+            )
+        except Exception as error:
             print(
-                "[ENQUIRY WORKFLOW] ignored constrained Listing without ID",
+                "[ENQUIRY WORKFLOW] owned Listing retrieval failed "
+                f"error={type(error).__name__}",
                 flush=True,
             )
-            continue
-        candidate = dict(listing)
-        if bubble_get:
-            try:
-                hydrated = bubble_get(f"{base_url}/obj/listing/{listing_id}")
-                if isinstance(hydrated, dict):
-                    candidate.update(hydrated)
-                    candidate.setdefault("_id", listing_id)
-            except Exception as error:
+            raise
+        for listing in constrained_listings:
+            listing_id = listing.get("_id")
+            if not listing_id:
                 print(
-                    f"[ENQUIRY WORKFLOW] listing_id={listing_id} hydration failed "
-                    f"error={type(error).__name__}; using constrained record",
+                    "[ENQUIRY WORKFLOW] ignored constrained Listing without ID",
                     flush=True,
                 )
-        returned_owner = candidate.get("owner")
-        if returned_owner and str(returned_owner) != str(user_id):
-            print(
-                f"[ENQUIRY WORKFLOW] listing_id={listing_id} rejected owner mismatch",
-                flush=True,
-            )
-            continue
-        # Bubble already applied the exact owner constraint. Privacy rules may omit
-        # owner from the response, so absence is not evidence of an ownership mismatch.
-        owned_listings.append(candidate)
-    print(
-        f"[ENQUIRY WORKFLOW] owned_listings_count={len(owned_listings)} "
-        f"constrained_results={len(constrained_listings)}",
-        flush=True,
-    )
+                continue
+            candidate = dict(listing)
+            if bubble_get:
+                try:
+                    hydrated = bubble_get(f"{base_url}/obj/listing/{listing_id}")
+                    if isinstance(hydrated, dict):
+                        candidate.update(hydrated)
+                        candidate.setdefault("_id", listing_id)
+                except Exception as error:
+                    print(
+                        f"[ENQUIRY WORKFLOW] listing_id={listing_id} hydration failed "
+                        f"error={type(error).__name__}; using constrained record",
+                        flush=True,
+                    )
+            returned_owner = candidate.get("owner")
+            if returned_owner and str(returned_owner) != str(user_id):
+                print(
+                    f"[ENQUIRY WORKFLOW] listing_id={listing_id} rejected owner mismatch",
+                    flush=True,
+                )
+                continue
+            owned_listings.append(candidate)
+        print(
+            f"[ENQUIRY WORKFLOW] owned_listings_count={len(owned_listings)} "
+            f"constrained_results={len(constrained_listings)}",
+            flush=True,
+        )
     condo_names = relationship_names(
-        base_url, "condo", [listing.get("condo") for listing in owned_listings]
+        base_url, "condo", [
+            listing.get("condo")
+            for listing in ([matched] if matched else owned_listings)
+        ]
     )
-    matched, method, ambiguous = match_owned_listing(
-        message_text, owned_listings, condo_names
-    )
+    if not matched:
+        matched, method, ambiguous = match_owned_listing(
+            message_text, owned_listings, condo_names
+        )
+        print(
+            "[ENQUIRY WORKFLOW] broad listing fallback "
+            f"duration_ms={(time.perf_counter() - fallback_started) * 1000:.1f}",
+            flush=True,
+        )
     if matched:
         bubble_patch(
             f"{base_url}/obj/enquiry/{enquiry_id}", {"Listing": matched["_id"]}

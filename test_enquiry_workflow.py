@@ -157,6 +157,14 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         self.assertIn((
             "https://bubble.test", "listing",
+            [
+                {"key": "owner", "constraint_type": "equals", "value": "user-1"},
+                {"key": "sourceURL", "constraint_type": "text contains",
+                 "value": "501124208"},
+            ],
+        ), [call.args for call in self.records.call_args_list])
+        self.assertNotIn((
+            "https://bubble.test", "listing",
             [{"key": "owner", "constraint_type": "equals", "value": "user-1"}],
         ), [call.args for call in self.records.call_args_list])
         self.assertIn("One Menerung 3-bed at RM15,000", result.response_text)
@@ -198,6 +206,61 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertEqual(matched["_id"], "listing-1")
         self.assertEqual(method, "portal_reference")
         self.assertEqual(ambiguous, [])
+
+    def test_same_reference_from_two_portals_runs_one_fast_lookup(self):
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/501124208",
+            "availability": True,
+        }
+        self.records.side_effect = [iter([listing]), iter([])]
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = self.consume(user, (
+            "https://www.propertyguru.com.my/l/501124208 "
+            "https://www.iproperty.com.my/l/501124208"
+        ))
+        self.assertIn("https://wa.me/", result.response_text)
+        listing_calls = [
+            call for call in self.records.call_args_list
+            if call.args[1] == "listing"
+        ]
+        self.assertEqual(len(listing_calls), 1)
+        self.assertEqual(
+            listing_calls[0].args[2][1]["value"], "501124208"
+        )
+
+    def test_ambiguous_fast_lookup_falls_back_without_guessing(self):
+        listings = [{
+            "_id": f"listing-{index}", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/501124208",
+            "availability": True,
+        } for index in (1, 2)]
+        self.records.side_effect = [iter(listings), iter(listings)]
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = self.consume(
+            user, "https://www.propertyguru.com.my/l/501124208"
+        )
+        self.assertIn("I found 2", result.response_text)
+        self.assertFalse(any(
+            call.args[0].endswith("/obj/enquiry/enquiry-1")
+            and "Listing" in call.args[1]
+            for call in self.patch_user.call_args_list
+        ))
+        listing_constraints = [
+            call.args[2] for call in self.records.call_args_list
+            if call.args[1] == "listing"
+        ]
+        self.assertEqual(len(listing_constraints), 2)
+        self.assertEqual(len(listing_constraints[0]), 2)
+        self.assertEqual(len(listing_constraints[1]), 1)
 
     def test_markdown_forwarded_urls_extract_recognised_reference(self):
         text = (
@@ -246,12 +309,9 @@ class EnquiryWorkflowTests(unittest.TestCase):
             [call.args for call in self.patch_user.call_args_list],
         )
         logs = "\n".join(str(call) for call in mocked_print.call_args_list)
-        self.assertIn("owned_listings_count=1", logs)
+        self.assertNotIn("owned_listings_count=", logs)
         self.assertIn("portal_references=['501124208']", logs)
-        self.assertIn(
-            "enquiry_id=enquiry-1 listing_id=listing-1 match_method=portal_reference",
-            logs,
-        )
+        self.assertIn("match_method=portal_reference_fast_path", logs)
         self.assertIn("listing_id=listing-1 availability=true", logs)
         self.assertNotIn("[ENQUIRY WORKFLOW] candidate", logs)
 
@@ -277,8 +337,14 @@ class EnquiryWorkflowTests(unittest.TestCase):
             rentee_whatsapp_number="60115551234",
         )
         self.assertIn("One Menerung", result.response_text)
-        bubble_get.assert_any_call(
-            "https://bubble.test/obj/listing/listing-1"
+        listing_hydrations = [
+            call for call in bubble_get.call_args_list
+            if "/obj/listing/" in call.args[0]
+        ]
+        self.assertEqual(len(listing_hydrations), 1)
+        self.assertEqual(
+            listing_hydrations[0].args[0],
+            "https://bubble.test/obj/listing/listing-1",
         )
 
     def test_fallback_condo_beds_and_rent_parsing_matches_exactly(self):
@@ -322,11 +388,12 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertNotIn("[ENQUIRY WORKFLOW] candidate", logs)
 
     def test_no_match_logs_one_concise_summary_without_candidate_dump(self):
-        self.records.return_value = iter([{
+        listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "beds": 4, "priceRent": 18000,
             "sourceURL": "https://www.propertyguru.com.my/l/999999",
-        }])
+        }
+        self.records.side_effect = [iter([listing]), iter([listing])]
         self.relationship_names.return_value = {"condo-1": "One Menerung"}
         user = {
             "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
@@ -477,6 +544,33 @@ class EnquiryWorkflowTests(unittest.TestCase):
             link,
             "https://wa.me/60115551234?text=Hi%2C%20I%27m%20following%20up%20on%20enquiry%20RNT-7K4M9Q2P",
         )
+
+    def test_configured_rentee_number_builds_expected_handoff_link(self):
+        link = workflow.build_whatsapp_handoff_link(
+            "RNT-7K4M9Q2P", "601112032754", normalize_phone
+        )
+        self.assertTrue(link.startswith(
+            "https://wa.me/601112032754?text="
+        ))
+        self.assertIn("RNT-7K4M9Q2P", link)
+
+    def test_handoff_number_normalises_supported_formatting(self):
+        link = workflow.build_whatsapp_handoff_link(
+            "RNT-7K4M9Q2P", "+60 (11)-1203 2754", normalize_phone
+        )
+        self.assertTrue(link.startswith(
+            "https://wa.me/601112032754?text="
+        ))
+
+    def test_missing_or_invalid_handoff_number_fails_safely(self):
+        for configured_number in (None, "", "+() -", "+60 11 ABC 2754"):
+            with self.subTest(configured_number=configured_number):
+                with self.assertRaisesRegex(
+                    ValueError, "dialable number is not configured"
+                ):
+                    workflow.build_whatsapp_handoff_link(
+                        "RNT-7K4M9Q2P", configured_number, normalize_phone
+                    )
 
     def test_existing_valid_handoff_code_is_reused_without_write(self):
         records = MagicMock()

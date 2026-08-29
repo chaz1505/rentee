@@ -2743,10 +2743,7 @@ def _process_whatsapp_message(message):
                     relationship_names=get_relationship_names,
                     bubble_get=bubble,
                     normalize_phone=normalize_phone,
-                    rentee_whatsapp_number=(
-                        os.environ.get("WHATSAPP_BUSINESS_PHONE_NUMBER")
-                        or os.environ.get("WHATSAPP_PHONE_NUMBER")
-                    ),
+                    rentee_whatsapp_number=os.getenv("RENTEE_WHATSAPP_NUMBER"),
                 )
                 if workflow_result.handled:
                     send_whatsapp_text(phone, workflow_result.response_text)

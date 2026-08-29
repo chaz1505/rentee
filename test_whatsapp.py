@@ -11,6 +11,7 @@ os.environ.setdefault("WHATSAPP_VERIFY_TOKEN", "verify-me")
 os.environ.setdefault("WHATSAPP_ACCESS_TOKEN", "wa-token")
 os.environ.setdefault("WHATSAPP_PHONE_NUMBER_ID", "phone-number-id")
 os.environ.setdefault("WHATSAPP_BUSINESS_PHONE_NUMBER", "60115551234")
+os.environ.setdefault("RENTEE_WHATSAPP_NUMBER", "601112032754")
 
 import app as app_module
 
@@ -214,11 +215,52 @@ class WhatsAppTests(unittest.TestCase):
         app_module._process_whatsapp_message(item)
 
         mocked_workflow.assert_called_once()
+        self.assertEqual(
+            mocked_workflow.call_args.kwargs["rentee_whatsapp_number"],
+            "601112032754",
+        )
         mocked_send.assert_called_once_with(
             "60123456789", "Sure — send me the agent enquiry."
         )
         result.complete.assert_called_once_with()
         mocked_lead.assert_not_called()
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_internal_user_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_handoff_number_does_not_use_meta_phone_number_id(
+        self, _typing, mocked_workflow, _mocked_send, _mocked_lead
+    ):
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        mocked_workflow.return_value = MagicMock(handled=True, response_text="Handled")
+        item = webhook_payload()["entry"][0]["changes"][0]["value"]["messages"][0]
+        with patch.dict(os.environ, {
+            "RENTEE_WHATSAPP_NUMBER": "601112032754",
+            "WHATSAPP_PHONE_NUMBER_ID": "meta-sender-id",
+        }):
+            app_module._process_whatsapp_message(item)
+        self.assertEqual(
+            mocked_workflow.call_args.kwargs["rentee_whatsapp_number"],
+            "601112032754",
+        )
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_internal_user_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_missing_handoff_number_is_passed_as_unconfigured(
+        self, _typing, mocked_workflow, _mocked_send, _mocked_lead
+    ):
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        mocked_workflow.return_value = MagicMock(handled=True, response_text="Handled")
+        item = webhook_payload(message_id="wamid.missing-config")["entry"][0]["changes"][0]["value"]["messages"][0]
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RENTEE_WHATSAPP_NUMBER", None)
+            app_module._process_whatsapp_message(item)
+        self.assertIsNone(
+            mocked_workflow.call_args.kwargs["rentee_whatsapp_number"]
+        )
 
     @patch("app.find_or_create_whatsapp_lead")
     @patch("app.handle_external_handoff_message")
