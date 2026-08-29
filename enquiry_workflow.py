@@ -16,6 +16,7 @@ PENDING_ENQUIRY_TTL = timedelta(minutes=30)
 HANDOFF_CODE_PATTERN = re.compile(r"\bRNT-[A-Z0-9]{8}\b", re.I)
 HANDOFF_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LEAD_NAME_FIELD = "name"
+LEAD_AGENT_FIELD = "Agent"
 
 
 @dataclass
@@ -227,6 +228,7 @@ def handle_external_handoff_message(
                 incoming_phone,
                 customer_name=candidate_name,
                 agent_classification=enquiry_classification,
+                agent_user_id=enquiry.get("Agent"),
             )
             lead_id = lead.get("_id")
             if not lead_id:
@@ -271,6 +273,7 @@ def handle_external_handoff_message(
             )
             existing_name = str(lead.get(LEAD_NAME_FIELD) or "").strip()
             final_name = existing_name
+            name_action = "unchanged"
             if not final_name and candidate_name:
                 final_name = candidate_name
                 bubble_patch(
@@ -278,10 +281,15 @@ def handle_external_handoff_message(
                     {LEAD_NAME_FIELD: final_name},
                 )
                 lead[LEAD_NAME_FIELD] = final_name
+                name_action = "set"
             elif final_name and not lead_created:
                 name_source = "existing"
+                name_action = "kept"
+            elif final_name:
+                name_action = "set"
             print(
-                f"[ENQUIRY WORKFLOW] lead_id={lead_id} name_source={name_source}",
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} name_source={name_source} "
+                f"action={name_action}",
                 flush=True,
             )
             if final_classification == "Yes" and final_name:
@@ -297,6 +305,35 @@ def handle_external_handoff_message(
                     f"agent_suffix={suffix_action}",
                     flush=True,
                 )
+            enquiry_agent_user_id = str(enquiry.get("Agent") or "").strip()
+            existing_agent_user_id = str(lead.get(LEAD_AGENT_FIELD) or "").strip()
+            if enquiry_agent_user_id:
+                if not existing_agent_user_id:
+                    if not lead_created:
+                        bubble_patch(
+                            f"{base_url}/obj/lead/{lead_id}",
+                            {LEAD_AGENT_FIELD: enquiry_agent_user_id},
+                        )
+                    lead[LEAD_AGENT_FIELD] = enquiry_agent_user_id
+                    print(
+                        f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                        f"lead_agent_user_id={enquiry_agent_user_id} action=set",
+                        flush=True,
+                    )
+                elif existing_agent_user_id == enquiry_agent_user_id:
+                    print(
+                        f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                        f"lead_agent_user_id={enquiry_agent_user_id} action=kept",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                        f"existing_agent_user_id={existing_agent_user_id} "
+                        f"enquiry_agent_user_id={enquiry_agent_user_id} "
+                        "action=conflict_preserved",
+                        flush=True,
+                    )
             if not linked_lead_id:
                 bubble_patch(
                     f"{base_url}/obj/enquiry/{enquiry_id}", {"Lead": lead_id}

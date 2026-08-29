@@ -65,6 +65,7 @@ WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
 WHATSAPP_LEAD_NAME_FIELD = "name"
+WHATSAPP_LEAD_AGENT_FIELD = "Agent"
 MAX_WHATSAPP_RECOMMENDATION_IMAGES = 4
 
 _condo_cache = None
@@ -619,7 +620,8 @@ def find_lead_by_phone(phone, bubble_env="live"):
 
 
 def find_or_create_whatsapp_lead(
-    phone, customer_name=None, bubble_env="live", agent_classification=None
+    phone, customer_name=None, bubble_env="live", agent_classification=None,
+    agent_user_id=None,
 ):
     canonical = normalize_phone(phone)
     if not canonical:
@@ -633,8 +635,9 @@ def find_or_create_whatsapp_lead(
         payload["Agent?"] = agent_classification
         if str(customer_name or "").strip():
             payload[WHATSAPP_LEAD_NAME_FIELD] = str(customer_name).strip()
+        if str(agent_user_id or "").strip():
+            payload[WHATSAPP_LEAD_AGENT_FIELD] = str(agent_user_id).strip()
     lead_id = _bubble_create(base_url, "lead", payload)
-    # The repository exposes no confirmed Lead name/source field, so do not invent one.
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     stored_phone = normalize_phone(lead.get(WHATSAPP_LEAD_PHONE_FIELD))
     if stored_phone != canonical:
@@ -649,6 +652,8 @@ def find_or_create_whatsapp_lead(
         lead.setdefault("Agent?", agent_classification)
         if str(customer_name or "").strip():
             lead.setdefault(WHATSAPP_LEAD_NAME_FIELD, str(customer_name).strip())
+        if str(agent_user_id or "").strip():
+            lead.setdefault(WHATSAPP_LEAD_AGENT_FIELD, str(agent_user_id).strip())
     lead.setdefault("searchBriefJSON", "")
     return lead, True
 
