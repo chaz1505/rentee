@@ -529,43 +529,45 @@ def consume_pending_enquiry(
         )
         label = _listing_label(matched, condo_names)
         response = f"Got it — I've matched this to your {label}."
-        handoff_eligible = matched.get("availability") is True
-        if handoff_eligible:
-            print(
-                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_eligible=true",
-                flush=True,
-            )
-            enquiry = (
-                bubble_get(f"{base_url}/obj/enquiry/{enquiry_id}")
-                if bubble_get else {}
-            )
-            code = ensure_handoff_code(
-                enquiry_id, enquiry, base_url, bubble_records, bubble_patch
-            )
-            link = build_whatsapp_handoff_link(
-                code, rentee_whatsapp_number, normalize_phone
-            )
-            print(
-                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_link_generated",
-                flush=True,
-            )
-            response += (
-                "\n\nSend this link to the enquirer so they can continue with Rentee:\n"
-                f"{link}"
-            )
-        elif matched.get("availability") is False:
+        if availability is False:
             print(
                 f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
                 "handoff_eligible=false reason=listing_unavailable",
                 flush=True,
             )
-            response += " It's already marked unavailable."
-        else:
+            return EnquiryWorkflowResult(
+                True, f"The {label} is marked as unavailable."
+            )
+
+        if availability is not True:
             print(
                 f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
-                "handoff_eligible=false reason=availability_unknown",
+                "handoff_eligible=true availability_not_explicitly_false",
                 flush=True,
             )
+        else:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_eligible=true",
+                flush=True,
+            )
+        enquiry = (
+            bubble_get(f"{base_url}/obj/enquiry/{enquiry_id}")
+            if bubble_get else {}
+        )
+        code = ensure_handoff_code(
+            enquiry_id, enquiry, base_url, bubble_records, bubble_patch
+        )
+        link = build_whatsapp_handoff_link(
+            code, rentee_whatsapp_number, normalize_phone
+        )
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_link_generated",
+            flush=True,
+        )
+        response += (
+            "\n\nSend this link to the enquirer so they can continue with Rentee:\n"
+            f"{link}"
+        )
         return EnquiryWorkflowResult(True, response)
     if ambiguous:
         first = ambiguous[0]

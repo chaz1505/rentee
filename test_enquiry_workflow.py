@@ -362,13 +362,77 @@ class EnquiryWorkflowTests(unittest.TestCase):
             workflow.PENDING_AGENT_FIELD: "Yes",
             workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
         }
-        result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
-        self.assertIn("already marked unavailable", result.response_text)
+        with patch("enquiry_workflow.ensure_handoff_code") as ensure_code, \
+                patch("enquiry_workflow.build_whatsapp_handoff_link") as build_link:
+            result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
+        self.assertTrue(result.handled)
+        self.assertIn("marked as unavailable", result.response_text)
         self.assertNotIn("wa.me", result.response_text)
+        ensure_code.assert_not_called()
+        build_link.assert_not_called()
         self.assertFalse(any(
             "Handoff Code" in call.args[1]
             for call in self.patch_user.call_args_list
         ))
+
+    def test_null_availability_proceeds_to_existing_handoff(self):
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "availability": None,
+        }
+        self.records.side_effect = [iter([listing]), iter([])]
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        with patch("enquiry_workflow._new_handoff_code", return_value="RNT-7K4M9Q2P"), \
+                patch("builtins.print") as mocked_print:
+            result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
+        self.assertIn("https://wa.me/60115551234?", result.response_text)
+        self.assertIn("RNT-7K4M9Q2P", result.response_text)
+        logs = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("availability=unknown", logs)
+        self.assertIn("handoff_eligible=true availability_not_explicitly_false", logs)
+
+    def test_absent_availability_proceeds_to_existing_handoff(self):
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/12345",
+        }
+        self.records.side_effect = [iter([listing]), iter([])]
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        with patch("enquiry_workflow._new_handoff_code", return_value="RNT-7K4M9Q2P"):
+            result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
+        self.assertIn("https://wa.me/60115551234?", result.response_text)
+        self.assertIn({"Handoff Code": "RNT-7K4M9Q2P"}, [
+            call.args[1] for call in self.patch_user.call_args_list
+        ])
+
+    def test_availability_date_does_not_affect_boolean_availability_gate(self):
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "availability": None,
+            "availability_date": "2030-01-01T00:00:00.000Z",
+        }
+        self.records.side_effect = [iter([listing]), iter([])]
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        with patch("enquiry_workflow._new_handoff_code", return_value="RNT-7K4M9Q2P"):
+            result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
+        self.assertIn("https://wa.me/60115551234?", result.response_text)
 
     def test_expired_state_is_cleared_but_message_is_not_consumed(self):
         user = {
