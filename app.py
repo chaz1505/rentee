@@ -10,8 +10,11 @@ import threading
 import time
 import re
 from urllib.parse import urlparse
+from collections import deque
 from types import SimpleNamespace
 from pathlib import Path
+
+from enquiry_workflow import find_internal_user, handle_internal_user_message
 
 from search_flow import (
     apply_search_update,
@@ -61,6 +64,8 @@ _condo_cache = None
 _condo_cache_checked_at = 0.0
 _condo_cache_lock = threading.Lock()
 _whatsapp_processing_ids = set()
+_whatsapp_processed_ids = set()
+_whatsapp_processed_order = deque(maxlen=1000)
 _whatsapp_processing_lock = threading.Lock()
 _whatsapp_phone_locks = {}
 
@@ -539,6 +544,14 @@ def _bubble_create(base_url, object_type, payload):
     if not object_id:
         raise ValueError(f"Bubble did not return a {object_type} ID.")
     return object_id
+
+
+def _bubble_patch(url, payload):
+    response = requests.patch(
+        url, headers=_bubble_headers(), json=payload, timeout=30,
+    )
+    response.raise_for_status()
+    return response
 
 
 def _bubble_records(base_url, object_type, constraints=None, query_params=None):
@@ -2471,6 +2484,34 @@ def _process_whatsapp_message(message):
     reply_sent = False
     try:
         with phone_lock:
+            base_url = get_bubble_base_url("live")
+            internal_user = find_internal_user(
+                phone, base_url, _bubble_records, bubble, normalize_phone
+            )
+            safe_phone = f"...{phone[-4:]}" if phone else "unknown"
+            if internal_user:
+                print(
+                    "[ENQUIRY WORKFLOW] internal User matched "
+                    f"phone={safe_phone} user_id={internal_user.get('_id')}",
+                    flush=True,
+                )
+                workflow_result = handle_internal_user_message(
+                    internal_user, text, base_url, _bubble_patch
+                )
+                if workflow_result.handled:
+                    send_whatsapp_text(phone, workflow_result.response_text)
+                    workflow_result.complete()
+                    print(
+                        f"[ENQUIRY WORKFLOW] user_id={internal_user.get('_id')} handled",
+                        flush=True,
+                    )
+                    reply_sent = True
+                    return
+            else:
+                print(
+                    f"[ENQUIRY WORKFLOW] no internal User match phone={safe_phone}",
+                    flush=True,
+                )
             lead, lead_created = find_or_create_whatsapp_lead(
                 phone, message.get("customer_name"), "live"
             )
@@ -2483,7 +2524,6 @@ def _process_whatsapp_message(message):
                 if previous_message else None
             )
             current_message_id = create_whatsapp_ai_message(lead_id, "live")
-            safe_phone = f"...{phone[-4:]}" if phone else "unknown"
             print(
                 "[WHATSAPP CONVERSATION] "
                 f"phone={safe_phone} lead_id={lead_id} lead_created={lead_created} "
@@ -2541,6 +2581,11 @@ def _process_whatsapp_message(message):
     finally:
         with _whatsapp_processing_lock:
             _whatsapp_processing_ids.discard(message_id)
+            if message_id not in _whatsapp_processed_ids:
+                if len(_whatsapp_processed_order) == _whatsapp_processed_order.maxlen:
+                    _whatsapp_processed_ids.discard(_whatsapp_processed_order[0])
+                _whatsapp_processed_order.append(message_id)
+                _whatsapp_processed_ids.add(message_id)
 
 
 def _whatsapp_text_messages(payload):
@@ -2587,7 +2632,10 @@ def receive_whatsapp_webhook():
     for message in _whatsapp_text_messages(payload):
         message_id = str(message["id"])
         with _whatsapp_processing_lock:
-            if message_id in _whatsapp_processing_ids:
+            if (
+                message_id in _whatsapp_processing_ids
+                or message_id in _whatsapp_processed_ids
+            ):
                 continue
             _whatsapp_processing_ids.add(message_id)
         worker = threading.Thread(

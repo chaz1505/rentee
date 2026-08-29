@@ -36,7 +36,12 @@ class ImmediateThread:
 class WhatsAppTests(unittest.TestCase):
     def setUp(self):
         app_module._whatsapp_processing_ids.clear()
+        app_module._whatsapp_processed_ids.clear()
+        app_module._whatsapp_processed_order.clear()
         app_module._whatsapp_phone_locks.clear()
+        self.internal_user_patcher = patch("app.find_internal_user", return_value=None)
+        self.mocked_internal_user = self.internal_user_patcher.start()
+        self.addCleanup(self.internal_user_patcher.stop)
 
     def test_webhook_verification_accepts_valid_token_and_rejects_invalid(self):
         client = app_module.app.test_client()
@@ -187,6 +192,77 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message["from"], "60123456789")
         self.assertEqual(message["text"]["body"], "Hi")
         self.assertEqual(message["customer_name"], "Aisha")
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_internal_user_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_internal_user_handled_message_skips_external_lead_flow(
+        self, _typing, mocked_workflow, mocked_send, mocked_lead
+    ):
+        self.mocked_internal_user.return_value = {
+            "_id": "user-1", "phone": "+60 12-345 6789"
+        }
+        result = MagicMock(
+            handled=True, response_text="Sure — send me the agent enquiry."
+        )
+        mocked_workflow.return_value = result
+        item = webhook_payload(text="new agent enquiry coming")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        mocked_workflow.assert_called_once()
+        mocked_send.assert_called_once_with(
+            "60123456789", "Sure — send me the agent enquiry."
+        )
+        result.complete.assert_called_once_with()
+        mocked_lead.assert_not_called()
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_internal_user_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_completed_duplicate_internal_webhook_is_not_consumed_twice(
+        self, _typing, mocked_workflow, mocked_send
+    ):
+        self.mocked_internal_user.return_value = {
+            "_id": "user-1", "phone": "60123456789"
+        }
+        result = MagicMock(
+            handled=True,
+            response_text="Got it — I've received the agent enquiry.",
+        )
+        mocked_workflow.return_value = result
+        client = app_module.app.test_client()
+        payload = webhook_payload(message_id="wamid.forwarded-enquiry")
+
+        client.post("/whatsapp/webhook", json=payload)
+        client.post("/whatsapp/webhook", json=payload)
+
+        mocked_workflow.assert_called_once()
+        mocked_send.assert_called_once()
+        result.complete.assert_called_once_with()
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-1")
+    @patch("app.find_latest_ai_message", return_value=None)
+    @patch("app.send_whatsapp_text")
+    @patch("app.run_rentee_turn", return_value=("Normal reply", "response-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.find_or_create_whatsapp_lead", return_value=({"_id": "lead-1"}, False))
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_unknown_internal_user_falls_through_to_existing_whatsapp_flow(
+        self, _typing, mocked_lead, _folio, mocked_turn, mocked_send,
+        _latest, _create, _save
+    ):
+        item = webhook_payload(text="Find me a home")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        self.mocked_internal_user.assert_called_once()
+        mocked_lead.assert_called_once()
+        mocked_turn.assert_called_once()
+        mocked_send.assert_called_once_with("60123456789", "Normal reply")
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-2")
