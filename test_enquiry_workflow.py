@@ -246,7 +246,12 @@ class EnquiryWorkflowTests(unittest.TestCase):
         logs = "\n".join(str(call) for call in mocked_print.call_args_list)
         self.assertIn("owned_listings_count=1", logs)
         self.assertIn("portal_references=['501124208']", logs)
-        self.assertIn("reference_match=True", logs)
+        self.assertIn(
+            "enquiry_id=enquiry-1 listing_id=listing-1 match_method=portal_reference",
+            logs,
+        )
+        self.assertIn("listing_id=listing-1 availability=true", logs)
+        self.assertNotIn("[ENQUIRY WORKFLOW] candidate", logs)
 
     def test_sparse_constrained_listing_is_hydrated_before_matching(self):
         self.records.return_value = iter([{"_id": "listing-1"}])
@@ -298,13 +303,47 @@ class EnquiryWorkflowTests(unittest.TestCase):
             workflow.PENDING_AGENT_FIELD: "No",
             workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
         }
-        result = self.consume(user, "One Menerung 3 beds RM15,000")
+        with patch("builtins.print") as mocked_print:
+            result = self.consume(user, "One Menerung 3 beds RM15,000")
         self.assertIn("I found 2", result.response_text)
         enquiry_updates = [
             call for call in self.patch_user.call_args_list
             if "/obj/enquiry/" in call.args[0]
         ]
         self.assertEqual(enquiry_updates, [])
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("ambiguous listing match", logs)
+        self.assertIn("method=condo_beds_price", logs)
+        self.assertIn("listing_ids=['listing-1', 'listing-2']", logs)
+        self.assertNotIn("[ENQUIRY WORKFLOW] candidate", logs)
+
+    def test_no_match_logs_one_concise_summary_without_candidate_dump(self):
+        self.records.return_value = iter([{
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "beds": 4, "priceRent": 18000,
+            "sourceURL": "https://www.propertyguru.com.my/l/999999",
+        }])
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        message = (
+            "One Menerung 3 Beds / RM 15,000 /mo "
+            "https://www.propertyguru.com.my/l/501124208"
+        )
+        with patch("builtins.print") as mocked_print:
+            result = self.consume(user, message)
+        self.assertIn("couldn't confidently match", result.response_text)
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("no listing match", logs)
+        self.assertIn("portal_refs=['501124208']", logs)
+        self.assertIn("parsed_condos=['One Menerung']", logs)
+        self.assertIn("parsed_beds=3.0", logs)
+        self.assertIn("parsed_rent=15000.0", logs)
+        self.assertIn("owned_listings_count=1", logs)
+        self.assertNotIn("[ENQUIRY WORKFLOW] candidate", logs)
 
     def test_unavailable_match_reports_known_status_without_future_actions(self):
         listing = {

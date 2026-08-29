@@ -217,34 +217,15 @@ def match_owned_listing(
     references = {_portal_reference(url) for url in message_urls}
     normalised_urls.discard(None)
     references.discard(None)
-    print(
-        f"[ENQUIRY WORKFLOW] extracted_urls={message_urls} "
-        f"portal_references={sorted(references)}",
-        flush=True,
-    )
+    if references:
+        print(
+            f"[ENQUIRY WORKFLOW] portal_references={sorted(references)}",
+            flush=True,
+        )
 
     beds = _extract_beds(message_text)
     rent = _extract_rent(message_text)
     normalised_message = _normalise_name(message_text)
-    for listing in listings:
-        source_url = _normalise_url(listing.get("sourceURL"))
-        reference = _portal_reference(listing.get("sourceURL"))
-        condo_id = str(listing.get("condo") or "")
-        condo_name = condo_names.get(condo_id)
-        candidate_beds = _as_number(listing.get("beds"))
-        candidate_rent = _as_number(listing.get("priceRent"))
-        print(
-            "[ENQUIRY WORKFLOW] candidate "
-            f"listing_id={listing.get('_id')} source_url={source_url} "
-            f"portal_reference={reference} beds={candidate_beds} "
-            f"priceRent={candidate_rent} condo_id={condo_id or None} "
-            f"condo_name={condo_name} url_match={source_url in normalised_urls} "
-            f"reference_match={bool(reference and reference in references)} "
-            f"condo_match={bool(_normalise_name(condo_name) and _normalise_name(condo_name) in normalised_message)} "
-            f"beds_match={beds is not None and candidate_beds == beds} "
-            f"rent_match={rent is not None and candidate_rent == rent}",
-            flush=True,
-        )
 
     direct = [
         listing for listing in listings
@@ -279,6 +260,30 @@ def match_owned_listing(
     if len(fallback) == 1:
         return fallback[0], "condo_beds_price", []
     return None, None, fallback
+
+
+def _matching_log_context(message_text, condo_names):
+    references = sorted({
+        reference for reference in (
+            _portal_reference(url) for url in _extract_urls(message_text)
+        ) if reference
+    })
+    normalised_message = _normalise_name(message_text)
+    parsed_condos = [
+        name for name in condo_names.values()
+        if _normalise_name(name) and _normalise_name(name) in normalised_message
+    ]
+    return references, parsed_condos[:3], _extract_beds(message_text), _extract_rent(message_text)
+
+
+def _ambiguous_match_method(message_text, listings):
+    urls = {_normalise_url(url) for url in _extract_urls(message_text)}
+    references = {_portal_reference(url) for url in _extract_urls(message_text)}
+    if any(_normalise_url(listing.get("sourceURL")) in urls for listing in listings):
+        return "source_url"
+    if any(_portal_reference(listing.get("sourceURL")) in references for listing in listings):
+        return "portal_reference"
+    return "condo_beds_price"
 
 
 def _listing_label(listing, condo_names):
@@ -387,6 +392,16 @@ def consume_pending_enquiry(
             f"listing_id={matched['_id']} match_method={method}",
             flush=True,
         )
+        availability = matched.get("availability")
+        availability_label = (
+            "true" if availability is True else
+            "false" if availability is False else "unknown"
+        )
+        print(
+            f"[ENQUIRY WORKFLOW] listing_id={matched['_id']} "
+            f"availability={availability_label}",
+            flush=True,
+        )
         label = _listing_label(matched, condo_names)
         response = f"Got it — I've matched this to your {label}."
         if matched.get("availability") is False:
@@ -395,8 +410,11 @@ def consume_pending_enquiry(
     if ambiguous:
         first = ambiguous[0]
         label = _listing_label(first, condo_names)
+        ambiguous_method = _ambiguous_match_method(message_text, ambiguous)
+        listing_ids = [listing.get("_id") for listing in ambiguous if listing.get("_id")]
         print(
-            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} ambiguous_matches={len(ambiguous)}",
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} ambiguous listing match "
+            f"method={ambiguous_method} listing_ids={listing_ids}",
             flush=True,
         )
         return EnquiryWorkflowResult(
@@ -404,7 +422,16 @@ def consume_pending_enquiry(
             f"I found {len(ambiguous)} of your {label} listings. "
             "Which unit is this enquiry for?",
         )
-    print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} no listing match", flush=True)
+    references, parsed_condos, parsed_beds, parsed_rent = _matching_log_context(
+        message_text, condo_names
+    )
+    print(
+        f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} no listing match "
+        f"portal_refs={references} parsed_condos={parsed_condos} "
+        f"parsed_beds={parsed_beds} parsed_rent={parsed_rent} "
+        f"owned_listings_count={len(owned_listings)}",
+        flush=True,
+    )
     return EnquiryWorkflowResult(
         True,
         "Got it — I've created the enquiry, but I couldn't confidently match it "
