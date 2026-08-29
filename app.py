@@ -14,7 +14,11 @@ from collections import deque
 from types import SimpleNamespace
 from pathlib import Path
 
-from enquiry_workflow import find_internal_user, handle_internal_user_message
+from enquiry_workflow import (
+    find_internal_user,
+    handle_external_handoff_message,
+    handle_internal_user_message,
+)
 
 from search_flow import (
     apply_search_update,
@@ -2692,6 +2696,11 @@ def _process_whatsapp_message(message):
                     bubble_records=_bubble_records,
                     relationship_names=get_relationship_names,
                     bubble_get=bubble,
+                    normalize_phone=normalize_phone,
+                    rentee_whatsapp_number=(
+                        os.environ.get("WHATSAPP_BUSINESS_PHONE_NUMBER")
+                        or os.environ.get("WHATSAPP_PHONE_NUMBER")
+                    ),
                 )
                 if workflow_result.handled:
                     send_whatsapp_text(phone, workflow_result.response_text)
@@ -2707,6 +2716,18 @@ def _process_whatsapp_message(message):
                     f"[ENQUIRY WORKFLOW] no internal User match phone={safe_phone}",
                     flush=True,
                 )
+                handoff_result = handle_external_handoff_message(
+                    phone, text, base_url, _bubble_records, bubble,
+                    _bubble_patch, normalize_phone,
+                )
+                if handoff_result.handled:
+                    send_whatsapp_text(phone, handoff_result.response_text)
+                    print(
+                        f"[ENQUIRY WORKFLOW] external handoff handled phone={safe_phone}",
+                        flush=True,
+                    )
+                    reply_sent = True
+                    return
             lead, lead_created = find_or_create_whatsapp_lead(
                 phone, message.get("customer_name"), "live"
             )

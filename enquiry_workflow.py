@@ -3,14 +3,17 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 import re
+import secrets
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 AWAITING_ENQUIRY_FIELD = "Awaiting Enquiry"
 PENDING_AGENT_FIELD = "Pending Enquirer Agent?"
 AWAITING_SINCE_FIELD = "Awaiting Enquiry Since"
 PENDING_ENQUIRY_TTL = timedelta(minutes=30)
+HANDOFF_CODE_PATTERN = re.compile(r"\bRNT-[A-Z0-9]{8}\b", re.I)
+HANDOFF_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
 @dataclass
@@ -23,6 +26,127 @@ class EnquiryWorkflowResult:
         """Commit state changes that must happen only after WhatsApp sends."""
         if self._after_send:
             self._after_send()
+
+
+def extract_handoff_code(message_text):
+    match = HANDOFF_CODE_PATTERN.search(str(message_text or ""))
+    return match.group(0).upper() if match else None
+
+
+def _valid_handoff_code(value):
+    return bool(HANDOFF_CODE_PATTERN.fullmatch(str(value or "").strip()))
+
+
+def _new_handoff_code():
+    return "RNT-" + "".join(secrets.choice(HANDOFF_CODE_ALPHABET) for _ in range(8))
+
+
+def ensure_handoff_code(
+    enquiry_id, enquiry, base_url, bubble_records, bubble_patch
+):
+    existing = str((enquiry or {}).get("Handoff Code") or "").strip().upper()
+    if _valid_handoff_code(existing):
+        return existing
+    while True:
+        code = _new_handoff_code()
+        constraints = [{
+            "key": "Handoff Code", "constraint_type": "equals", "value": code,
+        }]
+        if not any(bubble_records(base_url, "enquiry", constraints)):
+            bubble_patch(
+                f"{base_url}/obj/enquiry/{enquiry_id}", {"Handoff Code": code}
+            )
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_code_created",
+                flush=True,
+            )
+            return code
+
+
+def build_whatsapp_handoff_link(code, rentee_whatsapp_number, normalize_phone):
+    number = normalize_phone(rentee_whatsapp_number)
+    if not number:
+        raise ValueError("Rentee WhatsApp dialable number is not configured.")
+    message = f"Hi, I'm following up on enquiry {code}"
+    return f"https://wa.me/{number}?text={quote(message, safe='')}"
+
+
+def handle_external_handoff_message(
+    sender_phone, message_text, base_url, bubble_records, bubble_get,
+    bubble_patch, normalize_phone,
+):
+    """Resolve and bind one external WhatsApp sender to an existing Enquiry."""
+    code = extract_handoff_code(message_text)
+    if not code:
+        return EnquiryWorkflowResult(False)
+    constraints = [{
+        "key": "Handoff Code", "constraint_type": "equals", "value": code,
+    }]
+    matches = list(bubble_records(base_url, "enquiry", constraints))
+    if not matches:
+        return EnquiryWorkflowResult(False)
+    print(f"[ENQUIRY WORKFLOW] external handoff detected code={code}", flush=True)
+    if len(matches) != 1 or not matches[0].get("_id"):
+        print(
+            f"[ENQUIRY WORKFLOW] handoff code resolution inconsistent matches={len(matches)}",
+            flush=True,
+        )
+        return EnquiryWorkflowResult(
+            True, "I couldn't connect this enquiry automatically. Please ask the agent "
+            "who sent you the link to send you a fresh one."
+        )
+    enquiry_id = matches[0]["_id"]
+    enquiry = bubble_get(f"{base_url}/obj/enquiry/{enquiry_id}")
+    listing_id = enquiry.get("Listing")
+    if not listing_id:
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} incomplete handoff missing Listing",
+            flush=True,
+        )
+        return EnquiryWorkflowResult(
+            True, "I couldn't connect this enquiry automatically. Please ask the agent "
+            "who sent you the link to send you a fresh one."
+        )
+    try:
+        bubble_get(f"{base_url}/obj/listing/{listing_id}")
+    except Exception as error:
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff Listing unavailable "
+            f"error={type(error).__name__}",
+            flush=True,
+        )
+        return EnquiryWorkflowResult(
+            True, "I couldn't connect this enquiry automatically. Please ask the agent "
+            "who sent you the link to send you a fresh one."
+        )
+    incoming_phone = normalize_phone(sender_phone)
+    existing_phone = normalize_phone(enquiry.get("Enquirer Phone"))
+    safe_incoming = f"...{incoming_phone[-4:]}" if incoming_phone else "unknown"
+    if existing_phone and existing_phone != incoming_phone:
+        safe_existing = f"...{existing_phone[-4:]}"
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff conflict "
+            f"existing_phone={safe_existing} incoming_phone={safe_incoming}",
+            flush=True,
+        )
+        return EnquiryWorkflowResult(
+            True, "I couldn't connect this enquiry automatically. Please ask the agent "
+            "who sent you the link to send you a fresh one."
+        )
+    if not existing_phone:
+        bubble_patch(
+            f"{base_url}/obj/enquiry/{enquiry_id}",
+            {"Enquirer Phone": incoming_phone},
+        )
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+            f"enquirer_phone_set phone={safe_incoming}",
+            flush=True,
+        )
+    print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff completed", flush=True)
+    return EnquiryWorkflowResult(
+        True, "Hi — I've got your enquiry for this property. I'll help you from here."
+    )
 
 
 def find_internal_user(phone, base_url, bubble_records, bubble_get, normalize_phone):
@@ -300,7 +424,8 @@ def _listing_label(listing, condo_names):
 
 def consume_pending_enquiry(
     user, pending, message_text, base_url, bubble_create, bubble_records,
-    bubble_patch, relationship_names, bubble_get=None,
+    bubble_patch, relationship_names, bubble_get=None, normalize_phone=None,
+    rentee_whatsapp_number=None,
 ):
     """Create the Enquiry, deterministically match an owned Listing, and respond."""
     user_id = user["_id"]
@@ -404,8 +529,43 @@ def consume_pending_enquiry(
         )
         label = _listing_label(matched, condo_names)
         response = f"Got it — I've matched this to your {label}."
-        if matched.get("availability") is False:
+        handoff_eligible = matched.get("availability") is True
+        if handoff_eligible:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_eligible=true",
+                flush=True,
+            )
+            enquiry = (
+                bubble_get(f"{base_url}/obj/enquiry/{enquiry_id}")
+                if bubble_get else {}
+            )
+            code = ensure_handoff_code(
+                enquiry_id, enquiry, base_url, bubble_records, bubble_patch
+            )
+            link = build_whatsapp_handoff_link(
+                code, rentee_whatsapp_number, normalize_phone
+            )
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff_link_generated",
+                flush=True,
+            )
+            response += (
+                "\n\nSend this link to the enquirer so they can continue with Rentee:\n"
+                f"{link}"
+            )
+        elif matched.get("availability") is False:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                "handoff_eligible=false reason=listing_unavailable",
+                flush=True,
+            )
             response += " It's already marked unavailable."
+        else:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                "handoff_eligible=false reason=availability_unknown",
+                flush=True,
+            )
         return EnquiryWorkflowResult(True, response)
     if ambiguous:
         first = ambiguous[0]
@@ -415,6 +575,11 @@ def consume_pending_enquiry(
         print(
             f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} ambiguous listing match "
             f"method={ambiguous_method} listing_ids={listing_ids}",
+            flush=True,
+        )
+        print(
+            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+            "handoff_eligible=false reason=ambiguous_listing",
             flush=True,
         )
         return EnquiryWorkflowResult(
@@ -432,6 +597,11 @@ def consume_pending_enquiry(
         f"owned_listings_count={len(owned_listings)}",
         flush=True,
     )
+    print(
+        f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+        "handoff_eligible=false reason=no_listing_match",
+        flush=True,
+    )
     return EnquiryWorkflowResult(
         True,
         "Got it — I've created the enquiry, but I couldn't confidently match it "
@@ -442,7 +612,7 @@ def consume_pending_enquiry(
 def handle_internal_user_message(
     user, message_text, base_url, bubble_patch, now=None,
     bubble_create=None, bubble_records=None, relationship_names=None,
-    bubble_get=None,
+    bubble_get=None, normalize_phone=None, rentee_whatsapp_number=None,
 ):
     """Handle one internal User message without depending on Flask or WhatsApp."""
     user_id = user.get("_id")
@@ -459,7 +629,8 @@ def handle_internal_user_message(
             raise RuntimeError("Pending Enquiry dependencies are not configured.")
         return consume_pending_enquiry(
             user, pending, message_text, base_url, bubble_create, bubble_records,
-            bubble_patch, relationship_names, bubble_get,
+            bubble_patch, relationship_names, bubble_get, normalize_phone,
+            rentee_whatsapp_number,
         )
     if pending:
         print(f"[ENQUIRY WORKFLOW] user_id={user_id} pending state expired", flush=True)

@@ -10,6 +10,7 @@ os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 os.environ.setdefault("WHATSAPP_VERIFY_TOKEN", "verify-me")
 os.environ.setdefault("WHATSAPP_ACCESS_TOKEN", "wa-token")
 os.environ.setdefault("WHATSAPP_PHONE_NUMBER_ID", "phone-number-id")
+os.environ.setdefault("WHATSAPP_BUSINESS_PHONE_NUMBER", "60115551234")
 
 import app as app_module
 
@@ -217,6 +218,41 @@ class WhatsAppTests(unittest.TestCase):
             "60123456789", "Sure — send me the agent enquiry."
         )
         result.complete.assert_called_once_with()
+        mocked_lead.assert_not_called()
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.handle_external_handoff_message")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_internal_user_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_internal_user_with_handoff_code_never_enters_external_handoff_route(
+        self, _typing, mocked_internal, mocked_send, mocked_external, mocked_lead
+    ):
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        mocked_internal.return_value = MagicMock(
+            handled=True, response_text="Internal response"
+        )
+        item = webhook_payload(text="Please check RNT-7K4M9Q2P")["entry"][0]["changes"][0]["value"]["messages"][0]
+        app_module._process_whatsapp_message(item)
+        mocked_external.assert_not_called()
+        mocked_lead.assert_not_called()
+        mocked_send.assert_called_once_with("60123456789", "Internal response")
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_external_handoff_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_valid_external_handoff_skips_normal_lead_flow(
+        self, _typing, mocked_handoff, mocked_send, mocked_lead
+    ):
+        mocked_handoff.return_value = MagicMock(
+            handled=True,
+            response_text="Hi — I've got your enquiry for this property. I'll help you from here.",
+        )
+        item = webhook_payload(text="RNT-7K4M9Q2P")["entry"][0]["changes"][0]["value"]["messages"][0]
+        app_module._process_whatsapp_message(item)
+        mocked_handoff.assert_called_once()
+        mocked_send.assert_called_once()
         mocked_lead.assert_not_called()
 
     @patch("app.threading.Thread", ImmediateThread)

@@ -22,6 +22,8 @@ class EnquiryWorkflowTests(unittest.TestCase):
             user, text, "https://bubble.test", self.patch_user, self.now,
             bubble_create=self.create, bubble_records=self.records,
             relationship_names=self.relationship_names,
+            normalize_phone=normalize_phone,
+            rentee_whatsapp_number="60115551234",
         )
 
     def test_internal_user_phone_matching_tolerates_common_formatting(self):
@@ -153,10 +155,10 @@ class EnquiryWorkflowTests(unittest.TestCase):
         result = self.consume(
             user, "See https://www.propertyguru.com.my/l/501124208"
         )
-        self.records.assert_called_once_with(
+        self.assertIn((
             "https://bubble.test", "listing",
             [{"key": "owner", "constraint_type": "equals", "value": "user-1"}],
-        )
+        ), [call.args for call in self.records.call_args_list])
         self.assertIn("One Menerung 3-bed at RM15,000", result.response_text)
         self.assertIn(
             ("https://bubble.test/obj/enquiry/enquiry-1", {"Listing": "listing-1"}),
@@ -271,9 +273,11 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "https://bubble.test", self.patch_user, self.now,
             bubble_create=self.create, bubble_records=self.records,
             relationship_names=self.relationship_names, bubble_get=bubble_get,
+            normalize_phone=normalize_phone,
+            rentee_whatsapp_number="60115551234",
         )
         self.assertIn("One Menerung", result.response_text)
-        bubble_get.assert_called_once_with(
+        bubble_get.assert_any_call(
             "https://bubble.test/obj/listing/listing-1"
         )
 
@@ -360,6 +364,11 @@ class EnquiryWorkflowTests(unittest.TestCase):
         }
         result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
         self.assertIn("already marked unavailable", result.response_text)
+        self.assertNotIn("wa.me", result.response_text)
+        self.assertFalse(any(
+            "Handoff Code" in call.args[1]
+            for call in self.patch_user.call_args_list
+        ))
 
     def test_expired_state_is_cleared_but_message_is_not_consumed(self):
         user = {
@@ -384,6 +393,150 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         self.assertFalse(result.handled)
         self.patch_user.assert_not_called()
+
+    def test_handoff_code_format_storage_and_link(self):
+        records = MagicMock(return_value=iter([]))
+        patch_bubble = MagicMock()
+        with patch("enquiry_workflow._new_handoff_code", return_value="RNT-7K4M9Q2P"):
+            code = workflow.ensure_handoff_code(
+                "enquiry-1", {}, "https://bubble.test", records, patch_bubble
+            )
+        self.assertEqual(code, "RNT-7K4M9Q2P")
+        patch_bubble.assert_called_once_with(
+            "https://bubble.test/obj/enquiry/enquiry-1",
+            {"Handoff Code": "RNT-7K4M9Q2P"},
+        )
+        link = workflow.build_whatsapp_handoff_link(
+            code, "+60 11-555 1234", normalize_phone
+        )
+        self.assertEqual(
+            link,
+            "https://wa.me/60115551234?text=Hi%2C%20I%27m%20following%20up%20on%20enquiry%20RNT-7K4M9Q2P",
+        )
+
+    def test_existing_valid_handoff_code_is_reused_without_write(self):
+        records = MagicMock()
+        patch_bubble = MagicMock()
+        code = workflow.ensure_handoff_code(
+            "enquiry-1", {"Handoff Code": "rnt-7k4m9q2p"},
+            "https://bubble.test", records, patch_bubble,
+        )
+        self.assertEqual(code, "RNT-7K4M9Q2P")
+        records.assert_not_called()
+        patch_bubble.assert_not_called()
+
+    def test_handoff_code_collision_generates_another_code(self):
+        records = MagicMock(side_effect=[
+            iter([{"_id": "existing"}]), iter([]),
+        ])
+        patch_bubble = MagicMock()
+        with patch("enquiry_workflow._new_handoff_code", side_effect=[
+            "RNT-AAAAAAAA", "RNT-BBBBBBBB",
+        ]):
+            code = workflow.ensure_handoff_code(
+                "enquiry-1", {}, "https://bubble.test", records, patch_bubble
+            )
+        self.assertEqual(code, "RNT-BBBBBBBB")
+        self.assertEqual(patch_bubble.call_args.args[1], {
+            "Handoff Code": "RNT-BBBBBBBB"
+        })
+
+    def test_available_match_creates_handoff_and_appends_link(self):
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "availability": True,
+        }
+        self.records.side_effect = [iter([listing]), iter([])]
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        with patch("enquiry_workflow._new_handoff_code", return_value="RNT-7K4M9Q2P"):
+            result = self.consume(user, "https://www.propertyguru.com.my/l/12345")
+        self.assertIn("https://wa.me/60115551234?", result.response_text)
+        self.assertIn("RNT-7K4M9Q2P", result.response_text)
+        payloads = [call.args[1] for call in self.patch_user.call_args_list]
+        self.assertIn({"Listing": "listing-1"}, payloads)
+        self.assertIn({"Handoff Code": "RNT-7K4M9Q2P"}, payloads)
+
+    def test_external_handoff_sets_empty_phone(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[
+            {"_id": "enquiry-1", "Listing": "listing-1", "Enquirer Phone": ""},
+            {"_id": "listing-1"},
+        ])
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "+60 12-345 6789", "follow up rnt-7k4m9q2p please",
+            "https://bubble.test", records, bubble_get, patch_bubble,
+            normalize_phone,
+        )
+        self.assertTrue(result.handled)
+        self.assertEqual(
+            result.response_text,
+            "Hi — I've got your enquiry for this property. I'll help you from here.",
+        )
+        patch_bubble.assert_called_once_with(
+            "https://bubble.test/obj/enquiry/enquiry-1",
+            {"Enquirer Phone": "60123456789"},
+        )
+
+    def test_external_handoff_same_phone_is_idempotent(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[
+            {"Listing": "listing-1", "Enquirer Phone": "+60 12-345 6789"},
+            {"_id": "listing-1"},
+        ])
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, patch_bubble, normalize_phone,
+        )
+        self.assertTrue(result.handled)
+        patch_bubble.assert_not_called()
+
+    def test_external_handoff_different_phone_cannot_overwrite(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[
+            {"Listing": "listing-1", "Enquirer Phone": "60111111111"},
+            {"_id": "listing-1"},
+        ])
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "60122222222", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, patch_bubble, normalize_phone,
+        )
+        self.assertTrue(result.handled)
+        self.assertIn("fresh one", result.response_text)
+        patch_bubble.assert_not_called()
+
+    def test_invalid_or_unknown_handoff_code_falls_through(self):
+        records = MagicMock(return_value=iter([]))
+        invalid = workflow.handle_external_handoff_message(
+            "60123456789", "reference 12345", "https://bubble.test",
+            records, MagicMock(), MagicMock(), normalize_phone,
+        )
+        unknown = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, MagicMock(), MagicMock(), normalize_phone,
+        )
+        self.assertFalse(invalid.handled)
+        self.assertFalse(unknown.handled)
+
+    def test_resolved_handoff_missing_listing_does_not_bind(self):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        patch_bubble = MagicMock()
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, MagicMock(return_value={"Enquirer Phone": ""}),
+            patch_bubble, normalize_phone,
+        )
+        self.assertTrue(result.handled)
+        self.assertIn("fresh one", result.response_text)
+        patch_bubble.assert_not_called()
 
 
 if __name__ == "__main__":
