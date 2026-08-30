@@ -70,6 +70,15 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "going to send you an agent enquiry",
             "next one is from an agent",
             "I'm going to forward an agent enquiry",
+            "sending you an agent lead",
+            "new agent lead",
+            "sending you a lead from another agent",
+            "agent enquiry coming",
+            "agent lead incoming",
+            "I've got an agent enquiry",
+            "another agent is enquiring",
+            "this enquiry is from an agent",
+            "agent coming through",
         ):
             with self.subTest(text=text):
                 self.assertEqual(workflow.detect_new_enquiry_instruction(text), "agent")
@@ -81,13 +90,28 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "going to send you a lead",
             "next one is a lead",
             "I'm going to forward a new lead",
+            "sending you a lead",
+            "new lead coming",
+            "tenant enquiry coming",
+            "direct lead",
+            "customer enquiry",
+            "sending you a tenant lead",
         ):
             with self.subTest(text=text):
                 self.assertEqual(workflow.detect_new_enquiry_instruction(text), "lead")
 
+    def test_explicit_agent_always_precedes_generic_lead_wording(self):
+        for text in (
+            "sending you an agent lead",
+            "new agent lead",
+            "sending you a lead from another agent",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(workflow.detect_new_enquiry_instruction(text), "agent")
+
     def test_agent_instruction_sets_state_and_replies(self):
         result = workflow.handle_internal_user_message(
-            {"_id": "user-1"}, "new agent enquiry coming",
+            {"_id": "user-1"}, "sending you an agent lead",
             "https://bubble.test", self.patch_user, self.now,
         )
         self.assertTrue(result.handled)

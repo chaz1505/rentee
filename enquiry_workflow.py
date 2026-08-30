@@ -394,11 +394,20 @@ def detect_new_enquiry_instruction(message_text):
     setup_language = bool(re.search(
         r"\b(next|new|coming|forward|forwarding|send|sending|going to)\b", text
     ))
-    if not setup_language:
-        return None
-    if re.search(r"\bagent\b", text) and re.search(r"\b(enquir|next|one)\w*\b", text):
+    agent_indication = bool(re.search(r"\bagent\b", text)) and (
+        setup_language
+        or bool(re.search(r"\banother agent is enquir\w*\b", text))
+        or bool(re.search(r"\benquir\w*\s+is\s+from\s+an?\s+agent\b", text))
+        or bool(re.search(r"\bagent\s+(?:lead|enquir\w*|incoming|coming through)\b", text))
+    )
+    if agent_indication:
         return "agent"
-    if re.search(r"\blead\b", text) and re.search(r"\b(enquir|next|one|lead)\w*\b", text):
+    lead_indication = (
+        setup_language and bool(re.search(r"\b(?:lead|customer|tenant)\b", text))
+    ) or bool(re.search(
+        r"\b(?:direct lead|customer enquir\w*|tenant enquir\w*)\b", text
+    ))
+    if lead_indication:
         return "lead"
     return None
 
