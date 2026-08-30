@@ -379,7 +379,8 @@ class SearchFlowStateTests(unittest.TestCase):
 
     def test_active_instructions_are_small_and_skill_based(self):
         instructions = app_module.build_response_args("Help me find a home")["instructions"]
-        self.assertLess(len(instructions), 5000)
+        self.assertLess(len(instructions), 9000)
+        self.assertIn("# Forwarded Listing Enquiry", instructions)
         self.assertIn("# Property Search", instructions)
         self.assertIn("# Condo advice", instructions)
         self.assertNotIn("NEW_PROPERTY_SEARCH", instructions)

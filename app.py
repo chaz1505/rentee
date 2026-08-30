@@ -99,6 +99,7 @@ SKILLS_DIRECTORY = Path(__file__).with_name("skills")
 def load_ai_skills():
     """Load the small, versioned domain skills supplied to Rentee."""
     skill_paths = (
+        SKILLS_DIRECTORY / "forwarded_enquiry" / "SKILL.md",
         SKILLS_DIRECTORY / "property_search" / "SKILL.md",
         SKILLS_DIRECTORY / "condo_advice" / "SKILL.md",
     )
