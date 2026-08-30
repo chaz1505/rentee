@@ -314,7 +314,7 @@ class OwnerCheckTests(unittest.TestCase):
             "_id": "lead-1", "ActiveForwardedEnquiry": enquiry["_id"],
         }
         with patch("app.bubble", side_effect=[
-                 enquiry, {"OwnerContact": owner_contact},
+                 enquiry, {"ownerContact": owner_contact},
              ]) as get, \
              patch("app._bubble_patch") as update:
             result = app_module.prepare_owner_check(lead)
@@ -343,7 +343,6 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertIn(
             "listing_id=listing-1 raw_owner_contact_present=true", logs
         )
-        self.assertIn("raw_keys=['OwnerContact']", logs)
         self.assertNotIn("+60 11-555 1234", logs)
 
     def test_owner_contact_is_read_from_enquiry_listing_not_enquiry_id(self):
@@ -351,7 +350,7 @@ class OwnerCheckTests(unittest.TestCase):
         lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-A"}
         with patch("app.bubble", side_effect=[
                  enquiry, {"_id": "listing-B", "condo": "condo-C",
-                           "OwnerContact": "+60 11-555 1234"},
+                           "ownerContact": "+60 11-555 1234"},
              ]) as get, patch("app._bubble_patch") as update:
             app_module.prepare_owner_check(lead)
         self.assertEqual(get.call_args_list[0].args[0].split("/")[-1], "enquiry-A")
@@ -405,7 +404,7 @@ class OwnerCheckTests(unittest.TestCase):
         lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-active"}
         with patch("app._bubble_records") as records, \
              patch("app.bubble", side_effect=[
-                 enquiry, {"OwnerContact": "+60 11-555 1234"},
+                 enquiry, {"ownerContact": "+60 11-555 1234"},
              ]), patch("app._bubble_patch") as update:
             app_module.prepare_owner_check(lead)
         records.assert_not_called()

@@ -946,18 +946,13 @@ def prepare_owner_check(lead, bubble_env="live"):
             flush=True,
         )
         listing = bubble(f"{base_url}/obj/listing/{listing_id}")
-        raw_keys = sorted(str(key) for key in listing)
-        owner_contact_present = "OwnerContact" in listing
+        owner_contact_present = "ownerContact" in listing
         print(
             f"[OWNER CHECK] listing_id={listing_id} "
             f"raw_owner_contact_present={str(owner_contact_present).lower()}",
             flush=True,
         )
-        print(
-            f"[OWNER CHECK] listing_id={listing_id} raw_keys={raw_keys}",
-            flush=True,
-        )
-        owner_contact = str(listing.get("OwnerContact") or "").strip()
+        owner_contact = str(listing.get("ownerContact") or "").strip()
         if not owner_contact:
             print(
                 f"[OWNER CHECK] enquiry_id={enquiry_id} "
