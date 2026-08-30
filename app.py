@@ -670,6 +670,10 @@ FURNITURE_STATUS_VALUES = {
 }
 
 
+class TenantProfileExtractionError(RuntimeError):
+    pass
+
+
 def find_handoff_lead_by_phone(phone, bubble_env="live"):
     """Resolve a Lead through the durable Enquiry handoff relationship."""
     canonical = normalize_phone(phone)
@@ -736,6 +740,8 @@ def extract_tenant_profile(message_text):
             f"{datetime.date.today().isoformat()}.\n\nCURRENT MESSAGE:\n{message_text}"
         ),
         reasoning={"effort": "low"},
+        max_output_tokens=600,
+        timeout=15,
         text={"format": {
             "type": "json_schema", "name": "tenant_profile_extraction",
             "strict": True,
@@ -746,7 +752,18 @@ def extract_tenant_profile(message_text):
             },
         }},
     )
-    extracted = json.loads(response.output_text)
+    status = str(getattr(response, "status", "") or "").strip().lower()
+    if status and status != "completed":
+        raise TenantProfileExtractionError(f"response_status={status}")
+    output_text = str(getattr(response, "output_text", "") or "").strip()
+    if not output_text:
+        raise TenantProfileExtractionError("empty_structured_output")
+    try:
+        extracted = json.loads(output_text)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise TenantProfileExtractionError("invalid_structured_output") from error
+    if not isinstance(extracted, dict):
+        raise TenantProfileExtractionError("invalid_structured_output")
     return {field: extracted.get(field) for field in TENANT_PROFILE_FIELDS}
 
 
@@ -796,19 +813,28 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
             f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
             f"tenant_profile_extracted fields={fields}", flush=True,
         )
-        if payload:
-            base_url = get_bubble_base_url(bubble_env)
+    except Exception as error:
+        print(
+            f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+            "tenant_profile_extraction_failed "
+            f"error={type(error).__name__}", flush=True,
+        )
+        return lead
+    if payload:
+        base_url = get_bubble_base_url(bubble_env)
+        try:
             _bubble_patch(f"{base_url}/obj/lead/{lead_id}", payload)
             lead.update(payload)
             print(
                 f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
                 f"tenant_profile_updated fields={fields}", flush=True,
             )
-    except Exception:
-        print(
-            f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
-            "tenant_profile_extraction_failed", flush=True,
-        )
+        except Exception as error:
+            print(
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                "tenant_profile_update_failed "
+                f"error={type(error).__name__}", flush=True,
+            )
     return lead
 
 

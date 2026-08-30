@@ -55,6 +55,7 @@ class TenantProfileCaptureTests(unittest.TestCase):
         self.assertEqual(set(schema["properties"]), set(app_module.TENANT_PROFILE_FIELDS))
         self.assertEqual(set(schema["required"]), set(app_module.TENANT_PROFILE_FIELDS))
         self.assertNotIn("budgetBuy", schema["properties"])
+        self.assertNotIn("tools", create.call_args.kwargs)
 
     def test_pax_values_remain_independent_and_missing_is_null(self):
         extracted = self.extraction(adults=2, children=2, helpers=1)
@@ -185,6 +186,34 @@ class TenantProfileCaptureTests(unittest.TestCase):
             app_module.capture_linked_tenant_profile("60123456789", "profile")["_id"],
             "lead-1",
         )
+
+    def test_incomplete_response_rejects_partial_structured_output(self):
+        partial = self.extraction(nationality="British")
+        response = SimpleNamespace(
+            status="incomplete", output_text=json.dumps(partial)
+        )
+        with patch.object(
+            app_module.client.responses, "create", return_value=response
+        ):
+            with self.assertRaises(app_module.TenantProfileExtractionError):
+                app_module.extract_tenant_profile("Nationality: British")
+
+    @patch("app._bubble_patch", side_effect=RuntimeError("Bubble unavailable"))
+    @patch("app.extract_tenant_profile")
+    @patch("app.find_handoff_lead_by_phone")
+    def test_bubble_update_failure_returns_existing_lead_without_mutating_it(
+        self, find_linked, extract, _patch_bubble,
+    ):
+        lead = {"_id": "lead-1", "budgetRent": 12000}
+        find_linked.return_value = lead
+        extract.return_value = self.extraction(budgetRent=14000)
+
+        result = app_module.capture_linked_tenant_profile(
+            "60123456789", "Actually 14k"
+        )
+
+        self.assertIs(result, lead)
+        self.assertEqual(result["budgetRent"], 12000)
 
 
 class WhatsAppTests(unittest.TestCase):
@@ -701,6 +730,50 @@ class WhatsAppTests(unittest.TestCase):
             message_id="message-profile", bubble_env="live",
         )
         send.assert_called_once_with("60123456789", "Normal reply")
+
+    def _assert_profile_capture_failure_still_converses(
+        self, *, extraction_error=None, update_error=None,
+    ):
+        text = "British, budget 12k"
+        item = webhook_payload(text=text)["entry"][0]["changes"][0]["value"]["messages"][0]
+        extracted = {
+            field: (12000 if field == "budgetRent" else None)
+            for field in app_module.TENANT_PROFILE_FIELDS
+        }
+        with patch("app.send_whatsapp_typing_indicator"), \
+             patch("app.find_handoff_lead_by_phone", return_value={"_id": "lead-linked"}), \
+             patch("app.extract_tenant_profile", return_value=extracted,
+                   side_effect=extraction_error), \
+             patch("app._bubble_patch", side_effect=update_error), \
+             patch("app.find_or_create_whatsapp_lead") as create_lead, \
+             patch("app.find_or_create_lead_folio", return_value=("folio-1", False)), \
+             patch("app.find_latest_ai_message", return_value=None), \
+             patch("app.create_whatsapp_ai_message", return_value="message-profile"), \
+             patch("app.run_rentee_turn", return_value=("Normal reply", "resp-1", False)) as turn, \
+             patch("app.save_whatsapp_ai_message"), \
+             patch("app.send_whatsapp_text") as send:
+            app_module._process_whatsapp_message(item)
+        create_lead.assert_not_called()
+        turn.assert_called_once()
+        self.assertEqual(turn.call_args.args[0], text)
+        send.assert_called_once_with("60123456789", "Normal reply")
+
+    def test_extractor_exception_still_runs_normal_conversation(self):
+        self._assert_profile_capture_failure_still_converses(
+            extraction_error=RuntimeError("OpenAI unavailable")
+        )
+
+    def test_incomplete_extractor_response_still_runs_normal_conversation(self):
+        self._assert_profile_capture_failure_still_converses(
+            extraction_error=app_module.TenantProfileExtractionError(
+                "response_status=incomplete"
+            )
+        )
+
+    def test_bubble_profile_update_failure_still_runs_normal_conversation(self):
+        self._assert_profile_capture_failure_still_converses(
+            update_error=RuntimeError("Bubble unavailable")
+        )
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-2")
