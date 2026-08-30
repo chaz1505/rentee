@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+import requests
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -1113,6 +1114,60 @@ TENANT PROFILE
 
 
 class TransactionIntentTests(unittest.TestCase):
+    def test_enquiry_creation_payload_uses_native_text_lists(self):
+        rent = workflow.build_enquiry_creation_payload(
+            "user-1", "No", "rental enquiry", "Rent/Let"
+        )
+        buy = workflow.build_enquiry_creation_payload(
+            "user-1", "No", "buyer enquiry", "Buy/Sell"
+        )
+        self.assertEqual(rent["TransactionType"], ["Rent/Let"])
+        self.assertEqual(buy["TransactionType"], ["Buy/Sell"])
+        self.assertIsInstance(rent["TransactionType"], list)
+        self.assertIsInstance(buy["TransactionType"], list)
+
+    def test_unresolved_transaction_is_omitted_from_creation_payload(self):
+        for value in (None, "", "Rent", "Buy"):
+            with self.subTest(value=value):
+                payload = workflow.build_enquiry_creation_payload(
+                    "user-1", "No", "enquiry", value
+                )
+                self.assertNotIn("TransactionType", payload)
+                self.assertEqual(set(payload), {
+                    "Agent", "Agent?", "Original Enquiry",
+                })
+
+    def test_enquiry_http_400_logs_safe_response_and_keeps_pending(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = (
+            b'Invalid TransactionType in buyer enquiry forwarded secret text'
+        )
+        error = requests.HTTPError("400 Client Error", response=response)
+        create = MagicMock(side_effect=error)
+        patch_bubble = MagicMock()
+        user = {
+            "_id": "user-1", workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "No",
+            workflow.AWAITING_SINCE_FIELD: datetime.now(timezone.utc).isoformat(),
+        }
+        with patch("builtins.print") as mocked_print:
+            with self.assertRaises(requests.HTTPError):
+                workflow.handle_internal_user_message(
+                    user, "buyer enquiry forwarded secret text",
+                    "https://bubble.test", patch_bubble,
+                    bubble_create=create,
+                    bubble_records=MagicMock(),
+                    relationship_names=MagicMock(),
+                )
+        log = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("status=400", log)
+        self.assertIn("transaction_type_type=list", log)
+        self.assertIn("Invalid TransactionType", log)
+        self.assertNotIn("buyer enquiry forwarded secret text", log)
+        self.assertIn("pending state retained", log)
+        patch_bubble.assert_not_called()
+
     def test_explicit_rental_and_tenant_wording(self):
         for text in ("new rental enquiry", "tenant enquiry", "client wants to rent"):
             with self.subTest(text=text):

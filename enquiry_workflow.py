@@ -111,6 +111,40 @@ def enquiry_transaction_type(enquiry):
     return valid[0] if len(set(valid)) == 1 else None
 
 
+def build_enquiry_creation_payload(user_id, agent_value, message_text,
+                                   transaction_type=None):
+    payload = {
+        "Agent": user_id,
+        "Agent?": agent_value,
+        "Original Enquiry": message_text,
+    }
+    if transaction_type in VALID_ENQUIRY_TRANSACTIONS:
+        # Bubble Data API text-list fields use native JSON arrays.
+        payload["TransactionType"] = [transaction_type]
+    return payload
+
+
+def _enquiry_creation_failure_details(error, payload):
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        body = (
+            " ".join(str(response.text or "").split())
+            if response is not None else ""
+        )
+    except Exception:
+        body = ""
+    original_enquiry = str(payload.get("Original Enquiry") or "")
+    if original_enquiry:
+        body = body.replace(original_enquiry, "<redacted>")
+    transaction_value = payload.get("TransactionType")
+    return (
+        status,
+        body[:1000] or type(error).__name__,
+        type(transaction_value).__name__ if "TransactionType" in payload else "omitted",
+    )
+
+
 def _clean_person_name(value, minimum_words=1):
     candidate = " ".join(str(value or "").strip().split())
     candidate = re.split(
@@ -832,21 +866,31 @@ def consume_pending_enquiry(
     user_id = user["_id"]
     agent_value = "Yes" if pending["agent"] else "No"
     explicit_transaction = explicit_transaction_type(message_text)
-    creation_payload = {
-        "Agent": user_id,
-        "Agent?": agent_value,
-        "Original Enquiry": message_text,
-    }
-    if explicit_transaction:
-        creation_payload["TransactionType"] = [explicit_transaction]
+    creation_payload = build_enquiry_creation_payload(
+        user_id, agent_value, message_text, explicit_transaction
+    )
     try:
         enquiry_id = bubble_create(base_url, "enquiry", creation_payload)
     except Exception as error:
-        print(
-            f"[ENQUIRY WORKFLOW] user_id={user_id} Enquiry creation failed "
-            f"error={type(error).__name__}; pending state retained",
-            flush=True,
+        status, bubble_error, transaction_type_type = (
+            _enquiry_creation_failure_details(error, creation_payload)
         )
+        if status is not None:
+            print(
+                f"[ENQUIRY WORKFLOW] user_id={user_id} Enquiry creation failed "
+                f"status={status} fields={list(creation_payload)} "
+                f"transaction_type_type={transaction_type_type} "
+                f"bubble_error={bubble_error!r}; pending state retained",
+                flush=True,
+            )
+        else:
+            print(
+                f"[ENQUIRY WORKFLOW] user_id={user_id} Enquiry creation failed "
+                f"error={type(error).__name__} fields={list(creation_payload)} "
+                f"transaction_type_type={transaction_type_type}; "
+                "pending state retained",
+                flush=True,
+            )
         raise
     print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} created", flush=True)
     # Creation is the durable consumption point. A matching failure must not cause
