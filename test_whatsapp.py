@@ -425,8 +425,10 @@ class OwnerCheckTests(unittest.TestCase):
         }
         now = datetime(2026, 8, 30, 4, 5, tzinfo=timezone.utc)
         with patch("app.bubble", return_value=listing), \
+             patch("app.owner_check_whatsapp_window", return_value="open"), \
              patch("app.send_whatsapp_text") as send, \
-             patch("app._bubble_patch") as update:
+             patch("app._bubble_patch") as update, \
+             patch("builtins.print") as logged:
             sent = app_module.send_pending_owner_check(
                 lead, enquiry, now=now
             )
@@ -453,12 +455,20 @@ class OwnerCheckTests(unittest.TestCase):
         )
         self.assertEqual(enquiry["OwnerCheckStatus"], "Sent")
         self.assertEqual(enquiry["OwnerCheckResponse"], "unchanged")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "destination=ownerContact phone=...551234 "
+            "window=open method=freeform",
+            logs,
+        )
+        self.assertNotIn("60115551234", logs)
 
     def test_failed_owner_send_leaves_pending_and_sent_at_untouched(self):
         enquiry = self.enquiry(
             OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
         )
         with patch("app.bubble", return_value={"name": "One Menerung"}), \
+             patch("app.owner_check_whatsapp_window", return_value="open"), \
              patch("app.send_whatsapp_text", side_effect=RuntimeError("Meta down")), \
              patch("app._bubble_patch") as update:
             sent = app_module.send_pending_owner_check({"_id": "lead-1"}, enquiry)
@@ -466,6 +476,135 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertEqual(enquiry["OwnerCheckStatus"], "Pending")
         self.assertNotIn("OwnerCheckSentAt", enquiry)
         update.assert_not_called()
+
+    def test_owner_window_uses_latest_inbound_created_date(self):
+        now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        with patch("app._bubble_records", return_value=iter([
+            {"Created Date": "2026-08-29T10:00:00Z"},
+            {"Created Date": "2026-08-30T11:00:00Z"},
+        ])) as records:
+            window = app_module.owner_check_whatsapp_window(
+                "+60 11-555 1234", now=now
+            )
+        self.assertEqual(window, "open")
+        self.assertEqual(records.call_args.args[2], [
+            {"key": "phone", "constraint_type": "equals",
+             "value": "60115551234"},
+            {"key": "direction", "constraint_type": "equals",
+             "value": "Inbound"},
+        ])
+
+    def test_owner_window_expired_inbound_is_closed(self):
+        now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+        with patch("app._bubble_records", return_value=iter([
+            {"Created Date": "2026-08-29T11:59:59Z"},
+        ])):
+            self.assertEqual(
+                app_module.owner_check_whatsapp_window("60115551234", now=now),
+                "closed",
+            )
+
+    def test_owner_window_without_inbound_history_is_closed(self):
+        with patch("app._bubble_records", return_value=iter([])) as records:
+            self.assertEqual(
+                app_module.owner_check_whatsapp_window("60115551234"), "closed"
+            )
+        self.assertEqual(
+            records.call_args.args[2][1]["value"], "Inbound"
+        )
+
+    def test_recent_outbound_only_history_does_not_open_window(self):
+        with patch("app._bubble_records", return_value=iter([])) as records:
+            window = app_module.owner_check_whatsapp_window("60115551234")
+        self.assertEqual(window, "closed")
+        self.assertEqual(records.call_args.args[2][1], {
+            "key": "direction", "constraint_type": "equals", "value": "Inbound",
+        })
+
+    def test_malformed_inbound_created_date_is_unknown(self):
+        with patch("app._bubble_records", return_value=iter([
+            {"Created Date": "not-a-date"},
+        ])):
+            self.assertEqual(
+                app_module.owner_check_whatsapp_window("60115551234"), "unknown"
+            )
+
+    def test_closed_window_uses_template_and_marks_sent_only_on_success(self):
+        enquiry = self.enquiry(
+            OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
+        )
+        now = datetime(2026, 8, 30, 4, 5, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {
+                 "WHATSAPP_OWNER_CHECK_TEMPLATE_NAME": "owner_check",
+                 "WHATSAPP_OWNER_CHECK_TEMPLATE_LANGUAGE": "en_US",
+             }), patch("app.bubble", return_value={"name": "One Menerung"}), \
+             patch("app.owner_check_whatsapp_window", return_value="closed"), \
+             patch("app.send_whatsapp_text") as freeform, \
+             patch("app.send_whatsapp_template", return_value=["wamid.template"]) as template, \
+             patch("app._bubble_patch") as update, \
+             patch("builtins.print") as logged:
+            result = app_module.send_pending_owner_check(
+                {"_id": "lead-1"}, enquiry, now=now
+            )
+        self.assertTrue(result)
+        freeform.assert_not_called()
+        template.assert_called_once_with(
+            "60115551234", "owner_check", "en_US"
+        )
+        update.assert_called_once()
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("window=closed method=template", logs)
+
+    def test_template_failure_or_missing_config_leaves_pending(self):
+        for configured, failure in ((True, RuntimeError("Meta down")), (False, None)):
+            with self.subTest(configured=configured):
+                enquiry = self.enquiry(
+                    OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
+                )
+                environment = (
+                    {"WHATSAPP_OWNER_CHECK_TEMPLATE_NAME": "owner_check"}
+                    if configured else {}
+                )
+                with patch.dict(
+                         os.environ, environment, clear=False
+                     ), patch("app.bubble", return_value={"name": "One Menerung"}), \
+                     patch("app.owner_check_whatsapp_window", return_value="closed"), \
+                     patch("app.send_whatsapp_template", side_effect=failure) as template, \
+                     patch("app._bubble_patch") as update:
+                    if not configured:
+                        os.environ.pop("WHATSAPP_OWNER_CHECK_TEMPLATE_NAME", None)
+                    result = app_module.send_pending_owner_check(
+                        {"_id": "lead-1"}, enquiry
+                    )
+                self.assertFalse(result)
+                self.assertEqual(enquiry["OwnerCheckStatus"], "Pending")
+                self.assertNotIn("OwnerCheckSentAt", enquiry)
+                update.assert_not_called()
+                if configured:
+                    template.assert_called_once()
+                else:
+                    template.assert_not_called()
+
+    @patch("app.requests.post")
+    def test_owner_template_uses_meta_template_payload(self, post):
+        post.return_value.status_code = 200
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {
+            "messages": [{"id": "wamid.template"}],
+        }
+        ids = app_module.send_whatsapp_template(
+            "+60 11-555 1234", "owner_check", "en_US"
+        )
+        self.assertEqual(ids, ["wamid.template"])
+        self.assertEqual(post.call_args.kwargs["json"], {
+            "messaging_product": "whatsapp",
+            "to": "60115551234",
+            "type": "template",
+            "template": {
+                "name": "owner_check",
+                "language": {"code": "en_US"},
+            },
+        })
 
     def test_sent_and_replied_owner_checks_do_not_resend(self):
         for status in ("Sent", "Replied"):
@@ -1496,11 +1635,19 @@ class WhatsAppTests(unittest.TestCase):
         item = webhook_payload(message_id="wamid.inbound")[
             "entry"
         ][0]["changes"][0]["value"]["messages"][0]
-        app_module._process_whatsapp_message(item)
+        with patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
         create_ai.assert_called_once_with("lead-a", "60123456789", "live")
         save_meta_id.assert_called_once_with(
             "message-current", "wamid.outbound", "live"
         )
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "[WHATSAPP AI SEND] lead_id=lead-a destination=enquirer "
+            "phone=...456789",
+            logs,
+        )
+        self.assertNotIn("60123456789", logs)
 
     @patch("app.requests.patch")
     def test_completed_ai_message_saves_answer_and_response_id(self, mocked_patch):

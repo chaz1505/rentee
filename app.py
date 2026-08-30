@@ -1073,6 +1073,91 @@ def build_owner_check_message(enquiry, lead, listing):
     )
 
 
+def _masked_whatsapp_phone(value):
+    phone = normalize_phone(value)
+    return f"...{phone[-6:]}" if phone else "unknown"
+
+
+def _bubble_created_at(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def owner_check_whatsapp_window(phone, bubble_env="live", now=None):
+    """Return open/closed/unknown from the latest inbound WhatsApp Message."""
+    canonical = normalize_phone(phone)
+    constraints = [
+        {"key": "phone", "constraint_type": "equals", "value": canonical},
+        {"key": "direction", "constraint_type": "equals", "value": "Inbound"},
+    ]
+    try:
+        messages = list(_bubble_records(
+            get_bubble_base_url(bubble_env), "message", constraints
+        ))
+    except Exception:
+        return "unknown"
+    if not messages:
+        return "closed"
+    messages.sort(
+        key=lambda item: str(
+            item.get("Created Date") or item.get("created_date") or ""
+        ),
+        reverse=True,
+    )
+    created_at = _bubble_created_at(
+        messages[0].get("Created Date") or messages[0].get("created_date")
+    )
+    if created_at is None:
+        return "unknown"
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    current = current.astimezone(datetime.timezone.utc)
+    age = current - created_at
+    return "open" if datetime.timedelta(0) <= age <= datetime.timedelta(hours=24) else "closed"
+
+
+def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
+    """Send one configured Meta WhatsApp template without changing its content."""
+    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    response = requests.post(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+        f"{phone_number_id}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": normalize_phone(to_phone),
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+            },
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    message_id = ((payload.get("messages") or [{}])[0]).get("id")
+    safe_phone = normalize_phone(to_phone)
+    print(
+        f"WhatsApp sent to ...{safe_phone[-4:]} status={response.status_code} "
+        f"message_id={message_id}", flush=True,
+    )
+    return [message_id]
+
+
 def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
     """Send one durable Pending owner check and mark Sent only after success."""
     enquiry_id = str((enquiry or {}).get("_id") or "").strip()
@@ -1088,12 +1173,40 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
     try:
         listing = bubble(f"{base_url}/obj/listing/{listing_id}")
         message = build_owner_check_message(enquiry, lead, listing)
+        current = now or datetime.datetime.now(datetime.timezone.utc)
+        window = owner_check_whatsapp_window(phone, bubble_env, current)
+        method = "freeform" if window == "open" else "template"
         print(
             f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
             "status=pending action=send_attempt", flush=True,
         )
-        send_whatsapp_text(phone, message)
-        sent_at = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
+        print(
+            f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+            f"destination=ownerContact phone={_masked_whatsapp_phone(phone)} "
+            f"window={window} method={method}", flush=True,
+        )
+        if method == "freeform":
+            send_whatsapp_text(phone, message)
+        else:
+            template_name = str(
+                os.getenv("WHATSAPP_OWNER_CHECK_TEMPLATE_NAME")
+                or os.getenv("OWNER_CHECK_TEMPLATE_NAME")
+                or ""
+            ).strip()
+            if not template_name:
+                print(
+                    f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+                    "action=send_failed error=missing_template_configuration",
+                    flush=True,
+                )
+                return False
+            language = str(
+                os.getenv("WHATSAPP_OWNER_CHECK_TEMPLATE_LANGUAGE")
+                or os.getenv("OWNER_CHECK_TEMPLATE_LANGUAGE")
+                or "en_US"
+            ).strip()
+            send_whatsapp_template(phone, template_name, language)
+        sent_at = current.isoformat()
         sent_at = sent_at.replace("+00:00", "Z")
         payload = {"OwnerCheckStatus": "Sent", "OwnerCheckSentAt": sent_at}
         _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", payload)
@@ -3282,6 +3395,9 @@ def _process_whatsapp_message(message):
                         internal_user.get("_id") if internal_user else None
                     ),
                     find_or_create_lead=find_or_create_whatsapp_lead,
+                    find_or_create_folio=lambda lead_id: (
+                        find_or_create_lead_folio(lead_id, "live")
+                    ),
                     whatsapp_profile_name=message.get("customer_name"),
                 )
                 linked_handoff_lead_id = getattr(handoff_result, "lead_id", None)
@@ -3409,6 +3525,11 @@ def _process_whatsapp_message(message):
                     answer = recommendation_summary
             save_whatsapp_ai_message(
                 current_message_id, answer, response_id, "live"
+            )
+            print(
+                f"[WHATSAPP AI SEND] lead_id={lead_id} "
+                f"destination=enquirer phone={_masked_whatsapp_phone(phone)}",
+                flush=True,
             )
             if recommendation_listings:
                 outbound_ids = send_whatsapp_recommendation_batch(
