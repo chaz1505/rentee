@@ -1169,6 +1169,8 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
     eligible = [
         message for message in messages
         if message.get("lead") == lead_id
+        and str(message.get("direction") or "Outbound").strip().casefold()
+        == "outbound"
         and str(message.get("own_Sent?") or "").strip().casefold() != "yes"
         and str(message.get("response_ID") or "").strip()
         and message.get("_id")
@@ -1202,9 +1204,48 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
     return previous
 
 
-def create_whatsapp_ai_message(lead_id, bubble_env="live"):
+def persist_inbound_whatsapp_message(
+    phone, whatsapp_message_id, message_content, lead_id=None, bubble_env="live",
+):
+    """Create one durable Bubble Message for an inbound Meta message."""
+    base_url = get_bubble_base_url(bubble_env)
+    meta_id = str(whatsapp_message_id or "").strip()
+    constraints = [{
+        "key": "whatsappMessageId", "constraint_type": "equals", "value": meta_id,
+    }]
+    existing = next(iter(_bubble_records(base_url, "message", constraints)), None)
+    if existing and existing.get("_id"):
+        message_id = existing["_id"]
+        if lead_id and str(existing.get("lead") or "") != str(lead_id):
+            _bubble_patch(
+                f"{base_url}/obj/message/{message_id}", {"lead": lead_id}
+            )
+        return message_id, False
+    payload = {
+        "phone": normalize_phone(phone),
+        "direction": "Inbound",
+        "own_Sent?": "Yes",
+        "whatsappMessageId": meta_id,
+        "messageContent": str(message_content or ""),
+    }
+    if lead_id:
+        payload["lead"] = lead_id
+    return _bubble_create(base_url, "message", payload), True
+
+
+def attach_whatsapp_message_lead(message_id, lead_id, bubble_env="live"):
+    if message_id and lead_id:
+        _bubble_patch(
+            f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}",
+            {"lead": lead_id},
+        )
+
+
+def create_whatsapp_ai_message(lead_id, phone=None, bubble_env="live"):
     return _bubble_create(get_bubble_base_url(bubble_env), "message", {
         "lead": lead_id,
+        "phone": normalize_phone(phone),
+        "direction": "Outbound",
         "own_Sent?": "No",
         "messageContent": "",
     })
@@ -1218,6 +1259,16 @@ def save_whatsapp_ai_message(message_id, answer, response_id, bubble_env="live")
         timeout=30,
     )
     response.raise_for_status()
+
+
+def save_whatsapp_message_id(message_id, whatsapp_message_id, bubble_env="live"):
+    meta_id = str(whatsapp_message_id or "").strip()
+    if not message_id or not meta_id:
+        return
+    _bubble_patch(
+        f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}",
+        {"whatsappMessageId": meta_id},
+    )
 
 
 def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
@@ -1647,7 +1698,10 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
     intro, cards, footer, shown = _whatsapp_recommendation_sections(
         listings, folio_id, top_count
     )
-    send_whatsapp_text(to_phone, intro)
+    sent_text_ids = []
+    intro_ids = send_whatsapp_text(to_phone, intro)
+    if isinstance(intro_ids, list):
+        sent_text_ids.extend(message_id for message_id in intro_ids if message_id)
     seen_listing_ids = set()
     for listing, card in zip(shown, cards):
         listing_id = str(listing.get("listing_id") or "")
@@ -1686,8 +1740,13 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
                 "no image available",
                 flush=True,
             )
-        send_whatsapp_text(to_phone, card)
-    send_whatsapp_text(to_phone, footer)
+        card_ids = send_whatsapp_text(to_phone, card)
+        if isinstance(card_ids, list):
+            sent_text_ids.extend(message_id for message_id in card_ids if message_id)
+    footer_ids = send_whatsapp_text(to_phone, footer)
+    if isinstance(footer_ids, list):
+        sent_text_ids.extend(message_id for message_id in footer_ids if message_id)
+    return sent_text_ids
 
 
 def create_folio_items(recommendations, base_url, message_id):
@@ -3198,6 +3257,19 @@ def _process_whatsapp_message(message):
     try:
         with phone_lock:
             base_url = get_bubble_base_url("live")
+            inbound_message_id = None
+            try:
+                inbound_message_id, _inbound_created = (
+                    persist_inbound_whatsapp_message(
+                        phone, message_id, text, bubble_env="live"
+                    )
+                )
+            except Exception as error:
+                print(
+                    "[WHATSAPP MESSAGE] inbound_persistence_failed "
+                    f"message_id={message_id} error={type(error).__name__}",
+                    flush=True,
+                )
             internal_user = find_internal_user(
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )
@@ -3212,6 +3284,18 @@ def _process_whatsapp_message(message):
                     find_or_create_lead=find_or_create_whatsapp_lead,
                     whatsapp_profile_name=message.get("customer_name"),
                 )
+                linked_handoff_lead_id = getattr(handoff_result, "lead_id", None)
+                if linked_handoff_lead_id:
+                    try:
+                        attach_whatsapp_message_lead(
+                            inbound_message_id, linked_handoff_lead_id, "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP MESSAGE] inbound_lead_link_failed "
+                            f"message_id={message_id} error={type(error).__name__}",
+                            flush=True,
+                        )
                 send_whatsapp_text(phone, handoff_result.response_text)
                 followup_text = getattr(handoff_result, "followup_text", None)
                 if isinstance(followup_text, str) and followup_text.strip():
@@ -3272,6 +3356,14 @@ def _process_whatsapp_message(message):
                     phone, message.get("customer_name"), "live"
                 )
             lead_id = lead["_id"]
+            try:
+                attach_whatsapp_message_lead(inbound_message_id, lead_id, "live")
+            except Exception as error:
+                print(
+                    "[WHATSAPP MESSAGE] inbound_lead_link_failed "
+                    f"message_id={message_id} error={type(error).__name__}",
+                    flush=True,
+                )
             folio_id, folio_created = find_or_create_lead_folio(lead_id, "live")
             previous_message = find_latest_ai_message(lead_id, "live")
             previous_message_id = previous_message.get("_id") if previous_message else None
@@ -3279,7 +3371,9 @@ def _process_whatsapp_message(message):
                 str(previous_message.get("response_ID") or "").strip()
                 if previous_message else None
             )
-            current_message_id = create_whatsapp_ai_message(lead_id, "live")
+            current_message_id = create_whatsapp_ai_message(
+                lead_id, phone, "live"
+            )
             print(
                 "[WHATSAPP CONVERSATION] "
                 f"phone={safe_phone} lead_id={lead_id} lead_created={lead_created} "
@@ -3317,11 +3411,33 @@ def _process_whatsapp_message(message):
                 current_message_id, answer, response_id, "live"
             )
             if recommendation_listings:
-                send_whatsapp_recommendation_batch(
+                outbound_ids = send_whatsapp_recommendation_batch(
                     phone, folio_id, recommendation_listings
                 )
+                if isinstance(outbound_ids, list) and outbound_ids:
+                    try:
+                        save_whatsapp_message_id(
+                            current_message_id, outbound_ids[0], "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP MESSAGE] outbound_id_persistence_failed "
+                            f"message_id={current_message_id} "
+                            f"error={type(error).__name__}", flush=True,
+                        )
             else:
-                send_whatsapp_text(phone, answer)
+                outbound_ids = send_whatsapp_text(phone, answer)
+                if isinstance(outbound_ids, list) and outbound_ids:
+                    try:
+                        save_whatsapp_message_id(
+                            current_message_id, outbound_ids[0], "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP MESSAGE] outbound_id_persistence_failed "
+                            f"message_id={current_message_id} "
+                            f"error={type(error).__name__}", flush=True,
+                        )
             reply_sent = True
             print(
                 "[WHATSAPP CONVERSATION] "

@@ -532,6 +532,20 @@ class WhatsAppTests(unittest.TestCase):
         self.internal_user_patcher = patch("app.find_internal_user", return_value=None)
         self.mocked_internal_user = self.internal_user_patcher.start()
         self.addCleanup(self.internal_user_patcher.stop)
+        direct_persistence_tests = {
+            "test_inbound_message_persists_whatsapp_fields_once",
+            "test_duplicate_inbound_meta_id_reuses_existing_message",
+        }
+        if self._testMethodName not in direct_persistence_tests:
+            self.inbound_patcher = patch(
+                "app.persist_inbound_whatsapp_message",
+                return_value=("inbound-message", True),
+            )
+            self.mocked_inbound = self.inbound_patcher.start()
+            self.addCleanup(self.inbound_patcher.stop)
+        self.attach_inbound_patcher = patch("app.attach_whatsapp_message_lead")
+        self.mocked_attach_inbound = self.attach_inbound_patcher.start()
+        self.addCleanup(self.attach_inbound_patcher.stop)
 
     def test_webhook_verification_accepts_valid_token_and_rejects_invalid(self):
         client = app_module.app.test_client()
@@ -1370,7 +1384,12 @@ class WhatsAppTests(unittest.TestCase):
     def test_latest_ai_message_is_lead_scoped_filtered_and_newest(self, mocked_records):
         mocked_records.return_value = iter([
             {"_id": "own", "lead": "lead-a", "own_Sent?": "Yes",
-             "response_ID": "ignore-own", "Created Date": "2026-08-28T05:00:00Z"},
+             "direction": "Inbound", "response_ID": "ignore-own",
+             "Created Date": "2026-08-28T05:00:00Z"},
+            {"_id": "inbound-misflagged", "lead": "lead-a",
+             "own_Sent?": "No", "direction": "Inbound",
+             "response_ID": "ignore-inbound",
+             "Created Date": "2026-08-28T07:00:00Z"},
             {"_id": "empty", "lead": "lead-a", "own_Sent?": "No",
              "response_ID": "", "Created Date": "2026-08-28T04:00:00Z"},
             {"_id": "other", "lead": "lead-b", "own_Sent?": "No",
@@ -1392,17 +1411,95 @@ class WhatsAppTests(unittest.TestCase):
         ])
         self.assertEqual(len(args), 3)
         logs = "\n".join(str(call) for call in mocked_print.call_args_list)
-        self.assertIn("messages_fetched=5", logs)
+        self.assertIn("messages_fetched=6", logs)
         self.assertIn("eligible_messages=2", logs)
         self.assertIn("own_sent_values=['No', 'Yes']", logs)
 
     @patch("app._bubble_create", return_value="message-current")
     def test_current_ai_message_uses_existing_bubble_semantics(self, mocked_create):
-        message_id = app_module.create_whatsapp_ai_message("lead-a")
+        message_id = app_module.create_whatsapp_ai_message(
+            "lead-a", "+60 12-345 6789"
+        )
         self.assertEqual(message_id, "message-current")
         mocked_create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "message",
-            {"lead": "lead-a", "own_Sent?": "No", "messageContent": ""},
+            {
+                "lead": "lead-a", "phone": "60123456789",
+                "direction": "Outbound", "own_Sent?": "No",
+                "messageContent": "",
+            },
+        )
+
+    @patch("app._bubble_create", return_value="inbound-current")
+    @patch("app._bubble_records", return_value=iter([]))
+    def test_inbound_message_persists_whatsapp_fields_once(
+        self, mocked_records, mocked_create
+    ):
+        message_id, created = app_module.persist_inbound_whatsapp_message(
+            "+60 12-345 6789", "wamid.inbound", "Hello Rentee", "lead-a"
+        )
+        self.assertEqual((message_id, created), ("inbound-current", True))
+        mocked_records.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "message", [{
+                "key": "whatsappMessageId", "constraint_type": "equals",
+                "value": "wamid.inbound",
+            }]
+        )
+        mocked_create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "message", {
+                "phone": "60123456789", "direction": "Inbound",
+                "own_Sent?": "Yes", "whatsappMessageId": "wamid.inbound",
+                "messageContent": "Hello Rentee", "lead": "lead-a",
+            }
+        )
+        self.assertNotIn("response_ID", mocked_create.call_args.args[2])
+
+    @patch("app._bubble_create")
+    @patch("app._bubble_records")
+    def test_duplicate_inbound_meta_id_reuses_existing_message(
+        self, mocked_records, mocked_create
+    ):
+        mocked_records.return_value = iter([{
+            "_id": "inbound-existing", "lead": "lead-a",
+            "whatsappMessageId": "wamid.inbound",
+        }])
+        result = app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.inbound", "Retried", "lead-a"
+        )
+        self.assertEqual(result, ("inbound-existing", False))
+        mocked_create.assert_not_called()
+
+    @patch("app._bubble_patch")
+    def test_outbound_meta_message_id_is_saved(self, mocked_patch):
+        app_module.save_whatsapp_message_id(
+            "message-current", "wamid.outbound", "live"
+        )
+        mocked_patch.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/message/message-current",
+            {"whatsappMessageId": "wamid.outbound"},
+        )
+
+    @patch("app.save_whatsapp_message_id")
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.find_latest_ai_message", return_value=None)
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Reply", "resp-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.find_or_create_whatsapp_lead",
+           return_value=({"_id": "lead-a"}, False))
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_normal_ai_response_persists_outbound_phone_and_meta_id(
+        self, _typing, _lead, _folio, _turn, _send, _latest, create_ai,
+        _save_ai, save_meta_id,
+    ):
+        item = webhook_payload(message_id="wamid.inbound")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        app_module._process_whatsapp_message(item)
+        create_ai.assert_called_once_with("lead-a", "60123456789", "live")
+        save_meta_id.assert_called_once_with(
+            "message-current", "wamid.outbound", "live"
         )
 
     @patch("app.requests.patch")

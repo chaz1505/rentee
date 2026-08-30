@@ -50,6 +50,7 @@ class EnquiryWorkflowResult:
     _after_send: object = None
     followup_text: Optional[str] = None
     enquiry_id: Optional[str] = None
+    lead_id: Optional[str] = None
 
     def complete(self):
         """Commit state changes that must happen only after WhatsApp sends."""
@@ -511,6 +512,7 @@ def handle_external_handoff_message(
         True, "Hi — I've got your enquiry for this property. I'll help you from here.",
         followup_text=followup_text,
         enquiry_id=enquiry_id,
+        lead_id=lead_id if find_or_create_lead else None,
     )
 
 
