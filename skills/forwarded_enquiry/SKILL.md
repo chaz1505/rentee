@@ -6,37 +6,47 @@ description: Handle a WhatsApp handoff about one specific forwarded Listing; use
 # Forwarded Listing Enquiry
 
 Use for a specific Listing enquiry forwarded by Gwen/another internal agent through the
-Enquiry/WhatsApp handoff. The flow may identify the Listing and Rent/Let vs Buy/Sell,
-create/link the Enquiry and Lead, gather profile facts, and progress toward viewing. This
-skill—not Property Search—is authoritative unless the enquirer explicitly asks for alternatives.
+Enquiry/WhatsApp handoff. It governs Listing and transaction context, Lead/profile handling,
+and progression. Do not use Property Search unless the enquirer explicitly asks for alternatives.
 
 ## Stay with the specific Listing
 
-Default progression: answer Listing questions → collect useful profile facts → judge whether
-the profile is sufficient for this Listing → ask when they want to view → later progress with
-the owner/listing agent. Keep replies concise and never add unrelated questions just to continue.
+Current progression: answer Listing questions → collect useful profile facts → judge sufficiency
+→ state that Rentee will check with the owner → stop. Never add unrelated questions.
 
 Do not proactively ask about neighbourhoods, condos, work/school destinations, searching
 Greater KL, or other areas/Listings. Do not broaden the search without an explicit request.
 This applies to agent and direct leads.
 
-Good: “Thanks — I've got the profile. When would you like to view the property?”
-Bad: “Which neighbourhoods or condos would you like me to target?”
-For “What floor is the unit?”, answer from grounded Listing context without area discovery.
+Answer “What floor is the unit?” from grounded Listing context without area discovery.
 
 ## Passive profile collection
 
-Extraction/persistence is passive. A message may contain no profile facts, some facts, only a
-Listing question, or both. Answer questions even when no profile facts are supplied. For
-“Budget is 15k. What floor is it?”, acknowledge briefly and answer the floor question; do not
-turn the exchange into a form or claim a value was saved unless that outcome is known.
+Extraction/persistence is passive. Messages may contain profile facts, a Listing question, both,
+or neither. Always answer the question. For “Budget is 15k. What floor is it?”, acknowledge
+briefly and answer it; do not create a form flow or claim a value was saved without confirmation.
 
-Profile sufficiency is contextual judgment, not a rigid checklist. It means enough information
-to credibly progress this Listing. Nationality, household/pax, occupation, pets, timing, budget,
-bedrooms, furnishing, and viewing preference can help, but none is universally mandatory. Use
-known Lead, Enquiry, Listing, and conversation context. Do not re-ask clear information or ask
-optional questions to fill Bubble fields. Ask only the smallest materially useful follow-up;
-otherwise progress to viewing. Never invent missing values.
+Sufficiency is contextual judgment: enough to credibly progress this Listing, not a checklist.
+Nationality, household/pax, occupation, pets, timing, budget, bedrooms, furnishing, and viewing
+preference can help, but none is universally mandatory. Use Lead, Enquiry, Listing, and
+conversation context. Do not re-ask clear facts or fill Bubble fields conversationally. Ask only
+the smallest material follow-up; otherwise use the strict response below. Never invent values.
+
+## Strict stop after profile sufficiency
+
+Once the profile is sufficient, the customer-facing response must stop at:
+
+“Thanks — I've got the profile. Let me check this with the owner.”
+
+Do not recap or reproduce the profile. Do not ask when they want to view, request viewing
+slots or a timezone, ask further qualification or area/neighbourhood questions, ask permission
+to share phone/email, say contact details will be shared, suggest the owner will contact them,
+explain internal workflow, claim owner approval or confirmed availability, invent an owner/agent
+response, or add any other helpful next step.
+
+If the same message contains a direct Listing question, answer it first, then give only the
+brief owner-check statement. Example: “It's on the 18th floor. Thanks — I've got the profile.
+Let me check this with the owner.”
 
 ## Transaction and budgets
 
@@ -49,13 +59,16 @@ if ambiguous, ask Gwen/internal sender, never the enquirer. A `Rent/Let` budget 
 ## Agent and direct leads
 
 For `Lead.Agent? = Yes`, treat them as an agent representing a prospect and progressing this
-Listing: answer operational questions, accept the represented profile, and move toward viewing;
-never use consumer discovery. For `No`, keep the same initial focus. Broader recommendations
+Listing: answer operational questions, accept the represented profile, then use the same strict
+owner-check stop; never use consumer discovery. For `No`, keep the same initial focus. Broader recommendations
 become relevant only when the Listing is unsuitable or the lead explicitly requests them.
 
 ## Capability boundaries
 
-Current implementation does not automatically contact landlords/listing agents, determine
-owner acceptance, or schedule confirmed viewings. Those are future stages. Never claim they
-happened without a completed tool/action; request a preferred viewing time and describe the
-actual next step accurately.
+Future intended progression is: sufficient profile → owner/listing-agent availability and
+suitability check → positive confirmation → ask when the enquirer would like to view → viewing
+scheduling.
+
+Current implementation stops before owner/listing-agent contact. It does not automatically
+contact them, determine acceptance or availability, or schedule confirmed viewings. Never claim
+any of those actions or outcomes, and do not ask for a preferred viewing time yet.
