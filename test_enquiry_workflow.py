@@ -106,9 +106,124 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "sending you an agent lead",
             "new agent lead",
             "sending you a lead from another agent",
+            "sending you an agency lead",
+            "im sending you and agency lead",
+            "actually it's an agent enquiry",
+            "sorry, agency lead",
+            "another agent",
+            "cobroke enquiry",
+            "co-broke enquiry",
         ):
             with self.subTest(text=text):
                 self.assertEqual(workflow.detect_new_enquiry_instruction(text), "agent")
+
+    def test_minor_setup_typo_is_handled_deterministically(self):
+        self.assertEqual(
+            workflow.detect_new_enquiry_instruction("sneding you a lead"), "lead"
+        )
+
+    def test_pending_setup_correction_is_not_consumed_as_enquiry(self):
+        user = {
+            "_id": "user-1",
+            workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "No",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = self.consume(user, "im sending you and agency lead")
+        self.assertEqual(result.response_text, "Sure — send me the agent enquiry.")
+        self.create.assert_not_called()
+        self.assertEqual(self.patch_user.call_args.args[1][
+            workflow.AWAITING_ENQUIRY_FIELD
+        ], True)
+        self.assertEqual(self.patch_user.call_args.args[1][
+            workflow.PENDING_AGENT_FIELD
+        ], "Yes")
+
+    def test_pending_cancel_phrases_clear_state_without_enquiry(self):
+        for text in ("cancel this enquiry", "never mind", "start over"):
+            with self.subTest(text=text):
+                self.patch_user.reset_mock()
+                self.create.reset_mock()
+                user = {
+                    "_id": "user-1",
+                    workflow.AWAITING_ENQUIRY_FIELD: True,
+                    workflow.PENDING_AGENT_FIELD: "Yes",
+                    workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+                }
+                result = self.consume(user, text)
+                self.assertEqual(
+                    result.response_text,
+                    "Okay — cancelled. Send me another enquiry whenever you're ready.",
+                )
+                self.create.assert_not_called()
+                self.assertEqual(self.patch_user.call_args.args[1], {
+                    workflow.AWAITING_ENQUIRY_FIELD: False,
+                    workflow.PENDING_AGENT_FIELD: "",
+                    workflow.AWAITING_SINCE_FIELD: None,
+                })
+
+    def test_unrelated_pending_message_is_retained_without_enquiry(self):
+        user = {
+            "_id": "user-1",
+            workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "No",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        result = self.consume(user, "How are you today?")
+        self.assertEqual(
+            result.response_text,
+            "I'm still waiting for the forwarded enquiry. Send it through, "
+            "or say 'cancel enquiry' to stop.",
+        )
+        self.create.assert_not_called()
+        self.patch_user.assert_not_called()
+
+    def test_production_setup_sequence_waits_for_actual_property_enquiry(self):
+        first = workflow.handle_internal_user_message(
+            {"_id": "user-1"}, "sneding you a lead",
+            "https://bubble.test", self.patch_user, self.now,
+        )
+        self.assertEqual(first.response_text, "Sure — send me the lead enquiry.")
+        self.create.assert_not_called()
+
+        pending_lead = {
+            "_id": "user-1",
+            workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "No",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        second = self.consume(pending_lead, "sending you an agency lead")
+        self.assertEqual(second.response_text, "Sure — send me the agent enquiry.")
+        self.create.assert_not_called()
+
+        pending_agent = {
+            "_id": "user-1",
+            workflow.AWAITING_ENQUIRY_FIELD: True,
+            workflow.PENDING_AGENT_FIELD: "Yes",
+            workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
+        }
+        third = self.consume(pending_agent, "im sending you and agency lead")
+        self.assertEqual(third.response_text, "Sure — send me the agent enquiry.")
+        self.create.assert_not_called()
+
+        listing = {
+            "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
+            "sourceURL": "https://www.propertyguru.com.my/l/501124208",
+            "priceRent": 15000, "beds": 3, "availability": True,
+        }
+        self.records.return_value = iter([listing])
+        self.relationship_names.return_value = {"condo-1": "One Menerung"}
+        actual = self.consume(
+            pending_agent,
+            "PropertyGuru 3 beds RM15,000 "
+            "https://www.propertyguru.com.my/l/501124208",
+        )
+        self.assertIn("One Menerung", actual.response_text)
+        self.create.assert_called_once()
+        self.assertEqual(self.create.call_args.args[2]["Agent?"], "Yes")
+        self.assertIn("propertyguru.com.my", self.create.call_args.args[2][
+            "Original Enquiry"
+        ].lower())
 
     def test_agent_instruction_sets_state_and_replies(self):
         result = workflow.handle_internal_user_message(

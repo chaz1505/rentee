@@ -546,25 +546,71 @@ def find_internal_user(phone, base_url, bubble_records, bubble_get, normalize_ph
 def detect_new_enquiry_instruction(message_text):
     """Return 'agent', 'lead', or None for lightweight setup instructions."""
     text = " ".join(str(message_text or "").casefold().split())
+    text = re.sub(r"\bsneding\b", "sending", text)
     setup_language = bool(re.search(
-        r"\b(next|new|coming|forward|forwarding|send|sending|going to)\b", text
+        r"\b(next|new|coming|forward|forwarding|send|sending|going to|actually|sorry)\b",
+        text,
     ))
-    agent_indication = bool(re.search(r"\bagent\b", text)) and (
+    agent_wording = bool(re.search(
+        r"\b(?:agent|agency|co[ -]?broke)\b", text
+    ))
+    agent_indication = agent_wording and (
         setup_language
-        or bool(re.search(r"\banother agent is enquir\w*\b", text))
+        or bool(re.search(r"\banother\s+agent\b", text))
+        or bool(re.search(r"\b(?:lead|enquir\w*)\s+from\s+an?\s+agent\b", text))
         or bool(re.search(r"\benquir\w*\s+is\s+from\s+an?\s+agent\b", text))
-        or bool(re.search(r"\bagent\s+(?:lead|enquir\w*|incoming|coming through)\b", text))
+        or bool(re.search(
+            r"\b(?:agent|agency|co[ -]?broke)\s+(?:lead|enquir\w*|incoming|coming through)\b",
+            text,
+        ))
+        or bool(re.search(
+            r"\b(?:this|it)\s+(?:is|'s)\s+an?\s+agent\s+enquir\w*\b", text
+        ))
     )
     if agent_indication:
         return "agent"
     lead_indication = (
         setup_language and bool(re.search(r"\b(?:lead|customer|tenant)\b", text))
     ) or bool(re.search(
-        r"\b(?:direct lead|customer enquir\w*|tenant enquir\w*)\b", text
+        r"\b(?:direct lead|customer enquir\w*|tenant enquir\w*|this is a lead enquir\w*)\b",
+        text,
     ))
     if lead_indication:
         return "lead"
     return None
+
+
+def detect_pending_enquiry_cancel(message_text):
+    """Recognize explicit cancellation/reset commands while setup is pending."""
+    text = " ".join(str(message_text or "").casefold().split())
+    return bool(re.search(
+        r"\b(?:cancel(?:\s+(?:this\s+)?enquir\w*)?|never\s*mind|"
+        r"stop\s+(?:this\s+)?enquir\w*|forget\s+(?:this\s+)?enquir\w*|"
+        r"start\s+over|reset\s+enquir\w*)\b",
+        text,
+    ))
+
+
+def is_plausible_forwarded_enquiry(message_text):
+    """Return whether a pending message contains recognizable enquiry content."""
+    text = " ".join(str(message_text or "").casefold().split())
+    if not text:
+        return False
+    if re.search(r"https?://\S+|\b(?:propertyguru|iproperty)\b", text):
+        return True
+    if re.search(
+        r"\b(?:rm|myr)\s*[\d,]+|\b\d+\s*(?:bed(?:room)?s?|br)\b|"
+        r"\b(?:rent|price|asking)\s*[:=-]?\s*(?:rm|myr|\d)",
+        text,
+    ):
+        return True
+    if re.search(r"\bforwarded?\b", text):
+        return True
+    return bool(re.search(
+        r"\b(?:agent|lead|customer|tenant|buyer)\s+"
+        r"(?:says|wants|asked|enquir\w*|is\s+(?:looking|interested))\b",
+        text,
+    ))
 
 
 def _parse_bubble_date(value):
@@ -1170,7 +1216,40 @@ def handle_internal_user_message(
         return EnquiryWorkflowResult(False)
     now = now or datetime.now(timezone.utc)
     pending = get_pending_enquiry_state(user)
+    instruction = detect_new_enquiry_instruction(message_text)
     if pending and not is_pending_enquiry_expired(pending, now):
+        if instruction:
+            agent = instruction == "agent"
+            print(
+                f"[ENQUIRY WORKFLOW] user_id={user_id} "
+                f"pending setup corrected classification={instruction}",
+                flush=True,
+            )
+            set_pending_enquiry(user_id, agent, base_url, bubble_patch, now)
+            return EnquiryWorkflowResult(
+                True, f"Sure — send me the {instruction} enquiry."
+            )
+        if detect_pending_enquiry_cancel(message_text):
+            clear_pending_enquiry(user_id, base_url, bubble_patch)
+            print(
+                f"[ENQUIRY WORKFLOW] user_id={user_id} pending enquiry cancelled",
+                flush=True,
+            )
+            return EnquiryWorkflowResult(
+                True,
+                "Okay — cancelled. Send me another enquiry whenever you're ready.",
+            )
+        if not is_plausible_forwarded_enquiry(message_text):
+            print(
+                f"[ENQUIRY WORKFLOW] user_id={user_id} "
+                "pending enquiry retained reason=message_not_plausible",
+                flush=True,
+            )
+            return EnquiryWorkflowResult(
+                True,
+                "I'm still waiting for the forwarded enquiry. Send it through, "
+                "or say 'cancel enquiry' to stop.",
+            )
         print(
             f"[ENQUIRY WORKFLOW] user_id={user_id} pending enquiry consumed",
             flush=True,
@@ -1229,7 +1308,6 @@ def handle_internal_user_message(
                 f"with Rentee:\n{link}",
             )
 
-    instruction = detect_new_enquiry_instruction(message_text)
     if instruction:
         agent = instruction == "agent"
         print(
