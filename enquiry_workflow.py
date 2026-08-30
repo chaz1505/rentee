@@ -111,6 +111,22 @@ def enquiry_transaction_type(enquiry):
     return valid[0] if len(set(valid)) == 1 else None
 
 
+def merged_lead_transaction_types(lead, enquiry):
+    """Return a cumulative valid Lead transaction list, or None if unchanged."""
+    existing = (lead or {}).get("TransactionType") or []
+    if isinstance(existing, str):
+        existing = [existing]
+    merged = []
+    for value in existing:
+        if value in VALID_ENQUIRY_TRANSACTIONS and value not in merged:
+            merged.append(value)
+    current = enquiry_transaction_type(enquiry)
+    if not current or current in merged:
+        return None
+    merged.append(current)
+    return merged
+
+
 def build_enquiry_creation_payload(user_id, agent_value, message_text,
                                    transaction_type=None):
     payload = {
@@ -358,6 +374,19 @@ def handle_external_handoff_message(
                 return EnquiryWorkflowResult(
                     True, "I couldn't connect this enquiry automatically. Please ask "
                     "the agent who sent you the link to send you a fresh one."
+                )
+
+            merged_transactions = merged_lead_transaction_types(lead, enquiry)
+            if merged_transactions is not None:
+                bubble_patch(
+                    f"{base_url}/obj/lead/{lead_id}",
+                    {"TransactionType": merged_transactions},
+                )
+                lead["TransactionType"] = merged_transactions
+                print(
+                    f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                    "transaction_types_merged",
+                    flush=True,
                 )
 
             existing_classification = str(lead.get("Agent?") or "").strip()

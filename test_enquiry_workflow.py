@@ -1261,5 +1261,84 @@ class TransactionIntentTests(unittest.TestCase):
         self.assertIsNone(self._external_template([]))
 
 
+class LeadTransactionPropagationTests(unittest.TestCase):
+    def test_cumulative_transaction_merge_rules(self):
+        cases = (
+            ({}, ["Rent/Let"], ["Rent/Let"]),
+            ({}, ["Buy/Sell"], ["Buy/Sell"]),
+            ({"TransactionType": ["Rent/Let"]}, ["Rent/Let"], None),
+            ({"TransactionType": ["Rent/Let"]}, ["Buy/Sell"],
+             ["Rent/Let", "Buy/Sell"]),
+            ({"TransactionType": ["Buy/Sell"]}, ["Rent/Let"],
+             ["Buy/Sell", "Rent/Let"]),
+            ({"TransactionType": ["Rent/Let", "Buy/Sell"]},
+             ["Buy/Sell"], None),
+            ({"TransactionType": ["Rent/Let"]}, [], None),
+            ({"TransactionType": ["Rent/Let"]}, ["Unknown"], None),
+        )
+        for lead, enquiry_values, expected in cases:
+            with self.subTest(lead=lead, enquiry=enquiry_values):
+                self.assertEqual(
+                    workflow.merged_lead_transaction_types(
+                        lead, {"TransactionType": enquiry_values}
+                    ),
+                    expected,
+                )
+
+    def test_handoff_patches_new_lead_with_enquiry_transaction(self):
+        enquiry = {
+            "_id": "enquiry-1", "Listing": "listing-1",
+            "Enquirer Phone": "60123456789",
+            "TransactionType": ["Rent/Let"],
+        }
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[enquiry, {"_id": "listing-1"}])
+        bubble_patch = MagicMock()
+        finder = MagicMock(return_value=({"_id": "lead-1"}, True))
+
+        result = workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, bubble_patch, normalize_phone,
+            find_or_create_lead=finder,
+        )
+
+        self.assertTrue(result.handled)
+        self.assertIn(
+            unittest.mock.call(
+                "https://bubble.test/obj/lead/lead-1",
+                {"TransactionType": ["Rent/Let"]},
+            ),
+            bubble_patch.call_args_list,
+        )
+
+    def test_handoff_patches_existing_lead_cumulatively(self):
+        enquiry = {
+            "_id": "enquiry-1", "Listing": "listing-1",
+            "Enquirer Phone": "60123456789",
+            "TransactionType": ["Buy/Sell"],
+        }
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[enquiry, {"_id": "listing-1"}])
+        bubble_patch = MagicMock()
+        finder = MagicMock(return_value=({
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "Agent?": "No",
+        }, False))
+
+        workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, bubble_patch, normalize_phone,
+            find_or_create_lead=finder,
+        )
+
+        self.assertIn(
+            unittest.mock.call(
+                "https://bubble.test/obj/lead/lead-1",
+                {"TransactionType": ["Rent/Let", "Buy/Sell"]},
+            ),
+            bubble_patch.call_args_list,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
