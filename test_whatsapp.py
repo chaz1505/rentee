@@ -300,6 +300,87 @@ class TenantProfileCaptureTests(unittest.TestCase):
         self.assertNotIn("British", log)
 
 
+class OwnerCheckTests(unittest.TestCase):
+    def enquiry(self, **values):
+        result = {
+            "_id": "enquiry-1", "Listing": "listing-1",
+            "Enquirer Phone": "60123456789",
+        }
+        result.update(values)
+        return result
+
+    def prepare(self, enquiry, owner_contact="+60 11-555 1234"):
+        with patch("app._bubble_records", return_value=iter([enquiry])), \
+             patch("app.bubble", return_value={"OwnerContact": owner_contact}) as get, \
+             patch("app._bubble_patch") as update:
+            result = app_module.prepare_owner_check("60123456789")
+        return result, get, update
+
+    def test_valid_formatted_owner_contact_creates_pending_state(self):
+        result, get, update = self.prepare(self.enquiry())
+        get.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/listing/listing-1"
+        )
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+            {"OwnerCheckStatus": "Pending", "OwnerCheckPhone": "60115551234"},
+        )
+        self.assertEqual(result["OwnerCheckStatus"], "Pending")
+        self.assertNotIn("OwnerCheckSentAt", update.call_args.args[1])
+        self.assertNotIn("OwnerCheckResponse", update.call_args.args[1])
+
+    def test_blank_and_invalid_owner_contact_do_not_create_pending_state(self):
+        for contact in ("", "not-a-phone", "123"):
+            with self.subTest(contact=contact):
+                _result, _get, update = self.prepare(self.enquiry(), contact)
+                update.assert_not_called()
+
+    def test_existing_matching_pending_state_is_reused(self):
+        enquiry = self.enquiry(
+            OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
+        )
+        _result, _get, update = self.prepare(enquiry)
+        update.assert_not_called()
+
+    def test_sent_and_replied_states_never_regress(self):
+        for status in ("Sent", "Replied"):
+            with self.subTest(status=status):
+                _result, get, update = self.prepare(
+                    self.enquiry(OwnerCheckStatus=status)
+                )
+                get.assert_not_called()
+                update.assert_not_called()
+
+    def test_ambiguous_enquiry_does_not_guess(self):
+        enquiries = [self.enquiry(), self.enquiry(_id="enquiry-2")]
+        with patch("app._bubble_records", return_value=iter(enquiries)), \
+             patch("app.bubble") as get, patch("app._bubble_patch") as update:
+            self.assertIsNone(app_module.prepare_owner_check("60123456789"))
+        get.assert_not_called()
+        update.assert_not_called()
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-profile")
+    @patch("app.find_latest_ai_message", return_value=None)
+    @patch("app.send_whatsapp_text")
+    @patch("app.prepare_owner_check")
+    @patch("app.run_rentee_turn", return_value=(
+        app_module.OWNER_CHECK_RESPONSE, "response-1", False,
+    ))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.capture_linked_tenant_profile", return_value={"_id": "lead-linked"})
+    @patch("app.send_whatsapp_typing_indicator")
+    @patch("app.find_internal_user", return_value=None)
+    def test_sufficient_profile_prepares_state_and_sends_only_customer_reply(
+        self, _internal, _typing, _capture, _folio, _turn, prepare, send,
+        _latest, _create, _save,
+    ):
+        item = webhook_payload(text="Complete profile")["entry"][0]["changes"][0]["value"]["messages"][0]
+        app_module._process_whatsapp_message(item)
+        prepare.assert_called_once_with("60123456789", "live")
+        send.assert_called_once_with("60123456789", app_module.OWNER_CHECK_RESPONSE)
+
+
 class WhatsAppTests(unittest.TestCase):
     def setUp(self):
         app_module._whatsapp_processing_ids.clear()

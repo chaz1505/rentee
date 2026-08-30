@@ -672,6 +672,8 @@ TENANT_PROFILE_FIELDS = (
 TENANT_FURNISHING_TEXT_VALUES = {
     "Fully Furnished", "Partially Furnished", "Unfurnished",
 }
+OWNER_CHECK_RESPONSE = "Thanks — I've got the profile. Let me check this with the owner."
+OWNER_CHECK_STATUSES = {"Pending", "Sent", "Replied"}
 
 
 class TenantProfileExtractionError(RuntimeError):
@@ -889,6 +891,89 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
                     f"error={type(error).__name__} fields={fields}", flush=True,
                 )
     return lead
+
+
+def prepare_owner_check(phone, bubble_env="live"):
+    """Best-effort durable pending state; this function sends no messages."""
+    canonical = normalize_phone(phone)
+    if not canonical:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    constraints = [{
+        "key": "Enquirer Phone", "constraint_type": "equals",
+        "value": canonical,
+    }]
+    enquiry_id = "unknown"
+    try:
+        enquiries = [
+            enquiry for enquiry in _bubble_records(base_url, "enquiry", constraints)
+            if enquiry.get("_id") and enquiry.get("Listing")
+            and normalize_phone(enquiry.get("Enquirer Phone", canonical)) == canonical
+        ]
+        if len(enquiries) != 1:
+            reason = "missing_enquiry" if not enquiries else "ambiguous_enquiry"
+            print(f"[OWNER CHECK] enquiry_id=unknown unresolved reason={reason}", flush=True)
+            return None
+        enquiry = enquiries[0]
+        enquiry_id = str(enquiry["_id"])
+        status = str(enquiry.get("OwnerCheckStatus") or "").strip()
+        if status in {"Sent", "Replied"}:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} "
+                f"action=skipped status={status}", flush=True,
+            )
+            return enquiry
+        if status and status not in OWNER_CHECK_STATUSES:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} "
+                "unresolved reason=invalid_existing_status", flush=True,
+            )
+            return enquiry
+        listing = bubble(f"{base_url}/obj/listing/{enquiry['Listing']}")
+        owner_contact = str(listing.get("OwnerContact") or "").strip()
+        if not owner_contact:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} "
+                "unresolved reason=missing_owner_contact", flush=True,
+            )
+            return enquiry
+        owner_phone = normalize_phone(owner_contact)
+        if not 8 <= len(owner_phone) <= 15:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} "
+                "unresolved reason=invalid_owner_contact", flush=True,
+            )
+            return enquiry
+        if (
+            status == "Pending"
+            and normalize_phone(enquiry.get("OwnerCheckPhone")) == owner_phone
+        ):
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} action=pending_reused",
+                flush=True,
+            )
+            return enquiry
+        payload = {
+            "OwnerCheckStatus": "Pending",
+            "OwnerCheckPhone": owner_phone,
+        }
+        _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", payload)
+        enquiry.update(payload)
+        print(
+            f"[OWNER CHECK] enquiry_id={enquiry_id} action=pending_created",
+            flush=True,
+        )
+        return enquiry
+    except Exception as error:
+        print(
+            f"[OWNER CHECK] enquiry_id={enquiry_id} unresolved "
+            f"reason=persistence_failed error={type(error).__name__}", flush=True,
+        )
+        return None
+
+
+def _requests_owner_check(answer):
+    return " ".join(str(answer or "").split()).endswith(OWNER_CHECK_RESPONSE)
 
 
 def _select_existing_folio(folios, lead_id):
@@ -3073,6 +3158,8 @@ def _process_whatsapp_message(message):
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
             )
+            if _requests_owner_check(answer):
+                prepare_owner_check(phone, "live")
             recommendation_listings = []
             if recommendations_relevant:
                 recommendation_result = json.loads(
