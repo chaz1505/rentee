@@ -29,7 +29,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
 
     def complete_handoff_with_lead(
         self, enquiry, lead, created=False, sender_phone="+60 12-345 6789",
-        finder=None, patcher=None,
+        finder=None, patcher=None, folio_finder=None,
     ):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
         bubble_get = MagicMock(side_effect=[enquiry, {"_id": "listing-1"}])
@@ -39,8 +39,70 @@ class EnquiryWorkflowTests(unittest.TestCase):
             sender_phone, "RNT-7K4M9Q2P", "https://bubble.test",
             records, bubble_get, patch_bubble, normalize_phone,
             find_or_create_lead=finder,
+            find_or_create_folio=folio_finder,
         )
         return result, finder, patch_bubble
+
+    def test_new_handoff_lead_ensures_folio(self):
+        folio_finder = MagicMock(return_value=("folio-1", True))
+        result, _finder, _patch = self.complete_handoff_with_lead(
+            {"Listing": "listing-1", "Enquirer Phone": ""},
+            {"_id": "lead-1"}, created=True, folio_finder=folio_finder,
+        )
+        self.assertIn("I've got your enquiry", result.response_text)
+        folio_finder.assert_called_once_with("lead-1")
+
+    def test_existing_handoff_lead_without_folio_creates_one(self):
+        folio_finder = MagicMock(return_value=("folio-new", True))
+        result, _finder, _patch = self.complete_handoff_with_lead(
+            {"Listing": "listing-1", "Enquirer Phone": "60123456789"},
+            {"_id": "lead-existing"}, folio_finder=folio_finder,
+        )
+        self.assertEqual(result.lead_id, "lead-existing")
+        folio_finder.assert_called_once_with("lead-existing")
+
+    def test_existing_handoff_lead_reuses_existing_folio(self):
+        folio_finder = MagicMock(return_value=("folio-existing", False))
+        with patch("builtins.print") as logged:
+            result, _finder, _patch = self.complete_handoff_with_lead(
+                {"Listing": "listing-1", "Enquirer Phone": "60123456789"},
+                {"_id": "lead-existing"}, folio_finder=folio_finder,
+            )
+        self.assertIn("I've got your enquiry", result.response_text)
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "lead_id=lead-existing folio_id=folio-existing folio=existing", logs
+        )
+
+    def test_repeated_handoff_callback_reuses_folio_without_duplicate(self):
+        folios = {}
+        creates = []
+
+        def find_or_create(lead_id):
+            if lead_id in folios:
+                return folios[lead_id], False
+            folios[lead_id] = "folio-1"
+            creates.append(lead_id)
+            return "folio-1", True
+
+        for _ in range(2):
+            result, _finder, _patch = self.complete_handoff_with_lead(
+                {"Listing": "listing-1", "Enquirer Phone": "60123456789",
+                 "Lead": "lead-existing"},
+                {"_id": "lead-existing"}, folio_finder=find_or_create,
+            )
+            self.assertIn("I've got your enquiry", result.response_text)
+        self.assertEqual(creates, ["lead-existing"])
+
+    def test_folio_creation_failure_fails_handoff_safely(self):
+        folio_finder = MagicMock(side_effect=RuntimeError("Bubble unavailable"))
+        result, _finder, _patch = self.complete_handoff_with_lead(
+            {"Listing": "listing-1", "Enquirer Phone": "60123456789"},
+            {"_id": "lead-existing"}, folio_finder=folio_finder,
+        )
+        self.assertTrue(result.handled)
+        self.assertIn("fresh one", result.response_text)
+        self.assertIsNone(result.lead_id)
 
     def test_internal_user_phone_matching_tolerates_common_formatting(self):
         formats = ("+60123456789", "+60 12-345 6789", "+60 (12) 345-6789")

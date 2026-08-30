@@ -1668,6 +1668,20 @@ class WhatsAppTests(unittest.TestCase):
 
     @patch("app._bubble_create")
     @patch("app._bubble_records")
+    def test_missing_lead_folio_is_created_with_lead_relationship(
+        self, mocked_records, mocked_create
+    ):
+        mocked_records.side_effect = [iter([]), iter([])]
+        mocked_create.return_value = "folio-new"
+        result = app_module.find_or_create_lead_folio("lead-a")
+        self.assertEqual(result, ("folio-new", True))
+        mocked_create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "folio",
+            {"lead": "lead-a", "folioItems": []},
+        )
+
+    @patch("app._bubble_create")
+    @patch("app._bubble_records")
     def test_existing_folio_is_reused_when_exact_constraint_returns_nothing(
         self, mocked_records, mocked_create
     ):
