@@ -806,6 +806,28 @@ TENANT PROFILE
             {"Lead": "lead-1"},
             [call.args[1] for call in patch_bubble.call_args_list],
         )
+        self.assertIn(
+            {"ActiveForwardedEnquiry": "enquiry-1"},
+            [call.args[1] for call in patch_bubble.call_args_list],
+        )
+
+    def test_later_handoff_replaces_active_forwarded_enquiry(self):
+        enquiry = {
+            "Listing": "listing-1", "Enquirer Phone": "60123456789",
+            "Agent?": "No", "Lead": "lead-1",
+        }
+        lead = {
+            "_id": "lead-1", "Agent?": "No",
+            "ActiveForwardedEnquiry": "enquiry-old",
+        }
+        _result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            enquiry, lead
+        )
+        self.assertIn(
+            {"ActiveForwardedEnquiry": "enquiry-1"},
+            [call.args[1] for call in patch_bubble.call_args_list],
+        )
+        self.assertEqual(lead["ActiveForwardedEnquiry"], "enquiry-1")
 
     def test_handoff_creates_normal_lead_with_text_no(self):
         enquiry = {
@@ -1000,6 +1022,7 @@ TENANT PROFILE
                 lead_updates = [
                     call.args[1] for call in patch_bubble.call_args_list
                     if call.args[0].endswith("/obj/lead/lead-1")
+                    and "Agent?" in call.args[1]
                 ]
                 expected_updates = (
                     [] if expected_action == "kept" else [{"Agent?": expected}]

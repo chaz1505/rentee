@@ -476,6 +476,16 @@ def handle_external_handoff_message(
                 bubble_patch(
                     f"{base_url}/obj/enquiry/{enquiry_id}", {"Lead": lead_id}
                 )
+            bubble_patch(
+                f"{base_url}/obj/lead/{lead_id}",
+                {"ActiveForwardedEnquiry": enquiry_id},
+            )
+            lead["ActiveForwardedEnquiry"] = enquiry_id
+            print(
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                f"active_forwarded_enquiry_id={enquiry_id} action=set",
+                flush=True,
+            )
             print(
                 f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
                 f"lead_id={lead_id} lead linked",

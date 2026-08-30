@@ -304,23 +304,30 @@ class OwnerCheckTests(unittest.TestCase):
     def enquiry(self, **values):
         result = {
             "_id": "enquiry-1", "Listing": "listing-1",
-            "Enquirer Phone": "60123456789",
+            "Enquirer Phone": "60123456789", "Lead": "lead-1",
         }
         result.update(values)
         return result
 
     def prepare(self, enquiry, owner_contact="+60 11-555 1234"):
-        with patch("app._bubble_records", return_value=iter([enquiry])), \
-             patch("app.bubble", return_value={"OwnerContact": owner_contact}) as get, \
+        lead = {
+            "_id": "lead-1", "ActiveForwardedEnquiry": enquiry["_id"],
+        }
+        with patch("app.bubble", side_effect=[
+                 enquiry, {"OwnerContact": owner_contact},
+             ]) as get, \
              patch("app._bubble_patch") as update:
-            result = app_module.prepare_owner_check("60123456789")
+            result = app_module.prepare_owner_check(lead)
         return result, get, update
 
     def test_valid_formatted_owner_contact_creates_pending_state(self):
         result, get, update = self.prepare(self.enquiry())
-        get.assert_called_once_with(
-            "https://www.rentee.asia/api/1.1/obj/listing/listing-1"
-        )
+        self.assertEqual(get.call_args_list[0].args, (
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+        ))
+        self.assertEqual(get.call_args_list[1].args, (
+            "https://www.rentee.asia/api/1.1/obj/listing/listing-1",
+        ))
         update.assert_called_once_with(
             "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
             {"OwnerCheckStatus": "Pending", "OwnerCheckPhone": "60115551234"},
@@ -348,16 +355,35 @@ class OwnerCheckTests(unittest.TestCase):
                 _result, get, update = self.prepare(
                     self.enquiry(OwnerCheckStatus=status)
                 )
-                get.assert_not_called()
+                self.assertEqual(get.call_count, 1)
                 update.assert_not_called()
 
-    def test_ambiguous_enquiry_does_not_guess(self):
-        enquiries = [self.enquiry(), self.enquiry(_id="enquiry-2")]
-        with patch("app._bubble_records", return_value=iter(enquiries)), \
+    def test_missing_active_enquiry_does_not_guess(self):
+        with patch("app._bubble_records") as records, \
              patch("app.bubble") as get, patch("app._bubble_patch") as update:
-            self.assertIsNone(app_module.prepare_owner_check("60123456789"))
+            self.assertIsNone(app_module.prepare_owner_check({"_id": "lead-1"}))
+        records.assert_not_called()
         get.assert_not_called()
         update.assert_not_called()
+
+    def test_active_enquiry_lead_mismatch_is_rejected(self):
+        enquiry = self.enquiry(Lead="lead-other")
+        lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-1"}
+        with patch("app.bubble", return_value=enquiry), \
+             patch("app._bubble_patch") as update:
+            self.assertIsNone(app_module.prepare_owner_check(lead))
+        update.assert_not_called()
+
+    def test_multiple_history_does_not_trigger_enquiry_search(self):
+        enquiry = self.enquiry(_id="enquiry-active")
+        lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-active"}
+        with patch("app._bubble_records") as records, \
+             patch("app.bubble", side_effect=[
+                 enquiry, {"OwnerContact": "+60 11-555 1234"},
+             ]), patch("app._bubble_patch") as update:
+            app_module.prepare_owner_check(lead)
+        records.assert_not_called()
+        self.assertTrue(update.call_args.args[0].endswith("/enquiry/enquiry-active"))
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-profile")
@@ -377,7 +403,7 @@ class OwnerCheckTests(unittest.TestCase):
     ):
         item = webhook_payload(text="Complete profile")["entry"][0]["changes"][0]["value"]["messages"][0]
         app_module._process_whatsapp_message(item)
-        prepare.assert_called_once_with("60123456789", "live")
+        prepare.assert_called_once_with({"_id": "lead-linked"}, "live")
         send.assert_called_once_with("60123456789", app_module.OWNER_CHECK_RESPONSE)
 
 

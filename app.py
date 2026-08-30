@@ -893,29 +893,36 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
     return lead
 
 
-def prepare_owner_check(phone, bubble_env="live"):
+def prepare_owner_check(lead, bubble_env="live"):
     """Best-effort durable pending state; this function sends no messages."""
-    canonical = normalize_phone(phone)
-    if not canonical:
+    lead_id = str((lead or {}).get("_id") or "").strip()
+    enquiry_id = str(
+        (lead or {}).get("ActiveForwardedEnquiry") or ""
+    ).strip()
+    if not lead_id:
+        return None
+    if not enquiry_id:
+        print(
+            f"[OWNER CHECK] lead_id={lead_id} unresolved "
+            "reason=no_active_forwarded_enquiry", flush=True,
+        )
         return None
     base_url = get_bubble_base_url(bubble_env)
-    constraints = [{
-        "key": "Enquirer Phone", "constraint_type": "equals",
-        "value": canonical,
-    }]
-    enquiry_id = "unknown"
     try:
-        enquiries = [
-            enquiry for enquiry in _bubble_records(base_url, "enquiry", constraints)
-            if enquiry.get("_id") and enquiry.get("Listing")
-            and normalize_phone(enquiry.get("Enquirer Phone", canonical)) == canonical
-        ]
-        if len(enquiries) != 1:
-            reason = "missing_enquiry" if not enquiries else "ambiguous_enquiry"
-            print(f"[OWNER CHECK] enquiry_id=unknown unresolved reason={reason}", flush=True)
+        enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
+        if str(enquiry.get("Lead") or "").strip() != lead_id:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} lead_id={lead_id} "
+                "unresolved reason=active_enquiry_lead_mismatch", flush=True,
+            )
             return None
-        enquiry = enquiries[0]
-        enquiry_id = str(enquiry["_id"])
+        listing_id = str(enquiry.get("Listing") or "").strip()
+        if not listing_id:
+            print(
+                f"[OWNER CHECK] enquiry_id={enquiry_id} "
+                "unresolved reason=missing_listing", flush=True,
+            )
+            return enquiry
         status = str(enquiry.get("OwnerCheckStatus") or "").strip()
         if status in {"Sent", "Replied"}:
             print(
@@ -929,7 +936,7 @@ def prepare_owner_check(phone, bubble_env="live"):
                 "unresolved reason=invalid_existing_status", flush=True,
             )
             return enquiry
-        listing = bubble(f"{base_url}/obj/listing/{enquiry['Listing']}")
+        listing = bubble(f"{base_url}/obj/listing/{listing_id}")
         owner_contact = str(listing.get("OwnerContact") or "").strip()
         if not owner_contact:
             print(
@@ -960,7 +967,8 @@ def prepare_owner_check(phone, bubble_env="live"):
         _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", payload)
         enquiry.update(payload)
         print(
-            f"[OWNER CHECK] enquiry_id={enquiry_id} action=pending_created",
+            f"[OWNER CHECK] enquiry_id={enquiry_id} "
+            "resolved_via=lead_active_forwarded_enquiry action=pending_created",
             flush=True,
         )
         return enquiry
@@ -3159,7 +3167,7 @@ def _process_whatsapp_message(message):
                 message_id=current_message_id, bubble_env="live",
             )
             if _requests_owner_check(answer):
-                prepare_owner_check(phone, "live")
+                prepare_owner_check(lead, "live")
             recommendation_listings = []
             if recommendations_relevant:
                 recommendation_result = json.loads(
