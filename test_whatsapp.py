@@ -410,10 +410,96 @@ class OwnerCheckTests(unittest.TestCase):
         records.assert_not_called()
         self.assertTrue(update.call_args.args[0].endswith("/enquiry/enquiry-active"))
 
+    def test_pending_owner_check_sends_once_and_marks_sent(self):
+        enquiry = self.enquiry(
+            TransactionType=["Rent/Let"], OwnerCheckStatus="Pending",
+            OwnerCheckPhone="60115551234", OwnerCheckResponse="unchanged",
+        )
+        lead = {
+            "_id": "lead-1", "nationality": "British", "adults": 2,
+            "children": 2, "pets": "No", "budgetRent": 15000,
+            "phone": "60123456789", "email": "private@example.com",
+        }
+        listing = {
+            "name": "One Menerung", "beds": 3, "priceRent": 15000,
+        }
+        now = datetime(2026, 8, 30, 4, 5, tzinfo=timezone.utc)
+        with patch("app.bubble", return_value=listing), \
+             patch("app.send_whatsapp_text") as send, \
+             patch("app._bubble_patch") as update:
+            sent = app_module.send_pending_owner_check(
+                lead, enquiry, now=now
+            )
+            repeated = app_module.send_pending_owner_check(
+                lead, enquiry, now=now
+            )
+        self.assertTrue(sent)
+        self.assertFalse(repeated)
+        send.assert_called_once()
+        destination, message = send.call_args.args
+        self.assertEqual(destination, "60115551234")
+        self.assertIn("still available", message)
+        self.assertIn("would the owner consider this tenant profile", message)
+        self.assertIn("British", message)
+        self.assertIn("2 adults + 2 children", message)
+        self.assertNotIn("60123456789", message)
+        self.assertNotIn("private@example.com", message)
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+            {
+                "OwnerCheckStatus": "Sent",
+                "OwnerCheckSentAt": "2026-08-30T04:05:00Z",
+            },
+        )
+        self.assertEqual(enquiry["OwnerCheckStatus"], "Sent")
+        self.assertEqual(enquiry["OwnerCheckResponse"], "unchanged")
+
+    def test_failed_owner_send_leaves_pending_and_sent_at_untouched(self):
+        enquiry = self.enquiry(
+            OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
+        )
+        with patch("app.bubble", return_value={"name": "One Menerung"}), \
+             patch("app.send_whatsapp_text", side_effect=RuntimeError("Meta down")), \
+             patch("app._bubble_patch") as update:
+            sent = app_module.send_pending_owner_check({"_id": "lead-1"}, enquiry)
+        self.assertFalse(sent)
+        self.assertEqual(enquiry["OwnerCheckStatus"], "Pending")
+        self.assertNotIn("OwnerCheckSentAt", enquiry)
+        update.assert_not_called()
+
+    def test_sent_and_replied_owner_checks_do_not_resend(self):
+        for status in ("Sent", "Replied"):
+            with self.subTest(status=status), \
+                 patch("app.bubble") as get, \
+                 patch("app.send_whatsapp_text") as send, \
+                 patch("app._bubble_patch") as update:
+                result = app_module.send_pending_owner_check(
+                    {"_id": "lead-1"},
+                    self.enquiry(
+                        OwnerCheckStatus=status,
+                        OwnerCheckPhone="60115551234",
+                    ),
+                )
+            self.assertFalse(result)
+            get.assert_not_called()
+            send.assert_not_called()
+            update.assert_not_called()
+
+    def test_owner_message_omits_unknown_profile_facts(self):
+        message = app_module.build_owner_check_message(
+            {"TransactionType": ["Rent/Let"]},
+            {"nationality": "Malaysian"},
+            {"name": "The Estate", "beds": 2},
+        )
+        self.assertIn("Malaysian", message)
+        for invented in ("children", "pets", "occupation", "budget", "moving"):
+            self.assertNotIn(invented, message.lower())
+
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-profile")
     @patch("app.find_latest_ai_message", return_value=None)
     @patch("app.send_whatsapp_text")
+    @patch("app.send_pending_owner_check")
     @patch("app.prepare_owner_check")
     @patch("app.run_rentee_turn", return_value=(
         app_module.OWNER_CHECK_RESPONSE, "response-1", False,
@@ -423,12 +509,17 @@ class OwnerCheckTests(unittest.TestCase):
     @patch("app.send_whatsapp_typing_indicator")
     @patch("app.find_internal_user", return_value=None)
     def test_sufficient_profile_prepares_state_and_sends_only_customer_reply(
-        self, _internal, _typing, _capture, _folio, _turn, prepare, send,
+        self, _internal, _typing, _capture, _folio, _turn, prepare, owner_send, send,
         _latest, _create, _save,
     ):
+        prepared = {"_id": "enquiry-1", "OwnerCheckStatus": "Pending"}
+        prepare.return_value = prepared
         item = webhook_payload(text="Complete profile")["entry"][0]["changes"][0]["value"]["messages"][0]
         app_module._process_whatsapp_message(item)
         prepare.assert_called_once_with({"_id": "lead-linked"}, "live")
+        owner_send.assert_called_once_with(
+            {"_id": "lead-linked"}, prepared, "live"
+        )
         send.assert_called_once_with("60123456789", app_module.OWNER_CHECK_RESPONSE)
 
 

@@ -995,6 +995,121 @@ def prepare_owner_check(lead, bubble_env="live"):
         return None
 
 
+def _owner_check_amount(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    if amount <= 0:
+        return None
+    return f"RM{amount:,.0f}"
+
+
+def build_owner_check_message(enquiry, lead, listing):
+    """Build grounded owner/co-broke copy without customer contact details."""
+    transaction_types = (enquiry or {}).get("TransactionType") or []
+    if isinstance(transaction_types, str):
+        transaction_types = [transaction_types]
+    transaction = next(
+        (value for value in transaction_types if value in {RENT_TRANSACTION, BUY_TRANSACTION}),
+        None,
+    )
+    property_parts = []
+    property_name = next((
+        str(listing.get(field)).strip()
+        for field in ("name", "title", "listingName", "condoName")
+        if str(listing.get(field) or "").strip()
+    ), None)
+    if property_name:
+        property_parts.append(property_name)
+    beds = listing.get("beds")
+    if isinstance(beds, (int, float)) and not isinstance(beds, bool) and beds > 0:
+        property_parts.append(f"{beds:g} bed")
+    price_field = "priceSale" if transaction == BUY_TRANSACTION else "priceRent"
+    asking = _owner_check_amount(listing.get(price_field))
+    if asking:
+        asking += "/month" if transaction != BUY_TRANSACTION else ""
+        property_parts.append(f"at {asking}")
+
+    profile_parts = []
+    nationality = str((lead or {}).get("nationality") or "").strip()
+    if nationality:
+        profile_parts.append(nationality)
+    household = []
+    for field, label in (
+        ("adults", "adults"), ("children", "children"), ("helpers", "helpers"),
+    ):
+        value = (lead or {}).get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            household.append(f"{value} {label}")
+    if household:
+        profile_parts.append(" + ".join(household))
+    for field, prefix in (
+        ("occupation", "occupation"),
+        ("pets", "pets"),
+        ("startDate", "moving" if transaction != BUY_TRANSACTION else "target timing"),
+        ("furnishingPreference", "furnishing"),
+    ):
+        value = str((lead or {}).get(field) or "").strip()
+        if value:
+            profile_parts.append(f"{prefix}: {value}")
+    budget_field = "budgetBuy" if transaction == BUY_TRANSACTION else "budgetRent"
+    budget = _owner_check_amount((lead or {}).get(budget_field))
+    if budget:
+        profile_parts.append(f"budget {budget}")
+
+    message = "Hi, I have an enquiry"
+    if property_parts:
+        message += " for " + ", ".join(property_parts)
+    message += "."
+    if profile_parts:
+        message += " " + ", ".join(profile_parts) + "."
+    profile_label = "buyer" if transaction == BUY_TRANSACTION else "tenant"
+    return (
+        f"{message} Is the unit still available and would the owner consider "
+        f"this {profile_label} profile?"
+    )
+
+
+def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
+    """Send one durable Pending owner check and mark Sent only after success."""
+    enquiry_id = str((enquiry or {}).get("_id") or "").strip()
+    if str((enquiry or {}).get("OwnerCheckStatus") or "").strip() != "Pending":
+        return False
+    phone = normalize_phone((enquiry or {}).get("OwnerCheckPhone"))
+    if not 8 <= len(phone) <= 15:
+        return False
+    listing_id = str((enquiry or {}).get("Listing") or "").strip()
+    if not enquiry_id or not listing_id:
+        return False
+    base_url = get_bubble_base_url(bubble_env)
+    try:
+        listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+        message = build_owner_check_message(enquiry, lead, listing)
+        print(
+            f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+            "status=pending action=send_attempt", flush=True,
+        )
+        send_whatsapp_text(phone, message)
+        sent_at = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
+        sent_at = sent_at.replace("+00:00", "Z")
+        payload = {"OwnerCheckStatus": "Sent", "OwnerCheckSentAt": sent_at}
+        _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", payload)
+        enquiry.update(payload)
+        print(
+            f"[OWNER CHECK SEND] enquiry_id={enquiry_id} action=sent", flush=True,
+        )
+        return True
+    except Exception as error:
+        print(
+            f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+            f"action=send_failed error={type(error).__name__}", flush=True,
+        )
+        return False
+
+
 def _requests_owner_check(answer):
     return " ".join(str(answer or "").split()).endswith(OWNER_CHECK_RESPONSE)
 
@@ -3182,7 +3297,9 @@ def _process_whatsapp_message(message):
                 message_id=current_message_id, bubble_env="live",
             )
             if _requests_owner_check(answer):
-                prepare_owner_check(lead, "live")
+                owner_check = prepare_owner_check(lead, "live")
+                if owner_check:
+                    send_pending_owner_check(lead, owner_check, "live")
             recommendation_listings = []
             if recommendations_relevant:
                 recommendation_result = json.loads(
