@@ -361,6 +361,92 @@ class WhatsAppTests(unittest.TestCase):
         mocked_send.assert_called_once()
         mocked_lead.assert_not_called()
 
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.run_rentee_turn")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_external_handoff_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_successful_handoff_sends_acknowledgement_then_profile_request(
+        self, _typing, mocked_handoff, mocked_send, mocked_turn, mocked_lead
+    ):
+        acknowledgement = (
+            "Hi — I've got your enquiry for this property. I'll help you from here."
+        )
+        mocked_handoff.return_value = MagicMock(
+            handled=True, response_text=acknowledgement,
+            followup_text=app_module.TENANT_PROFILE_REQUEST,
+            enquiry_id="enquiry-1",
+        )
+        item = webhook_payload(
+            message_id="wamid.handoff-profile", text="RNT-7K4M9Q2P"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        self.assertEqual(mocked_send.call_args_list, [
+            unittest.mock.call("60123456789", acknowledgement),
+            unittest.mock.call(
+                "60123456789", app_module.TENANT_PROFILE_REQUEST
+            ),
+        ])
+        mocked_turn.assert_not_called()
+        mocked_lead.assert_not_called()
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app.handle_external_handoff_message")
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_duplicate_handoff_webhook_sends_profile_request_only_once(
+        self, _typing, mocked_send, mocked_handoff
+    ):
+        mocked_handoff.return_value = MagicMock(
+            handled=True, response_text="Acknowledged",
+            followup_text=app_module.TENANT_PROFILE_REQUEST,
+            enquiry_id="enquiry-1",
+        )
+        client = app_module.app.test_client()
+        payload = webhook_payload(
+            message_id="wamid.duplicate-handoff", text="RNT-7K4M9Q2P"
+        )
+
+        client.post("/whatsapp/webhook", json=payload)
+        client.post("/whatsapp/webhook", json=payload)
+
+        mocked_handoff.assert_called_once()
+        self.assertEqual(mocked_send.call_count, 2)
+        mocked_send.assert_any_call(
+            "60123456789", app_module.TENANT_PROFILE_REQUEST
+        )
+
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.run_rentee_turn")
+    @patch("app.send_whatsapp_text")
+    @patch("app.handle_external_handoff_message")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_profile_send_failure_keeps_handoff_and_does_not_run_llm(
+        self, _typing, mocked_handoff, mocked_send, mocked_turn, mocked_lead
+    ):
+        mocked_handoff.return_value = MagicMock(
+            handled=True, response_text="Acknowledged",
+            followup_text=app_module.TENANT_PROFILE_REQUEST,
+            enquiry_id="enquiry-1",
+        )
+        mocked_send.side_effect = [None, RuntimeError("Meta unavailable")]
+        item = webhook_payload(
+            message_id="wamid.profile-failure", text="RNT-7K4M9Q2P"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        with patch("builtins.print") as mocked_print:
+            app_module._process_whatsapp_message(item)
+
+        self.assertEqual(mocked_send.call_count, 2)
+        self.assertIn(
+            "enquiry_id=enquiry-1 tenant_profile_request_failed",
+            " ".join(str(call) for call in mocked_print.call_args_list),
+        )
+        mocked_turn.assert_not_called()
+        mocked_lead.assert_not_called()
+
     @patch("app.threading.Thread", ImmediateThread)
     @patch("app.send_whatsapp_text")
     @patch("app.handle_internal_user_message")

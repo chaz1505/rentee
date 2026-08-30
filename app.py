@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from enquiry_workflow import (
+    TENANT_PROFILE_REQUEST,
     extract_handoff_code,
     find_internal_user,
     handle_external_handoff_message,
@@ -2757,6 +2758,22 @@ def _process_whatsapp_message(message):
                     whatsapp_profile_name=message.get("customer_name"),
                 )
                 send_whatsapp_text(phone, handoff_result.response_text)
+                followup_text = getattr(handoff_result, "followup_text", None)
+                if isinstance(followup_text, str) and followup_text.strip():
+                    enquiry_id = getattr(handoff_result, "enquiry_id", None)
+                    try:
+                        send_whatsapp_text(phone, followup_text)
+                        print(
+                            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                            "tenant_profile_request_sent",
+                            flush=True,
+                        )
+                    except Exception:
+                        print(
+                            f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                            "tenant_profile_request_failed",
+                            flush=True,
+                        )
                 print(
                     f"[ENQUIRY WORKFLOW] handoff message handled phone={safe_phone}",
                     flush=True,

@@ -17,6 +17,17 @@ HANDOFF_CODE_PATTERN = re.compile(r"\bRNT-[A-Z0-9]{8}\b", re.I)
 HANDOFF_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LEAD_NAME_FIELD = "name"
 LEAD_OWNER_FIELD = "owner"
+TENANT_PROFILE_REQUEST = """Hi there, thanks for reaching out. Would you be able to share the below info for the owner and let me know when you’d like to view?
+
+TENANT PROFILE
+🚩Nationality:
+👨‍👩‍👦‍👦Pax (adults/kids/helpers):
+🛏️How many rooms do you need?
+🪑Furnished or Unfurnished?
+💻Occupation:
+🐶Pet?
+🗓️Start date:
+💰Budget:"""
 
 
 @dataclass
@@ -24,6 +35,8 @@ class EnquiryWorkflowResult:
     handled: bool
     response_text: Optional[str] = None
     _after_send: object = None
+    followup_text: Optional[str] = None
+    enquiry_id: Optional[str] = None
 
     def complete(self):
         """Commit state changes that must happen only after WhatsApp sends."""
@@ -355,7 +368,9 @@ def handle_external_handoff_message(
             )
     print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff completed", flush=True)
     return EnquiryWorkflowResult(
-        True, "Hi — I've got your enquiry for this property. I'll help you from here."
+        True, "Hi — I've got your enquiry for this property. I'll help you from here.",
+        followup_text=TENANT_PROFILE_REQUEST,
+        enquiry_id=enquiry_id,
     )
 
 

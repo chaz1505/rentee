@@ -676,6 +676,8 @@ class EnquiryWorkflowTests(unittest.TestCase):
             result.response_text,
             "Hi — I've got your enquiry for this property. I'll help you from here.",
         )
+        self.assertEqual(result.followup_text, workflow.TENANT_PROFILE_REQUEST)
+        self.assertEqual(result.enquiry_id, "enquiry-1")
         patch_bubble.assert_called_once_with(
             "https://bubble.test/obj/enquiry/enquiry-1",
             {"Enquirer Phone": "60123456789"},
@@ -721,8 +723,10 @@ class EnquiryWorkflowTests(unittest.TestCase):
             records, MagicMock(), MagicMock(), normalize_phone,
         )
         self.assertFalse(invalid.handled)
+        self.assertIsNone(invalid.followup_text)
         self.assertTrue(unknown.handled)
         self.assertIn("fresh one", unknown.response_text)
+        self.assertIsNone(unknown.followup_text)
 
     def test_originating_agent_cannot_bind_own_handoff(self):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
@@ -738,8 +742,22 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         self.assertTrue(result.handled)
         self.assertIn("for the enquirer", result.response_text)
+        self.assertIsNone(result.followup_text)
         patch_bubble.assert_not_called()
         self.assertEqual(bubble_get.call_count, 1)
+
+    def test_tenant_profile_request_matches_fixed_template(self):
+        self.assertEqual(workflow.TENANT_PROFILE_REQUEST, """Hi there, thanks for reaching out. Would you be able to share the below info for the owner and let me know when you’d like to view?
+
+TENANT PROFILE
+🚩Nationality:
+👨‍👩‍👦‍👦Pax (adults/kids/helpers):
+🛏️How many rooms do you need?
+🪑Furnished or Unfurnished?
+💻Occupation:
+🐶Pet?
+🗓️Start date:
+💰Budget:""")
 
     def test_different_bubble_user_can_complete_handoff(self):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
