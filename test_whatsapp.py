@@ -94,7 +94,7 @@ class TenantProfileCaptureTests(unittest.TestCase):
             "bedroomsMin": 3, "budgetRent": 12000,
         })
 
-    def test_furniture_status_uses_exact_bubble_option_strings(self):
+    def test_furnishing_preference_uses_exact_bubble_text_values(self):
         for value in (
             "Fully Furnished", "Partially Furnished", "Unfurnished",
         ):
@@ -111,6 +111,36 @@ class TenantProfileCaptureTests(unittest.TestCase):
                 self.extraction(furnishingPreference=None)
             ),
         )
+
+    def test_profile_payload_serializes_text_and_numbers_by_bubble_schema(self):
+        payload = app_module._tenant_profile_patch(self.extraction(
+            nationality="British", adults=2, children=2, helpers=1,
+            bedroomsMin=3, furnishingPreference="Fully Furnished",
+            occupation="Finance Director at Shell", pets="No",
+            budgetRent=12000, viewingPreference="Saturday afternoon",
+        ))
+        self.assertEqual(set(payload), {
+            "nationality", "adults", "children", "helpers", "bedroomsMin",
+            "furnishingPreference", "occupation", "pets", "budgetRent",
+            "viewingPreference",
+        })
+        for field in ("adults", "children", "helpers", "bedroomsMin", "budgetRent"):
+            self.assertIsInstance(payload[field], (int, float))
+            self.assertNotIsInstance(payload[field], bool)
+        for field in (
+            "nationality", "furnishingPreference", "occupation", "pets",
+            "viewingPreference",
+        ):
+            self.assertIsInstance(payload[field], str)
+
+    def test_invalid_and_empty_profile_values_are_omitted(self):
+        payload = app_module._tenant_profile_patch(self.extraction(
+            nationality="  ", adults="2 adults", children=-1, helpers=True,
+            bedroomsMin="3", furnishingPreference="Anything is fine",
+            occupation=None, pets="", startDate="mid October",
+            budgetRent="RM12,000", viewingPreference=[],
+        ))
+        self.assertEqual(payload, {})
 
     def test_text_profile_values_preserve_useful_detail(self):
         payload = app_module._tenant_profile_patch(self.extraction(
@@ -214,6 +244,38 @@ class TenantProfileCaptureTests(unittest.TestCase):
 
         self.assertIs(result, lead)
         self.assertEqual(result["budgetRent"], 12000)
+
+    @patch("app.extract_tenant_profile")
+    @patch("app.find_handoff_lead_by_phone")
+    def test_bubble_http_failure_logs_status_fields_and_safe_response(
+        self, find_linked, extract,
+    ):
+        find_linked.return_value = {"_id": "lead-1"}
+        extract.return_value = self.extraction(
+            nationality="British", adults=2,
+            furnishingPreference="Fully Furnished",
+        )
+        response = requests.Response()
+        response.status_code = 400
+        response._content = (
+            b'Invalid data for furnishingPreference: Fully Furnished'
+        )
+        error = requests.HTTPError("400 Client Error", response=response)
+
+        with patch("app._bubble_patch", side_effect=error), \
+             patch("builtins.print") as mocked_print:
+            app_module.capture_linked_tenant_profile(
+                "60123456789", "profile"
+            )
+
+        log = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("tenant_profile_update_failed status=400", log)
+        self.assertIn(
+            "fields=['nationality', 'adults', 'furnishingPreference']", log
+        )
+        self.assertIn("Invalid data for furnishingPreference", log)
+        self.assertNotIn("Fully Furnished", log)
+        self.assertNotIn("British", log)
 
 
 class WhatsAppTests(unittest.TestCase):

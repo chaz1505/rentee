@@ -665,7 +665,7 @@ TENANT_PROFILE_FIELDS = (
     "furnishingPreference", "occupation", "pets", "startDate",
     "budgetRent", "viewingPreference",
 )
-FURNITURE_STATUS_VALUES = {
+TENANT_FURNISHING_TEXT_VALUES = {
     "Fully Furnished", "Partially Furnished", "Unfurnished",
 }
 
@@ -781,7 +781,9 @@ def _tenant_profile_patch(extracted):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                 continue
         elif field == "furnishingPreference":
-            if value not in FURNITURE_STATUS_VALUES:
+            # Bubble Lead.furnishingPreference is text, restricted here to the
+            # application's canonical furniture wording.
+            if value not in TENANT_FURNISHING_TEXT_VALUES:
                 continue
         elif field == "startDate":
             try:
@@ -795,6 +797,28 @@ def _tenant_profile_patch(extracted):
             value = value.strip()
         payload[field] = value
     return payload
+
+
+def _bubble_profile_failure_details(error, payload):
+    """Return safe HTTP diagnostics without exposing submitted profile values."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        body = (
+            " ".join(str(response.text or "").split())
+            if response is not None else ""
+        )
+    except Exception:
+        body = ""
+    for value in payload.values():
+        rendered = str(value).strip()
+        if not rendered:
+            continue
+        body = re.sub(
+            rf"(?<![\w.]){re.escape(rendered)}(?![\w.])",
+            "<redacted>", body,
+        )
+    return status, (body[:1000] or type(error).__name__)
 
 
 def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
@@ -830,11 +854,21 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
                 f"tenant_profile_updated fields={fields}", flush=True,
             )
         except Exception as error:
-            print(
-                f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
-                "tenant_profile_update_failed "
-                f"error={type(error).__name__}", flush=True,
-            )
+            if isinstance(error, requests.HTTPError):
+                status, bubble_error = _bubble_profile_failure_details(
+                    error, payload
+                )
+                print(
+                    f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                    f"tenant_profile_update_failed status={status} "
+                    f"fields={fields} bubble_error={bubble_error!r}", flush=True,
+                )
+            else:
+                print(
+                    f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                    "tenant_profile_update_failed "
+                    f"error={type(error).__name__} fields={fields}", flush=True,
+                )
     return lead
 
 
