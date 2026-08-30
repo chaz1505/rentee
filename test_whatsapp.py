@@ -3,6 +3,7 @@ import os
 import unittest
 import requests
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -34,6 +35,156 @@ class ImmediateThread:
         self.target, self.args = target, args
     def start(self):
         self.target(*self.args)
+
+
+class TenantProfileCaptureTests(unittest.TestCase):
+    def extraction(self, **values):
+        result = {field: None for field in app_module.TENANT_PROFILE_FIELDS}
+        result.update(values)
+        return result
+
+    def test_structured_extraction_schema_covers_only_supported_fields(self):
+        output = self.extraction(nationality="British")
+        with patch.object(
+            app_module.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ) as create:
+            result = app_module.extract_tenant_profile("Nationality: British")
+        self.assertEqual(result["nationality"], "British")
+        schema = create.call_args.kwargs["text"]["format"]["schema"]
+        self.assertEqual(set(schema["properties"]), set(app_module.TENANT_PROFILE_FIELDS))
+        self.assertEqual(set(schema["required"]), set(app_module.TENANT_PROFILE_FIELDS))
+        self.assertNotIn("budgetBuy", schema["properties"])
+
+    def test_pax_values_remain_independent_and_missing_is_null(self):
+        extracted = self.extraction(adults=2, children=2, helpers=1)
+        self.assertEqual(app_module._tenant_profile_patch(extracted), {
+            "adults": 2, "children": 2, "helpers": 1,
+        })
+        no_helper_mentioned = self.extraction(adults=2, children=2)
+        self.assertNotIn(
+            "helpers", app_module._tenant_profile_patch(no_helper_mentioned)
+        )
+        explicit_no_helper = self.extraction(helpers=0)
+        self.assertEqual(
+            app_module._tenant_profile_patch(explicit_no_helper)["helpers"], 0
+        )
+
+    def test_natural_language_pax_contract_is_in_extraction_prompt(self):
+        output = self.extraction(adults=2, children=2)
+        with patch.object(
+            app_module.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ) as create:
+            result = app_module.extract_tenant_profile(
+                "my husband and I with two kids"
+            )
+        self.assertEqual((result["adults"], result["children"]), (2, 2))
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("Split adults, children, and helpers independently", prompt)
+
+    def test_bedrooms_budget_and_identity_fields_are_whitelisted(self):
+        extracted = self.extraction(bedroomsMin=3, budgetRent=12000)
+        extracted.update({
+            "budgetBuy": 999999, "owner": "other", "Agent?": "No",
+            "name": "Changed", "phone": "000",
+        })
+        self.assertEqual(app_module._tenant_profile_patch(extracted), {
+            "bedroomsMin": 3, "budgetRent": 12000,
+        })
+
+    def test_furniture_status_uses_exact_bubble_option_strings(self):
+        for value in (
+            "Fully Furnished", "Partially Furnished", "Unfurnished",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    app_module._tenant_profile_patch(
+                        self.extraction(furnishingPreference=value)
+                    )["furnishingPreference"],
+                    value,
+                )
+        self.assertNotIn(
+            "furnishingPreference",
+            app_module._tenant_profile_patch(
+                self.extraction(furnishingPreference=None)
+            ),
+        )
+
+    def test_text_profile_values_preserve_useful_detail(self):
+        payload = app_module._tenant_profile_patch(self.extraction(
+            pets="1 small dog", occupation="Finance Director at Shell",
+            viewingPreference="Saturday afternoon",
+        ))
+        self.assertEqual(payload, {
+            "occupation": "Finance Director at Shell",
+            "pets": "1 small dog",
+            "viewingPreference": "Saturday afternoon",
+        })
+
+    def test_exact_date_serializes_as_bubble_date_and_approximate_is_omitted(self):
+        exact = app_module._tenant_profile_patch(
+            self.extraction(startDate="2026-10-15")
+        )
+        approximate = app_module._tenant_profile_patch(
+            self.extraction(startDate=None)
+        )
+        self.assertEqual(exact["startDate"], "2026-10-15T00:00:00.000Z")
+        self.assertNotIn("startDate", approximate)
+
+    @patch("app._bubble_patch")
+    @patch("app.extract_tenant_profile")
+    @patch("app.find_handoff_lead_by_phone")
+    def test_capture_updates_only_non_null_values_and_allows_corrections(
+        self, find_linked, extract, patch_bubble,
+    ):
+        find_linked.return_value = {
+            "_id": "lead-1", "nationality": "British", "budgetRent": 12000,
+            "owner": "user-gwen", "Agent?": "No", "name": "Sarah",
+            "phone": "60123456789",
+        }
+        extract.return_value = self.extraction(
+            budgetRent=14000, viewingPreference="Saturday afternoon"
+        )
+        lead = app_module.capture_linked_tenant_profile(
+            "60123456789", "Actually 14k; Saturday afternoon"
+        )
+        patch_bubble.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/lead/lead-1",
+            {"budgetRent": 14000, "viewingPreference": "Saturday afternoon"},
+        )
+        self.assertEqual(lead["nationality"], "British")
+        self.assertEqual(lead["budgetRent"], 14000)
+        for field, expected in {
+            "owner": "user-gwen", "Agent?": "No", "name": "Sarah",
+            "phone": "60123456789",
+        }.items():
+            self.assertEqual(lead[field], expected)
+
+    @patch("app.bubble", return_value={"_id": "lead-1"})
+    @patch("app._bubble_records")
+    def test_durable_enquiry_relationship_resolves_existing_lead(
+        self, records, bubble_get,
+    ):
+        records.return_value = iter([{
+            "_id": "enquiry-1", "Enquirer Phone": "60123456789",
+            "Lead": "lead-1",
+        }])
+        lead = app_module.find_handoff_lead_by_phone("+60 12-345-6789")
+        self.assertEqual(lead["_id"], "lead-1")
+        bubble_get.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/lead/lead-1"
+        )
+
+    @patch("app.extract_tenant_profile", side_effect=RuntimeError("AI unavailable"))
+    @patch("app.find_handoff_lead_by_phone", return_value={"_id": "lead-1"})
+    def test_extraction_failure_returns_existing_lead_without_raising(
+        self, _find, _extract,
+    ):
+        self.assertEqual(
+            app_module.capture_linked_tenant_profile("60123456789", "profile")["_id"],
+            "lead-1",
+        )
 
 
 class WhatsAppTests(unittest.TestCase):
@@ -524,6 +675,32 @@ class WhatsAppTests(unittest.TestCase):
         mocked_lead.assert_called_once()
         mocked_turn.assert_called_once()
         mocked_send.assert_called_once_with("60123456789", "Normal reply")
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-profile")
+    @patch("app.find_latest_ai_message", return_value=None)
+    @patch("app.send_whatsapp_text")
+    @patch("app.run_rentee_turn", return_value=("Normal reply", "response-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.capture_linked_tenant_profile", return_value={"_id": "lead-linked"})
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_linked_profile_reply_reuses_lead_and_continues_normal_conversation(
+        self, _typing, capture, create_lead, _folio, turn, send,
+        _latest, _create_message, _save,
+    ):
+        text = "British, 2 adults, no pets, budget 12k"
+        item = webhook_payload(text=text)["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        capture.assert_called_once_with("60123456789", text, "live")
+        create_lead.assert_not_called()
+        turn.assert_called_once_with(
+            text, "folio-1", previous_response_id=None,
+            message_id="message-profile", bubble_env="live",
+        )
+        send.assert_called_once_with("60123456789", "Normal reply")
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-2")

@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 import csv
+import datetime
 import io
 import os
 import requests
@@ -657,6 +658,158 @@ def find_or_create_whatsapp_lead(
             lead.setdefault(WHATSAPP_LEAD_OWNER_FIELD, str(owner_user_id).strip())
     lead.setdefault("searchBriefJSON", "")
     return lead, True
+
+
+TENANT_PROFILE_FIELDS = (
+    "nationality", "adults", "children", "helpers", "bedroomsMin",
+    "furnishingPreference", "occupation", "pets", "startDate",
+    "budgetRent", "viewingPreference",
+)
+FURNITURE_STATUS_VALUES = {
+    "Fully Furnished", "Partially Furnished", "Unfurnished",
+}
+
+
+def find_handoff_lead_by_phone(phone, bubble_env="live"):
+    """Resolve a Lead through the durable Enquiry handoff relationship."""
+    canonical = normalize_phone(phone)
+    if not canonical:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    constraints = [{
+        "key": "Enquirer Phone", "constraint_type": "equals",
+        "value": canonical,
+    }]
+    enquiries = list(_bubble_records(base_url, "enquiry", constraints))
+    lead_ids = {
+        str(enquiry.get("Lead")) for enquiry in enquiries
+        if enquiry.get("Lead")
+        and normalize_phone(enquiry.get("Enquirer Phone", canonical)) == canonical
+    }
+    if len(lead_ids) != 1:
+        return None
+    lead_id = lead_ids.pop()
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    if not lead.get("_id"):
+        lead["_id"] = lead_id
+    return lead
+
+
+def extract_tenant_profile(message_text):
+    """Extract only explicit tenant-profile facts from one inbound message."""
+    schema_properties = {
+        "nationality": {"type": ["string", "null"]},
+        "adults": {"type": ["integer", "null"], "minimum": 0},
+        "children": {"type": ["integer", "null"], "minimum": 0},
+        "helpers": {"type": ["integer", "null"], "minimum": 0},
+        "bedroomsMin": {"type": ["integer", "null"], "minimum": 0},
+        "furnishingPreference": {
+            "type": ["string", "null"],
+            "enum": [
+                "Fully Furnished", "Partially Furnished", "Unfurnished", None,
+            ],
+        },
+        "occupation": {"type": ["string", "null"]},
+        "pets": {"type": ["string", "null"]},
+        "startDate": {
+            "type": ["string", "null"],
+            "description": "Exact date as YYYY-MM-DD, otherwise null.",
+        },
+        "budgetRent": {"type": ["number", "null"], "minimum": 0},
+        "viewingPreference": {"type": ["string", "null"]},
+    }
+    response = client.responses.create(
+        model="gpt-5-mini",
+        input=(
+            "Extract only tenant-profile facts explicitly and confidently supplied in "
+            "the CURRENT MESSAGE. Return null for every absent or ambiguous field; "
+            "absence never means zero. Split adults, children, and helpers independently. "
+            "A generic family total is not a breakdown. 'No helper/children/pets' may be "
+            "zero/No. Rooms required means bedroomsMin. Convert rental budget shorthand "
+            "such as 12k to 12000, but never copy a property's asking rent unless stated "
+            "as the sender's budget. Furnishing must be exactly Fully Furnished, Partially "
+            "Furnished, or Unfurnished; ambiguous/no-preference wording is null. Preserve "
+            "useful occupation, pet, and viewing detail. For startDate, return YYYY-MM-DD "
+            "only for an exact, responsibly resolvable date. Month/day without a year uses "
+            "the next occurrence. Approximate phrases such as mid-month, end of next month, "
+            "or ASAP must be null. Today in Kuala Lumpur is "
+            f"{datetime.date.today().isoformat()}.\n\nCURRENT MESSAGE:\n{message_text}"
+        ),
+        reasoning={"effort": "low"},
+        text={"format": {
+            "type": "json_schema", "name": "tenant_profile_extraction",
+            "strict": True,
+            "schema": {
+                "type": "object", "properties": schema_properties,
+                "required": list(TENANT_PROFILE_FIELDS),
+                "additionalProperties": False,
+            },
+        }},
+    )
+    extracted = json.loads(response.output_text)
+    return {field: extracted.get(field) for field in TENANT_PROFILE_FIELDS}
+
+
+def _tenant_profile_patch(extracted):
+    """Validate and serialize non-null profile values for Bubble."""
+    payload = {}
+    for field in TENANT_PROFILE_FIELDS:
+        value = extracted.get(field)
+        if value is None:
+            continue
+        if field in {"adults", "children", "helpers", "bedroomsMin"}:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                continue
+        elif field == "budgetRent":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                continue
+        elif field == "furnishingPreference":
+            if value not in FURNITURE_STATUS_VALUES:
+                continue
+        elif field == "startDate":
+            try:
+                parsed = datetime.date.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                continue
+            value = f"{parsed.isoformat()}T00:00:00.000Z"
+        elif not isinstance(value, str) or not value.strip():
+            continue
+        else:
+            value = value.strip()
+        payload[field] = value
+    return payload
+
+
+def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
+    """Best-effort profile capture; failures must not interrupt conversation."""
+    try:
+        lead = find_handoff_lead_by_phone(phone, bubble_env)
+    except Exception:
+        return None
+    if not lead or not lead.get("_id"):
+        return None
+    lead_id = lead["_id"]
+    try:
+        payload = _tenant_profile_patch(extract_tenant_profile(message_text))
+        fields = list(payload)
+        print(
+            f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+            f"tenant_profile_extracted fields={fields}", flush=True,
+        )
+        if payload:
+            base_url = get_bubble_base_url(bubble_env)
+            _bubble_patch(f"{base_url}/obj/lead/{lead_id}", payload)
+            lead.update(payload)
+            print(
+                f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                f"tenant_profile_updated fields={fields}", flush=True,
+            )
+    except Exception:
+        print(
+            f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+            "tenant_profile_extraction_failed", flush=True,
+        )
+    return lead
 
 
 def _select_existing_folio(folios, lead_id):
@@ -2809,9 +2962,13 @@ def _process_whatsapp_message(message):
                     f"[ENQUIRY WORKFLOW] no internal User match phone={safe_phone}",
                     flush=True,
                 )
-            lead, lead_created = find_or_create_whatsapp_lead(
-                phone, message.get("customer_name"), "live"
-            )
+            linked_lead = capture_linked_tenant_profile(phone, text, "live")
+            if linked_lead:
+                lead, lead_created = linked_lead, False
+            else:
+                lead, lead_created = find_or_create_whatsapp_lead(
+                    phone, message.get("customer_name"), "live"
+                )
             lead_id = lead["_id"]
             folio_id, folio_created = find_or_create_lead_folio(lead_id, "live")
             previous_message = find_latest_ai_message(lead_id, "live")
