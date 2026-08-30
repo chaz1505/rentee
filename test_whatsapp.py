@@ -426,7 +426,8 @@ class OwnerCheckTests(unittest.TestCase):
         now = datetime(2026, 8, 30, 4, 5, tzinfo=timezone.utc)
         with patch("app.bubble", return_value=listing), \
              patch("app.owner_check_whatsapp_window", return_value="open"), \
-             patch("app.send_whatsapp_text") as send, \
+             patch("app.send_whatsapp_text", return_value=["wamid.freeform"]) as send, \
+             patch("app._bubble_create", return_value="message-owner") as create, \
              patch("app._bubble_patch") as update, \
              patch("builtins.print") as logged:
             sent = app_module.send_pending_owner_check(
@@ -455,6 +456,16 @@ class OwnerCheckTests(unittest.TestCase):
         )
         self.assertEqual(enquiry["OwnerCheckStatus"], "Sent")
         self.assertEqual(enquiry["OwnerCheckResponse"], "unchanged")
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "message", {
+                "phone": "60115551234",
+                "direction": "Outbound",
+                "own_Sent?": "No",
+                "messageContent": message,
+                "whatsappMessageId": "wamid.freeform",
+                "lead": "lead-1",
+            },
+        )
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn(
             "destination=ownerContact phone=...551234 "
@@ -541,6 +552,7 @@ class OwnerCheckTests(unittest.TestCase):
              patch("app.owner_check_whatsapp_window", return_value="closed"), \
              patch("app.send_whatsapp_text") as freeform, \
              patch("app.send_whatsapp_template", return_value=["wamid.template"]) as template, \
+             patch("app._bubble_create", return_value="message-owner") as create, \
              patch("app._bubble_patch") as update, \
              patch("builtins.print") as logged:
             result = app_module.send_pending_owner_check(
@@ -551,6 +563,13 @@ class OwnerCheckTests(unittest.TestCase):
         template.assert_called_once_with(
             "60115551234", "owner_check", "en_US"
         )
+        persisted = create.call_args.args[2]
+        self.assertEqual(persisted["phone"], "60115551234")
+        self.assertEqual(persisted["direction"], "Outbound")
+        self.assertEqual(persisted["own_Sent?"], "No")
+        self.assertEqual(persisted["whatsappMessageId"], "wamid.template")
+        self.assertIn("still available", persisted["messageContent"])
+        self.assertEqual(persisted["lead"], "lead-1")
         update.assert_called_once()
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn("window=closed method=template", logs)
@@ -584,6 +603,32 @@ class OwnerCheckTests(unittest.TestCase):
                     template.assert_called_once()
                 else:
                     template.assert_not_called()
+
+    def test_message_persistence_failure_after_meta_does_not_resend(self):
+        enquiry = self.enquiry(
+            OwnerCheckStatus="Pending", OwnerCheckPhone="60115551234",
+        )
+        now = datetime(2026, 8, 30, 4, 5, tzinfo=timezone.utc)
+        with patch("app.bubble", return_value={"name": "One Menerung"}), \
+             patch("app.owner_check_whatsapp_window", return_value="open"), \
+             patch("app.send_whatsapp_text", return_value=["wamid.accepted"]) as send, \
+             patch("app._bubble_create", side_effect=RuntimeError("Bubble down")), \
+             patch("app._bubble_patch") as update, \
+             patch("builtins.print") as logged:
+            first = app_module.send_pending_owner_check(
+                {"_id": "lead-1"}, enquiry, now=now
+            )
+            second = app_module.send_pending_owner_check(
+                {"_id": "lead-1"}, enquiry, now=now
+            )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        send.assert_called_once()
+        update.assert_called_once()
+        self.assertEqual(enquiry["OwnerCheckStatus"], "Sent")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("action=message_persistence_failed", logs)
+        self.assertIn("preserving_sent_state=true", logs)
 
     @patch("app.requests.post")
     def test_owner_template_uses_meta_template_payload(self, post):

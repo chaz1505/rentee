@@ -1158,6 +1158,27 @@ def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
     return [message_id]
 
 
+def persist_owner_check_whatsapp_message(
+    phone, message_content, whatsapp_message_id, lead_id=None, bubble_env="live",
+):
+    payload = {
+        "phone": normalize_phone(phone),
+        "direction": "Outbound",
+        "own_Sent?": "No",
+        "messageContent": str(message_content or ""),
+        "whatsappMessageId": str(whatsapp_message_id or "").strip(),
+    }
+    if lead_id:
+        payload["lead"] = lead_id
+    return _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
+
+
+def _first_whatsapp_message_id(sent_ids):
+    if not isinstance(sent_ids, list):
+        return None
+    return next((str(value).strip() for value in sent_ids if str(value or "").strip()), None)
+
+
 def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
     """Send one durable Pending owner check and mark Sent only after success."""
     enquiry_id = str((enquiry or {}).get("_id") or "").strip()
@@ -1186,7 +1207,7 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
             f"window={window} method={method}", flush=True,
         )
         if method == "freeform":
-            send_whatsapp_text(phone, message)
+            sent_ids = send_whatsapp_text(phone, message)
         else:
             template_name = str(
                 os.getenv("WHATSAPP_OWNER_CHECK_TEMPLATE_NAME")
@@ -1205,7 +1226,29 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
                 or os.getenv("OWNER_CHECK_TEMPLATE_LANGUAGE")
                 or "en_US"
             ).strip()
-            send_whatsapp_template(phone, template_name, language)
+            sent_ids = send_whatsapp_template(phone, template_name, language)
+        meta_message_id = _first_whatsapp_message_id(sent_ids)
+        if meta_message_id:
+            try:
+                persist_owner_check_whatsapp_message(
+                    phone, message, meta_message_id,
+                    lead_id=str((lead or {}).get("_id") or "").strip() or None,
+                    bubble_env=bubble_env,
+                )
+            except Exception as error:
+                print(
+                    f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+                    "action=message_persistence_failed "
+                    f"error={type(error).__name__} preserving_sent_state=true",
+                    flush=True,
+                )
+        else:
+            print(
+                f"[OWNER CHECK SEND] enquiry_id={enquiry_id} "
+                "action=message_persistence_failed "
+                "error=missing_meta_message_id preserving_sent_state=true",
+                flush=True,
+            )
         sent_at = current.isoformat()
         sent_at = sent_at.replace("+00:00", "Z")
         payload = {"OwnerCheckStatus": "Sent", "OwnerCheckSentAt": sent_at}
