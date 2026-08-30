@@ -16,7 +16,10 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from enquiry_workflow import (
+    BUY_TRANSACTION,
+    RENT_TRANSACTION,
     TENANT_PROFILE_REQUEST,
+    enquiry_transaction_type,
     extract_handoff_code,
     find_internal_user,
     handle_external_handoff_message,
@@ -696,6 +699,14 @@ def find_handoff_lead_by_phone(phone, bubble_env="live"):
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     if not lead.get("_id"):
         lead["_id"] = lead_id
+    transaction_types = {
+        enquiry_transaction_type(enquiry) for enquiry in enquiries
+        if str(enquiry.get("Lead") or "") == lead_id
+        and enquiry_transaction_type(enquiry)
+    }
+    lead["_handoff_transaction_type"] = (
+        transaction_types.pop() if len(transaction_types) == 1 else None
+    )
     return lead
 
 
@@ -730,7 +741,7 @@ def extract_tenant_profile(message_text):
             "absence never means zero. Split adults, children, and helpers independently. "
             "A generic family total is not a breakdown. 'No helper/children/pets' may be "
             "zero/No. Rooms required means bedroomsMin. Convert rental budget shorthand "
-            "such as 12k to 12000, but never copy a property's asking rent unless stated "
+            "such as 12k to 12000 and 2.5m to 2500000, but never copy a property's asking rent unless stated "
             "as the sender's budget. Furnishing must be exactly Fully Furnished, Partially "
             "Furnished, or Unfurnished; ambiguous/no-preference wording is null. Preserve "
             "useful occupation, pet, and viewing detail. For startDate, return YYYY-MM-DD "
@@ -767,7 +778,7 @@ def extract_tenant_profile(message_text):
     return {field: extracted.get(field) for field in TENANT_PROFILE_FIELDS}
 
 
-def _tenant_profile_patch(extracted):
+def _tenant_profile_patch(extracted, transaction_type=RENT_TRANSACTION):
     """Validate and serialize non-null profile values for Bubble."""
     payload = {}
     for field in TENANT_PROFILE_FIELDS:
@@ -779,6 +790,10 @@ def _tenant_profile_patch(extracted):
                 continue
         elif field == "budgetRent":
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+                continue
+            if transaction_type == BUY_TRANSACTION:
+                field = "budgetBuy"
+            elif transaction_type != RENT_TRANSACTION:
                 continue
         elif field == "furnishingPreference":
             # Bubble Lead.furnishingPreference is text, restricted here to the
@@ -831,7 +846,10 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
         return None
     lead_id = lead["_id"]
     try:
-        payload = _tenant_profile_patch(extract_tenant_profile(message_text))
+        payload = _tenant_profile_patch(
+            extract_tenant_profile(message_text),
+            lead.get("_handoff_transaction_type"),
+        )
         fields = list(payload)
         print(
             f"[ENQUIRY WORKFLOW] lead_id={lead_id} "

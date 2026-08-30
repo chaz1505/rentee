@@ -208,7 +208,9 @@ class EnquiryWorkflowTests(unittest.TestCase):
         ), [call.args for call in self.records.call_args_list])
         self.assertIn("One Menerung 3-bed at RM15,000", result.response_text)
         self.assertIn(
-            ("https://bubble.test/obj/enquiry/enquiry-1", {"Listing": "listing-1"}),
+            ("https://bubble.test/obj/enquiry/enquiry-1", {
+                "Listing": "listing-1", "TransactionType": ["Rent/Let"],
+            }),
             [call.args for call in self.patch_user.call_args_list],
         )
 
@@ -250,6 +252,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "sourceURL": "https://www.propertyguru.com.my/l/501124208",
+            "priceRent": 15000,
             "availability": True,
         }
         self.records.side_effect = [iter([listing]), iter([])]
@@ -344,7 +347,9 @@ class EnquiryWorkflowTests(unittest.TestCase):
             )
         self.assertIn("One Menerung", result.response_text)
         self.assertIn(
-            ("https://bubble.test/obj/enquiry/enquiry-1", {"Listing": "listing-1"}),
+            ("https://bubble.test/obj/enquiry/enquiry-1", {
+                "Listing": "listing-1", "TransactionType": ["Rent/Let"],
+            }),
             [call.args for call in self.patch_user.call_args_list],
         )
         logs = "\n".join(str(call) for call in mocked_print.call_args_list)
@@ -485,6 +490,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "priceRent": 15000,
             "availability": None,
         }
         self.records.side_effect = [iter([listing]), iter([])]
@@ -507,6 +513,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "priceRent": 15000,
         }
         self.records.side_effect = [iter([listing]), iter([])]
         self.relationship_names.return_value = {"condo-1": "One Menerung"}
@@ -526,6 +533,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "priceRent": 15000,
             "availability": None,
             "availability_date": "2030-01-01T00:00:00.000Z",
         }
@@ -642,6 +650,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "owner": "user-1", "condo": "condo-1",
             "sourceURL": "https://www.propertyguru.com.my/l/12345",
+            "priceRent": 15000,
             "availability": True,
         }
         self.records.side_effect = [iter([listing]), iter([])]
@@ -656,13 +665,16 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn("https://wa.me/60115551234?", result.response_text)
         self.assertIn("RNT-7K4M9Q2P", result.response_text)
         payloads = [call.args[1] for call in self.patch_user.call_args_list]
-        self.assertIn({"Listing": "listing-1"}, payloads)
+        self.assertIn({
+            "Listing": "listing-1", "TransactionType": ["Rent/Let"],
+        }, payloads)
         self.assertIn({"Handoff Code": "RNT-7K4M9Q2P"}, payloads)
 
     def test_external_handoff_sets_empty_phone(self):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
         bubble_get = MagicMock(side_effect=[
-            {"_id": "enquiry-1", "Listing": "listing-1", "Enquirer Phone": ""},
+            {"_id": "enquiry-1", "Listing": "listing-1", "Enquirer Phone": "",
+             "TransactionType": ["Rent/Let"]},
             {"_id": "listing-1"},
         ])
         patch_bubble = MagicMock()
@@ -1098,6 +1110,100 @@ TENANT PROFILE
         self.assertTrue(result.handled)
         self.assertIn("fresh one", result.response_text)
         patch_bubble.assert_not_called()
+
+
+class TransactionIntentTests(unittest.TestCase):
+    def test_explicit_rental_and_tenant_wording(self):
+        for text in ("new rental enquiry", "tenant enquiry", "client wants to rent"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    workflow.explicit_transaction_type(text), "Rent/Let"
+                )
+
+    def test_explicit_buyer_and_purchase_wording(self):
+        for text in ("buyer enquiry", "client wants to purchase", "for sale"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    workflow.explicit_transaction_type(text), "Buy/Sell"
+                )
+
+    def test_listing_transaction_inference(self):
+        cases = (
+            ({"priceRent": 12000}, "Rent/Let"),
+            ({"priceSale": 2500000}, "Buy/Sell"),
+            ({"priceRent": 12000, "priceSale": 2500000}, None),
+            ({}, None),
+            ({"TransactionType": ["Rent/Let"]}, "Rent/Let"),
+            ({"TransactionType": ["Buy/Sell"]}, "Buy/Sell"),
+        )
+        for listing, expected in cases:
+            with self.subTest(listing=listing):
+                self.assertEqual(
+                    workflow.listing_transaction_type(listing), expected
+                )
+
+    def test_explicit_wording_wins_over_ambiguous_listing(self):
+        explicit = workflow.explicit_transaction_type("this one is for rent")
+        inferred = workflow.listing_transaction_type({
+            "priceRent": 12000, "priceSale": 2500000,
+        })
+        self.assertEqual(explicit or inferred, "Rent/Let")
+
+    def test_gwen_confirmation_persists_and_resumes_handoff(self):
+        for answer, expected in (("rent", "Rent/Let"), ("buy", "Buy/Sell")):
+            with self.subTest(answer=answer):
+                enquiry = {
+                    "_id": "enquiry-1", "Agent": "user-1",
+                    "Listing": "listing-1", "TransactionType": [],
+                }
+                records = MagicMock(side_effect=[iter([enquiry]), iter([])])
+                patch_bubble = MagicMock()
+                bubble_get = MagicMock(side_effect=[
+                    {"_id": "listing-1", "availability": True},
+                    dict(enquiry),
+                ])
+                with patch(
+                    "enquiry_workflow._new_handoff_code",
+                    return_value="RNT-7K4M9Q2P",
+                ):
+                    result = workflow.handle_internal_user_message(
+                        {"_id": "user-1"}, answer, "https://bubble.test",
+                        patch_bubble, bubble_records=records,
+                        bubble_get=bubble_get, normalize_phone=normalize_phone,
+                        rentee_whatsapp_number="60115551234",
+                    )
+                self.assertIn("https://wa.me/", result.response_text)
+                self.assertIn(
+                    unittest.mock.call(
+                        "https://bubble.test/obj/enquiry/enquiry-1",
+                        {"TransactionType": [expected]},
+                    ),
+                    patch_bubble.call_args_list,
+                )
+
+    def _external_template(self, transaction_type):
+        records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
+        bubble_get = MagicMock(side_effect=[
+            {"_id": "enquiry-1", "Listing": "listing-1",
+             "Enquirer Phone": "60123456789",
+             "TransactionType": transaction_type},
+            {"_id": "listing-1"},
+        ])
+        return workflow.handle_external_handoff_message(
+            "60123456789", "RNT-7K4M9Q2P", "https://bubble.test",
+            records, bubble_get, MagicMock(), normalize_phone,
+        ).followup_text
+
+    def test_transaction_specific_profile_templates(self):
+        self.assertEqual(
+            self._external_template(["Rent/Let"]),
+            workflow.TENANT_PROFILE_REQUEST,
+        )
+        self.assertEqual(
+            self._external_template(["Buy/Sell"]),
+            workflow.BUYER_PROFILE_REQUEST,
+        )
+        self.assertIsNone(self._external_template([]))
 
 
 if __name__ == "__main__":

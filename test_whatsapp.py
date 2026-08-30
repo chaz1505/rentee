@@ -142,6 +142,27 @@ class TenantProfileCaptureTests(unittest.TestCase):
         ))
         self.assertEqual(payload, {})
 
+    def test_budget_routes_to_only_the_resolved_transaction_field(self):
+        extracted = self.extraction(budgetRent=12000)
+        self.assertEqual(
+            app_module._tenant_profile_patch(extracted, "Rent/Let"),
+            {"budgetRent": 12000},
+        )
+        self.assertEqual(
+            app_module._tenant_profile_patch(extracted, "Buy/Sell"),
+            {"budgetBuy": 12000},
+        )
+        self.assertEqual(
+            app_module._tenant_profile_patch(extracted, None), {},
+        )
+
+    def test_unresolved_transaction_keeps_non_budget_profile_fields(self):
+        payload = app_module._tenant_profile_patch(
+            self.extraction(nationality="British", adults=2, budgetRent=12000),
+            None,
+        )
+        self.assertEqual(payload, {"nationality": "British", "adults": 2})
+
     def test_text_profile_values_preserve_useful_detail(self):
         payload = app_module._tenant_profile_patch(self.extraction(
             pets="1 small dog", occupation="Finance Director at Shell",
@@ -173,6 +194,7 @@ class TenantProfileCaptureTests(unittest.TestCase):
             "_id": "lead-1", "nationality": "British", "budgetRent": 12000,
             "owner": "user-gwen", "Agent?": "No", "name": "Sarah",
             "phone": "60123456789",
+            "_handoff_transaction_type": "Rent/Let",
         }
         extract.return_value = self.extraction(
             budgetRent=14000, viewingPreference="Saturday afternoon"

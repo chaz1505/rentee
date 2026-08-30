@@ -28,6 +28,19 @@ TENANT PROFILE
 🐶Pet?
 🗓️Start date:
 💰Budget:"""
+BUYER_PROFILE_REQUEST = """BUYER PROFILE
+🚩Nationality:
+👨‍👩‍👦‍👦Pax (adults/kids/helpers):
+🛏️How many rooms do you need?
+🪑Furnished or Unfurnished?
+💻Occupation:
+🐶Pet?
+🗓️Target timing:
+💰Budget:"""
+RENT_TRANSACTION = "Rent/Let"
+BUY_TRANSACTION = "Buy/Sell"
+VALID_ENQUIRY_TRANSACTIONS = {RENT_TRANSACTION, BUY_TRANSACTION}
+TRANSACTION_CONFIRMATION_REQUEST = "Is this enquiry for rent or purchase?"
 
 
 @dataclass
@@ -47,6 +60,55 @@ class EnquiryWorkflowResult:
 def extract_handoff_code(message_text):
     match = HANDOFF_CODE_PATTERN.search(str(message_text or ""))
     return match.group(0).upper() if match else None
+
+
+def explicit_transaction_type(message_text, confirmation=False):
+    text = " ".join(str(message_text or "").lower().split())
+    rent_patterns = (
+        r"\b(?:rent|rental|tenant)\b", r"\bwants? to rent\b",
+    )
+    buy_patterns = (
+        r"\b(?:buyer|buy|purchase)\b", r"\bfor sale\b",
+        r"\bwants? to (?:buy|purchase)\b",
+    )
+    rent = any(re.search(pattern, text) for pattern in rent_patterns)
+    buy = any(re.search(pattern, text) for pattern in buy_patterns)
+    if rent == buy:
+        return None
+    if confirmation and len(text.split()) > 8:
+        return None
+    return RENT_TRANSACTION if rent else BUY_TRANSACTION
+
+
+def listing_transaction_type(listing):
+    def positive_number(value):
+        try:
+            return float(value) > 0
+        except (TypeError, ValueError):
+            return False
+    listed_types = (listing or {}).get("TransactionType") or []
+    if isinstance(listed_types, str):
+        listed_types = [listed_types]
+    listed_types = {
+        value for value in listed_types if value in VALID_ENQUIRY_TRANSACTIONS
+    }
+    if len(listed_types) == 1:
+        return next(iter(listed_types))
+    if len(listed_types) > 1:
+        return None
+    has_rent = positive_number((listing or {}).get("priceRent"))
+    has_sale = positive_number((listing or {}).get("priceSale"))
+    if has_rent == has_sale:
+        return None
+    return RENT_TRANSACTION if has_rent else BUY_TRANSACTION
+
+
+def enquiry_transaction_type(enquiry):
+    values = (enquiry or {}).get("TransactionType") or []
+    if isinstance(values, str):
+        values = [values]
+    valid = [value for value in values if value in VALID_ENQUIRY_TRANSACTIONS]
+    return valid[0] if len(set(valid)) == 1 else None
 
 
 def _clean_person_name(value, minimum_words=1):
@@ -367,9 +429,14 @@ def handle_external_handoff_message(
                 "agent who sent you the link to send you a fresh one."
             )
     print(f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} handoff completed", flush=True)
+    transaction_type = enquiry_transaction_type(enquiry)
+    followup_text = (
+        TENANT_PROFILE_REQUEST if transaction_type == RENT_TRANSACTION else
+        BUYER_PROFILE_REQUEST if transaction_type == BUY_TRANSACTION else None
+    )
     return EnquiryWorkflowResult(
         True, "Hi — I've got your enquiry for this property. I'll help you from here.",
-        followup_text=TENANT_PROFILE_REQUEST,
+        followup_text=followup_text,
         enquiry_id=enquiry_id,
     )
 
@@ -764,12 +831,16 @@ def consume_pending_enquiry(
     """Create the Enquiry, deterministically match an owned Listing, and respond."""
     user_id = user["_id"]
     agent_value = "Yes" if pending["agent"] else "No"
+    explicit_transaction = explicit_transaction_type(message_text)
+    creation_payload = {
+        "Agent": user_id,
+        "Agent?": agent_value,
+        "Original Enquiry": message_text,
+    }
+    if explicit_transaction:
+        creation_payload["TransactionType"] = [explicit_transaction]
     try:
-        enquiry_id = bubble_create(base_url, "enquiry", {
-            "Agent": user_id,
-            "Agent?": agent_value,
-            "Original Enquiry": message_text,
-        })
+        enquiry_id = bubble_create(base_url, "enquiry", creation_payload)
     except Exception as error:
         print(
             f"[ENQUIRY WORKFLOW] user_id={user_id} Enquiry creation failed "
@@ -883,9 +954,11 @@ def consume_pending_enquiry(
         ]
     )
     if matched:
-        bubble_patch(
-            f"{base_url}/obj/enquiry/{enquiry_id}", {"Listing": matched["_id"]}
-        )
+        transaction_type = explicit_transaction or listing_transaction_type(matched)
+        enquiry_update = {"Listing": matched["_id"]}
+        if transaction_type:
+            enquiry_update["TransactionType"] = [transaction_type]
+        bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", enquiry_update)
         print(
             f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
             f"listing_id={matched['_id']} match_method={method}",
@@ -903,6 +976,13 @@ def consume_pending_enquiry(
         )
         label = _listing_label(matched, condo_names)
         response = f"Got it — I've matched this to your {label}."
+        if not transaction_type:
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                "transaction_type_unresolved",
+                flush=True,
+            )
+            return EnquiryWorkflowResult(True, TRANSACTION_CONFIRMATION_REQUEST)
         if availability is False:
             print(
                 f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
@@ -1011,6 +1091,49 @@ def handle_internal_user_message(
     if pending:
         print(f"[ENQUIRY WORKFLOW] user_id={user_id} pending state expired", flush=True)
         clear_pending_enquiry(user_id, base_url, bubble_patch)
+
+    confirmation = explicit_transaction_type(message_text, confirmation=True)
+    if confirmation and bubble_records and bubble_get:
+        constraints = [{
+            "key": "Agent", "constraint_type": "equals", "value": user_id,
+        }]
+        unresolved = []
+        for candidate in bubble_records(base_url, "enquiry", constraints):
+            if candidate.get("_id") and candidate.get("Listing") \
+                    and not candidate.get("Handoff Code") \
+                    and not enquiry_transaction_type(candidate):
+                unresolved.append(candidate)
+        if len(unresolved) == 1:
+            enquiry = unresolved[0]
+            enquiry_id = enquiry["_id"]
+            bubble_patch(
+                f"{base_url}/obj/enquiry/{enquiry_id}",
+                {"TransactionType": [confirmation]},
+            )
+            listing = bubble_get(
+                f"{base_url}/obj/listing/{enquiry['Listing']}"
+            )
+            if listing.get("availability") is False:
+                return EnquiryWorkflowResult(
+                    True, "That listing is marked as unavailable."
+                )
+            hydrated = bubble_get(f"{base_url}/obj/enquiry/{enquiry_id}")
+            hydrated["TransactionType"] = [confirmation]
+            code = ensure_handoff_code(
+                enquiry_id, hydrated, base_url, bubble_records, bubble_patch
+            )
+            link = build_whatsapp_handoff_link(
+                code, rentee_whatsapp_number, normalize_phone
+            )
+            print(
+                f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
+                f"transaction_type_confirmed value={confirmation}", flush=True,
+            )
+            return EnquiryWorkflowResult(
+                True,
+                "Got it. Send this link to the enquirer so they can continue "
+                f"with Rentee:\n{link}",
+            )
 
     instruction = detect_new_enquiry_instruction(message_text)
     if instruction:
