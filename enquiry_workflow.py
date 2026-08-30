@@ -249,7 +249,8 @@ def build_whatsapp_handoff_link(code, rentee_whatsapp_number, normalize_phone):
 def handle_external_handoff_message(
     sender_phone, message_text, base_url, bubble_records, bubble_get,
     bubble_patch, normalize_phone, sender_user_id=None,
-    find_or_create_lead=None, whatsapp_profile_name=None,
+    find_or_create_lead=None, find_or_create_folio=None,
+    whatsapp_profile_name=None,
 ):
     """Resolve and bind one external WhatsApp sender to an existing Enquiry."""
     code = extract_handoff_code(message_text)
@@ -492,6 +493,16 @@ def handle_external_handoff_message(
                 f"lead_id={lead_id} lead linked",
                 flush=True,
             )
+            if find_or_create_folio:
+                folio_id, folio_created = find_or_create_folio(lead_id)
+                if not folio_id:
+                    raise ValueError("Folio lookup/create returned no ID.")
+                print(
+                    f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
+                    f"folio_id={folio_id} "
+                    f"folio={'created' if folio_created else 'existing'}",
+                    flush=True,
+                )
         except Exception as error:
             print(
                 f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} Lead linking failed "
