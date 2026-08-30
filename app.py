@@ -940,7 +940,23 @@ def prepare_owner_check(lead, bubble_env="live"):
                 "unresolved reason=invalid_existing_status", flush=True,
             )
             return enquiry
+        auth_state = "admin_token_present" if BUBBLE_API_TOKEN else "admin_token_missing"
+        print(
+            f"[OWNER CHECK] listing_id={listing_id} bubble_auth={auth_state}",
+            flush=True,
+        )
         listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+        raw_keys = sorted(str(key) for key in listing)
+        owner_contact_present = "OwnerContact" in listing
+        print(
+            f"[OWNER CHECK] listing_id={listing_id} "
+            f"raw_owner_contact_present={str(owner_contact_present).lower()}",
+            flush=True,
+        )
+        print(
+            f"[OWNER CHECK] listing_id={listing_id} raw_keys={raw_keys}",
+            flush=True,
+        )
         owner_contact = str(listing.get("OwnerContact") or "").strip()
         if not owner_contact:
             print(

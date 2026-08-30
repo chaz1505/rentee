@@ -321,7 +321,8 @@ class OwnerCheckTests(unittest.TestCase):
         return result, get, update
 
     def test_valid_formatted_owner_contact_creates_pending_state(self):
-        result, get, update = self.prepare(self.enquiry())
+        with patch("builtins.print") as logged:
+            result, get, update = self.prepare(self.enquiry())
         self.assertEqual(get.call_args_list[0].args, (
             "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
         ))
@@ -335,6 +336,15 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertEqual(result["OwnerCheckStatus"], "Pending")
         self.assertNotIn("OwnerCheckSentAt", update.call_args.args[1])
         self.assertNotIn("OwnerCheckResponse", update.call_args.args[1])
+        logs = " ".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "listing_id=listing-1 bubble_auth=admin_token_present", logs
+        )
+        self.assertIn(
+            "listing_id=listing-1 raw_owner_contact_present=true", logs
+        )
+        self.assertIn("raw_keys=['OwnerContact']", logs)
+        self.assertNotIn("+60 11-555 1234", logs)
 
     def test_owner_contact_is_read_from_enquiry_listing_not_enquiry_id(self):
         enquiry = self.enquiry(_id="enquiry-A", Listing="listing-B")
