@@ -769,7 +769,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn("I've got your enquiry", result.response_text)
         finder.assert_called_once_with(
             "60123456789", customer_name=None, agent_classification="Yes",
-            agent_user_id=None,
+            owner_user_id=None,
         )
         self.assertIn(
             {"Lead": "lead-1"},
@@ -786,7 +786,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         finder.assert_called_once_with(
             "60123456789", customer_name=None, agent_classification="No",
-            agent_user_id=None,
+            owner_user_id=None,
         )
 
     def test_explicit_enquirer_name_patterns_are_conservative(self):
@@ -817,7 +817,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         )
         finder.assert_called_once_with(
             "60123456789", customer_name="Sarah Lim (Agent)",
-            agent_classification="Yes", agent_user_id=None,
+            agent_classification="Yes", owner_user_id=None,
         )
         name_updates = [
             call.args[1] for call in patch_bubble.call_args_list
@@ -843,7 +843,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertTrue(result.handled)
         finder.assert_called_once_with(
             "60123456789", customer_name="Aisha Rahman",
-            agent_classification="No", agent_user_id=None,
+            agent_classification="No", owner_user_id=None,
         )
 
     def test_new_lead_gets_originating_enquiry_agent(self):
@@ -852,7 +852,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "Agent?": "No", "Agent": "user-gwen",
         }
         finder = MagicMock(return_value=(
-            {"_id": "lead-1", "Agent?": "No", "Agent": "user-gwen"}, True
+            {"_id": "lead-1", "Agent?": "No", "owner": "user-gwen"}, True
         ))
         result, finder, patch_bubble = self.complete_handoff_with_lead(
             enquiry, {}, finder=finder
@@ -860,10 +860,10 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn("I've got your enquiry", result.response_text)
         finder.assert_called_once_with(
             "60123456789", customer_name=None, agent_classification="No",
-            agent_user_id="user-gwen",
+            owner_user_id="user-gwen",
         )
         self.assertFalse(any(
-            call.args[0].endswith("/obj/lead/lead-1") and "Agent" in call.args[1]
+            call.args[0].endswith("/obj/lead/lead-1") and "owner" in call.args[1]
             for call in patch_bubble.call_args_list
         ))
 
@@ -873,10 +873,10 @@ class EnquiryWorkflowTests(unittest.TestCase):
             "Agent?": "No", "Agent": "user-gwen",
         }
         _result, _finder, patch_bubble = self.complete_handoff_with_lead(
-            enquiry, {"_id": "lead-1", "Agent?": "No", "Agent": ""}
+            enquiry, {"_id": "lead-1", "Agent?": "No", "owner": ""}
         )
         self.assertIn(
-            {"Agent": "user-gwen"},
+            {"owner": "user-gwen"},
             [call.args[1] for call in patch_bubble.call_args_list],
         )
 
@@ -888,14 +888,14 @@ class EnquiryWorkflowTests(unittest.TestCase):
         with patch("builtins.print") as mocked_print:
             _result, _finder, patch_bubble = self.complete_handoff_with_lead(
                 enquiry,
-                {"_id": "lead-1", "Agent?": "No", "Agent": "user-gwen"},
+                {"_id": "lead-1", "Agent?": "No", "owner": "user-gwen"},
             )
         self.assertNotIn(
-            {"Agent": "user-gwen"},
+            {"owner": "user-gwen"},
             [call.args[1] for call in patch_bubble.call_args_list],
         )
         self.assertIn(
-            "lead_agent_user_id=user-gwen action=kept",
+            "owner_user_id=user-gwen action=kept",
             " ".join(str(call) for call in mocked_print.call_args_list),
         )
 
@@ -907,16 +907,16 @@ class EnquiryWorkflowTests(unittest.TestCase):
         with patch("builtins.print") as mocked_print:
             result, _finder, patch_bubble = self.complete_handoff_with_lead(
                 enquiry,
-                {"_id": "lead-1", "Agent?": "No", "Agent": "user-other"},
+                {"_id": "lead-1", "Agent?": "No", "owner": "user-other"},
             )
         self.assertIn("I've got your enquiry", result.response_text)
         self.assertNotIn(
-            {"Agent": "user-gwen"},
+            {"owner": "user-gwen"},
             [call.args[1] for call in patch_bubble.call_args_list],
         )
         self.assertIn(
-            "existing_agent_user_id=user-other enquiry_agent_user_id=user-gwen "
-            "action=conflict_preserved",
+            "existing_owner_user_id=user-other enquiry_agent_user_id=user-gwen "
+            "action=owner_conflict_preserved",
             " ".join(str(call) for call in mocked_print.call_args_list),
         )
 

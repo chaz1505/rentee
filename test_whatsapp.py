@@ -131,16 +131,34 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
     @patch("app.bubble", return_value={"_id": "lead-new"})
-    def test_new_handoff_lead_uses_confirmed_agent_relationship_field(
+    def test_new_handoff_lead_uses_owner_relationship_field(
         self, _bubble, _find, mocked_create
     ):
         lead, created = app_module.find_or_create_whatsapp_lead(
             "60123456789", agent_classification="No",
-            agent_user_id="user-gwen",
+            owner_user_id="user-gwen",
         )
         self.assertTrue(created)
-        self.assertEqual(lead["Agent"], "user-gwen")
-        self.assertEqual(mocked_create.call_args.args[2]["Agent"], "user-gwen")
+        self.assertEqual(lead["owner"], "user-gwen")
+        self.assertEqual(mocked_create.call_args.args[2]["owner"], "user-gwen")
+        self.assertNotIn("Agent", mocked_create.call_args.args[2])
+
+    @patch("app._bubble_create", return_value="lead-new")
+    @patch("app.find_lead_by_phone", return_value=None)
+    @patch("app.bubble", return_value={"_id": "lead-new"})
+    def test_owner_is_independent_from_agent_classification(
+        self, _bubble, _find, mocked_create
+    ):
+        lead, created = app_module.find_or_create_whatsapp_lead(
+            "60123456789", agent_classification="Yes",
+            owner_user_id="user-gwen",
+        )
+        self.assertTrue(created)
+        self.assertEqual(lead["owner"], "user-gwen")
+        self.assertEqual(lead["Agent?"], "Yes")
+        self.assertEqual(mocked_create.call_args.args[2], {
+            "phone": "60123456789", "Agent?": "Yes", "owner": "user-gwen",
+        })
 
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)

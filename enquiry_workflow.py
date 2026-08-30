@@ -16,7 +16,7 @@ PENDING_ENQUIRY_TTL = timedelta(minutes=30)
 HANDOFF_CODE_PATTERN = re.compile(r"\bRNT-[A-Z0-9]{8}\b", re.I)
 HANDOFF_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 LEAD_NAME_FIELD = "name"
-LEAD_AGENT_FIELD = "Agent"
+LEAD_OWNER_FIELD = "owner"
 
 
 @dataclass
@@ -228,7 +228,7 @@ def handle_external_handoff_message(
                 incoming_phone,
                 customer_name=candidate_name,
                 agent_classification=enquiry_classification,
-                agent_user_id=enquiry.get("Agent"),
+                owner_user_id=enquiry.get("Agent"),
             )
             lead_id = lead.get("_id")
             if not lead_id:
@@ -306,32 +306,32 @@ def handle_external_handoff_message(
                     flush=True,
                 )
             enquiry_agent_user_id = str(enquiry.get("Agent") or "").strip()
-            existing_agent_user_id = str(lead.get(LEAD_AGENT_FIELD) or "").strip()
+            existing_owner_user_id = str(lead.get(LEAD_OWNER_FIELD) or "").strip()
             if enquiry_agent_user_id:
-                if not existing_agent_user_id:
+                if not existing_owner_user_id:
                     if not lead_created:
                         bubble_patch(
                             f"{base_url}/obj/lead/{lead_id}",
-                            {LEAD_AGENT_FIELD: enquiry_agent_user_id},
+                            {LEAD_OWNER_FIELD: enquiry_agent_user_id},
                         )
-                    lead[LEAD_AGENT_FIELD] = enquiry_agent_user_id
+                    lead[LEAD_OWNER_FIELD] = enquiry_agent_user_id
                     print(
                         f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
-                        f"lead_agent_user_id={enquiry_agent_user_id} action=set",
+                        f"owner_user_id={enquiry_agent_user_id} action=set",
                         flush=True,
                     )
-                elif existing_agent_user_id == enquiry_agent_user_id:
+                elif existing_owner_user_id == enquiry_agent_user_id:
                     print(
                         f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
-                        f"lead_agent_user_id={enquiry_agent_user_id} action=kept",
+                        f"owner_user_id={enquiry_agent_user_id} action=kept",
                         flush=True,
                     )
                 else:
                     print(
                         f"[ENQUIRY WORKFLOW] lead_id={lead_id} "
-                        f"existing_agent_user_id={existing_agent_user_id} "
+                        f"existing_owner_user_id={existing_owner_user_id} "
                         f"enquiry_agent_user_id={enquiry_agent_user_id} "
-                        "action=conflict_preserved",
+                        "action=owner_conflict_preserved",
                         flush=True,
                     )
             if not linked_lead_id:
