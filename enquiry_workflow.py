@@ -1038,13 +1038,24 @@ def consume_pending_enquiry(
     )
     if matched:
         transaction_type = explicit_transaction or listing_transaction_type(matched)
-        enquiry_update = {"Listing": matched["_id"]}
+        matched_listing_id = str(matched["_id"])
+        condo_id = str(matched.get("condo") or "")
+        print(
+            f"[FORWARDED ENQUIRY] enquiry_id={enquiry_id} "
+            f"matched_listing_id={matched_listing_id} condo_id={condo_id}",
+            flush=True,
+        )
+        enquiry_update = {"Listing": matched_listing_id}
         if transaction_type:
             enquiry_update["TransactionType"] = [transaction_type]
         bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", enquiry_update)
         print(
+            f"[FORWARDED ENQUIRY] enquiry_id={enquiry_id} "
+            f"listing_relationship_written={matched_listing_id}", flush=True,
+        )
+        print(
             f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
-            f"listing_id={matched['_id']} match_method={method}",
+            f"listing_id={matched_listing_id} match_method={method}",
             flush=True,
         )
         availability = matched.get("availability")

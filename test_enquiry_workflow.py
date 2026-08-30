@@ -192,9 +192,10 @@ class EnquiryWorkflowTests(unittest.TestCase):
             workflow.PENDING_AGENT_FIELD: "Yes",
             workflow.AWAITING_SINCE_FIELD: self.now.isoformat(),
         }
-        result = self.consume(
-            user, "See https://www.propertyguru.com.my/l/501124208"
-        )
+        with patch("builtins.print") as mocked_print:
+            result = self.consume(
+                user, "See https://www.propertyguru.com.my/l/501124208"
+            )
         self.assertIn((
             "https://bubble.test", "listing",
             [
@@ -213,6 +214,21 @@ class EnquiryWorkflowTests(unittest.TestCase):
                 "Listing": "listing-1", "TransactionType": ["Rent/Let"],
             }),
             [call.args for call in self.patch_user.call_args_list],
+        )
+        listing_payload = next(
+            call.args[1] for call in self.patch_user.call_args_list
+            if "Listing" in call.args[1]
+        )
+        self.assertEqual(listing_payload["Listing"], listing["_id"])
+        self.assertNotEqual(listing_payload["Listing"], listing["condo"])
+        logs = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn(
+            "enquiry_id=enquiry-1 matched_listing_id=listing-1 condo_id=condo-1",
+            logs,
+        )
+        self.assertIn(
+            "enquiry_id=enquiry-1 listing_relationship_written=listing-1",
+            logs,
         )
 
     def test_matching_never_selects_another_users_listing(self):

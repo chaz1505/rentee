@@ -336,6 +336,22 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertNotIn("OwnerCheckSentAt", update.call_args.args[1])
         self.assertNotIn("OwnerCheckResponse", update.call_args.args[1])
 
+    def test_owner_contact_is_read_from_enquiry_listing_not_enquiry_id(self):
+        enquiry = self.enquiry(_id="enquiry-A", Listing="listing-B")
+        lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-A"}
+        with patch("app.bubble", side_effect=[
+                 enquiry, {"_id": "listing-B", "condo": "condo-C",
+                           "OwnerContact": "+60 11-555 1234"},
+             ]) as get, patch("app._bubble_patch") as update:
+            app_module.prepare_owner_check(lead)
+        self.assertEqual(get.call_args_list[0].args[0].split("/")[-1], "enquiry-A")
+        self.assertEqual(get.call_args_list[1].args[0].split("/")[-1], "listing-B")
+        self.assertNotEqual(get.call_args_list[1].args[0].split("/")[-1], "enquiry-A")
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-A",
+            {"OwnerCheckStatus": "Pending", "OwnerCheckPhone": "60115551234"},
+        )
+
     def test_blank_and_invalid_owner_contact_do_not_create_pending_state(self):
         for contact in ("", "not-a-phone", "123"):
             with self.subTest(contact=contact):

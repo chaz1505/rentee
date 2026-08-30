@@ -923,6 +923,10 @@ def prepare_owner_check(lead, bubble_env="live"):
                 "unresolved reason=missing_listing", flush=True,
             )
             return enquiry
+        print(
+            f"[OWNER CHECK] enquiry_id={enquiry_id} listing_id={listing_id}",
+            flush=True,
+        )
         status = str(enquiry.get("OwnerCheckStatus") or "").strip()
         if status in {"Sent", "Replied"}:
             print(
