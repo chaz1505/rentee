@@ -3885,6 +3885,22 @@ def _process_whatsapp_message(message):
     reply_sent = False
     try:
         with phone_lock:
+            identity_error = None
+            whatsapp_user = None
+            bubble_user_id = None
+            try:
+                whatsapp_user = resolve_whatsapp_user(
+                    phone, message.get("customer_name"), "live"
+                )
+                bubble_user_id = conversation_store.relationship_id(
+                    whatsapp_user.get("_id")
+                )
+                message["bubble_user_id"] = bubble_user_id
+            except WhatsAppIdentityCollision as error:
+                # Do not enter User/Lead processing for an ambiguous identity. We
+                # still perform Conversation routing below so the inbound Message
+                # can be retained safely when an existing context is available.
+                identity_error = error
             if message_type == "audio":
                 media_id = str((message.get("audio") or {}).get("id") or "").strip()
                 print(
@@ -3975,6 +3991,21 @@ def _process_whatsapp_message(message):
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
+            if identity_error:
+                if not inbound_message_id:
+                    existing_general = find_existing_general_conversation_by_phone(
+                        phone, "live"
+                    )
+                    existing_general_id = conversation_store.relationship_id(
+                        (existing_general or {}).get("_id")
+                    )
+                    if existing_general_id:
+                        inbound_message_id, _created = persist_inbound_whatsapp_message(
+                            phone, message_id, text,
+                            conversation_id=existing_general_id,
+                            bubble_env="live",
+                        )
+                raise identity_error
             internal_user = find_internal_user(
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )

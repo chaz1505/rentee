@@ -768,6 +768,7 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertEqual(first["_id"], second["_id"])
         self.assertEqual(find.call_count, 2)
 
+    @patch("app.resolve_whatsapp_user", return_value={"_id": "user-whatsapp"})
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-profile")
     @patch("app.find_latest_ai_message", return_value=None)
@@ -786,7 +787,7 @@ class OwnerCheckTests(unittest.TestCase):
     @patch("app.find_internal_user", return_value=None)
     def test_sufficient_profile_prepares_state_and_sends_only_customer_reply(
         self, _internal, _typing, _reply, _general, _capture, _folio, _turn,
-        prepare, owner_send, send, _latest, _create, _save,
+        prepare, owner_send, send, _latest, _create, _save, _whatsapp_user,
     ):
         prepared = {"_id": "enquiry-1", "OwnerCheckStatus": "Pending"}
         prepare.return_value = prepared
@@ -799,6 +800,121 @@ class OwnerCheckTests(unittest.TestCase):
         send.assert_called_once_with("60123456789", app_module.OWNER_CHECK_RESPONSE)
 
 
+class WhatsAppUserIdentityTests(unittest.TestCase):
+    def test_existing_number_returns_existing_user_without_create(self):
+        existing = {"_id": "user-1", "phone": "60123456789"}
+        with patch(
+            "app.find_bubble_users_by_phone", return_value=[existing]
+        ), patch("app.create_whatsapp_bubble_user") as create:
+            result = app_module.resolve_whatsapp_user("+60 12-345 6789", "Aisha")
+        self.assertEqual(result, existing)
+        create.assert_not_called()
+
+    def test_unknown_number_creates_one_user_with_deterministic_fields(self):
+        with patch(
+            "app.find_bubble_users_by_phone", return_value=[]
+        ), patch("app._bubble_create", return_value="user-new") as create:
+            result = app_module.resolve_whatsapp_user("+60 12-345 6789", "Aisha")
+        self.assertEqual(result["_id"], "user-new")
+        create.assert_called_once_with(
+            app_module.get_bubble_base_url("live"), "user", {
+                "phone": "60123456789",
+                "email": "whatsapp-60123456789@users.rentee.internal",
+                "name": "Aisha",
+            },
+        )
+
+    def test_missing_profile_name_does_not_prevent_creation(self):
+        with patch(
+            "app.find_bubble_users_by_phone", return_value=[]
+        ), patch("app._bubble_create", return_value="user-new") as create:
+            app_module.resolve_whatsapp_user("60123456789")
+        payload = create.call_args.args[2]
+        self.assertNotIn("name", payload)
+        self.assertEqual(
+            payload["email"], "whatsapp-60123456789@users.rentee.internal"
+        )
+
+    def test_repeated_messages_resolve_to_same_user(self):
+        users = []
+
+        def find(_phone, _env="live"):
+            return list(users)
+
+        def create(phone, profile_name=None, bubble_env="live"):
+            user = {"_id": "user-1", "phone": phone}
+            users.append(user)
+            return user
+
+        with patch("app.find_bubble_users_by_phone", side_effect=find), \
+             patch("app.create_whatsapp_bubble_user", side_effect=create) as created:
+            first = app_module.resolve_whatsapp_user("+60123456789")
+            second = app_module.resolve_whatsapp_user("60 12 345 6789")
+        self.assertEqual(first["_id"], second["_id"])
+        self.assertEqual(created.call_count, 1)
+
+    def test_two_numbers_resolve_to_different_users(self):
+        users = {}
+
+        def find(phone, _env="live"):
+            return [users[phone]] if phone in users else []
+
+        def create(phone, profile_name=None, bubble_env="live"):
+            user = {"_id": f"user-{phone}", "phone": phone}
+            users[phone] = user
+            return user
+
+        with patch("app.find_bubble_users_by_phone", side_effect=find), \
+             patch("app.create_whatsapp_bubble_user", side_effect=create):
+            first = app_module.resolve_whatsapp_user("60111111111")
+            second = app_module.resolve_whatsapp_user("60122222222")
+        self.assertNotEqual(first["_id"], second["_id"])
+
+    def test_duplicate_exact_users_raise_collision_without_create(self):
+        matches = [{"_id": "user-1"}, {"_id": "user-2"}]
+        with patch(
+            "app.find_bubble_users_by_phone", return_value=matches
+        ), patch("app.create_whatsapp_bubble_user") as create, \
+             patch("builtins.print") as logged:
+            with self.assertRaises(app_module.WhatsAppIdentityCollision):
+                app_module.resolve_whatsapp_user("+60 12-345 6789")
+        create.assert_not_called()
+        log_text = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("[WHATSAPP IDENTITY COLLISION]", log_text)
+        self.assertIn("matches=2", log_text)
+        self.assertIn("user-1", log_text)
+        self.assertIn("user-2", log_text)
+
+    def test_creation_race_requeries_and_reuses_created_user(self):
+        raced = {"_id": "user-raced", "phone": "60123456789"}
+        with patch(
+            "app.find_bubble_users_by_phone",
+            side_effect=[[], [raced]],
+        ) as find, patch(
+            "app.create_whatsapp_bubble_user", side_effect=RuntimeError("duplicate")
+        ) as create:
+            result = app_module.resolve_whatsapp_user("60123456789")
+        self.assertEqual(result, raced)
+        self.assertEqual(find.call_count, 2)
+        create.assert_called_once()
+
+    def test_resolution_does_not_create_a_lead(self):
+        with patch(
+            "app.find_bubble_users_by_phone", return_value=[]
+        ), patch(
+            "app.create_whatsapp_bubble_user", return_value={"_id": "user-new"}
+        ), patch("app.find_or_create_whatsapp_lead") as create_lead:
+            app_module.resolve_whatsapp_user("60123456789")
+        create_lead.assert_not_called()
+
+    def test_phone_formatting_normalizes_consistently(self):
+        values = ("+60 12-345 6789", "60123456789", "60 (12) 345-6789")
+        self.assertEqual(
+            {app_module.normalize_phone(value) for value in values},
+            {"60123456789"},
+        )
+
+
 class WhatsAppTests(unittest.TestCase):
     def setUp(self):
         app_module._whatsapp_processing_ids.clear()
@@ -808,6 +924,11 @@ class WhatsAppTests(unittest.TestCase):
         self.internal_user_patcher = patch("app.find_internal_user", return_value=None)
         self.mocked_internal_user = self.internal_user_patcher.start()
         self.addCleanup(self.internal_user_patcher.stop)
+        self.whatsapp_user_patcher = patch(
+            "app.resolve_whatsapp_user", return_value={"_id": "user-whatsapp"}
+        )
+        self.mocked_whatsapp_user = self.whatsapp_user_patcher.start()
+        self.addCleanup(self.whatsapp_user_patcher.stop)
         direct_persistence_tests = {
             "test_inbound_message_persists_whatsapp_fields_once",
             "test_duplicate_inbound_meta_id_reuses_existing_message",
@@ -1018,6 +1139,10 @@ class WhatsAppTests(unittest.TestCase):
              patch("builtins.print") as logged:
             app_module._process_whatsapp_message(item)
 
+        self.mocked_whatsapp_user.assert_called_once_with(
+            "60123456789", None, "live"
+        )
+        self.assertEqual(item["bubble_user_id"], "user-whatsapp")
         inbound = [
             call for call in self.mocked_inbound.call_args_list
             if call.kwargs.get("conversation_id") == "conversation-b"
@@ -1041,6 +1166,35 @@ class WhatsAppTests(unittest.TestCase):
             logs,
         )
         self.assertNotIn("clarification", logs)
+
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_identity_collision_preserves_inbound_on_existing_conversation(
+        self, _typing,
+    ):
+        conversation = {
+            "_id": "conversation-owner", "Principal": "principal-1",
+            "Enquiry": "enquiry-1", "Lead": "lead-1",
+        }
+        self.active_phone_conversation_patcher.stop()
+        with patch(
+            "app.resolve_whatsapp_user",
+            side_effect=app_module.WhatsAppIdentityCollision("duplicate identity"),
+        ), patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch("app.find_or_create_whatsapp_lead") as create_lead, \
+             patch("app.send_whatsapp_text"):
+            item = webhook_payload(
+                message_id="wamid.identity-collision", text="Hello"
+            )["entry"][0]["changes"][0]["value"]["messages"][0]
+            app_module._process_whatsapp_message(item)
+
+        matching = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-owner"
+        ]
+        self.assertEqual(len(matching), 1)
+        create_lead.assert_not_called()
 
     def test_new_message_creation_rejects_missing_conversation(self):
         with patch("app._bubble_records", return_value=iter([])), \
