@@ -11,6 +11,68 @@ import conversation
 
 
 class ConversationTests(unittest.TestCase):
+    def test_enquiry_specific_creation_copies_lead_and_listing(self):
+        with patch("conversation._get", return_value={
+                 "Lead": "lead-1", "Listing": "listing-1",
+             }), patch("conversation.find_active_conversation", return_value=None), \
+             patch("conversation._create", return_value="conversation-1") as create:
+            result, created = conversation.find_or_create_conversation(
+                "user-1", "60115551234", "enquiry-1"
+            )
+        self.assertTrue(created)
+        self.assertEqual(result["Lead"], "lead-1")
+        self.assertEqual(result["Listing"], "listing-1")
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["Lead"], "lead-1")
+        self.assertEqual(payload["Listing"], "listing-1")
+
+    def test_existing_conversation_patches_only_missing_denormalized_fields(self):
+        existing = {
+            "_id": "conversation-1", "Principal": "user-1",
+            "CounterParty Phone": "60115551234", "Enquiry": "enquiry-1",
+            "Status": "Active",
+        }
+        with patch("conversation._get", return_value={
+                 "Lead": "lead-1", "Listing": "listing-1",
+             }), patch("conversation.find_active_conversation",
+                       return_value=existing), patch("conversation._patch") as update:
+            result, created = conversation.find_or_create_conversation(
+                "user-1", "60115551234", "enquiry-1"
+            )
+        self.assertFalse(created)
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "conversation", "conversation-1",
+            {"Lead": "lead-1", "Listing": "listing-1"},
+        )
+        self.assertEqual(result["Lead"], "lead-1")
+        self.assertEqual(result["Listing"], "listing-1")
+
+    def test_existing_lead_and_listing_are_not_overwritten(self):
+        existing = {
+            "_id": "conversation-1", "Lead": "lead-existing",
+            "Listing": "listing-existing",
+        }
+        with patch("conversation._get", return_value={
+                 "Lead": "lead-new", "Listing": "listing-new",
+             }), patch("conversation.find_active_conversation",
+                       return_value=existing), patch("conversation._patch") as update:
+            result, created = conversation.find_or_create_conversation(
+                "user-1", "60115551234", "enquiry-1"
+            )
+        self.assertFalse(created)
+        update.assert_not_called()
+        self.assertEqual(result["Lead"], "lead-existing")
+        self.assertEqual(result["Listing"], "listing-existing")
+
+    def test_lead_and_listing_are_not_conversation_identity_constraints(self):
+        with patch("conversation._records", return_value=iter([])) as records:
+            conversation.find_active_conversation(
+                "user-1", "60115551234", "enquiry-1"
+            )
+        keys = [constraint["key"] for constraint in records.call_args.args[2]]
+        self.assertNotIn("Lead", keys)
+        self.assertNotIn("Listing", keys)
+
     def test_creates_enquiry_specific_conversation(self):
         with patch("conversation._create", return_value="conversation-1") as create:
             result = conversation.create_conversation(
@@ -32,9 +94,11 @@ class ConversationTests(unittest.TestCase):
         existing = {
             "_id": "conversation-1", "Principal": "user-1",
             "CounterParty Phone": "60115551234", "Enquiry": "enquiry-1",
-            "Status": "Active",
+            "Status": "Active", "Lead": "lead-1", "Listing": "listing-1",
         }
-        with patch("conversation._records", return_value=iter([existing])) as records, \
+        with patch("conversation._get", return_value={
+                 "Lead": "lead-1", "Listing": "listing-1",
+             }), patch("conversation._records", return_value=iter([existing])) as records, \
              patch("conversation.create_conversation") as create:
             result, created = conversation.find_or_create_conversation(
                 "user-1", "+60 11-555 1234", "enquiry-1"
@@ -54,7 +118,9 @@ class ConversationTests(unittest.TestCase):
             "CounterParty Phone": "60115551234", "Enquiry": "enquiry-old",
             "Status": "Active",
         }
-        with patch("conversation._records", return_value=iter([wrong])), \
+        with patch("conversation._get", return_value={
+                 "Lead": "lead-new", "Listing": "listing-new",
+             }), patch("conversation._records", return_value=iter([wrong])), \
              patch("conversation.create_conversation",
                    return_value={"_id": "conversation-new"}) as create:
             result, created = conversation.find_or_create_conversation(

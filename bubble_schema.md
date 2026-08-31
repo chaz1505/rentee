@@ -24,8 +24,8 @@ Fields:
 | Enquiry | Enquiry | Optional enquiry-specific conversation |
 | Last Inbound At | date | Latest inbound activity |
 | Last Outbound At | date | Latest outbound activity |
-| Lead | Lead | Present in Bubble; do not rely on unless needed |
-| Listing | Listing | Present in Bubble; do not rely on unless needed |
+| Lead | Lead | Convenience relationship copied from Enquiry.Lead for enquiry-specific Conversations |
+| Listing | Listing | Convenience relationship copied from Enquiry.Listing for enquiry-specific Conversations |
 | Previous Response ID | text | OpenAI response continuity for this logical Conversation |
 | Principal | User | Who Rentee is acting for |
 | Rentee Role | text | Role/skills Rentee performs in this Conversation |
@@ -40,6 +40,8 @@ Conversation semantics:
 - create/find another Conversation instead
 - one physical WhatsApp chat can therefore contain multiple logical Rentee Conversations
 - a general Conversation may exist with Enquiry empty
+- Conversation.Enquiry remains the authoritative transaction link; Lead and Listing are denormalized conveniences
+- a principal-side Conversation is created only when Rentee actually communicates with the Principal about that Enquiry
 
 ## Enquiry
 
@@ -87,6 +89,9 @@ Message semantics:
 - own_Sent? describes human vs AI authorship
 - normal inbound human = Inbound + Yes
 - AI outbound = Outbound + No
+- every Message newly persisted by Python must have exactly one Conversation
+- historical Message records without Conversation remain readable during migration
+- Meta reply context resolves through Message.whatsappMessageId to Message.Conversation
 
 ## Listing
 

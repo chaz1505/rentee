@@ -301,10 +301,19 @@ class TenantProfileCaptureTests(unittest.TestCase):
 
 
 class OwnerCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.conversation_patcher = patch(
+            "app.conversation_store.find_or_create_conversation",
+            return_value=({"_id": "conversation-owner"}, False),
+        )
+        self.conversation_patcher.start()
+        self.addCleanup(self.conversation_patcher.stop)
+
     def enquiry(self, **values):
         result = {
             "_id": "enquiry-1", "Listing": "listing-1",
             "Enquirer Phone": "60123456789", "Lead": "lead-1",
+            "Principal": "principal-1",
         }
         result.update(values)
         return result
@@ -464,6 +473,7 @@ class OwnerCheckTests(unittest.TestCase):
                 "messageContent": message,
                 "whatsappMessageId": "wamid.freeform",
                 "lead": "lead-1",
+                "Conversation": "conversation-owner",
             },
         )
         logs = "\n".join(str(call) for call in logged.call_args_list)
@@ -652,7 +662,7 @@ class OwnerCheckTests(unittest.TestCase):
             "principal-1", "60115551234", enquiry_id="enquiry-1",
             counterparty_role="Owner Representative",
             rentee_role="Tenant Introducing Agent", subject="One Menerung",
-            bubble_env="live",
+            bubble_env="live", side="owner",
         )
         payload = create.call_args.args[2]
         self.assertEqual(payload["Conversation"], "conversation-1")
@@ -707,6 +717,46 @@ class OwnerCheckTests(unittest.TestCase):
         for invented in ("children", "pets", "occupation", "budget", "moving"):
             self.assertNotIn(invented, message.lower())
 
+    def test_direct_and_representative_lead_conversation_roles(self):
+        cases = (
+            ("No", "Lead", "Lead Advisor"),
+            ("Yes", "Lead Representative", "Lead Representative Coordinator"),
+        )
+        for agent_value, counterparty_role, rentee_role in cases:
+            with self.subTest(agent_value=agent_value), \
+                 patch("app.bubble", return_value={
+                     "_id": "enquiry-1", "Lead": "lead-1",
+                     "Principal": "principal-1", "Agent?": agent_value,
+                 }), patch(
+                     "app.conversation_store.find_or_create_conversation",
+                     return_value=({"_id": "conversation-1"}, False),
+                 ) as find:
+                result = app_module.find_forwarded_lead_conversation(
+                    {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-1"},
+                    "+60 12-345 6789",
+                )
+            self.assertEqual(result["_id"], "conversation-1")
+            find.assert_called_once_with(
+                "principal-1", "+60 12-345 6789", enquiry_id="enquiry-1",
+                counterparty_role=counterparty_role, rentee_role=rentee_role,
+                bubble_env="live", side="lead",
+            )
+
+    def test_repeated_lead_conversation_resolution_reuses_identity_helper(self):
+        lead = {"_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-1"}
+        enquiry = {
+            "_id": "enquiry-1", "Lead": "lead-1", "Principal": "principal-1",
+            "Agent?": "No",
+        }
+        with patch("app.bubble", return_value=enquiry), patch(
+            "app.conversation_store.find_or_create_conversation",
+            return_value=({"_id": "conversation-1"}, False),
+        ) as find:
+            first = app_module.find_forwarded_lead_conversation(lead, "60123456789")
+            second = app_module.find_forwarded_lead_conversation(lead, "60123456789")
+        self.assertEqual(first["_id"], second["_id"])
+        self.assertEqual(find.call_count, 2)
+
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-profile")
     @patch("app.find_latest_ai_message", return_value=None)
@@ -718,11 +768,14 @@ class OwnerCheckTests(unittest.TestCase):
     ))
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.capture_linked_tenant_profile", return_value={"_id": "lead-linked"})
+    @patch("app.find_existing_general_conversation_by_phone",
+           return_value={"_id": "conversation-general"})
+    @patch("app.find_reply_to_conversation", return_value=None)
     @patch("app.send_whatsapp_typing_indicator")
     @patch("app.find_internal_user", return_value=None)
     def test_sufficient_profile_prepares_state_and_sends_only_customer_reply(
-        self, _internal, _typing, _capture, _folio, _turn, prepare, owner_send, send,
-        _latest, _create, _save,
+        self, _internal, _typing, _reply, _general, _capture, _folio, _turn,
+        prepare, owner_send, send, _latest, _create, _save,
     ):
         prepared = {"_id": "enquiry-1", "OwnerCheckStatus": "Pending"}
         prepare.return_value = prepared
@@ -748,6 +801,7 @@ class WhatsAppTests(unittest.TestCase):
             "test_inbound_message_persists_whatsapp_fields_once",
             "test_duplicate_inbound_meta_id_reuses_existing_message",
             "test_inbound_message_stores_conversation_and_updates_activity",
+            "test_new_message_creation_rejects_missing_conversation",
         }
         if self._testMethodName not in direct_persistence_tests:
             self.inbound_patcher = patch(
@@ -759,6 +813,35 @@ class WhatsAppTests(unittest.TestCase):
         self.attach_inbound_patcher = patch("app.attach_whatsapp_message_lead")
         self.mocked_attach_inbound = self.attach_inbound_patcher.start()
         self.addCleanup(self.attach_inbound_patcher.stop)
+        self.forwarded_conversation_patcher = patch(
+            "app.find_forwarded_lead_conversation", return_value=None
+        )
+        self.mocked_forwarded_conversation = (
+            self.forwarded_conversation_patcher.start()
+        )
+        self.addCleanup(self.forwarded_conversation_patcher.stop)
+        self.reply_conversation_patcher = patch(
+            "app.find_reply_to_conversation", return_value=None
+        )
+        self.reply_conversation_patcher.start()
+        self.addCleanup(self.reply_conversation_patcher.stop)
+        self.general_conversation_patcher = patch(
+            "app.find_general_conversation",
+            return_value={"_id": "conversation-general"},
+        )
+        self.general_conversation_patcher.start()
+        self.addCleanup(self.general_conversation_patcher.stop)
+        self.existing_general_patcher = patch(
+            "app.find_existing_general_conversation_by_phone",
+            return_value={"_id": "conversation-general"},
+        )
+        self.existing_general_patcher.start()
+        self.addCleanup(self.existing_general_patcher.stop)
+        self.persist_sent_patcher = patch(
+            "app.persist_sent_whatsapp_text", return_value="message-outbound"
+        )
+        self.persist_sent_patcher.start()
+        self.addCleanup(self.persist_sent_patcher.stop)
 
     def test_webhook_verification_accepts_valid_token_and_rejects_invalid(self):
         client = app_module.app.test_client()
@@ -777,6 +860,47 @@ class WhatsAppTests(unittest.TestCase):
     def test_phone_normalization_equates_common_formats(self):
         values = ["+60123456789", "60123456789", "60 12 345 6789", "+60-12-345-6789"]
         self.assertEqual({app_module.normalize_phone(value) for value in values}, {"60123456789"})
+
+    def test_reply_to_resolves_exact_message_conversation(self):
+        self.reply_conversation_patcher.stop()
+        with patch("app._bubble_records", return_value=iter([{
+            "_id": "message-old", "Conversation": "conversation-exact",
+        }])) as records, patch("app.bubble", return_value={
+            "_id": "conversation-exact", "Enquiry": "enquiry-2",
+        }):
+            result = app_module.find_reply_to_conversation({
+                "context": {"id": "wamid.replied-to"},
+            })
+        self.assertEqual(result["_id"], "conversation-exact")
+        self.assertEqual(records.call_args.args[2], [{
+            "key": "whatsappMessageId", "constraint_type": "equals",
+            "value": "wamid.replied-to",
+        }])
+
+    def test_new_message_creation_rejects_missing_conversation(self):
+        with patch("app._bubble_records", return_value=iter([])), \
+             patch("app._bubble_create") as create:
+            with self.assertRaises(ValueError):
+                app_module.persist_inbound_whatsapp_message(
+                    "60123456789", "wamid.new", "Hello"
+                )
+            with self.assertRaises(ValueError):
+                app_module.create_whatsapp_ai_message("lead-1", "60123456789")
+        create.assert_not_called()
+
+    def test_successful_ad_hoc_outbound_persists_conversation_and_activity(self):
+        self.persist_sent_patcher.stop()
+        with patch("app._bubble_create", return_value="message-1") as create, \
+             patch("app.conversation_store.update_conversation_last_outbound_at") as activity:
+            result = app_module.persist_sent_whatsapp_text(
+                "60123456789", "Thanks", ["wamid.out"], "conversation-1",
+                "lead-1",
+            )
+        self.assertEqual(result, "message-1")
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["Conversation"], "conversation-1")
+        self.assertEqual(payload["direction"], "Outbound")
+        activity.assert_called_once_with("conversation-1", "live")
 
     @patch("app.requests.get")
     def test_bubble_get_authenticates_and_preserves_caller_headers(self, mocked_get):
@@ -1631,7 +1755,7 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_create", return_value="message-current")
     def test_current_ai_message_uses_existing_bubble_semantics(self, mocked_create):
         message_id = app_module.create_whatsapp_ai_message(
-            "lead-a", "+60 12-345 6789"
+            "lead-a", "+60 12-345 6789", conversation_id="conversation-1"
         )
         self.assertEqual(message_id, "message-current")
         mocked_create.assert_called_once_with(
@@ -1639,17 +1763,19 @@ class WhatsAppTests(unittest.TestCase):
             {
                 "lead": "lead-a", "phone": "60123456789",
                 "direction": "Outbound", "own_Sent?": "No",
-                "messageContent": "",
+                "messageContent": "", "Conversation": "conversation-1",
             },
         )
 
     @patch("app._bubble_create", return_value="inbound-current")
     @patch("app._bubble_records", return_value=iter([]))
+    @patch("app.conversation_store.update_conversation_last_inbound_at")
     def test_inbound_message_persists_whatsapp_fields_once(
-        self, mocked_records, mocked_create
+        self, activity, mocked_records, mocked_create
     ):
         message_id, created = app_module.persist_inbound_whatsapp_message(
-            "+60 12-345 6789", "wamid.inbound", "Hello Rentee", "lead-a"
+            "+60 12-345 6789", "wamid.inbound", "Hello Rentee", "lead-a",
+            "conversation-1",
         )
         self.assertEqual((message_id, created), ("inbound-current", True))
         mocked_records.assert_called_once_with(
@@ -1663,9 +1789,11 @@ class WhatsAppTests(unittest.TestCase):
                 "phone": "60123456789", "direction": "Inbound",
                 "own_Sent?": "Yes", "whatsappMessageId": "wamid.inbound",
                 "messageContent": "Hello Rentee", "lead": "lead-a",
+                "Conversation": "conversation-1",
             }
         )
         self.assertNotIn("response_ID", mocked_create.call_args.args[2])
+        activity.assert_called_once_with("conversation-1", "live")
 
     @patch("app._bubble_create")
     @patch("app._bubble_records")
@@ -1736,9 +1864,11 @@ class WhatsAppTests(unittest.TestCase):
         ][0]["changes"][0]["value"]["messages"][0]
         with patch("builtins.print") as logged:
             app_module._process_whatsapp_message(item)
-        create_ai.assert_called_once_with("lead-a", "60123456789", "live")
+        create_ai.assert_called_once_with(
+            "lead-a", "60123456789", "live", "conversation-general"
+        )
         save_meta_id.assert_called_once_with(
-            "message-current", "wamid.outbound", "live"
+            "message-current", "wamid.outbound", "live", "conversation-general"
         )
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn(
@@ -1747,6 +1877,55 @@ class WhatsAppTests(unittest.TestCase):
             logs,
         )
         self.assertNotIn("60123456789", logs)
+
+    @patch("app.conversation_store.set_conversation_previous_response_id")
+    @patch("app.save_whatsapp_message_id")
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.find_latest_ai_message", return_value={
+        "_id": "legacy-message", "response_ID": "legacy-response",
+    })
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Reply", "response-new", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.find_forwarded_lead_conversation")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_forwarded_lead_conversation_scopes_messages_and_continuity(
+        self, _typing, find_conversation, find_lead, _folio, turn, _send,
+        _legacy, create_ai, _save_ai, save_meta_id, save_previous,
+    ):
+        find_lead.return_value = ({
+            "_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-1",
+        }, False)
+        find_conversation.return_value = {
+            "_id": "conversation-1",
+            "Previous Response ID": "conversation-response",
+        }
+        item = webhook_payload(
+            message_id="wamid.inbound", text="Is it still available?"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        self.assertEqual(
+            turn.call_args.kwargs["previous_response_id"],
+            "conversation-response",
+        )
+        create_ai.assert_called_once_with(
+            "lead-1", "60123456789", "live", "conversation-1"
+        )
+        associated_inbound_calls = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-1"
+        ]
+        self.assertEqual(len(associated_inbound_calls), 1)
+        save_meta_id.assert_called_once_with(
+            "message-current", "wamid.outbound", "live", "conversation-1"
+        )
+        save_previous.assert_called_once_with(
+            "conversation-1", "response-new", "live"
+        )
 
     @patch("app.requests.patch")
     def test_completed_ai_message_saves_answer_and_response_id(self, mocked_patch):

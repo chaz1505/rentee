@@ -82,6 +82,19 @@ def _records(base_url, object_type, constraints=None):
         cursor += len(results)
 
 
+def _get(base_url, object_type, object_id):
+    try:
+        response = requests.get(
+            f"{base_url}/obj/{object_type}/{object_id}", headers=_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        _log_http_failure(error, "get", "GET", object_type)
+        raise
+    return response.json()["response"]
+
+
 def _create(base_url, object_type, payload):
     try:
         response = requests.post(
@@ -112,7 +125,7 @@ def _patch(base_url, object_type, object_id, payload):
 
 
 def find_active_conversation(
-    principal_id, counterparty_phone, enquiry_id=None, bubble_env="live",
+    principal_id, counterparty_phone, enquiry_id=None, bubble_env="live", side=None,
 ):
     principal_id = relationship_id(principal_id)
     phone = normalize_phone(counterparty_phone)
@@ -129,7 +142,8 @@ def find_active_conversation(
             "key": "Enquiry", "constraint_type": "equals", "value": enquiry_id,
         })
     print(
-        f"[CONVERSATION] action=find_started principal_id={principal_id} "
+        f"[CONVERSATION] side={side or 'unspecified'} action=find_started "
+        f"principal_id={principal_id} "
         f"enquiry_id={enquiry_id or 'none'}", flush=True,
     )
     candidates = list(_records(
@@ -153,7 +167,8 @@ def find_active_conversation(
     matches.sort(key=lambda item: str(item.get("_id")))
     selected = matches[0]
     print(
-        f"[CONVERSATION] action=found conversation_id={selected['_id']} "
+        f"[CONVERSATION] side={side or 'unspecified'} action=found "
+        f"conversation_id={selected['_id']} "
         f"principal_id={principal_id} enquiry_id={enquiry_id or 'none'}",
         flush=True,
     )
@@ -163,7 +178,8 @@ def find_active_conversation(
 def create_conversation(
     principal_id, counterparty_phone, enquiry_id=None,
     counterparty_user_id=None, counterparty_name=None, counterparty_role=None,
-    rentee_role=None, subject=None, bubble_env="live",
+    rentee_role=None, subject=None, bubble_env="live", lead_id=None,
+    listing_id=None, side=None,
 ):
     principal_id = relationship_id(principal_id)
     phone = normalize_phone(counterparty_phone)
@@ -179,13 +195,16 @@ def create_conversation(
         "Counterparty User": relationship_id(counterparty_user_id),
         "Counterparty Name": str(counterparty_name or "").strip() or None,
         "Enquiry": enquiry_id,
+        "Lead": relationship_id(lead_id),
+        "Listing": relationship_id(listing_id),
         "CounterParty Role": str(counterparty_role or "").strip() or None,
         "Rentee Role": str(rentee_role or "").strip() or None,
         "Subject": str(subject or "").strip() or None,
     }
     payload.update({key: value for key, value in optional.items() if value})
     print(
-        f"[CONVERSATION] action=create_started principal_id={principal_id} "
+        f"[CONVERSATION] side={side or 'unspecified'} action=create_started "
+        f"principal_id={principal_id} "
         f"enquiry_id={enquiry_id or 'none'}", flush=True,
     )
     conversation_id = _create(
@@ -193,7 +212,8 @@ def create_conversation(
     )
     conversation = {"_id": conversation_id, **payload}
     print(
-        f"[CONVERSATION] action=created conversation_id={conversation_id} "
+        f"[CONVERSATION] side={side or 'unspecified'} action=created "
+        f"conversation_id={conversation_id} "
         f"principal_id={principal_id} enquiry_id={enquiry_id or 'none'}",
         flush=True,
     )
@@ -203,16 +223,39 @@ def create_conversation(
 def find_or_create_conversation(
     principal_id, counterparty_phone, enquiry_id=None,
     counterparty_user_id=None, counterparty_name=None, counterparty_role=None,
-    rentee_role=None, subject=None, bubble_env="live",
+    rentee_role=None, subject=None, bubble_env="live", side=None, lead_id=None,
 ):
+    enquiry_id = relationship_id(enquiry_id)
+    lead_id = relationship_id(lead_id)
+    listing_id = None
+    if enquiry_id:
+        enquiry = _get(
+            get_bubble_base_url(bubble_env), "enquiry", enquiry_id
+        )
+        enquiry_lead_id = relationship_id(enquiry.get("Lead"))
+        if enquiry_lead_id:
+            lead_id = enquiry_lead_id
+        listing_id = relationship_id(enquiry.get("Listing"))
     existing = find_active_conversation(
-        principal_id, counterparty_phone, enquiry_id, bubble_env
+        principal_id, counterparty_phone, enquiry_id, bubble_env, side
     )
     if existing:
+        missing = {}
+        if lead_id and not relationship_id(existing.get("Lead")):
+            missing["Lead"] = lead_id
+        if listing_id and not relationship_id(existing.get("Listing")):
+            missing["Listing"] = listing_id
+        if missing:
+            _patch(
+                get_bubble_base_url(bubble_env), "conversation", existing["_id"],
+                missing,
+            )
+            existing.update(missing)
         return existing, False
     return create_conversation(
         principal_id, counterparty_phone, enquiry_id, counterparty_user_id,
         counterparty_name, counterparty_role, rentee_role, subject, bubble_env,
+        lead_id, listing_id, side,
     ), True
 
 

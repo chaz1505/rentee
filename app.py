@@ -1164,6 +1164,9 @@ def persist_owner_check_whatsapp_message(
     phone, message_content, whatsapp_message_id, lead_id=None,
     conversation_id=None, bubble_env="live",
 ):
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        raise ValueError("New outbound WhatsApp Message requires Conversation.")
     payload = {
         "phone": normalize_phone(phone),
         "direction": "Outbound",
@@ -1173,13 +1176,15 @@ def persist_owner_check_whatsapp_message(
     }
     if lead_id:
         payload["lead"] = lead_id
-    if conversation_id:
-        payload["Conversation"] = conversation_id
+    payload["Conversation"] = conversation_id
     message_id = _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
-    if conversation_id:
-        conversation_store.update_conversation_last_outbound_at(
-            conversation_id, bubble_env
-        )
+    conversation_store.update_conversation_last_outbound_at(
+        conversation_id, bubble_env
+    )
+    print(
+        f"[MESSAGE] direction=outbound conversation_id={conversation_id} "
+        "action=persisted", flush=True,
+    )
     return message_id
 
 
@@ -1218,11 +1223,18 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
                     rentee_role="Tenant Introducing Agent",
                     subject=str((listing or {}).get("name") or "").strip() or None,
                     bubble_env=bubble_env,
+                    side="owner",
                 )
             )
         conversation_id = conversation_store.relationship_id(
             (conversation or {}).get("_id")
         )
+        if not conversation_id:
+            print(
+                f"[CONVERSATION ROUTING] direction=outbound action=unresolved "
+                f"reason=missing_principal enquiry_id={enquiry_id}", flush=True,
+            )
+            return False
         current = now or datetime.datetime.now(datetime.timezone.utc)
         window = owner_check_whatsapp_window(phone, bubble_env, current)
         method = "freeform" if window == "open" else "template"
@@ -1298,6 +1310,129 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
 
 def _requests_owner_check(answer):
     return " ".join(str(answer or "").split()).endswith(OWNER_CHECK_RESPONSE)
+
+
+def find_forwarded_lead_conversation(lead, phone, bubble_env="live"):
+    """Resolve the active enquiry-specific Conversation for a forwarded Lead."""
+    lead_id = conversation_store.relationship_id((lead or {}).get("_id"))
+    enquiry_id = conversation_store.relationship_id(
+        (lead or {}).get("ActiveForwardedEnquiry")
+    )
+    if not lead_id or not enquiry_id:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
+    if conversation_store.relationship_id(enquiry.get("Lead")) != lead_id:
+        return None
+    principal_id = conversation_store.relationship_id(enquiry.get("Principal"))
+    if not principal_id:
+        return None
+    representative = str(enquiry.get("Agent?") or "").strip() == "Yes"
+    conversation, _created = conversation_store.find_or_create_conversation(
+        principal_id,
+        phone,
+        enquiry_id=enquiry_id,
+        counterparty_role=("Lead Representative" if representative else "Lead"),
+        rentee_role=(
+            "Lead Representative Coordinator" if representative else "Lead Advisor"
+        ),
+        bubble_env=bubble_env,
+        side="lead",
+    )
+    return conversation
+
+
+def find_reply_to_conversation(message, bubble_env="live"):
+    """Resolve Meta reply context to the exact persisted Conversation."""
+    replied_to_id = str(((message or {}).get("context") or {}).get("id") or "").strip()
+    if not replied_to_id:
+        return None
+    constraints = [{
+        "key": "whatsappMessageId", "constraint_type": "equals",
+        "value": replied_to_id,
+    }]
+    previous = next(iter(_bubble_records(
+        get_bubble_base_url(bubble_env), "message", constraints
+    )), None)
+    conversation_id = conversation_store.relationship_id(
+        (previous or {}).get("Conversation")
+    )
+    if not conversation_id:
+        return None
+    conversation = bubble(
+        f"{get_bubble_base_url(bubble_env)}/obj/conversation/{conversation_id}"
+    )
+    conversation.setdefault("_id", conversation_id)
+    return conversation
+
+
+def find_general_conversation(
+    principal_id, phone, lead_id=None, counterparty_user_id=None,
+    counterparty_role=None, rentee_role=None, bubble_env="live",
+):
+    """Find/create the safe non-enquiry Conversation for one counterparty."""
+    principal_id = conversation_store.relationship_id(principal_id)
+    if not principal_id:
+        return None
+    conversation, _created = conversation_store.find_or_create_conversation(
+        principal_id, phone,
+        counterparty_user_id=counterparty_user_id,
+        counterparty_role=counterparty_role,
+        rentee_role=rentee_role,
+        bubble_env=bubble_env, side="general", lead_id=lead_id,
+    )
+    return conversation
+
+
+def find_existing_general_conversation_by_phone(phone, bubble_env="live"):
+    """Reuse a general Conversation only when phone lookup is unambiguous."""
+    constraints = [
+        {"key": "CounterParty Phone", "constraint_type": "equals",
+         "value": normalize_phone(phone)},
+        {"key": "Status", "constraint_type": "equals", "value": "Active"},
+    ]
+    candidates = [
+        item for item in _bubble_records(
+            get_bubble_base_url(bubble_env), "conversation", constraints
+        )
+        if not conversation_store.relationship_id(item.get("Enquiry"))
+        and conversation_store.relationship_id(item.get("Principal"))
+        and item.get("_id")
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def persist_sent_whatsapp_text(
+    phone, text, sent_ids, conversation_id, lead_id=None, bubble_env="live",
+):
+    """Persist one successfully sent non-streaming WhatsApp text."""
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        raise ValueError("New outbound WhatsApp Message requires Conversation.")
+    meta_message_id = _first_whatsapp_message_id(sent_ids)
+    if not meta_message_id:
+        raise ValueError("Successful WhatsApp send did not return a message ID.")
+    payload = {
+        "phone": normalize_phone(phone),
+        "direction": "Outbound",
+        "own_Sent?": "No",
+        "messageContent": str(text or ""),
+        "whatsappMessageId": meta_message_id,
+        "Conversation": conversation_id,
+    }
+    if lead_id:
+        payload["lead"] = lead_id
+    message_id = _bubble_create(
+        get_bubble_base_url(bubble_env), "message", payload
+    )
+    conversation_store.update_conversation_last_outbound_at(
+        conversation_id, bubble_env
+    )
+    print(
+        f"[MESSAGE] direction=outbound conversation_id={conversation_id} "
+        "action=persisted", flush=True,
+    )
+    return message_id
 
 
 def _select_existing_folio(folios, lead_id):
@@ -1406,8 +1541,8 @@ def persist_inbound_whatsapp_message(
         patch = {}
         if lead_id and str(existing.get("lead") or "") != str(lead_id):
             patch["lead"] = lead_id
-        if conversation_id and str(existing.get("Conversation") or "") != str(
-            conversation_id
+        if conversation_id and not conversation_store.relationship_id(
+            existing.get("Conversation")
         ):
             patch["Conversation"] = conversation_id
         if patch:
@@ -1419,6 +1554,9 @@ def persist_inbound_whatsapp_message(
                 conversation_id, bubble_env
             )
         return message_id, False
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        raise ValueError("New inbound WhatsApp Message requires Conversation.")
     payload = {
         "phone": normalize_phone(phone),
         "direction": "Inbound",
@@ -1428,13 +1566,15 @@ def persist_inbound_whatsapp_message(
     }
     if lead_id:
         payload["lead"] = lead_id
-    if conversation_id:
-        payload["Conversation"] = conversation_id
+    payload["Conversation"] = conversation_id
     message_id = _bubble_create(base_url, "message", payload)
-    if conversation_id:
-        conversation_store.update_conversation_last_inbound_at(
-            conversation_id, bubble_env
-        )
+    conversation_store.update_conversation_last_inbound_at(
+        conversation_id, bubble_env
+    )
+    print(
+        f"[MESSAGE] direction=inbound conversation_id={conversation_id} "
+        "action=persisted", flush=True,
+    )
     return message_id, True
 
 
@@ -1449,6 +1589,9 @@ def attach_whatsapp_message_lead(message_id, lead_id, bubble_env="live"):
 def create_whatsapp_ai_message(
     lead_id, phone=None, bubble_env="live", conversation_id=None,
 ):
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        raise ValueError("New AI WhatsApp Message requires Conversation.")
     payload = {
         "lead": lead_id,
         "phone": normalize_phone(phone),
@@ -1456,8 +1599,7 @@ def create_whatsapp_ai_message(
         "own_Sent?": "No",
         "messageContent": "",
     }
-    if conversation_id:
-        payload["Conversation"] = conversation_id
+    payload["Conversation"] = conversation_id
     return _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
 
 
@@ -3474,15 +3616,30 @@ def _process_whatsapp_message(message):
         with phone_lock:
             base_url = get_bubble_base_url("live")
             inbound_message_id = None
+            routed_conversation = None
+            routed_conversation_id = None
             try:
-                inbound_message_id, _inbound_created = (
-                    persist_inbound_whatsapp_message(
-                        phone, message_id, text, bubble_env="live"
-                    )
+                routed_conversation = find_reply_to_conversation(message, "live")
+                routed_conversation_id = conversation_store.relationship_id(
+                    (routed_conversation or {}).get("_id")
                 )
+                if routed_conversation_id:
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        f"resolution=reply_to conversation_id={routed_conversation_id}",
+                        flush=True,
+                    )
+                    inbound_message_id, _inbound_created = (
+                        persist_inbound_whatsapp_message(
+                            phone, message_id, text,
+                            conversation_id=routed_conversation_id,
+                            bubble_env="live",
+                        )
+                    )
             except Exception as error:
                 print(
-                    "[WHATSAPP MESSAGE] inbound_persistence_failed "
+                    "[CONVERSATION ROUTING] direction=inbound "
+                    "resolution=reply_to_failed "
                     f"message_id={message_id} error={type(error).__name__}",
                     flush=True,
                 )
@@ -3491,6 +3648,8 @@ def _process_whatsapp_message(message):
             )
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
             if extract_handoff_code(text):
+                lead_conversation_id = routed_conversation_id
+                linked_handoff_lead_id = None
                 handoff_result = handle_external_handoff_message(
                     phone, text, base_url, _bubble_records, bubble,
                     _bubble_patch, normalize_phone,
@@ -3515,12 +3674,57 @@ def _process_whatsapp_message(message):
                             f"message_id={message_id} error={type(error).__name__}",
                             flush=True,
                         )
-                send_whatsapp_text(phone, handoff_result.response_text)
+                    try:
+                        lead_conversation = routed_conversation
+                        if not lead_conversation:
+                            handoff_lead = {
+                                "_id": linked_handoff_lead_id,
+                                "ActiveForwardedEnquiry": getattr(
+                                    handoff_result, "enquiry_id", None
+                                ),
+                            }
+                            lead_conversation = find_forwarded_lead_conversation(
+                                handoff_lead, phone, "live"
+                            )
+                        lead_conversation_id = conversation_store.relationship_id(
+                            (lead_conversation or {}).get("_id")
+                        )
+                        if lead_conversation_id:
+                            inbound_message_id, _created = persist_inbound_whatsapp_message(
+                                phone, message_id, text,
+                                lead_id=linked_handoff_lead_id,
+                                conversation_id=lead_conversation_id,
+                                bubble_env="live",
+                            )
+                            if not routed_conversation_id:
+                                print(
+                                    "[CONVERSATION ROUTING] direction=inbound "
+                                    f"resolution=enquiry conversation_id={lead_conversation_id} "
+                                    f"enquiry_id={getattr(handoff_result, 'enquiry_id', None)}",
+                                    flush=True,
+                                )
+                    except Exception as error:
+                        print(
+                            "[CONVERSATION] side=lead action=failed "
+                            f"operation=handoff_association "
+                            f"error={type(error).__name__}", flush=True,
+                        )
+                sent_ids = send_whatsapp_text(phone, handoff_result.response_text)
+                if lead_conversation_id:
+                    persist_sent_whatsapp_text(
+                        phone, handoff_result.response_text, sent_ids,
+                        lead_conversation_id, linked_handoff_lead_id, "live",
+                    )
                 followup_text = getattr(handoff_result, "followup_text", None)
                 if isinstance(followup_text, str) and followup_text.strip():
                     enquiry_id = getattr(handoff_result, "enquiry_id", None)
                     try:
-                        send_whatsapp_text(phone, followup_text)
+                        sent_ids = send_whatsapp_text(phone, followup_text)
+                        if lead_conversation_id:
+                            persist_sent_whatsapp_text(
+                                phone, followup_text, sent_ids,
+                                lead_conversation_id, linked_handoff_lead_id, "live",
+                            )
                         print(
                             f"[ENQUIRY WORKFLOW] enquiry_id={enquiry_id} "
                             "tenant_profile_request_sent",
@@ -3554,7 +3758,32 @@ def _process_whatsapp_message(message):
                     rentee_whatsapp_number=os.getenv("RENTEE_WHATSAPP_NUMBER"),
                 )
                 if workflow_result.handled:
-                    send_whatsapp_text(phone, workflow_result.response_text)
+                    general_conversation = routed_conversation or find_general_conversation(
+                        internal_user.get("_id"), phone,
+                        counterparty_user_id=internal_user.get("_id"),
+                        counterparty_role="Principal",
+                        rentee_role="Principal Assistant", bubble_env="live",
+                    )
+                    general_conversation_id = conversation_store.relationship_id(
+                        (general_conversation or {}).get("_id")
+                    )
+                    if not inbound_message_id and general_conversation_id:
+                        inbound_message_id, _created = persist_inbound_whatsapp_message(
+                            phone, message_id, text,
+                            conversation_id=general_conversation_id,
+                            bubble_env="live",
+                        )
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution=general conversation_id={general_conversation_id}",
+                            flush=True,
+                        )
+                    sent_ids = send_whatsapp_text(phone, workflow_result.response_text)
+                    if general_conversation_id:
+                        persist_sent_whatsapp_text(
+                            phone, workflow_result.response_text, sent_ids,
+                            general_conversation_id, bubble_env="live",
+                        )
                     workflow_result.complete()
                     print(
                         f"[ENQUIRY WORKFLOW] user_id={internal_user.get('_id')} handled",
@@ -3575,6 +3804,57 @@ def _process_whatsapp_message(message):
                     phone, message.get("customer_name"), "live"
                 )
             lead_id = lead["_id"]
+            lead_conversation = routed_conversation
+            lead_conversation_id = routed_conversation_id
+            try:
+                if not lead_conversation_id:
+                    lead_conversation = find_forwarded_lead_conversation(
+                        lead, phone, "live"
+                    )
+                if not lead_conversation:
+                    principal_id = conversation_store.relationship_id(
+                        lead.get("owner")
+                    )
+                    if principal_id:
+                        lead_conversation = find_general_conversation(
+                            principal_id, phone, lead_id=lead_id,
+                            counterparty_role="Lead", rentee_role="Lead Advisor",
+                            bubble_env="live",
+                        )
+                    else:
+                        lead_conversation = find_existing_general_conversation_by_phone(
+                            phone, "live"
+                        )
+                lead_conversation_id = conversation_store.relationship_id(
+                    (lead_conversation or {}).get("_id")
+                )
+                if lead_conversation_id:
+                    inbound_message_id, _created = persist_inbound_whatsapp_message(
+                        phone, message_id, text, lead_id=lead_id,
+                        conversation_id=lead_conversation_id, bubble_env="live",
+                    )
+                    enquiry_id = conversation_store.relationship_id(
+                        (lead_conversation or {}).get("Enquiry")
+                    )
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        f"resolution={'enquiry' if enquiry_id else 'general'} "
+                        f"conversation_id={lead_conversation_id}"
+                        + (f" enquiry_id={enquiry_id}" if enquiry_id else ""),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        f"action=unresolved reason=missing_principal lead_id={lead_id}",
+                        flush=True,
+                    )
+            except Exception as error:
+                print(
+                    "[CONVERSATION] side=lead action=failed "
+                    f"operation=inbound_association error={type(error).__name__}",
+                    flush=True,
+                )
             try:
                 attach_whatsapp_message_lead(inbound_message_id, lead_id, "live")
             except Exception as error:
@@ -3590,8 +3870,23 @@ def _process_whatsapp_message(message):
                 str(previous_message.get("response_ID") or "").strip()
                 if previous_message else None
             )
+            conversation_previous_response_id = (
+                conversation_store.get_conversation_previous_response_id(
+                    lead_conversation
+                )
+            )
+            if conversation_previous_response_id:
+                previous_response_id = conversation_previous_response_id
+            if not lead_conversation_id:
+                raise RuntimeError("Cannot persist WhatsApp turn without Conversation")
             current_message_id = create_whatsapp_ai_message(
-                lead_id, phone, "live"
+                lead_id, phone, "live", lead_conversation_id
+            )
+            print(
+                "[CONVERSATION ROUTING] direction=outbound "
+                f"conversation_id={lead_conversation_id} "
+                f"enquiry_id={conversation_store.relationship_id((lead_conversation or {}).get('Enquiry')) or 'none'}",
+                flush=True,
             )
             print(
                 "[WHATSAPP CONVERSATION] "
@@ -3629,6 +3924,17 @@ def _process_whatsapp_message(message):
             save_whatsapp_ai_message(
                 current_message_id, answer, response_id, "live"
             )
+            if lead_conversation_id and response_id:
+                try:
+                    conversation_store.set_conversation_previous_response_id(
+                        lead_conversation_id, response_id, "live"
+                    )
+                except Exception as error:
+                    print(
+                        "[CONVERSATION] side=lead action=failed "
+                        "operation=previous_response_update "
+                        f"error={type(error).__name__}", flush=True,
+                    )
             print(
                 f"[WHATSAPP AI SEND] lead_id={lead_id} "
                 f"destination=enquirer phone={_masked_whatsapp_phone(phone)}",
@@ -3640,9 +3946,15 @@ def _process_whatsapp_message(message):
                 )
                 if isinstance(outbound_ids, list) and outbound_ids:
                     try:
-                        save_whatsapp_message_id(
-                            current_message_id, outbound_ids[0], "live"
-                        )
+                        if lead_conversation_id:
+                            save_whatsapp_message_id(
+                                current_message_id, outbound_ids[0], "live",
+                                lead_conversation_id,
+                            )
+                        else:
+                            save_whatsapp_message_id(
+                                current_message_id, outbound_ids[0], "live"
+                            )
                     except Exception as error:
                         print(
                             "[WHATSAPP MESSAGE] outbound_id_persistence_failed "
@@ -3653,9 +3965,15 @@ def _process_whatsapp_message(message):
                 outbound_ids = send_whatsapp_text(phone, answer)
                 if isinstance(outbound_ids, list) and outbound_ids:
                     try:
-                        save_whatsapp_message_id(
-                            current_message_id, outbound_ids[0], "live"
-                        )
+                        if lead_conversation_id:
+                            save_whatsapp_message_id(
+                                current_message_id, outbound_ids[0], "live",
+                                lead_conversation_id,
+                            )
+                        else:
+                            save_whatsapp_message_id(
+                                current_message_id, outbound_ids[0], "live"
+                            )
                     except Exception as error:
                         print(
                             "[WHATSAPP MESSAGE] outbound_id_persistence_failed "
