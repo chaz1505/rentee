@@ -74,6 +74,11 @@ WHATSAPP_LEAD_PHONE_FIELD = "phone"
 WHATSAPP_LEAD_NAME_FIELD = "name"
 WHATSAPP_LEAD_OWNER_FIELD = "owner"
 MAX_WHATSAPP_RECOMMENDATION_IMAGES = 4
+WHATSAPP_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+WHATSAPP_AUDIO_ERROR_RESPONSE = (
+    "Sorry, I couldn't understand that voice message. "
+    "Could you try again or send it as text?"
+)
 
 _condo_cache = None
 _condo_cache_checked_at = 0.0
@@ -1158,6 +1163,62 @@ def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
         f"message_id={message_id}", flush=True,
     )
     return [message_id]
+
+
+def download_whatsapp_audio(media_id):
+    """Download one Meta-hosted WhatsApp audio object into memory."""
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        raise ValueError("WhatsApp audio media ID is missing.")
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    headers = {"Authorization": f"Bearer {access_token}"}
+    metadata_response = requests.get(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
+        headers=headers, timeout=30,
+    )
+    metadata_response.raise_for_status()
+    metadata = metadata_response.json()
+    media_url = str(metadata.get("url") or "").strip()
+    if not media_url:
+        raise ValueError("Meta media metadata did not contain a download URL.")
+    audio_response = requests.get(media_url, headers=headers, timeout=60)
+    audio_response.raise_for_status()
+    audio_bytes = bytes(audio_response.content or b"")
+    if not audio_bytes:
+        raise ValueError("Downloaded WhatsApp audio was empty.")
+    mime_type = str(
+        metadata.get("mime_type")
+        or audio_response.headers.get("Content-Type")
+        or "audio/ogg"
+    ).split(";", 1)[0].strip()
+    return audio_bytes, mime_type
+
+
+def transcribe_whatsapp_audio(media_id, message_id=None):
+    """Download and transcribe WhatsApp audio without invoking Rentee's chat model."""
+    audio_bytes, mime_type = download_whatsapp_audio(media_id)
+    print(
+        f"[WHATSAPP AUDIO] message_id={message_id or 'unknown'} "
+        f"media_downloaded bytes={len(audio_bytes)}", flush=True,
+    )
+    extension = next((
+        suffix for marker, suffix in (
+            ("ogg", "ogg"), ("mpeg", "mp3"), ("mp4", "m4a"),
+            ("wav", "wav"), ("webm", "webm"),
+        ) if marker in mime_type.casefold()
+    ), "ogg")
+    transcription = client.audio.transcriptions.create(
+        model=WHATSAPP_TRANSCRIPTION_MODEL,
+        file=(f"whatsapp-voice.{extension}", audio_bytes, mime_type),
+    )
+    transcript = str(getattr(transcription, "text", "") or "").strip()
+    if not transcript:
+        raise ValueError("OpenAI returned an empty WhatsApp transcription.")
+    print(
+        f"[WHATSAPP TRANSCRIPTION] message_id={message_id or 'unknown'} "
+        f"chars={len(transcript)}", flush=True,
+    )
+    return transcript
 
 
 def persist_owner_check_whatsapp_message(
@@ -3609,11 +3670,24 @@ def _process_whatsapp_message(message):
             flush=True,
         )
     phone = normalize_phone(message["from"])
+    message_type = str(message.get("type") or "text").strip().casefold()
     text = str((message.get("text") or {}).get("body") or "").strip()
     phone_lock = _whatsapp_phone_locks.setdefault(phone, threading.Lock())
     reply_sent = False
     try:
         with phone_lock:
+            if message_type == "audio":
+                media_id = str((message.get("audio") or {}).get("id") or "").strip()
+                print(
+                    f"[WHATSAPP AUDIO] message_id={message_id} "
+                    f"sender={_masked_whatsapp_phone(phone)} "
+                    f"media_id={media_id or 'missing'} received", flush=True,
+                )
+                text = transcribe_whatsapp_audio(media_id, message_id)
+                print(
+                    f"[WHATSAPP AUDIO] message_id={message_id} "
+                    "processing_transcript_as_text", flush=True,
+                )
             base_url = get_bubble_base_url("live")
             inbound_message_id = None
             routed_conversation = None
@@ -3988,11 +4062,19 @@ def _process_whatsapp_message(message):
                 flush=True,
             )
     except Exception as error:
-        print(f"WhatsApp message {message_id} failed: {error}", flush=True)
+        if message_type == "audio":
+            print(
+                f"[WHATSAPP AUDIO] message_id={message_id} "
+                f"action=failed error={type(error).__name__}", flush=True,
+            )
+        else:
+            print(f"WhatsApp message {message_id} failed: {error}", flush=True)
         if not reply_sent:
             try:
                 send_whatsapp_text(
-                    phone, "Sorry, I had trouble checking that just now. Please try again."
+                    phone,
+                    WHATSAPP_AUDIO_ERROR_RESPONSE if message_type == "audio" else
+                    "Sorry, I had trouble checking that just now. Please try again."
                 )
             except Exception as send_error:
                 print(f"WhatsApp fallback send failed: {send_error}", flush=True)
@@ -4007,6 +4089,7 @@ def _process_whatsapp_message(message):
 
 
 def _whatsapp_text_messages(payload):
+    """Extract supported inbound text/audio messages; ignore statuses and others."""
     messages = []
     if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
         return messages
@@ -4019,11 +4102,21 @@ def _whatsapp_text_messages(payload):
                 for contact in contacts if contact.get("wa_id")
             }
             for item in value.get("messages", []) or []:
-                if item.get("type") != "text" or not item.get("id") or not item.get("from"):
+                message_type = item.get("type")
+                if message_type not in {"text", "audio"}:
                     continue
-                body = (item.get("text") or {}).get("body")
-                if not isinstance(body, str) or not body.strip():
+                if not item.get("id") or not item.get("from"):
                     continue
+                if message_type == "text":
+                    body = (item.get("text") or {}).get("body")
+                    if not isinstance(body, str) or not body.strip():
+                        continue
+                else:
+                    media_id = (item.get("audio") or {}).get("id")
+                    if not isinstance(media_id, str) or not media_id.strip():
+                        # Keep a genuine audio event so the worker can log and send
+                        # the standard transcription failure response.
+                        item = {**item, "audio": {**(item.get("audio") or {})}}
                 clean = dict(item)
                 clean["customer_name"] = names.get(str(item.get("from")))
                 messages.append(clean)

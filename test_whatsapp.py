@@ -30,6 +30,17 @@ def webhook_payload(message_id="wamid.1", phone="60123456789", text="Hi"):
     }
 
 
+def audio_webhook_payload(
+    message_id="wamid.audio-1", phone="60123456789", media_id="media-1",
+):
+    payload = webhook_payload(message_id, phone)
+    message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    message["type"] = "audio"
+    message.pop("text", None)
+    message["audio"] = {"id": media_id, "mime_type": "audio/ogg; codecs=opus"}
+    return payload
+
+
 class ImmediateThread:
     def __init__(self, target, args=(), **_kwargs):
         self.target, self.args = target, args
@@ -1093,6 +1104,137 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message["from"], "60123456789")
         self.assertEqual(message["text"]["body"], "Hi")
         self.assertEqual(message["customer_name"], "Aisha")
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app._process_whatsapp_message")
+    def test_audio_webhook_extracts_media_id_and_dispatches(self, mocked_process):
+        response = app_module.app.test_client().post(
+            "/whatsapp/webhook", json=audio_webhook_payload()
+        )
+        self.assertEqual(response.status_code, 200)
+        message = mocked_process.call_args.args[0]
+        self.assertEqual(message["type"], "audio")
+        self.assertEqual(message["audio"]["id"], "media-1")
+        self.assertEqual(message["customer_name"], "Aisha")
+
+    @patch("app.requests.get")
+    def test_download_whatsapp_audio_fetches_meta_url_and_bytes(self, get):
+        metadata = MagicMock()
+        metadata.json.return_value = {
+            "url": "https://lookaside.facebook.test/audio",
+            "mime_type": "audio/ogg",
+        }
+        metadata.raise_for_status.return_value = None
+        audio = MagicMock()
+        audio.content = b"voice-bytes"
+        audio.headers = {"Content-Type": "audio/ogg"}
+        audio.raise_for_status.return_value = None
+        get.side_effect = [metadata, audio]
+
+        content, mime_type = app_module.download_whatsapp_audio("media-1")
+
+        self.assertEqual(content, b"voice-bytes")
+        self.assertEqual(mime_type, "audio/ogg")
+        self.assertEqual(get.call_args_list[0].args[0],
+                         "https://graph.facebook.com/v23.0/media-1")
+        self.assertEqual(get.call_args_list[1].args[0],
+                         "https://lookaside.facebook.test/audio")
+        for call in get.call_args_list:
+            self.assertEqual(
+                call.kwargs["headers"], {"Authorization": "Bearer wa-token"}
+            )
+
+    @patch("app.download_whatsapp_audio",
+           return_value=(b"voice-bytes", "audio/ogg"))
+    def test_transcription_uses_dedicated_audio_api(self, _download):
+        with patch.object(
+            app_module.client.audio.transcriptions, "create",
+            return_value=SimpleNamespace(text="  Three bedrooms in KLCC  "),
+        ) as create:
+            transcript = app_module.transcribe_whatsapp_audio(
+                "media-1", "wamid.audio-1"
+            )
+        self.assertEqual(transcript, "Three bedrooms in KLCC")
+        self.assertEqual(
+            create.call_args.kwargs["model"], "gpt-4o-mini-transcribe"
+        )
+        self.assertEqual(create.call_args.kwargs["file"][1], b"voice-bytes")
+
+    @patch("app.download_whatsapp_audio",
+           return_value=(b"voice-bytes", "audio/ogg"))
+    def test_empty_openai_transcription_is_rejected(self, _download):
+        with patch.object(
+            app_module.client.audio.transcriptions, "create",
+            return_value=SimpleNamespace(text="   "),
+        ):
+            with self.assertRaises(ValueError):
+                app_module.transcribe_whatsapp_audio("media-1", "wamid.audio-1")
+
+    @patch("app.send_whatsapp_typing_indicator")
+    @patch("app.send_whatsapp_text", return_value=["wamid.reply"])
+    @patch("app.handle_internal_user_message")
+    @patch("app.transcribe_whatsapp_audio",
+           return_value="Show me three bedrooms in KLCC")
+    def test_audio_transcript_enters_existing_text_workflow(
+        self, transcribe, workflow, _send, _typing,
+    ):
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        result = SimpleNamespace(
+            handled=True, response_text="Okay", complete=MagicMock(),
+        )
+        workflow.return_value = result
+        item = audio_webhook_payload()["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        transcribe.assert_called_once_with("media-1", "wamid.audio-1")
+        self.assertEqual(workflow.call_args.args[1],
+                         "Show me three bedrooms in KLCC")
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app.send_whatsapp_typing_indicator")
+    @patch("app.send_whatsapp_text", return_value=["wamid.reply"])
+    @patch("app.handle_internal_user_message")
+    @patch("app.transcribe_whatsapp_audio", return_value="Agent enquiry coming")
+    def test_duplicate_audio_webhook_transcribes_and_responds_once(
+        self, transcribe, workflow, send, _typing,
+    ):
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        workflow.return_value = SimpleNamespace(
+            handled=True, response_text="Send it through", complete=MagicMock(),
+        )
+        client = app_module.app.test_client()
+        payload = audio_webhook_payload(message_id="wamid.audio-duplicate")
+
+        client.post("/whatsapp/webhook", json=payload)
+        client.post("/whatsapp/webhook", json=payload)
+
+        transcribe.assert_called_once()
+        send.assert_called_once_with("60123456789", "Send it through")
+
+    def test_failed_or_empty_audio_transcription_sends_safe_response(self):
+        item = audio_webhook_payload()["entry"][0]["changes"][0]["value"]["messages"][0]
+        for failure in (RuntimeError("OpenAI down"), ValueError("empty")):
+            with self.subTest(error=type(failure).__name__), \
+                 patch("app.send_whatsapp_typing_indicator"), \
+                 patch("app.transcribe_whatsapp_audio", side_effect=failure), \
+                 patch("app.send_whatsapp_text") as send:
+                app_module._process_whatsapp_message(item)
+            send.assert_called_once_with(
+                "60123456789", app_module.WHATSAPP_AUDIO_ERROR_RESPONSE
+            )
+            app_module._whatsapp_processed_ids.clear()
+            app_module._whatsapp_processed_order.clear()
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app._process_whatsapp_message")
+    def test_unsupported_whatsapp_message_type_is_ignored(self, process):
+        payload = audio_webhook_payload()
+        message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+        message["type"] = "image"
+        response = app_module.app.test_client().post("/whatsapp/webhook", json=payload)
+        self.assertEqual(response.status_code, 200)
+        process.assert_not_called()
 
     @patch("app.find_or_create_whatsapp_lead")
     @patch("app.send_whatsapp_text")
