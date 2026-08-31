@@ -1439,15 +1439,15 @@ def find_reply_to_conversation(message, bubble_env="live"):
     return conversation
 
 
-def find_active_conversation_by_phone(phone, message_text="", bubble_env="live"):
-    """Resolve an existing active phone Conversation without needing Principal."""
+def active_conversations_by_phone(phone, bubble_env="live"):
+    """Return all exact active phone Conversations without a Principal constraint."""
     canonical_phone = normalize_phone(phone)
     constraints = [
         {"key": "CounterParty Phone", "constraint_type": "equals",
          "value": canonical_phone},
         {"key": "Status", "constraint_type": "equals", "value": "Active"},
     ]
-    candidates = [
+    return [
         item for item in _bubble_records(
             get_bubble_base_url(bubble_env), "conversation", constraints
         )
@@ -1455,34 +1455,102 @@ def find_active_conversation_by_phone(phone, message_text="", bubble_env="live")
         and normalize_phone(item.get("CounterParty Phone")) == canonical_phone
         and str(item.get("Status") or "").strip() == "Active"
     ]
+
+
+def find_active_conversation_by_phone(
+    phone, message_text="", bubble_env="live", include_candidates=False,
+):
+    """Resolve an existing active phone Conversation without needing Principal."""
+    candidates = active_conversations_by_phone(phone, bubble_env)
+    result = None
+    resolution = "ambiguous"
     if len(candidates) == 1:
-        return candidates[0], "single_active", 1
-    if not candidates:
-        return None, "none", 0
+        result, resolution = candidates[0], "single_active"
+    elif not candidates:
+        resolution = "none"
+    else:
+        text = " ".join(str(message_text or "").casefold().split())
+        explicit = []
+        if text:
+            for conversation in candidates:
+                references = [
+                    conversation_store.relationship_id(conversation.get("Enquiry")),
+                    conversation_store.relationship_id(conversation.get("Listing")),
+                ]
+                subject = " ".join(
+                    str(conversation.get("Subject") or "").casefold().split()
+                )
+                if any(
+                    reference and reference.casefold() in text
+                    for reference in references
+                ):
+                    explicit.append(conversation)
+                elif len(subject) >= 4 and subject in text:
+                    explicit.append(conversation)
+        if len(explicit) == 1:
+            result, resolution = explicit[0], "explicit_reference"
+    response = (result, resolution, len(candidates))
+    return response + (candidates,) if include_candidates else response
 
-    text = " ".join(str(message_text or "").casefold().split())
-    explicit = []
-    if text:
-        for conversation in candidates:
-            references = [
-                conversation_store.relationship_id(conversation.get("Enquiry")),
-                conversation_store.relationship_id(conversation.get("Listing")),
-            ]
-            subject = " ".join(str(conversation.get("Subject") or "").casefold().split())
-            if any(reference and reference.casefold() in text for reference in references):
-                explicit.append(conversation)
-            elif len(subject) >= 4 and subject in text:
-                explicit.append(conversation)
-    if len(explicit) == 1:
-        return explicit[0], "explicit_reference", len(candidates)
 
-    general = [
-        conversation for conversation in candidates
-        if not conversation_store.relationship_id(conversation.get("Enquiry"))
+def _conversation_clarification_label(conversation, bubble_env="live"):
+    subject = " ".join(str((conversation or {}).get("Subject") or "").split())
+    if subject:
+        return subject
+    listing_id = conversation_store.relationship_id(
+        (conversation or {}).get("Listing")
+    )
+    if listing_id:
+        try:
+            listing = bubble(
+                f"{get_bubble_base_url(bubble_env)}/obj/listing/{listing_id}"
+            )
+            label = " ".join(str(
+                listing.get("name") or listing.get("title") or ""
+            ).split())
+            if label:
+                return label
+        except Exception:
+            pass
+    return "one enquiry"
+
+
+def build_conversation_clarification(candidates, bubble_env="live"):
+    labels = [
+        _conversation_clarification_label(item, bubble_env)
+        for item in candidates
     ]
-    if len(general) == 1:
-        return general[0], "general", len(candidates)
-    return None, "ambiguous", len(candidates)
+    principals = {
+        conversation_store.relationship_id(item.get("Principal"))
+        for item in candidates
+        if conversation_store.relationship_id(item.get("Principal"))
+    }
+    if len(principals) > 1:
+        rendered = []
+        for conversation, label in zip(candidates, labels):
+            principal_id = conversation_store.relationship_id(
+                conversation.get("Principal")
+            )
+            principal_name = None
+            if principal_id:
+                try:
+                    principal = bubble(
+                        f"{get_bubble_base_url(bubble_env)}/obj/user/{principal_id}"
+                    )
+                    principal_name = " ".join(str(
+                        principal.get("name") or principal.get("Name") or ""
+                    ).split())
+                except Exception:
+                    pass
+            rendered.append(
+                f"{label} for {principal_name}" if principal_name else label
+            )
+        labels = rendered
+    if len(labels) == 2:
+        options = f"{labels[0]} or {labels[1]}"
+    else:
+        options = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+    return f"Do you mean the {options}?"
 
 
 def find_general_conversation(
@@ -3890,6 +3958,7 @@ def _process_whatsapp_message(message):
             inbound_message_id = None
             routed_conversation = None
             routed_conversation_id = None
+            ambiguous_candidates = []
             try:
                 routed_conversation = find_reply_to_conversation(message, "live")
                 routed_conversation_id = conversation_store.relationship_id(
@@ -3917,8 +3986,11 @@ def _process_whatsapp_message(message):
                 )
             if not routed_conversation_id:
                 try:
-                    routed_conversation, resolution, candidate_count = (
-                        find_active_conversation_by_phone(phone, text, "live")
+                    (
+                        routed_conversation, resolution, candidate_count,
+                        ambiguous_candidates,
+                    ) = find_active_conversation_by_phone(
+                        phone, text, "live", include_candidates=True
                     )
                     routed_conversation_id = conversation_store.relationship_id(
                         (routed_conversation or {}).get("_id")
@@ -3951,6 +4023,71 @@ def _process_whatsapp_message(message):
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
+            if ambiguous_candidates and not routed_conversation_id:
+                principal_ids = {
+                    conversation_store.relationship_id(item.get("Principal"))
+                    for item in ambiguous_candidates
+                    if conversation_store.relationship_id(item.get("Principal"))
+                }
+                clarification = build_conversation_clarification(
+                    ambiguous_candidates, "live"
+                )
+                if len(principal_ids) == 1:
+                    principal_id = next(iter(principal_ids))
+                    lead_ids = {
+                        conversation_store.relationship_id(item.get("Lead"))
+                        for item in ambiguous_candidates
+                        if conversation_store.relationship_id(item.get("Lead"))
+                    }
+                    general = find_general_conversation(
+                        principal_id, phone,
+                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
+                        counterparty_role="Counterparty",
+                        rentee_role="Enquiry Coordinator", bubble_env="live",
+                    )
+                    general_id = conversation_store.relationship_id(
+                        (general or {}).get("_id")
+                    )
+                    if not general_id:
+                        raise RuntimeError(
+                            "Could not resolve general clarification Conversation"
+                        )
+                    inbound_message_id, _created = persist_inbound_whatsapp_message(
+                        phone, message_id, text,
+                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
+                        conversation_id=general_id, bubble_env="live",
+                    )
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        "resolution=general_for_clarification "
+                        f"conversation_id={general_id}", flush=True,
+                    )
+                    sent_ids = send_whatsapp_text(phone, clarification)
+                    persist_sent_whatsapp_text(
+                        phone, clarification, sent_ids, general_id,
+                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
+                        bubble_env="live",
+                    )
+                    print(
+                        "[CONVERSATION ROUTING] direction=outbound "
+                        "action=clarification "
+                        f"candidate_count={len(ambiguous_candidates)}", flush=True,
+                    )
+                    reply_sent = True
+                    return
+                print(
+                    "[CONVERSATION ROUTING] direction=inbound "
+                    "action=unresolved reason=multiple_principals "
+                    f"candidate_count={len(ambiguous_candidates)}", flush=True,
+                )
+                send_whatsapp_text(phone, clarification)
+                print(
+                    "[CONVERSATION ROUTING] direction=outbound "
+                    "action=clarification "
+                    f"candidate_count={len(ambiguous_candidates)}", flush=True,
+                )
+                reply_sent = True
+                return
             internal_user = find_internal_user(
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )

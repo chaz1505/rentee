@@ -838,7 +838,7 @@ class WhatsAppTests(unittest.TestCase):
         self.addCleanup(self.reply_conversation_patcher.stop)
         self.active_phone_conversation_patcher = patch(
             "app.find_active_conversation_by_phone",
-            return_value=(None, "none", 0),
+            return_value=(None, "none", 0, []),
         )
         self.active_phone_conversation_patcher.start()
         self.addCleanup(self.active_phone_conversation_patcher.stop)
@@ -947,6 +947,74 @@ class WhatsAppTests(unittest.TestCase):
             )
         self.assertEqual(result["_id"], "conversation-2")
         self.assertEqual((resolution, count), ("explicit_reference", 2))
+
+    @patch("app.persist_sent_whatsapp_text", return_value="message-out")
+    @patch("app.send_whatsapp_text", return_value=["wamid.clarification"])
+    @patch("app.find_general_conversation",
+           return_value={"_id": "conversation-general"})
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_ambiguous_same_principal_uses_general_and_stops_before_lead_routing(
+        self, _typing, active, general, send, persist_outbound,
+    ):
+        candidates = [
+            {"_id": "conversation-1", "Principal": "principal-1",
+             "CounterParty Phone": "60123456789", "Status": "Active",
+             "Enquiry": "enquiry-1", "Lead": "lead-1",
+             "Subject": "One Menerung"},
+            {"_id": "conversation-2", "Principal": "principal-1",
+             "CounterParty Phone": "60123456789", "Status": "Active",
+             "Enquiry": "enquiry-2", "Lead": "lead-1",
+             "Subject": "The Loft"},
+        ]
+        active.return_value = (None, "ambiguous", 2, candidates)
+        item = webhook_payload(
+            message_id="wamid.ambiguous", text="Yes, it is available"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        with patch("app.find_or_create_whatsapp_lead") as find_lead, \
+             patch("app.capture_linked_tenant_profile") as profile, \
+             patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
+
+        general.assert_called_once_with(
+            "principal-1", "60123456789", lead_id="lead-1",
+            counterparty_role="Counterparty", rentee_role="Enquiry Coordinator",
+            bubble_env="live",
+        )
+        inbound = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-general"
+        ]
+        self.assertEqual(len(inbound), 1)
+        send.assert_called_once_with(
+            "60123456789", "Do you mean the One Menerung or The Loft?"
+        )
+        persist_outbound.assert_called_once()
+        find_lead.assert_not_called()
+        profile.assert_not_called()
+        self.mocked_internal_user.assert_not_called()
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("resolution=ambiguous candidate_count=2", logs)
+        self.assertIn(
+            "resolution=general_for_clarification conversation_id=conversation-general",
+            logs,
+        )
+        self.assertIn("action=clarification candidate_count=2", logs)
+
+    def test_different_principal_ambiguity_does_not_choose_a_principal(self):
+        candidates = [
+            {"Principal": "principal-gwen", "Subject": "One Menerung"},
+            {"Principal": "principal-james", "Subject": "The Loft"},
+        ]
+        with patch("app.bubble", side_effect=[
+            {"name": "Gwen"}, {"name": "James"},
+        ]):
+            clarification = app_module.build_conversation_clarification(candidates)
+        self.assertEqual(
+            clarification,
+            "Do you mean the One Menerung for Gwen or The Loft for James?",
+        )
 
     def test_new_message_creation_rejects_missing_conversation(self):
         with patch("app._bubble_records", return_value=iter([])), \
@@ -2151,7 +2219,9 @@ class WhatsAppTests(unittest.TestCase):
             "Enquiry": "enquiry-1", "Lead": "lead-1", "Listing": "listing-1",
             "CounterParty Role": "Owner Representative",
         }
-        active.return_value = (owner_conversation, "single_active", 1)
+        active.return_value = (
+            owner_conversation, "single_active", 1, [owner_conversation]
+        )
         with patch("app.bubble", return_value={"_id": "lead-1"}), \
              patch("builtins.print") as logged:
             item = webhook_payload(
