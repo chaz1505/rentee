@@ -1460,262 +1460,40 @@ def active_conversations_by_phone(phone, bubble_env="live"):
 def find_active_conversation_by_phone(
     phone, message_text="", bubble_env="live", include_candidates=False,
 ):
-    """Resolve an existing active phone Conversation without needing Principal."""
+    """Select the active enquiry Conversation with the newest Enquiry."""
     all_candidates = active_conversations_by_phone(phone, bubble_env)
-    general_candidates = [
-        item for item in all_candidates
-        if not conversation_store.relationship_id(item.get("Enquiry"))
-    ]
     candidates = [
         item for item in all_candidates
         if conversation_store.relationship_id(item.get("Enquiry"))
     ]
-    if not candidates:
-        candidates = general_candidates
     result = None
-    resolution = "ambiguous"
+    resolution = "none"
     if len(candidates) == 1:
         result, resolution = candidates[0], "single_active"
-    elif not candidates:
-        resolution = "none"
-    else:
-        text = " ".join(str(message_text or "").casefold().split())
-        explicit = []
-        if text:
-            for conversation in candidates:
-                references = [
-                    conversation_store.relationship_id(conversation.get("Enquiry")),
-                    conversation_store.relationship_id(conversation.get("Listing")),
-                ]
-                subject = " ".join(
-                    str(conversation.get("Subject") or "").casefold().split()
-                )
-                if any(
-                    reference and reference.casefold() in text
-                    for reference in references
-                ):
-                    explicit.append(conversation)
-                elif len(subject) >= 4 and subject in text:
-                    explicit.append(conversation)
-        if len(explicit) == 1:
-            result, resolution = explicit[0], "explicit_reference"
+    elif len(candidates) > 1:
+        base_url = get_bubble_base_url(bubble_env)
+        ordered = []
+        for conversation in candidates:
+            enquiry_id = conversation_store.relationship_id(
+                conversation.get("Enquiry")
+            )
+            enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
+            created_value = enquiry.get("Created Date") or enquiry.get("created_date")
+            created_at = _bubble_created_at(created_value)
+            ordered.append((
+                created_at or datetime.datetime.min.replace(
+                    tzinfo=datetime.timezone.utc
+                ),
+                str(enquiry_id), str(conversation.get("_id") or ""),
+                conversation, str(created_value or ""),
+            ))
+        ordered.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        _created_at, _enquiry_key, _conversation_key, result, created_value = ordered[0]
+        result = dict(result)
+        result["_routing_enquiry_created_at"] = created_value
+        resolution = "latest_enquiry"
     response = (result, resolution, len(candidates))
     return response + (candidates,) if include_candidates else response
-
-
-def _routing_intent(text):
-    value = " ".join(str(text or "").casefold().split())
-    if re.search(
-        r"\b(profile\s*(?:ok|okay|fine|acceptable|accepted|suitable)|"
-        r"owner\s*(?:ok|okay)|not\s+suitable|acceptable|tenant\s+ok)\b", value,
-    ):
-        return "profile_response"
-    if re.search(r"\b(rented|unavailable|not\s+available|still\s+available)\b", value):
-        return "availability_response"
-    if re.search(
-        r"\b(view|viewing|slot|appointment|(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
-        r"\d{1,2}(?::\d{2})?\s*(?:am|pm))\b", value,
-    ):
-        return "viewing_response"
-    return "unknown"
-
-
-def _latest_outbound_for_conversation(conversation_id, bubble_env="live"):
-    constraints = [
-        {"key": "Conversation", "constraint_type": "equals",
-         "value": conversation_id},
-        {"key": "direction", "constraint_type": "equals", "value": "Outbound"},
-    ]
-    messages = list(_bubble_records(
-        get_bubble_base_url(bubble_env), "message", constraints
-    ))
-    messages.sort(key=lambda item: (
-        str(item.get("Created Date") or item.get("created_date") or ""),
-        str(item.get("_id") or ""),
-    ), reverse=True)
-    return messages[0] if messages else None
-
-
-def build_candidate_routing_context(
-    conversation, incoming_text, bubble_env="live", now=None,
-):
-    conversation_id = conversation_store.relationship_id(conversation.get("_id"))
-    enquiry_id = conversation_store.relationship_id(conversation.get("Enquiry"))
-    latest = _latest_outbound_for_conversation(conversation_id, bubble_env)
-    outbound_text = " ".join(str(
-        (latest or {}).get("messageContent") or ""
-    ).casefold().split())
-    created_at = _bubble_created_at(
-        (latest or {}).get("Created Date") or (latest or {}).get("created_date")
-        or conversation.get("Last Outbound At")
-    )
-    current = now or datetime.datetime.now(datetime.timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=datetime.timezone.utc)
-    age_seconds = max(0, int((current.astimezone(datetime.timezone.utc) - created_at).total_seconds())) \
-        if created_at else None
-    enquiry = {}
-    if enquiry_id:
-        try:
-            enquiry = bubble(
-                f"{get_bubble_base_url(bubble_env)}/obj/enquiry/{enquiry_id}"
-            )
-        except Exception:
-            enquiry = {}
-    intent = _routing_intent(incoming_text)
-    subject = " ".join(str(conversation.get("Subject") or "").casefold().split())
-    incoming = " ".join(str(incoming_text or "").casefold().split())
-    subject_match = bool(subject and len(subject) >= 4 and subject in incoming)
-    outbound_profile = any(token in outbound_text for token in (
-        "tenant profile", "consider this", "profile?", "profile ok",
-    ))
-    outbound_viewing = any(token in outbound_text for token in (
-        "viewing", "view the", "view?", "slot", "what time",
-    ))
-    outbound_availability = any(token in outbound_text for token in (
-        "still available", "unit available", "property available",
-    ))
-    owner_status = str(enquiry.get("OwnerCheckStatus") or "").strip()
-    score = 100 if subject_match else 0
-    semantic_match = False
-    if intent == "profile_response":
-        if outbound_profile:
-            score += 45
-            semantic_match = True
-        if owner_status == "Sent":
-            score += 35
-            semantic_match = True
-    elif intent == "availability_response":
-        if outbound_availability or outbound_profile:
-            score += 45
-            semantic_match = True
-        if owner_status == "Sent":
-            score += 25
-            semantic_match = True
-    elif intent == "viewing_response" and outbound_viewing:
-        score += 55
-        semantic_match = True
-    if semantic_match and age_seconds is not None:
-        score += 12 if age_seconds <= 600 else 8 if age_seconds <= 7200 else 4 if age_seconds <= 86400 else 0
-    if (
-        subject_match and age_seconds is not None
-        and re.search(r"\bjust\b.*\b(?:replied|replying|sent|about)\b", incoming)
-    ):
-        score += 30 if age_seconds <= 600 else 5
-    return {
-        "conversation": conversation, "conversation_id": conversation_id,
-        "enquiry_id": enquiry_id, "intent": intent,
-        "recent_outbound_age_seconds": age_seconds,
-        "owner_check_status": owner_status, "subject_match": subject_match,
-        "semantic_response_match": semantic_match, "score": score,
-    }
-
-
-def rank_conversation_candidates(candidates, incoming_text, bubble_env="live", now=None):
-    contexts = [
-        build_candidate_routing_context(item, incoming_text, bubble_env, now)
-        for item in candidates
-    ]
-    contexts.sort(key=lambda item: item["score"], reverse=True)
-    for context in contexts:
-        print(
-            "[CONVERSATION ROUTING] candidate "
-            f"conversation_id={context['conversation_id']} "
-            f"enquiry_id={context['enquiry_id'] or 'none'} "
-            f"recent_outbound_age={context['recent_outbound_age_seconds']} "
-            f"owner_check_status={context['owner_check_status'] or 'none'} "
-            f"score={context['score']}", flush=True,
-        )
-    if not contexts:
-        return None, contexts
-    top = contexts[0]
-    second_score = contexts[1]["score"] if len(contexts) > 1 else -1
-    explicit = top["subject_match"] and top["score"] > second_score
-    dominant = top["score"] >= 45 and top["score"] - second_score >= 20
-    return (top["conversation"] if explicit or dominant else None), contexts
-
-
-def _conversation_clarification_label(conversation, bubble_env="live"):
-    subject = " ".join(str((conversation or {}).get("Subject") or "").split())
-    if subject:
-        return subject
-    listing_id = conversation_store.relationship_id(
-        (conversation or {}).get("Listing")
-    )
-    if listing_id:
-        try:
-            listing = bubble(
-                f"{get_bubble_base_url(bubble_env)}/obj/listing/{listing_id}"
-            )
-            label = " ".join(str(
-                listing.get("name") or listing.get("title") or ""
-            ).split())
-            if label:
-                return label
-        except Exception:
-            pass
-    return "one enquiry"
-
-
-def _routing_recency_label(age_seconds):
-    if age_seconds is None:
-        return "earlier"
-    if age_seconds <= 600:
-        return "I sent just now"
-    if age_seconds <= 86400:
-        return "from earlier today"
-    if age_seconds <= 172800:
-        return "from yesterday"
-    return "from earlier"
-
-
-def build_conversation_clarification(
-    candidates, bubble_env="live", routing_contexts=None,
-):
-    labels = [
-        _conversation_clarification_label(item, bubble_env)
-        for item in candidates
-    ]
-    if len(set(label.casefold() for label in labels)) < len(labels):
-        ages = {
-            item["conversation_id"]: item.get("recent_outbound_age_seconds")
-            for item in routing_contexts or []
-        }
-        labels = [
-            f"{label} enquiry {_routing_recency_label(ages.get(conversation_store.relationship_id(conversation.get('_id'))))}"
-            for conversation, label in zip(candidates, labels)
-        ]
-    principals = {
-        conversation_store.relationship_id(item.get("Principal"))
-        for item in candidates
-        if conversation_store.relationship_id(item.get("Principal"))
-    }
-    if len(principals) > 1:
-        rendered = []
-        for conversation, label in zip(candidates, labels):
-            principal_id = conversation_store.relationship_id(
-                conversation.get("Principal")
-            )
-            principal_name = None
-            if principal_id:
-                try:
-                    principal = bubble(
-                        f"{get_bubble_base_url(bubble_env)}/obj/user/{principal_id}"
-                    )
-                    principal_name = " ".join(str(
-                        principal.get("name") or principal.get("Name") or ""
-                    ).split())
-                except Exception:
-                    pass
-            rendered.append(
-                f"{label} for {principal_name}" if principal_name else label
-            )
-        labels = rendered
-    if len(labels) == 2:
-        options = f"{labels[0]} or {labels[1]}"
-    else:
-        options = ", ".join(labels[:-1]) + f", or {labels[-1]}"
-    return f"Do you mean the {options}?"
 
 
 def find_general_conversation(
@@ -4123,7 +3901,6 @@ def _process_whatsapp_message(message):
             inbound_message_id = None
             routed_conversation = None
             routed_conversation_id = None
-            ambiguous_candidates = []
             try:
                 routed_conversation = find_reply_to_conversation(message, "live")
                 routed_conversation_id = conversation_store.relationship_id(
@@ -4151,21 +3928,37 @@ def _process_whatsapp_message(message):
                 )
             if not routed_conversation_id:
                 try:
-                    (
-                        routed_conversation, resolution, candidate_count,
-                        ambiguous_candidates,
-                    ) = find_active_conversation_by_phone(
-                        phone, text, "live", include_candidates=True
+                    routed_conversation, resolution, candidate_count = (
+                        find_active_conversation_by_phone(phone, text, "live")
                     )
+                    if candidate_count:
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"candidate_count={candidate_count}", flush=True,
+                        )
                     routed_conversation_id = conversation_store.relationship_id(
                         (routed_conversation or {}).get("_id")
                     )
                     if routed_conversation_id:
-                        print(
-                            "[CONVERSATION ROUTING] direction=inbound "
-                            f"resolution={resolution} "
-                            f"conversation_id={routed_conversation_id}", flush=True,
+                        enquiry_id = conversation_store.relationship_id(
+                            routed_conversation.get("Enquiry")
                         )
+                        if resolution == "latest_enquiry":
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                "resolution=latest_enquiry "
+                                f"conversation_id={routed_conversation_id} "
+                                f"enquiry_id={enquiry_id} "
+                                "enquiry_created_at="
+                                f"{routed_conversation.get('_routing_enquiry_created_at') or 'unknown'}",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                f"resolution={resolution} "
+                                f"conversation_id={routed_conversation_id}", flush=True,
+                            )
                         inbound_message_id, _inbound_created = (
                             persist_inbound_whatsapp_message(
                                 phone, message_id, text,
@@ -4176,107 +3969,12 @@ def _process_whatsapp_message(message):
                                 bubble_env="live",
                             )
                         )
-                    elif resolution == "ambiguous":
-                        print(
-                            "[CONVERSATION ROUTING] direction=inbound "
-                            f"resolution=ambiguous candidate_count={candidate_count}",
-                            flush=True,
-                        )
                 except Exception as error:
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
-            if ambiguous_candidates and not routed_conversation_id:
-                ranked_conversation, routing_contexts = rank_conversation_candidates(
-                    ambiguous_candidates, text, "live"
-                )
-                if ranked_conversation:
-                    routed_conversation = ranked_conversation
-                    routed_conversation_id = conversation_store.relationship_id(
-                        routed_conversation.get("_id")
-                    )
-                    inbound_message_id, _created = persist_inbound_whatsapp_message(
-                        phone, message_id, text,
-                        lead_id=conversation_store.relationship_id(
-                            routed_conversation.get("Lead")
-                        ),
-                        conversation_id=routed_conversation_id,
-                        bubble_env="live",
-                    )
-                    print(
-                        "[CONVERSATION ROUTING] direction=inbound "
-                        "resolution=context_ranked "
-                        f"conversation_id={routed_conversation_id} confidence=high",
-                        flush=True,
-                    )
-                    ambiguous_candidates = []
-            if ambiguous_candidates and not routed_conversation_id:
-                principal_ids = {
-                    conversation_store.relationship_id(item.get("Principal"))
-                    for item in ambiguous_candidates
-                    if conversation_store.relationship_id(item.get("Principal"))
-                }
-                clarification = build_conversation_clarification(
-                    ambiguous_candidates, "live", routing_contexts
-                )
-                if len(principal_ids) == 1:
-                    principal_id = next(iter(principal_ids))
-                    lead_ids = {
-                        conversation_store.relationship_id(item.get("Lead"))
-                        for item in ambiguous_candidates
-                        if conversation_store.relationship_id(item.get("Lead"))
-                    }
-                    general = find_general_conversation(
-                        principal_id, phone,
-                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
-                        counterparty_role="Counterparty",
-                        rentee_role="Enquiry Coordinator", bubble_env="live",
-                    )
-                    general_id = conversation_store.relationship_id(
-                        (general or {}).get("_id")
-                    )
-                    if not general_id:
-                        raise RuntimeError(
-                            "Could not resolve general clarification Conversation"
-                        )
-                    inbound_message_id, _created = persist_inbound_whatsapp_message(
-                        phone, message_id, text,
-                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
-                        conversation_id=general_id, bubble_env="live",
-                    )
-                    print(
-                        "[CONVERSATION ROUTING] direction=inbound "
-                        "resolution=general_for_clarification "
-                        f"conversation_id={general_id}", flush=True,
-                    )
-                    sent_ids = send_whatsapp_text(phone, clarification)
-                    persist_sent_whatsapp_text(
-                        phone, clarification, sent_ids, general_id,
-                        lead_id=(next(iter(lead_ids)) if len(lead_ids) == 1 else None),
-                        bubble_env="live",
-                    )
-                    print(
-                        "[CONVERSATION ROUTING] direction=outbound "
-                        "action=clarification "
-                        f"candidate_count={len(ambiguous_candidates)}", flush=True,
-                    )
-                    reply_sent = True
-                    return
-                print(
-                    "[CONVERSATION ROUTING] direction=inbound "
-                    "action=unresolved reason=multiple_principals "
-                    f"candidate_count={len(ambiguous_candidates)}", flush=True,
-                )
-                send_whatsapp_text(phone, clarification)
-                print(
-                    "[CONVERSATION ROUTING] direction=outbound "
-                    "action=clarification "
-                    f"candidate_count={len(ambiguous_candidates)}", flush=True,
-                )
-                reply_sent = True
-                return
             internal_user = find_internal_user(
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )
