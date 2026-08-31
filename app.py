@@ -574,6 +574,92 @@ def normalize_phone(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+class WhatsAppIdentityCollision(RuntimeError):
+    """Raised when one canonical WhatsApp number belongs to multiple Users."""
+
+
+def find_bubble_users_by_phone(phone, bubble_env="live"):
+    """Return every Bubble User with this exact canonical WhatsApp identity."""
+    canonical_phone = normalize_phone(phone)
+    if not canonical_phone:
+        raise ValueError("WhatsApp sender phone is missing.")
+    constraints = [{
+        "key": "phone", "constraint_type": "equals",
+        "value": canonical_phone,
+    }]
+    return [
+        user for user in _bubble_records(
+            get_bubble_base_url(bubble_env), "user", constraints
+        )
+        if user.get("_id")
+    ]
+
+
+def create_whatsapp_bubble_user(phone, profile_name=None, bubble_env="live"):
+    """Create the deterministic Bubble identity for a WhatsApp-only user."""
+    canonical_phone = normalize_phone(phone)
+    if not canonical_phone:
+        raise ValueError("WhatsApp sender phone is missing.")
+    payload = {
+        "phone": canonical_phone,
+        "email": f"whatsapp-{canonical_phone}@users.rentee.internal",
+    }
+    name = str(profile_name or "").strip()
+    if name:
+        payload["name"] = name
+    user_id = _bubble_create(get_bubble_base_url(bubble_env), "user", payload)
+    return {"_id": user_id, **payload}
+
+
+def resolve_whatsapp_user(phone, profile_name=None, bubble_env="live"):
+    """Resolve/create one Bubble User using canonical WhatsApp phone identity."""
+    canonical_phone = normalize_phone(phone)
+    if not canonical_phone:
+        raise ValueError("WhatsApp sender phone is missing.")
+
+    def resolve_matches(matches):
+        if len(matches) == 1:
+            user = matches[0]
+            print(
+                f"[WHATSAPP USER] phone={canonical_phone} action=existing "
+                f"user_id={user['_id']}", flush=True,
+            )
+            return user
+        if len(matches) > 1:
+            user_ids = sorted(str(user["_id"]) for user in matches)
+            print(
+                f"[WHATSAPP IDENTITY COLLISION] phone={canonical_phone} "
+                f"matches={len(matches)} user_ids={user_ids}", flush=True,
+            )
+            raise WhatsAppIdentityCollision(
+                f"Multiple Bubble Users match WhatsApp phone {canonical_phone}."
+            )
+        return None
+
+    existing = resolve_matches(
+        find_bubble_users_by_phone(canonical_phone, bubble_env)
+    )
+    if existing:
+        return existing
+    try:
+        created = create_whatsapp_bubble_user(
+            canonical_phone, profile_name, bubble_env
+        )
+    except Exception as create_error:
+        # A concurrent webhook may have created the same deterministic identity.
+        raced = resolve_matches(
+            find_bubble_users_by_phone(canonical_phone, bubble_env)
+        )
+        if raced:
+            return raced
+        raise create_error
+    print(
+        f"[WHATSAPP USER] phone={canonical_phone} action=created "
+        f"user_id={created['_id']}", flush=True,
+    )
+    return created
+
+
 def _bubble_headers():
     return {
         "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
