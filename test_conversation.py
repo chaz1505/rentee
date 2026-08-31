@@ -3,6 +3,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import requests
+
 os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 
 import conversation
@@ -19,31 +21,37 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(result["_id"], "conversation-1")
         self.assertEqual(create.call_args.args[2], {
             "Principal": "user-1",
-            "Counterparty Phone": "60115551234",
+            "CounterParty Phone": "60115551234",
             "Status": "Active",
             "Enquiry": "enquiry-1",
-            "Counterparty Role": "Owner Representative",
+            "CounterParty Role": "Owner Representative",
             "Rentee Role": "Tenant Introducing Agent",
         })
 
     def test_reuses_same_active_conversation(self):
         existing = {
             "_id": "conversation-1", "Principal": "user-1",
-            "Counterparty Phone": "60115551234", "Enquiry": "enquiry-1",
+            "CounterParty Phone": "60115551234", "Enquiry": "enquiry-1",
             "Status": "Active",
         }
-        with patch("conversation._records", return_value=iter([existing])), \
+        with patch("conversation._records", return_value=iter([existing])) as records, \
              patch("conversation.create_conversation") as create:
             result, created = conversation.find_or_create_conversation(
                 "user-1", "+60 11-555 1234", "enquiry-1"
             )
         self.assertEqual((result, created), (existing, False))
         create.assert_not_called()
+        constraints = records.call_args.args[2]
+        self.assertIn({
+            "key": "CounterParty Phone", "constraint_type": "equals",
+            "value": "60115551234",
+        }, constraints)
+        self.assertNotIn("Counterparty Phone", [item["key"] for item in constraints])
 
     def test_same_phone_different_enquiry_creates_different_conversation(self):
         wrong = {
             "_id": "conversation-old", "Principal": "user-1",
-            "Counterparty Phone": "60115551234", "Enquiry": "enquiry-old",
+            "CounterParty Phone": "60115551234", "Enquiry": "enquiry-old",
             "Status": "Active",
         }
         with patch("conversation._records", return_value=iter([wrong])), \
@@ -59,7 +67,7 @@ class ConversationTests(unittest.TestCase):
     def test_same_phone_different_principal_does_not_match(self):
         wrong = {
             "_id": "conversation-other", "Principal": "user-other",
-            "Counterparty Phone": "60115551234", "Enquiry": "enquiry-1",
+            "CounterParty Phone": "60115551234", "Enquiry": "enquiry-1",
             "Status": "Active",
         }
         with patch("conversation._records", return_value=iter([wrong])):
@@ -70,7 +78,7 @@ class ConversationTests(unittest.TestCase):
     def test_general_conversation_does_not_match_enquiry_specific(self):
         general = {
             "_id": "general", "Principal": "user-1",
-            "Counterparty Phone": "60115551234", "Status": "Active",
+            "CounterParty Phone": "60115551234", "Status": "Active",
         }
         with patch("conversation._records", return_value=iter([general])):
             self.assertIsNone(conversation.find_active_conversation(
@@ -80,7 +88,7 @@ class ConversationTests(unittest.TestCase):
     def test_enquiry_specific_does_not_match_general(self):
         specific = {
             "_id": "specific", "Principal": "user-1",
-            "Counterparty Phone": "60115551234", "Enquiry": "enquiry-1",
+            "CounterParty Phone": "60115551234", "Enquiry": "enquiry-1",
             "Status": "Active",
         }
         with patch("conversation._records", return_value=iter([specific])):
@@ -108,6 +116,25 @@ class ConversationTests(unittest.TestCase):
             "response-1",
         )
         self.assertEqual(update.call_count, 3)
+
+    def test_conversation_http_error_log_is_safe_and_actionable(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'Invalid field for phone 60115551234'
+        error = requests.HTTPError("400 Client Error", response=response)
+        with patch("conversation.requests.post", side_effect=error), \
+             patch("builtins.print") as logged, \
+             self.assertRaises(requests.HTTPError):
+            conversation.create_conversation(
+                "user-1", "60115551234", "enquiry-1"
+            )
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("action=create_started", logs)
+        self.assertIn("action=failed operation=create", logs)
+        self.assertIn("method=POST object_type=conversation status=400", logs)
+        self.assertIn("Invalid field", logs)
+        self.assertNotIn("60115551234", logs)
+        self.assertNotIn("test-token", logs)
 
 
 if __name__ == "__main__":

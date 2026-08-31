@@ -1,0 +1,131 @@
+# Bubble Schema
+
+IMPORTANT:
+Bubble field names recorded here should be treated as case-sensitive by Python.
+
+When a Bubble field name has been confirmed, Python should use exactly the spelling/capitalization recorded here.
+
+Do not silently normalize or invent Bubble field keys.
+
+When future Bubble schema changes are confirmed, update this file in the same code change where practical.
+
+## Conversation
+
+Purpose:
+A logical Rentee communication thread between a Principal and Counterparty, optionally concerning one Enquiry.
+
+Fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| CounterParty Phone | text | Exact Bubble field name. Normalized WhatsApp counterparty phone |
+| CounterParty Role | text | Exact Bubble field name |
+| Counterparty User | User | Optional relationship to User |
+| Enquiry | Enquiry | Optional enquiry-specific conversation |
+| Last Inbound At | date | Latest inbound activity |
+| Last Outbound At | date | Latest outbound activity |
+| Lead | Lead | Present in Bubble; do not rely on unless needed |
+| Listing | Listing | Present in Bubble; do not rely on unless needed |
+| Previous Response ID | text | OpenAI response continuity for this logical Conversation |
+| Principal | User | Who Rentee is acting for |
+| Rentee Role | text | Role/skills Rentee performs in this Conversation |
+| Status | text | Current expected values: Active / Closed |
+| Subject | text | Optional human-readable label |
+
+Conversation semantics:
+- logical identity is approximately Principal + CounterParty Phone + Enquiry
+- Enquiry is optional
+- an enquiry-specific Conversation remains tied to that Enquiry
+- do not switch an existing enquiry-specific Conversation to another Enquiry
+- create/find another Conversation instead
+- one physical WhatsApp chat can therefore contain multiple logical Rentee Conversations
+- a general Conversation may exist with Enquiry empty
+
+## Enquiry
+
+Purpose:
+Shared transaction state. Multiple Conversations can coordinate through the same Enquiry.
+
+Known fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| Principal | User | Who Rentee is acting for in this transaction |
+| Agent | User | Existing |
+| Agent? | text | Expected values Yes / No |
+| Enquirer Phone | text | Existing |
+| Handoff Code | text | Existing |
+| Lead | Lead | Relationship |
+| Listing | Listing | Relationship |
+| Original Enquiry | text | Existing |
+| TransactionType | list of text | Known values Rent/Let and Buy/Sell |
+| OwnerCheckStatus | text | Known values Pending / Sent / Replied |
+| OwnerCheckPhone | text | Existing |
+| OwnerCheckSentAt | date | Existing |
+| OwnerCheckResponse | text | Existing |
+
+## Message
+
+Purpose:
+One persisted communication event.
+
+Known fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| Conversation | Conversation | Logical Conversation containing this Message |
+| phone | text | Existing exact field name |
+| direction | text | Exact values Inbound / Outbound |
+| whatsappMessageId | text | Meta WhatsApp message ID |
+| lead | Lead | Existing relationship |
+| messageContent | text | Message content |
+| response_ID | text | Existing OpenAI response ID |
+| own_Sent? | text | Human vs AI authorship |
+
+Message semantics:
+- direction describes transport direction relative to Rentee
+- own_Sent? describes human vs AI authorship
+- normal inbound human = Inbound + Yes
+- AI outbound = Outbound + No
+
+## Listing
+
+| Field | Notes |
+|---|---|
+| condo | Existing |
+| beds | Existing |
+| priceRent | Existing |
+| sourceURL | Existing |
+| owner | User |
+| ownerContact | Exact known Bubble API field key; lowercase o |
+| availability | Existing |
+| availability_date | Existing |
+
+Important:
+ownerContact is currently the authoritative property-side destination used by the owner-check workflow.
+
+## Lead
+
+Agent?
+owner
+TransactionType
+ActiveForwardedEnquiry
+bedroomsMin
+budgetRent
+budgetBuy
+nationality
+adults
+children
+helpers
+furnishingPreference
+occupation
+pets
+startDate
+viewingPreference
+
+## Folio
+
+Known fields:
+
+lead
+folioItems
