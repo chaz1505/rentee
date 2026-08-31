@@ -931,6 +931,25 @@ class WhatsAppTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual((resolution, count), ("ambiguous", 2))
 
+    def test_general_conversation_is_excluded_from_enquiry_candidate_count(self):
+        self.active_phone_conversation_patcher.stop()
+        candidates = [
+            {"_id": "conversation-general", "Principal": "principal-1",
+             "CounterParty Phone": "60123456789", "Status": "Active"},
+            {"_id": "conversation-1", "Principal": "principal-1",
+             "CounterParty Phone": "60123456789", "Status": "Active",
+             "Enquiry": "enquiry-1"},
+            {"_id": "conversation-2", "Principal": "principal-1",
+             "CounterParty Phone": "60123456789", "Status": "Active",
+             "Enquiry": "enquiry-2"},
+        ]
+        with patch("app._bubble_records", return_value=iter(candidates)):
+            result, resolution, count = app_module.find_active_conversation_by_phone(
+                "60123456789", "okay"
+            )
+        self.assertIsNone(result)
+        self.assertEqual((resolution, count), ("ambiguous", 2))
+
     def test_multiple_active_conversations_can_use_explicit_property_reference(self):
         self.active_phone_conversation_patcher.stop()
         candidates = [
@@ -952,10 +971,11 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.send_whatsapp_text", return_value=["wamid.clarification"])
     @patch("app.find_general_conversation",
            return_value={"_id": "conversation-general"})
+    @patch("app.rank_conversation_candidates")
     @patch("app.find_active_conversation_by_phone")
     @patch("app.send_whatsapp_typing_indicator")
     def test_ambiguous_same_principal_uses_general_and_stops_before_lead_routing(
-        self, _typing, active, general, send, persist_outbound,
+        self, _typing, active, rank, general, send, persist_outbound,
     ):
         candidates = [
             {"_id": "conversation-1", "Principal": "principal-1",
@@ -968,6 +988,12 @@ class WhatsAppTests(unittest.TestCase):
              "Subject": "The Loft"},
         ]
         active.return_value = (None, "ambiguous", 2, candidates)
+        rank.return_value = (None, [
+            {"conversation_id": "conversation-1",
+             "recent_outbound_age_seconds": 120},
+            {"conversation_id": "conversation-2",
+             "recent_outbound_age_seconds": 90000},
+        ])
         item = webhook_payload(
             message_id="wamid.ambiguous", text="Yes, it is available"
         )["entry"][0]["changes"][0]["value"]["messages"][0]
@@ -1015,6 +1041,162 @@ class WhatsAppTests(unittest.TestCase):
             clarification,
             "Do you mean the One Menerung for Gwen or The Loft for James?",
         )
+
+    def test_profile_response_prefers_recent_sent_owner_check(self):
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        candidates = [
+            {"_id": "conversation-profile", "Enquiry": "enquiry-profile",
+             "Subject": "One Menerung"},
+            {"_id": "conversation-viewing", "Enquiry": "enquiry-viewing",
+             "Subject": "One Menerung"},
+        ]
+        messages = {
+            "conversation-profile": {
+                "Created Date": "2026-08-31T11:58:00Z",
+                "messageContent": "Is it available and would the owner consider this tenant profile?",
+            },
+            "conversation-viewing": {
+                "Created Date": "2026-08-28T12:00:00Z",
+                "messageContent": "Can they view Tuesday at 4pm?",
+            },
+        }
+        with patch(
+            "app._latest_outbound_for_conversation",
+            side_effect=lambda conversation_id, _env: messages[conversation_id],
+        ), patch("app.bubble", side_effect=lambda url: {
+            "OwnerCheckStatus": "Sent" if url.endswith("enquiry-profile") else "Replied"
+        }):
+            selected, contexts = app_module.rank_conversation_candidates(
+                candidates, "profile ok", now=now
+            )
+        self.assertEqual(selected["_id"], "conversation-profile")
+        profile = next(item for item in contexts
+                       if item["conversation_id"] == "conversation-profile")
+        viewing = next(item for item in contexts
+                       if item["conversation_id"] == "conversation-viewing")
+        self.assertEqual(profile["owner_check_status"], "Sent")
+        self.assertGreater(profile["score"], viewing["score"])
+
+    def test_owner_check_sent_adds_routing_confidence(self):
+        conversation = {"_id": "conversation-1", "Enquiry": "enquiry-1"}
+        outbound = {
+            "Created Date": "2026-08-31T11:58:00Z",
+            "messageContent": "Would the owner consider this tenant profile?",
+        }
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        with patch("app._latest_outbound_for_conversation", return_value=outbound), \
+             patch("app.bubble", return_value={"OwnerCheckStatus": "Sent"}):
+            sent = app_module.build_candidate_routing_context(
+                conversation, "profile ok", now=now
+            )
+        with patch("app._latest_outbound_for_conversation", return_value=outbound), \
+             patch("app.bubble", return_value={}):
+            blank = app_module.build_candidate_routing_context(
+                conversation, "profile ok", now=now
+            )
+        self.assertEqual(sent["score"] - blank["score"], 35)
+
+    def test_viewing_response_prefers_viewing_outbound(self):
+        candidates = [
+            {"_id": "profile", "Enquiry": "enquiry-1"},
+            {"_id": "viewing", "Enquiry": "enquiry-2"},
+        ]
+        messages = {
+            "profile": {"Created Date": "2026-08-31T11:58:00Z",
+                        "messageContent": "Would the owner accept the profile?"},
+            "viewing": {"Created Date": "2026-08-31T11:50:00Z",
+                        "messageContent": "What viewing slot works?"},
+        }
+        with patch("app._latest_outbound_for_conversation",
+                   side_effect=lambda cid, _env: messages[cid]), \
+             patch("app.bubble", return_value={}):
+            selected, _contexts = app_module.rank_conversation_candidates(
+                candidates, "Tuesday at 4pm",
+                now=datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual(selected["_id"], "viewing")
+
+    def test_explicit_property_reference_beats_conflicting_recent_semantics(self):
+        candidates = [
+            {"_id": "profile", "Enquiry": "enquiry-1",
+             "Subject": "One Menerung"},
+            {"_id": "loft", "Enquiry": "enquiry-2", "Subject": "The Loft"},
+        ]
+        messages = {
+            "profile": {"Created Date": "2026-08-31T11:59:00Z",
+                        "messageContent": "Would the owner accept the tenant profile?"},
+            "loft": {"Created Date": "2026-08-28T12:00:00Z",
+                     "messageContent": "Can they view Tuesday?"},
+        }
+        with patch("app._latest_outbound_for_conversation",
+                   side_effect=lambda cid, _env: messages[cid]), \
+             patch("app.bubble", side_effect=lambda url: {
+                 "OwnerCheckStatus": "Sent" if url.endswith("enquiry-1") else ""
+             }):
+            selected, _contexts = app_module.rank_conversation_candidates(
+                candidates, "The Loft profile is ok",
+                now=datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual(selected["_id"], "loft")
+
+    def test_recency_alone_does_not_select_a_candidate(self):
+        candidates = [
+            {"_id": "recent", "Enquiry": "enquiry-1"},
+            {"_id": "old", "Enquiry": "enquiry-2"},
+        ]
+        messages = {
+            "recent": {"Created Date": "2026-08-31T11:59:00Z",
+                       "messageContent": "Thanks"},
+            "old": {"Created Date": "2026-08-20T12:00:00Z",
+                    "messageContent": "Hello"},
+        }
+        with patch("app._latest_outbound_for_conversation",
+                   side_effect=lambda cid, _env: messages[cid]), \
+             patch("app.bubble", return_value={}):
+            selected, _contexts = app_module.rank_conversation_candidates(
+                candidates, "okay",
+                now=datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+            )
+        self.assertIsNone(selected)
+
+    def test_duplicate_subject_clarification_uses_recency_context(self):
+        candidates = [
+            {"_id": "recent", "Principal": "principal-1",
+             "Subject": "One Menerung"},
+            {"_id": "old", "Principal": "principal-1",
+             "Subject": "One Menerung"},
+        ]
+        contexts = [
+            {"conversation_id": "recent", "recent_outbound_age_seconds": 120},
+            {"conversation_id": "old", "recent_outbound_age_seconds": 90000},
+        ]
+        clarification = app_module.build_conversation_clarification(
+            candidates, routing_contexts=contexts
+        )
+        self.assertIn("One Menerung enquiry I sent just now", clarification)
+        self.assertIn("One Menerung enquiry from yesterday", clarification)
+
+    def test_just_replied_reference_resolves_recent_duplicate_subject(self):
+        candidates = [
+            {"_id": "recent", "Enquiry": "enquiry-1",
+             "Subject": "One Menerung"},
+            {"_id": "old", "Enquiry": "enquiry-2",
+             "Subject": "One Menerung"},
+        ]
+        messages = {
+            "recent": {"Created Date": "2026-08-31T11:58:00Z",
+                       "messageContent": "Checking this enquiry"},
+            "old": {"Created Date": "2026-08-20T12:00:00Z",
+                    "messageContent": "Checking this enquiry"},
+        }
+        with patch("app._latest_outbound_for_conversation",
+                   side_effect=lambda cid, _env: messages[cid]), \
+             patch("app.bubble", return_value={}):
+            selected, _contexts = app_module.rank_conversation_candidates(
+                candidates, "the One Menerung enquiry I just replied about",
+                now=datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual(selected["_id"], "recent")
 
     def test_new_message_creation_rejects_missing_conversation(self):
         with patch("app._bubble_records", return_value=iter([])), \
