@@ -630,6 +630,34 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertIn("action=message_persistence_failed", logs)
         self.assertIn("preserving_sent_state=true", logs)
 
+    def test_owner_check_uses_enquiry_principal_conversation(self):
+        enquiry = self.enquiry(
+            Principal="principal-1", OwnerCheckStatus="Pending",
+            OwnerCheckPhone="60115551234",
+        )
+        conversation_record = {"_id": "conversation-1"}
+        with patch("app.bubble", return_value={"name": "One Menerung"}), \
+             patch("app.conversation_store.find_or_create_conversation",
+                   return_value=(conversation_record, True)) as find_conversation, \
+             patch("app.owner_check_whatsapp_window", return_value="open"), \
+             patch("app.send_whatsapp_text", return_value=["wamid.owner"]), \
+             patch("app._bubble_create", return_value="message-owner") as create, \
+             patch("app.conversation_store.update_conversation_last_outbound_at") as activity, \
+             patch("app._bubble_patch"):
+            result = app_module.send_pending_owner_check(
+                {"_id": "lead-1"}, enquiry
+            )
+        self.assertTrue(result)
+        find_conversation.assert_called_once_with(
+            "principal-1", "60115551234", enquiry_id="enquiry-1",
+            counterparty_role="Owner Representative",
+            rentee_role="Tenant Introducing Agent", subject="One Menerung",
+            bubble_env="live",
+        )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["Conversation"], "conversation-1")
+        activity.assert_called_once_with("conversation-1", "live")
+
     @patch("app.requests.post")
     def test_owner_template_uses_meta_template_payload(self, post):
         post.return_value.status_code = 200
@@ -719,6 +747,7 @@ class WhatsAppTests(unittest.TestCase):
         direct_persistence_tests = {
             "test_inbound_message_persists_whatsapp_fields_once",
             "test_duplicate_inbound_meta_id_reuses_existing_message",
+            "test_inbound_message_stores_conversation_and_updates_activity",
         }
         if self._testMethodName not in direct_persistence_tests:
             self.inbound_patcher = patch(
@@ -1652,6 +1681,31 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.assertEqual(result, ("inbound-existing", False))
         mocked_create.assert_not_called()
+
+    @patch("app.conversation_store.update_conversation_last_inbound_at")
+    @patch("app._bubble_create", return_value="inbound-current")
+    @patch("app._bubble_records", return_value=iter([]))
+    def test_inbound_message_stores_conversation_and_updates_activity(
+        self, _records, create, activity
+    ):
+        result = app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.inbound", "Hello", "lead-a",
+            "conversation-1", "live",
+        )
+        self.assertEqual(result, ("inbound-current", True))
+        self.assertEqual(
+            create.call_args.args[2]["Conversation"], "conversation-1"
+        )
+        activity.assert_called_once_with("conversation-1", "live")
+
+    @patch("app._bubble_create", return_value="message-current")
+    def test_ai_outbound_message_optionally_stores_conversation(self, create):
+        app_module.create_whatsapp_ai_message(
+            "lead-a", "60123456789", "live", "conversation-1"
+        )
+        self.assertEqual(
+            create.call_args.args[2]["Conversation"], "conversation-1"
+        )
 
     @patch("app._bubble_patch")
     def test_outbound_meta_message_id_is_saved(self, mocked_patch):

@@ -15,6 +15,8 @@ from collections import deque
 from types import SimpleNamespace
 from pathlib import Path
 
+import conversation as conversation_store
+
 from enquiry_workflow import (
     BUY_TRANSACTION,
     RENT_TRANSACTION,
@@ -1159,7 +1161,8 @@ def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
 
 
 def persist_owner_check_whatsapp_message(
-    phone, message_content, whatsapp_message_id, lead_id=None, bubble_env="live",
+    phone, message_content, whatsapp_message_id, lead_id=None,
+    conversation_id=None, bubble_env="live",
 ):
     payload = {
         "phone": normalize_phone(phone),
@@ -1170,7 +1173,14 @@ def persist_owner_check_whatsapp_message(
     }
     if lead_id:
         payload["lead"] = lead_id
-    return _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
+    if conversation_id:
+        payload["Conversation"] = conversation_id
+    message_id = _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
+    if conversation_id:
+        conversation_store.update_conversation_last_outbound_at(
+            conversation_id, bubble_env
+        )
+    return message_id
 
 
 def _first_whatsapp_message_id(sent_ids):
@@ -1194,6 +1204,25 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
     try:
         listing = bubble(f"{base_url}/obj/listing/{listing_id}")
         message = build_owner_check_message(enquiry, lead, listing)
+        principal_id = conversation_store.relationship_id(
+            (enquiry or {}).get("Principal")
+        )
+        conversation = None
+        if principal_id:
+            conversation, _conversation_created = (
+                conversation_store.find_or_create_conversation(
+                    principal_id,
+                    phone,
+                    enquiry_id=enquiry_id,
+                    counterparty_role="Owner Representative",
+                    rentee_role="Tenant Introducing Agent",
+                    subject=str((listing or {}).get("name") or "").strip() or None,
+                    bubble_env=bubble_env,
+                )
+            )
+        conversation_id = conversation_store.relationship_id(
+            (conversation or {}).get("_id")
+        )
         current = now or datetime.datetime.now(datetime.timezone.utc)
         window = owner_check_whatsapp_window(phone, bubble_env, current)
         method = "freeform" if window == "open" else "template"
@@ -1233,6 +1262,7 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
                 persist_owner_check_whatsapp_message(
                     phone, message, meta_message_id,
                     lead_id=str((lead or {}).get("_id") or "").strip() or None,
+                    conversation_id=conversation_id,
                     bubble_env=bubble_env,
                 )
             except Exception as error:
@@ -1361,7 +1391,8 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
 
 
 def persist_inbound_whatsapp_message(
-    phone, whatsapp_message_id, message_content, lead_id=None, bubble_env="live",
+    phone, whatsapp_message_id, message_content, lead_id=None,
+    conversation_id=None, bubble_env="live",
 ):
     """Create one durable Bubble Message for an inbound Meta message."""
     base_url = get_bubble_base_url(bubble_env)
@@ -1372,9 +1403,20 @@ def persist_inbound_whatsapp_message(
     existing = next(iter(_bubble_records(base_url, "message", constraints)), None)
     if existing and existing.get("_id"):
         message_id = existing["_id"]
+        patch = {}
         if lead_id and str(existing.get("lead") or "") != str(lead_id):
+            patch["lead"] = lead_id
+        if conversation_id and str(existing.get("Conversation") or "") != str(
+            conversation_id
+        ):
+            patch["Conversation"] = conversation_id
+        if patch:
             _bubble_patch(
-                f"{base_url}/obj/message/{message_id}", {"lead": lead_id}
+                f"{base_url}/obj/message/{message_id}", patch
+            )
+        if conversation_id:
+            conversation_store.update_conversation_last_inbound_at(
+                conversation_id, bubble_env
             )
         return message_id, False
     payload = {
@@ -1386,7 +1428,14 @@ def persist_inbound_whatsapp_message(
     }
     if lead_id:
         payload["lead"] = lead_id
-    return _bubble_create(base_url, "message", payload), True
+    if conversation_id:
+        payload["Conversation"] = conversation_id
+    message_id = _bubble_create(base_url, "message", payload)
+    if conversation_id:
+        conversation_store.update_conversation_last_inbound_at(
+            conversation_id, bubble_env
+        )
+    return message_id, True
 
 
 def attach_whatsapp_message_lead(message_id, lead_id, bubble_env="live"):
@@ -1397,14 +1446,19 @@ def attach_whatsapp_message_lead(message_id, lead_id, bubble_env="live"):
         )
 
 
-def create_whatsapp_ai_message(lead_id, phone=None, bubble_env="live"):
-    return _bubble_create(get_bubble_base_url(bubble_env), "message", {
+def create_whatsapp_ai_message(
+    lead_id, phone=None, bubble_env="live", conversation_id=None,
+):
+    payload = {
         "lead": lead_id,
         "phone": normalize_phone(phone),
         "direction": "Outbound",
         "own_Sent?": "No",
         "messageContent": "",
-    })
+    }
+    if conversation_id:
+        payload["Conversation"] = conversation_id
+    return _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
 
 
 def save_whatsapp_ai_message(message_id, answer, response_id, bubble_env="live"):
@@ -1417,7 +1471,9 @@ def save_whatsapp_ai_message(message_id, answer, response_id, bubble_env="live")
     response.raise_for_status()
 
 
-def save_whatsapp_message_id(message_id, whatsapp_message_id, bubble_env="live"):
+def save_whatsapp_message_id(
+    message_id, whatsapp_message_id, bubble_env="live", conversation_id=None,
+):
     meta_id = str(whatsapp_message_id or "").strip()
     if not message_id or not meta_id:
         return
@@ -1425,6 +1481,10 @@ def save_whatsapp_message_id(message_id, whatsapp_message_id, bubble_env="live")
         f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}",
         {"whatsappMessageId": meta_id},
     )
+    if conversation_id:
+        conversation_store.update_conversation_last_outbound_at(
+            conversation_id, bubble_env
+        )
 
 
 def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):

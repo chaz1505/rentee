@@ -132,6 +132,7 @@ def build_enquiry_creation_payload(user_id, agent_value, message_text,
                                    transaction_type=None):
     payload = {
         "Agent": user_id,
+        "Principal": user_id,
         "Agent?": agent_value,
         "Original Enquiry": message_text,
     }

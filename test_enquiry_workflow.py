@@ -321,6 +321,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn("created the enquiry", result.response_text)
         self.create.assert_called_once_with("https://bubble.test", "enquiry", {
             "Agent": "user-1",
+            "Principal": "user-1",
             "Agent?": "Yes",
             "Original Enquiry": forwarded,
         })
@@ -1350,7 +1351,7 @@ class TransactionIntentTests(unittest.TestCase):
                 )
                 self.assertNotIn("TransactionType", payload)
                 self.assertEqual(set(payload), {
-                    "Agent", "Agent?", "Original Enquiry",
+                    "Agent", "Principal", "Agent?", "Original Enquiry",
                 })
 
     def test_enquiry_http_400_logs_safe_response_and_keeps_pending(self):
