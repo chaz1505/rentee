@@ -3,6 +3,7 @@ from flask_cors import CORS
 from openai import OpenAI
 import csv
 import datetime
+import difflib
 import io
 import os
 import requests
@@ -74,6 +75,9 @@ WHATSAPP_LEAD_PHONE_FIELD = "phone"
 WHATSAPP_LEAD_NAME_FIELD = "name"
 WHATSAPP_LEAD_OWNER_FIELD = "owner"
 MAX_WHATSAPP_RECOMMENDATION_IMAGES = 4
+GEO_NAME_CACHE_TTL_SECONDS = 300
+GEO_FUZZY_MATCH_THRESHOLD = 0.86
+GEO_SUGGESTION_THRESHOLD = 0.55
 WHATSAPP_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 WHATSAPP_AUDIO_ERROR_RESPONSE = (
     "Sorry, I couldn't understand that voice message. "
@@ -88,6 +92,8 @@ _whatsapp_processed_ids = set()
 _whatsapp_processed_order = deque(maxlen=1000)
 _whatsapp_processing_lock = threading.Lock()
 _whatsapp_phone_locks = {}
+_geo_name_cache = {}
+_geo_name_cache_lock = threading.Lock()
 
 CORE_PROMPT = """You are Rentee, an intelligent rental advisor helping people find a home.
 
@@ -402,7 +408,13 @@ def build_response_args(user_message, previous_response_id=None):
         },
         "transaction_type": {"type": "string", "enum": ["rent", "buy", "both"]},
         "bedrooms_min": {"type": "number"},
-        "geo_names": {"type": "array", "items": {"type": "string"}},
+        "geo_names": {
+            "type": "array", "items": {"type": "string"},
+            "description": (
+                "Candidate locations stated by the customer. The application "
+                "canonicalizes them and may ask for clarification."
+            ),
+        },
         "preferred_condo_names": {"type": "array", "items": {"type": "string"}},
         "area_update_mode": {
             "type": "string",
@@ -1425,6 +1437,52 @@ def find_reply_to_conversation(message, bubble_env="live"):
     )
     conversation.setdefault("_id", conversation_id)
     return conversation
+
+
+def find_active_conversation_by_phone(phone, message_text="", bubble_env="live"):
+    """Resolve an existing active phone Conversation without needing Principal."""
+    canonical_phone = normalize_phone(phone)
+    constraints = [
+        {"key": "CounterParty Phone", "constraint_type": "equals",
+         "value": canonical_phone},
+        {"key": "Status", "constraint_type": "equals", "value": "Active"},
+    ]
+    candidates = [
+        item for item in _bubble_records(
+            get_bubble_base_url(bubble_env), "conversation", constraints
+        )
+        if item.get("_id")
+        and normalize_phone(item.get("CounterParty Phone")) == canonical_phone
+        and str(item.get("Status") or "").strip() == "Active"
+    ]
+    if len(candidates) == 1:
+        return candidates[0], "single_active", 1
+    if not candidates:
+        return None, "none", 0
+
+    text = " ".join(str(message_text or "").casefold().split())
+    explicit = []
+    if text:
+        for conversation in candidates:
+            references = [
+                conversation_store.relationship_id(conversation.get("Enquiry")),
+                conversation_store.relationship_id(conversation.get("Listing")),
+            ]
+            subject = " ".join(str(conversation.get("Subject") or "").casefold().split())
+            if any(reference and reference.casefold() in text for reference in references):
+                explicit.append(conversation)
+            elif len(subject) >= 4 and subject in text:
+                explicit.append(conversation)
+    if len(explicit) == 1:
+        return explicit[0], "explicit_reference", len(candidates)
+
+    general = [
+        conversation for conversation in candidates
+        if not conversation_store.relationship_id(conversation.get("Enquiry"))
+    ]
+    if len(general) == 1:
+        return general[0], "general", len(candidates)
+    return None, "ambiguous", len(candidates)
 
 
 def find_general_conversation(
@@ -2780,6 +2838,112 @@ def get_named_object_ids(base_url, object_type, names):
     return matches
 
 
+def _normalized_geo_name(value):
+    """Normalize harmless Geo formatting without treating arbitrary names as valid."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def get_valid_geo_names(bubble_env="live", now=None):
+    """Return cached canonical names from Bubble's actual Geo objects."""
+    current = time.monotonic() if now is None else float(now)
+    with _geo_name_cache_lock:
+        cached = _geo_name_cache.get(bubble_env)
+        if cached and current - cached[0] < GEO_NAME_CACHE_TTL_SECONDS:
+            return list(cached[1])
+    base_url = get_bubble_base_url(bubble_env)
+    names = []
+    seen = set()
+    for record in _bubble_records(base_url, "geo"):
+        name = " ".join(str(
+            record.get("name") or record.get("Name") or ""
+        ).split())
+        key = _normalized_geo_name(name)
+        if name and key and key not in seen:
+            names.append(name)
+            seen.add(key)
+    with _geo_name_cache_lock:
+        _geo_name_cache[bubble_env] = (current, tuple(names))
+    return names
+
+
+def resolve_geo_name(candidate, valid_geo_names):
+    """Resolve one candidate conservatively to a canonical Bubble Geo name."""
+    original = " ".join(str(candidate or "").split())
+    normalized = _normalized_geo_name(original)
+    if not original or not normalized:
+        return {"candidate": original, "resolved": None, "method": None,
+                "score": None, "suggestion": None}
+    canonical = [
+        " ".join(str(name or "").split()) for name in valid_geo_names or []
+        if str(name or "").strip()
+    ]
+    exact = next(
+        (name for name in canonical if _normalized_geo_name(name) == normalized),
+        None,
+    )
+    if exact:
+        method = "exact" if original.casefold() == exact.casefold() else "normalized"
+        return {"candidate": original, "resolved": exact, "method": method,
+                "score": 1.0, "suggestion": exact}
+    scored = sorted((
+        (difflib.SequenceMatcher(None, normalized, _normalized_geo_name(name)).ratio(), name)
+        for name in canonical
+    ), reverse=True)
+    best_score, best_name = scored[0] if scored else (0.0, None)
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    if (
+        best_name and best_score >= GEO_FUZZY_MATCH_THRESHOLD
+        and best_score - second_score >= 0.08
+    ):
+        return {"candidate": original, "resolved": best_name, "method": "fuzzy",
+                "score": best_score, "suggestion": best_name}
+    suggestion = (
+        best_name if best_name and best_score >= GEO_SUGGESTION_THRESHOLD
+        and best_score - second_score >= 0.08 else None
+    )
+    return {"candidate": original, "resolved": None, "method": None,
+            "score": best_score, "suggestion": suggestion}
+
+
+def resolve_geo_names(candidates, valid_geo_names):
+    resolved, unresolved, suggestions = [], [], {}
+    seen = set()
+    for candidate in candidates or []:
+        result = resolve_geo_name(candidate, valid_geo_names)
+        canonical = result["resolved"]
+        if canonical:
+            key = canonical.casefold()
+            if key not in seen:
+                resolved.append(canonical)
+                seen.add(key)
+            score = result["score"]
+            suffix = f" score={score:.3f}" if result["method"] == "fuzzy" else ""
+            print(
+                f"[GEO RESOLUTION] candidate={result['candidate']!r} "
+                f"resolved={canonical!r} method={result['method']}{suffix}",
+                flush=True,
+            )
+        elif result["candidate"]:
+            unresolved.append(result["candidate"])
+            if result["suggestion"]:
+                suggestions[result["candidate"]] = result["suggestion"]
+            print(
+                f"[GEO RESOLUTION] candidate={result['candidate']!r} "
+                "status=unresolved", flush=True,
+            )
+    return {"resolved": resolved, "unresolved": unresolved,
+            "suggestions": suggestions}
+
+
+def unresolved_geo_response(resolution):
+    unresolved = resolution.get("unresolved") or []
+    suggestions = resolution.get("suggestions") or {}
+    if len(unresolved) == 1 and suggestions.get(unresolved[0]):
+        return f"Did you mean {suggestions[unresolved[0]]}?"
+    rendered = ", ".join(unresolved)
+    return f"I couldn't match {rendered} to an area I search. Which area did you mean?"
+
+
 def structured_lead_update(update, base_url):
     """Translate model-extracted values into Bubble's real structured Lead fields."""
     payload = {}
@@ -3088,6 +3252,11 @@ def apply_cumulative_search_update(cumulative_state, update):
 def lead_with_active_search_filters(lead, base_url):
     """Build an isolated Lead-shaped filter view from searchActive only."""
     state = load_active_search_state(lead)
+    bubble_env = "development" if "/version-test/" in base_url else "live"
+    valid_geo_names = get_valid_geo_names(bubble_env)
+    state["areas"] = resolve_geo_names(
+        state["areas"], valid_geo_names
+    )["resolved"]
     has_state_filters = bool(
         state["areas"] or state["selected_condos"]
         or state["bedroom_requirement"] or state["budget_requirement"]
@@ -3123,11 +3292,29 @@ def advance_property_search(folio_id, bubble_env, update):
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    valid_geo_names = get_valid_geo_names(bubble_env)
+    geo_resolution = resolve_geo_names(
+        update.get("geo_names") or [], valid_geo_names
+    )
+    safe_update = dict(update)
+    safe_update["geo_names"] = geo_resolution["resolved"]
+    cumulative_source = load_search_state(lead.get("searchBriefJSON"))
+    cumulative_source["areas"] = resolve_geo_names(
+        cumulative_source["areas"], valid_geo_names
+    )["resolved"]
+    if not cumulative_source["areas"] and cumulative_source["area_status"] == "known":
+        cumulative_source["area_status"] = "unknown"
+    active_source = load_active_search_state(lead)
+    active_source["areas"] = resolve_geo_names(
+        active_source["areas"], valid_geo_names
+    )["resolved"]
+    if not active_source["areas"] and active_source["area_status"] == "known":
+        active_source["area_status"] = "unknown"
     cumulative_state = apply_cumulative_search_update(
-        lead.get("searchBriefJSON"), update
+        cumulative_source, safe_update
     )
     active_state = apply_active_search_update(
-        load_active_search_state(lead), update
+        active_source, safe_update
     )
     preferred_names = [
         str(name).strip() for name in update.get("preferred_condo_names", [])
@@ -3137,12 +3324,23 @@ def advance_property_search(folio_id, bubble_env, update):
         cumulative_state = set_recommended_condos(cumulative_state, _unique_search_values(
             cumulative_state["recommended_condos"] + preferred_names
         ))
-    lead_fields = structured_lead_update(update, base_url)
+    lead_fields = structured_lead_update(safe_update, base_url)
     for field in ("Geo", "preferredCondos"):
         if field in lead_fields:
             lead_fields[field] = list(dict.fromkeys(
                 list(lead.get(field) or []) + list(lead_fields[field] or [])
             ))
+
+    if geo_resolution["unresolved"]:
+        save_search_state(
+            lead_id, cumulative_state, base_url, lead_fields, active_state
+        )
+        return {
+            "action": "ask",
+            "text": unresolved_geo_response(geo_resolution),
+            "state": cumulative_state, "active_state": active_state,
+            "lead_id": lead_id, "geo_resolution": geo_resolution,
+        }
 
     scope = listing_search_scope(
         active_state,
@@ -3717,6 +3915,42 @@ def _process_whatsapp_message(message):
                     f"message_id={message_id} error={type(error).__name__}",
                     flush=True,
                 )
+            if not routed_conversation_id:
+                try:
+                    routed_conversation, resolution, candidate_count = (
+                        find_active_conversation_by_phone(phone, text, "live")
+                    )
+                    routed_conversation_id = conversation_store.relationship_id(
+                        (routed_conversation or {}).get("_id")
+                    )
+                    if routed_conversation_id:
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution={resolution} "
+                            f"conversation_id={routed_conversation_id}", flush=True,
+                        )
+                        inbound_message_id, _inbound_created = (
+                            persist_inbound_whatsapp_message(
+                                phone, message_id, text,
+                                lead_id=conversation_store.relationship_id(
+                                    routed_conversation.get("Lead")
+                                ),
+                                conversation_id=routed_conversation_id,
+                                bubble_env="live",
+                            )
+                        )
+                    elif resolution == "ambiguous":
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution=ambiguous candidate_count={candidate_count}",
+                            flush=True,
+                        )
+                except Exception as error:
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        "resolution=active_phone_lookup_failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
             internal_user = find_internal_user(
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )
@@ -3870,13 +4104,21 @@ def _process_whatsapp_message(message):
                     f"[ENQUIRY WORKFLOW] no internal User match phone={safe_phone}",
                     flush=True,
                 )
-            linked_lead = capture_linked_tenant_profile(phone, text, "live")
-            if linked_lead:
-                lead, lead_created = linked_lead, False
+            routed_lead_id = conversation_store.relationship_id(
+                (routed_conversation or {}).get("Lead")
+            )
+            if routed_lead_id:
+                lead = bubble(f"{base_url}/obj/lead/{routed_lead_id}")
+                lead.setdefault("_id", routed_lead_id)
+                lead_created = False
             else:
-                lead, lead_created = find_or_create_whatsapp_lead(
-                    phone, message.get("customer_name"), "live"
-                )
+                linked_lead = capture_linked_tenant_profile(phone, text, "live")
+                if linked_lead:
+                    lead, lead_created = linked_lead, False
+                else:
+                    lead, lead_created = find_or_create_whatsapp_lead(
+                        phone, message.get("customer_name"), "live"
+                    )
             lead_id = lead["_id"]
             lead_conversation = routed_conversation
             lead_conversation_id = routed_conversation_id
@@ -3903,10 +4145,11 @@ def _process_whatsapp_message(message):
                     (lead_conversation or {}).get("_id")
                 )
                 if lead_conversation_id:
-                    inbound_message_id, _created = persist_inbound_whatsapp_message(
-                        phone, message_id, text, lead_id=lead_id,
-                        conversation_id=lead_conversation_id, bubble_env="live",
-                    )
+                    if not inbound_message_id:
+                        inbound_message_id, _created = persist_inbound_whatsapp_message(
+                            phone, message_id, text, lead_id=lead_id,
+                            conversation_id=lead_conversation_id, bubble_env="live",
+                        )
                     enquiry_id = conversation_store.relationship_id(
                         (lead_conversation or {}).get("Enquiry")
                     )

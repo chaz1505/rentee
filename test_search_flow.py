@@ -33,6 +33,111 @@ def complete_state():
 
 
 class SearchFlowStateTests(unittest.TestCase):
+    def setUp(self):
+        app_module._geo_name_cache.clear()
+        self.valid_geos_patcher = patch(
+            "app.get_valid_geo_names",
+            return_value=["Bangsar", "KLCC", "Mont Kiara"],
+        )
+        self.valid_geos_patcher.start()
+        self.addCleanup(self.valid_geos_patcher.stop)
+
+    def test_geo_resolution_exact_case_whitespace_and_safe_typo(self):
+        valid = ["Bangsar", "KLCC", "Mont Kiara"]
+        result = app_module.resolve_geo_names(
+            ["Bangsar", "bangsar", "  Mont   Kiara ", "Mont Kaira"], valid
+        )
+        self.assertEqual(result["resolved"], ["Bangsar", "Mont Kiara"])
+        self.assertEqual(result["unresolved"], [])
+
+    def test_bexley_and_unknown_never_resolve_when_not_canonical(self):
+        result = app_module.resolve_geo_names(
+            ["Bexley", "Imaginary Heights"], ["Bangsar", "KLCC", "Mont Kiara"]
+        )
+        self.assertEqual(result["resolved"], [])
+        self.assertEqual(result["unresolved"], ["Bexley", "Imaginary Heights"])
+
+    def test_mixed_geo_candidates_only_return_canonical_values(self):
+        result = app_module.resolve_geo_names(
+            ["klcc", "Bexley", "bangsar"], ["Bangsar", "KLCC"]
+        )
+        self.assertEqual(result["resolved"], ["KLCC", "Bangsar"])
+        self.assertEqual(result["unresolved"], ["Bexley"])
+
+    def test_geo_vocabulary_cache_uses_bubble_geo_names(self):
+        self.valid_geos_patcher.stop()
+        pages = iter([{
+            "results": [
+                {"_id": "geo-1", "name": "Bangsar"},
+                {"_id": "geo-2", "Name": "KLCC"},
+            ],
+            "remaining": 0,
+        }])
+        with patch("app.bubble", side_effect=lambda *_args, **_kwargs: next(pages)) as get:
+            first = app_module.get_valid_geo_names("live", now=100)
+            second = app_module.get_valid_geo_names("live", now=101)
+        self.assertEqual(first, ["Bangsar", "KLCC"])
+        self.assertEqual(second, first)
+        self.assertEqual(get.call_count, 1)
+
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids")
+    @patch("app.bubble")
+    def test_bexley_is_not_saved_or_passed_to_listing_search(
+        self, bubble, named_ids, save,
+    ):
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "searchBriefJSON": "", "searchActive": ""},
+        ]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "geo_names": ["Bexley"], "area_update_mode": "replace",
+            "search_listings": True,
+        })
+        self.assertEqual(result["action"], "ask")
+        self.assertNotIn("Bexley", result["state"]["areas"])
+        self.assertNotIn("Bexley", result["active_state"]["areas"])
+        self.assertEqual(result["geo_resolution"]["unresolved"], ["Bexley"])
+        named_ids.assert_not_called()
+        saved_payload = save.call_args.args
+        self.assertNotIn("Geo", saved_payload[3])
+
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.bubble")
+    def test_valid_bangsar_continues_to_listing_search(
+        self, bubble, _named_ids, _save,
+    ):
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "searchBriefJSON": "", "searchActive": ""},
+        ]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "geo_names": ["bangsar"], "area_update_mode": "replace",
+            "search_listings": True,
+        })
+        self.assertEqual(result["action"], "search_listings")
+        self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
+
+    @patch("app.save_search_state")
+    @patch("app.bubble")
+    def test_existing_valid_persisted_area_remains_canonical(
+        self, bubble, _save,
+    ):
+        stored = dump_search_state(apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+        }))
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "searchBriefJSON": stored,
+             "searchActive": stored},
+        ]
+        result = app_module.advance_property_search(
+            "folio-1", "live", {"question": "What budget?"}
+        )
+        self.assertEqual(result["state"]["areas"], ["Bangsar"])
+        self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
+
     @patch("app.get_relationship_names", return_value={"condo-1": "One Menerung"})
     @patch("app.bubble")
     def test_current_recommendations_reuse_folio_furnishing_and_size_read_only(
