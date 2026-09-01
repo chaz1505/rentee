@@ -1221,6 +1221,82 @@ class WhatsAppTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, message)
 
+    def test_ambiguity_message_one_usable_label_uses_safe_fallback(self):
+        candidates = [{"_id": "conversation-a"}, {"_id": "conversation-b"}]
+        with patch(
+            "app.conversation_display_label", side_effect=["", "the enquiry about One Menerung"]
+        ):
+            message, labels = app_module.build_conversation_ambiguity_message(candidates)
+        self.assertEqual(labels, [])
+        self.assertIn("reply to the message you mean", message)
+        self.assertNotIn("which do you mean: , or", message)
+
+    def test_ambiguity_message_zero_usable_labels_uses_safe_fallback(self):
+        candidates = [{"_id": "conversation-a"}, {"_id": "conversation-b"}]
+        with patch("app.conversation_display_label", return_value="   "):
+            message, labels = app_module.build_conversation_ambiguity_message(candidates)
+        self.assertEqual(labels, [])
+        self.assertIn("property or search", message)
+        self.assertNotIn("which do you mean", message)
+
+    def test_ambiguity_message_formats_two_and_three_distinct_labels(self):
+        two = [
+            {"_id": "conversation-a", "Enquiry": "enquiry-a", "Subject": "A"},
+            {"_id": "conversation-b", "Enquiry": "enquiry-b", "Subject": "B"},
+        ]
+        message, labels = app_module.build_conversation_ambiguity_message(two)
+        self.assertEqual(len(labels), 2)
+        self.assertIn("do you mean", message)
+        self.assertNotIn("which do you mean:", message)
+
+        three = two + [
+            {"_id": "conversation-c", "Enquiry": "enquiry-c", "Subject": "C"}
+        ]
+        message, labels = app_module.build_conversation_ambiguity_message(three)
+        self.assertEqual(len(labels), 3)
+        self.assertIn("which do you mean:", message)
+
+    def test_strong_search_clues_filter_to_the_only_search_conversation(self):
+        search = {"_id": "conversation-search", "Lead": "lead-search"}
+        enquiry = {
+            "_id": "conversation-enquiry", "Lead": "lead-enquiry",
+            "Enquiry": "enquiry-1", "Subject": "One Menerung",
+        }
+        for text in (
+            "How about something Petaling Jaya?",
+            "15k yes furnished",
+            "4 bed in KLCC",
+        ):
+            with self.subTest(text=text), patch(
+                "app.get_valid_geo_names", return_value=["Petaling Jaya", "KLCC"]
+            ):
+                selected, clue, compatible = (
+                    app_module.route_conversation_by_message_clue(
+                        text, [search, enquiry]
+                    )
+                )
+            self.assertEqual(selected, search)
+            self.assertEqual(clue, "property_search")
+            self.assertEqual(compatible, [search])
+
+    def test_weak_clue_and_multiple_search_conversations_do_not_guess(self):
+        searches = [
+            {"_id": "conversation-a", "Lead": "lead-a"},
+            {"_id": "conversation-b", "Lead": "lead-b"},
+        ]
+        selected, clue, compatible = app_module.route_conversation_by_message_clue(
+            "ok", searches
+        )
+        self.assertIsNone(selected)
+        self.assertIsNone(clue)
+        self.assertEqual(compatible, searches)
+        selected, clue, compatible = app_module.route_conversation_by_message_clue(
+            "4 bedrooms", searches
+        )
+        self.assertIsNone(selected)
+        self.assertEqual(clue, "property_search")
+        self.assertEqual(compatible, searches)
+
     def test_duplicate_labels_are_enriched_with_distinct_dates(self):
         candidates = [
             {
@@ -1292,6 +1368,57 @@ class WhatsAppTests(unittest.TestCase):
         internal.assert_not_called()
         create_lead.assert_not_called()
         rentee_turn.assert_not_called()
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Search updated", "resp-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-search", False))
+    @patch("app.find_or_create_whatsapp_lead")
+    @patch("app.capture_linked_tenant_profile")
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.get_valid_geo_names", return_value=["Petaling Jaya", "KLCC"])
+    @patch("app.bubble", return_value={
+        "_id": "lead-search", "searchActive": "search-active",
+    })
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_petaling_jaya_clue_routes_search_conversation_without_clarification(
+        self, _typing, _bubble, _geos, active, capture, phone_lead, folio,
+        turn, send, create_ai, _save_ai,
+    ):
+        search = {
+            "_id": "conversation-search", "Lead": "lead-search",
+            "CounterParty Phone": "60123456789", "Status": "Active",
+        }
+        enquiry = {
+            "_id": "conversation-enquiry", "Lead": "lead-enquiry",
+            "Enquiry": "enquiry-1", "Subject": "One Menerung",
+            "CounterParty Phone": "60123456789", "Status": "Active",
+        }
+        active.return_value = (None, "ambiguous", 2, [search, enquiry])
+        item = webhook_payload(
+            message_id="wamid.search-clue",
+            text="How about something Petaling Jaya?",
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        with patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
+
+        capture.assert_not_called()
+        phone_lead.assert_not_called()
+        folio.assert_called_once_with("lead-search", "live")
+        self.assertEqual(turn.call_args.args[1], "folio-search")
+        create_ai.assert_called_once_with(
+            "lead-search", "60123456789", "live", "conversation-search"
+        )
+        send.assert_called_once_with("60123456789", "Search updated")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "resolution=message_clue clue=property_search "
+            "conversation_id=conversation-search",
+            logs,
+        )
+        self.assertNotIn("clarification_sent", logs)
 
     @patch("app.conversation_store.set_conversation_previous_response_id")
     @patch("app.save_whatsapp_message_id")

@@ -1608,6 +1608,57 @@ def find_active_conversation_by_phone(
     return response + (all_candidates,) if include_candidates else response
 
 
+def _has_strong_property_search_clue(message_text, bubble_env="live"):
+    """Recognize only explicit property-search criteria, without an LLM guess."""
+    text = " ".join(str(message_text or "").casefold().split())
+    if not text:
+        return False
+    explicit_patterns = (
+        r"\b\d+(?:\.\d+)?\s*(?:bed|beds|bedroom|bedrooms)\b",
+        r"\b(?:rm\s*)?\d+(?:[,.]\d+)*(?:\s*k)?\b.*\b(?:budget|rent|month)\b",
+        r"\b\d+(?:\.\d+)?\s*k\b",
+        r"\b(?:fully|partially|semi|un)\s*-?furnished\b|\bfurnished\s+only\b",
+        r"\b(?:pet[- ]?friendly|pets? allowed|with (?:a )?pet)\b",
+        r"\b(?:landed|condo(?:minium)?|apartment|bungalow|townhouse|terrace)\b",
+        r"\b(?:balcony|cheaper|lower budget)\b",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_patterns):
+        return True
+    try:
+        valid_geo_names = get_valid_geo_names(bubble_env)
+    except Exception:
+        valid_geo_names = []
+    padded_text = f" {re.sub(r'[^a-z0-9]+', ' ', text).strip()} "
+    return any(
+        f" {re.sub(r'[^a-z0-9]+', ' ', str(name).casefold()).strip()} "
+        in padded_text
+        for name in valid_geo_names
+        if str(name).strip()
+    )
+
+
+def _property_search_conversation(conversation):
+    """A general Lead/search Conversation, never an enquiry/owner workflow."""
+    conversation = conversation or {}
+    role = str(conversation.get("CounterParty Role") or "").strip()
+    return (
+        not conversation_store.relationship_id(conversation.get("Enquiry"))
+        and role != "Owner Representative"
+    )
+
+
+def route_conversation_by_message_clue(
+    message_text, candidates, bubble_env="live",
+):
+    """Filter ambiguous candidates only for high-confidence workflow clues."""
+    candidates = [item for item in candidates or [] if item.get("_id")]
+    if not _has_strong_property_search_clue(message_text, bubble_env):
+        return None, None, candidates
+    compatible = [item for item in candidates if _property_search_conversation(item)]
+    selected = compatible[0] if len(compatible) == 1 else None
+    return selected, "property_search", compatible or candidates
+
+
 def _conversation_property_name(conversation, bubble_env="live"):
     subject = " ".join(str((conversation or {}).get("Subject") or "").split())
     if subject:
@@ -1712,7 +1763,20 @@ def build_conversation_ambiguity_message(candidates, bubble_env="live"):
         ),
         reverse=True,
     )[:3]
-    labels = [conversation_display_label(item, bubble_env) for item in ranked]
+    labels = [
+        " ".join(str(conversation_display_label(item, bubble_env) or "").split())
+        for item in ranked
+    ]
+    usable = [(item, label) for item, label in zip(ranked, labels) if label]
+    ranked = [item for item, _label in usable]
+    labels = [label for _item, label in usable]
+    fallback = (
+        "I have a couple of property conversations with you open. "
+        "Could you reply to the message you mean, or tell me which "
+        "property or search this is about?"
+    )
+    if len(labels) < 2:
+        return fallback, []
     if len(set(labels)) != len(labels):
         enriched = []
         for item, label in zip(ranked, labels):
@@ -1728,11 +1792,10 @@ def build_conversation_ambiguity_message(candidates, bubble_env="live"):
         if len(set(enriched)) == len(enriched):
             labels = enriched
         else:
-            return (
-                "I have a couple of property conversations with you open. "
-                "Could you reply to the message you mean, or tell me which "
-                "property this is about?"
-            ), []
+            return fallback, []
+    labels = list(dict.fromkeys(label.strip() for label in labels if label.strip()))
+    if len(labels) < 2:
+        return fallback, []
     if len(labels) == 2:
         message = f"Just checking — do you mean {labels[0]}, or {labels[1]}?"
     else:
@@ -4289,12 +4352,30 @@ def _process_whatsapp_message(message):
                             f"candidate_count={candidate_count}", flush=True,
                         )
                     if resolution == "ambiguous":
-                        print(
-                            "[CONVERSATION ROUTING] direction=inbound "
-                            "resolution=ambiguous "
-                            f"candidate_count={candidate_count} action=clarify",
-                            flush=True,
+                        clue_conversation, clue, clue_candidates = (
+                            route_conversation_by_message_clue(
+                                text, ambiguous_candidates, "live"
+                            )
                         )
+                        if clue_conversation:
+                            routed_conversation = clue_conversation
+                            resolution = "message_clue"
+                            ambiguous_candidates = []
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                f"resolution=message_clue clue={clue} "
+                                f"conversation_id={conversation_store.relationship_id(clue_conversation.get('_id'))}",
+                                flush=True,
+                            )
+                        else:
+                            ambiguous_candidates = clue_candidates
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                "resolution=ambiguous "
+                                f"candidate_count={len(ambiguous_candidates)} "
+                                "action=clarify",
+                                flush=True,
+                            )
                     routed_conversation_id = conversation_store.relationship_id(
                         (routed_conversation or {}).get("_id")
                     )
