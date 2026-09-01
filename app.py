@@ -11,6 +11,7 @@ import json
 import threading
 import time
 import re
+from PIL import Image, ImageOps
 from urllib.parse import urlparse
 from collections import deque
 from types import SimpleNamespace
@@ -1939,6 +1940,8 @@ def persist_sent_whatsapp_text(
         "direction": "Outbound",
         "own_Sent?": "No",
         "messageContent": str(text or ""),
+        "messageType": "text",
+        "image_URL": "",
         "whatsappMessageId": meta_message_id,
         "Conversation": conversation_id,
     }
@@ -2120,6 +2123,8 @@ def create_whatsapp_ai_message(
         "direction": "Outbound",
         "own_Sent?": "No",
         "messageContent": "",
+        "messageType": "text",
+        "image_URL": "",
     }
     payload["Conversation"] = conversation_id
     return _bubble_create(get_bubble_base_url(bubble_env), "message", payload)
@@ -2152,36 +2157,58 @@ def save_whatsapp_message_id(
 
 
 def persist_recommendation_whatsapp_ids(
-    message_id, whatsapp_message_ids, phone, message_content,
-    conversation_id, lead_id=None, bubble_env="live",
+    message_id, deliveries, phone, conversation_id, lead_id=None,
+    bubble_env="live",
 ):
-    """Keep every replyable recommendation send independently resolvable."""
+    """Persist one Bubble Message matching each actual WhatsApp delivery."""
     conversation_id = conversation_store.relationship_id(conversation_id)
     if not conversation_id:
         raise ValueError("Recommendation messages require a Conversation.")
-    unique_ids = list(dict.fromkeys(
-        str(value or "").strip() for value in whatsapp_message_ids or []
-        if str(value or "").strip()
-    ))
+    unique_deliveries = []
+    seen_ids = set()
+    for delivery in deliveries or []:
+        if not isinstance(delivery, dict):
+            continue
+        meta_id = str(delivery.get("whatsapp_message_id") or "").strip()
+        if not meta_id or meta_id in seen_ids:
+            continue
+        seen_ids.add(meta_id)
+        unique_deliveries.append(dict(delivery, whatsapp_message_id=meta_id))
     persisted = []
-    for index, meta_id in enumerate(unique_ids, start=1):
+    for index, delivery in enumerate(unique_deliveries, start=1):
+        meta_id = delivery["whatsapp_message_id"]
+        message_type = (
+            "image" if delivery.get("message_type") == "image" else "text"
+        )
+        payload = {
+            "phone": normalize_phone(phone),
+            "direction": "Outbound",
+            "own_Sent?": "No",
+            "messageType": message_type,
+            "messageContent": (
+                "" if message_type == "image"
+                else str(delivery.get("message_content") or "")
+            ),
+            "image_URL": (
+                str(delivery.get("image_url") or "")
+                if message_type == "image" else ""
+            ),
+            "whatsappMessageId": meta_id,
+            "Conversation": conversation_id,
+        }
+        if lead_id:
+            payload["lead"] = lead_id
         try:
             if index == 1:
-                save_whatsapp_message_id(
-                    message_id, meta_id, bubble_env, conversation_id
+                _bubble_patch(
+                    f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}",
+                    payload,
+                )
+                conversation_store.update_conversation_last_outbound_at(
+                    conversation_id, bubble_env
                 )
                 persisted_message_id = message_id
             else:
-                payload = {
-                    "phone": normalize_phone(phone),
-                    "direction": "Outbound",
-                    "own_Sent?": "No",
-                    "messageContent": str(message_content or ""),
-                    "whatsappMessageId": meta_id,
-                    "Conversation": conversation_id,
-                }
-                if lead_id:
-                    payload["lead"] = lead_id
                 persisted_message_id = _bubble_create(
                     get_bubble_base_url(bubble_env), "message", payload
                 )
@@ -2278,16 +2305,71 @@ def get_listing_whatsapp_image(listing):
     return None
 
 
-def send_whatsapp_image(to_phone, image_url):
-    """Send one public image URL through the existing WhatsApp Cloud API."""
+def normalize_image_for_whatsapp(image_bytes):
+    """Apply EXIF orientation to pixels and return a fresh JPEG payload."""
+    with Image.open(io.BytesIO(bytes(image_bytes or b""))) as source:
+        orientation = source.getexif().get(274, 1)
+        normalized = ImageOps.exif_transpose(source)
+        if normalized.mode not in ("RGB", "L"):
+            normalized = normalized.convert("RGB")
+        output = io.BytesIO()
+        normalized.save(output, format="JPEG", quality=88, optimize=True)
+    action = "normalized" if orientation not in (None, 1) else "unchanged"
+    print(
+        f"[WHATSAPP IMAGE] action={action} exif_orientation={orientation or 1}",
+        flush=True,
+    )
+    return output.getvalue()
+
+
+def _send_whatsapp_image_link(to_phone, image_url):
+    """Existing public-link send retained as the safe media fallback."""
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
     access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
-    url = (
-        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
-        f"{phone_number_id}/messages"
-    )
     response = requests.post(
-        url,
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{phone_number_id}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp", "to": normalize_phone(to_phone),
+            "type": "image", "image": {"link": image_url},
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response
+
+
+def send_whatsapp_image(to_phone, image_url):
+    """Normalize a remote image, upload its bytes, then send the Meta media ID."""
+    phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    try:
+        source_response = requests.get(image_url, timeout=30)
+        source_response.raise_for_status()
+        normalized_bytes = normalize_image_for_whatsapp(source_response.content)
+        upload_response = requests.post(
+            f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{phone_number_id}/media",
+            headers={"Authorization": f"Bearer {access_token}"},
+            data={"messaging_product": "whatsapp", "type": "image/jpeg"},
+            files={"file": ("listing.jpg", normalized_bytes, "image/jpeg")},
+            timeout=30,
+        )
+        upload_response.raise_for_status()
+        media_id = str((upload_response.json() or {}).get("id") or "").strip()
+        if not media_id:
+            raise ValueError("Meta media upload did not return an ID.")
+    except Exception as error:
+        print(
+            "[WHATSAPP IMAGE] action=normalization_failed "
+            f"fallback=existing_behavior error={type(error).__name__}",
+            flush=True,
+        )
+        return _send_whatsapp_image_link(to_phone, image_url)
+    response = requests.post(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{phone_number_id}/messages",
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -2296,7 +2378,7 @@ def send_whatsapp_image(to_phone, image_url):
             "messaging_product": "whatsapp",
             "to": normalize_phone(to_phone),
             "type": "image",
-            "image": {"link": image_url},
+            "image": {"id": media_id},
         },
         timeout=30,
     )
@@ -2629,10 +2711,23 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
     intro, cards, footer, shown = _whatsapp_recommendation_sections(
         listings, folio_id, top_count
     )
-    sent_text_ids = []
+    deliveries = []
+
+    def record_text(text, sent_ids, listing_id=None):
+        parts = split_whatsapp_text(text)
+        for index, meta_id in enumerate(sent_ids or []):
+            if not meta_id:
+                continue
+            deliveries.append({
+                "whatsapp_message_id": meta_id,
+                "message_type": "text",
+                "message_content": parts[index] if index < len(parts) else str(text),
+                "listing_id": listing_id or None,
+            })
+
     intro_ids = send_whatsapp_text(to_phone, intro)
     if isinstance(intro_ids, list):
-        sent_text_ids.extend(message_id for message_id in intro_ids if message_id)
+        record_text(intro, intro_ids)
     seen_listing_ids = set()
     for listing, card in zip(shown, cards):
         listing_id = str(listing.get("listing_id") or "")
@@ -2661,7 +2756,12 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
                             (image_payload.get("messages") or [{}])[0].get("id")
                         )
                     if image_message_id:
-                        sent_text_ids.append(image_message_id)
+                        deliveries.append({
+                            "whatsapp_message_id": image_message_id,
+                            "message_type": "image",
+                            "image_url": image_url,
+                            "listing_id": listing_id or None,
+                        })
                 except (AttributeError, TypeError, ValueError, IndexError):
                     pass
                 print(
@@ -2684,11 +2784,11 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
             )
         card_ids = send_whatsapp_text(to_phone, card)
         if isinstance(card_ids, list):
-            sent_text_ids.extend(message_id for message_id in card_ids if message_id)
+            record_text(card, card_ids, listing_id or None)
     footer_ids = send_whatsapp_text(to_phone, footer)
     if isinstance(footer_ids, list):
-        sent_text_ids.extend(message_id for message_id in footer_ids if message_id)
-    return sent_text_ids
+        record_text(footer, footer_ids)
+    return deliveries
 
 
 def create_folio_items(recommendations, base_url, message_id):
@@ -2821,6 +2921,12 @@ def structured_lead_requirements(lead):
         "helpers": _as_number(lead.get("helpers")),
         "viewing_preference": lead.get("viewingPreference"),
     }
+
+
+def known_tenant_profile_context(lead):
+    """Return Gwen-supplied free text for ranking context, never hard filters."""
+    value = " ".join(str((lead or {}).get("LeadDetailsShare") or "").split())
+    return value or None
 
 
 def get_relationship_names(base_url, object_type, relationship_ids):
@@ -3069,11 +3175,19 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         if listing.get("_id")
     ]
     matching_input = {
-        "customer_requirements": structured_lead_requirements(search_lead),
+        "structured_search_requirements": structured_lead_requirements(search_lead),
         "available_listings": grounded_listing_facts,
     }
+    tenant_profile_context = known_tenant_profile_context(search_lead)
+    if tenant_profile_context:
+        matching_input["known_tenant_profile"] = tenant_profile_context
     prompt = (
-        "Rank the grounded listings for this customer. Use the structured facts and "
+        "Rank the grounded listings for this customer. Treat "
+        "structured_search_requirements as the authoritative search criteria. If "
+        "known_tenant_profile is present, use it only as Gwen-supplied suitability "
+        "context and for grounded trade-offs; do not turn it into hard retrieval "
+        "criteria or let it override the structured search requirements. Use the "
+        "structured listing facts and "
         "make sensible trade-offs, including fit with the customer's budget tier. "
         "Return at most the 7 strongest genuine fits rather than exhaustively describing "
         "every plausible listing. Keep each reco_summary concise and mention material "
@@ -4999,12 +5113,12 @@ def _process_whatsapp_message(message):
                 flush=True,
             )
             if recommendation_listings:
-                outbound_ids = send_whatsapp_recommendation_batch(
+                outbound_deliveries = send_whatsapp_recommendation_batch(
                     phone, folio_id, recommendation_listings
                 )
-                if isinstance(outbound_ids, list) and outbound_ids:
+                if isinstance(outbound_deliveries, list) and outbound_deliveries:
                     persist_recommendation_whatsapp_ids(
-                        current_message_id, outbound_ids, phone, answer,
+                        current_message_id, outbound_deliveries, phone,
                         lead_conversation_id, lead_id, "live",
                     )
             else:

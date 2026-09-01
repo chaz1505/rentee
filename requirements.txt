@@ -5,3 +5,4 @@ requests
 flask-cors
 beautifulsoup4>=4.12.0
 playwright>=1.57.0,<2
+Pillow>=10.0.0

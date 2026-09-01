@@ -2,6 +2,8 @@ import json
 import os
 import unittest
 import requests
+from io import BytesIO
+from PIL import Image
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
@@ -2402,18 +2404,104 @@ class WhatsAppTests(unittest.TestCase):
             "https://cdn.test/first.jpg",
         )
 
+    @staticmethod
+    def oriented_test_image(orientation=None, image_format="JPEG", mode="RGB"):
+        image = Image.new(mode, (40, 20), (255, 0, 0, 128) if mode == "RGBA" else "red")
+        image.paste(
+            (0, 0, 255, 255) if mode == "RGBA" else "blue",
+            (20, 0, 40, 20),
+        )
+        output = BytesIO()
+        exif = Image.Exif()
+        if orientation is not None:
+            exif[274] = orientation
+        save_kwargs = {"exif": exif} if orientation is not None else {}
+        image.save(output, format=image_format, **save_kwargs)
+        return output.getvalue()
+
+    def test_exif_orientations_are_physically_normalized(self):
+        for orientation, expected_size in ((6, (20, 40)), (8, (20, 40)), (3, (40, 20))):
+            with self.subTest(orientation=orientation):
+                result = app_module.normalize_image_for_whatsapp(
+                    self.oriented_test_image(orientation)
+                )
+                with Image.open(BytesIO(result)) as normalized:
+                    self.assertEqual(normalized.format, "JPEG")
+                    self.assertEqual(normalized.size, expected_size)
+                    self.assertNotIn(274, normalized.getexif())
+                    if orientation == 3:
+                        left = normalized.getpixel((5, 10))
+                        self.assertGreater(left[2], left[0])
+
+    def test_normal_and_missing_orientation_remain_upright_and_idempotent(self):
+        for orientation in (1, None):
+            with self.subTest(orientation=orientation):
+                first = app_module.normalize_image_for_whatsapp(
+                    self.oriented_test_image(orientation)
+                )
+                second = app_module.normalize_image_for_whatsapp(first)
+                with Image.open(BytesIO(first)) as once, Image.open(BytesIO(second)) as twice:
+                    self.assertEqual(once.size, (40, 20))
+                    self.assertEqual(twice.size, once.size)
+                    self.assertEqual(twice.format, "JPEG")
+                    self.assertNotIn(274, twice.getexif())
+
+    def test_rgba_png_converts_to_valid_rgb_jpeg(self):
+        result = app_module.normalize_image_for_whatsapp(
+            self.oriented_test_image(image_format="PNG", mode="RGBA")
+        )
+        with Image.open(BytesIO(result)) as normalized:
+            self.assertEqual(normalized.format, "JPEG")
+            self.assertEqual(normalized.mode, "RGB")
+            self.assertEqual(normalized.size, (40, 20))
+
+    def test_corrupt_image_normalization_raises_for_media_fallback(self):
+        with self.assertRaises(Exception):
+            app_module.normalize_image_for_whatsapp(b"not-an-image")
+
     @patch("app.requests.post")
-    def test_send_whatsapp_image_uses_meta_image_payload(self, mocked_post):
-        mocked_post.return_value.status_code = 200
-        mocked_post.return_value.raise_for_status.return_value = None
-        app_module.send_whatsapp_image("+60 12 345 6789", "https://cdn.test/a.jpg")
-        payload = mocked_post.call_args.kwargs["json"]
+    @patch("app.requests.get")
+    def test_send_whatsapp_image_uploads_normalized_jpeg_before_send(
+        self, mocked_get, mocked_post,
+    ):
+        mocked_get.return_value.content = self.oriented_test_image(6)
+        mocked_get.return_value.raise_for_status.return_value = None
+        upload = MagicMock(status_code=200)
+        upload.json.return_value = {"id": "media-normalized"}
+        sent = MagicMock(status_code=200)
+        sent.json.return_value = {"messages": [{"id": "wamid.image"}]}
+        mocked_post.side_effect = [upload, sent]
+
+        result = app_module.send_whatsapp_image(
+            "+60 12 345 6789", "https://cdn.test/a.jpg"
+        )
+
+        self.assertIs(result, sent)
+        uploaded_bytes = mocked_post.call_args_list[0].kwargs["files"]["file"][1]
+        with Image.open(BytesIO(uploaded_bytes)) as uploaded:
+            self.assertEqual(uploaded.size, (20, 40))
+            self.assertNotIn(274, uploaded.getexif())
+        payload = mocked_post.call_args_list[1].kwargs["json"]
         self.assertEqual(payload, {
             "messaging_product": "whatsapp",
             "to": "60123456789",
             "type": "image",
-            "image": {"link": "https://cdn.test/a.jpg"},
+            "image": {"id": "media-normalized"},
         })
+
+    @patch("app._send_whatsapp_image_link")
+    @patch("app.requests.get")
+    def test_invalid_source_falls_back_to_existing_link_send(self, get, fallback):
+        get.return_value.content = b"not-an-image"
+        get.return_value.raise_for_status.return_value = None
+        fallback.return_value = MagicMock(status_code=200)
+        result = app_module.send_whatsapp_image(
+            "60123456789", "https://cdn.test/broken.jpg"
+        )
+        self.assertIs(result, fallback.return_value)
+        fallback.assert_called_once_with(
+            "60123456789", "https://cdn.test/broken.jpg"
+        )
 
     @patch("app.send_whatsapp_text")
     @patch("app.send_whatsapp_image")
@@ -2441,6 +2529,82 @@ class WhatsAppTests(unittest.TestCase):
             "text", "image", "text", "image", "text",
             "image", "text", "image", "text", "text",
         ])
+
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_image")
+    def test_recommendation_batch_returns_exact_structured_chronology(
+        self, image, text,
+    ):
+        text.side_effect = [
+            ["wamid.intro"], ["wamid.card-1"], ["wamid.card-2"],
+            ["wamid.card-3"], ["wamid.footer"],
+        ]
+        image.side_effect = [
+            MagicMock(json=lambda index=index: {"messages": [{"id": f"wamid.image-{index}"}]},
+                      status_code=200)
+            for index in range(1, 4)
+        ]
+        listings = [{
+            "listing_id": f"listing-{index}",
+            "property_name": f"Home {index}",
+            "coverPhoto": f"https://cdn.test/{index}.jpg",
+        } for index in range(1, 4)]
+
+        deliveries = app_module.send_whatsapp_recommendation_batch(
+            "60123456789", "folio-1", listings
+        )
+
+        self.assertEqual(len(deliveries), 8)
+        self.assertEqual(
+            [item["message_type"] for item in deliveries],
+            ["text", "image", "text", "image", "text", "image", "text", "text"],
+        )
+        self.assertEqual(
+            [item["whatsapp_message_id"] for item in deliveries],
+            [
+                "wamid.intro", "wamid.image-1", "wamid.card-1",
+                "wamid.image-2", "wamid.card-2", "wamid.image-3",
+                "wamid.card-3", "wamid.footer",
+            ],
+        )
+        self.assertEqual(deliveries[1]["image_url"], "https://cdn.test/1.jpg")
+        self.assertEqual(deliveries[1]["listing_id"], "listing-1")
+        self.assertIn("1. Home 1", deliveries[2]["message_content"])
+        self.assertEqual(deliveries[2]["listing_id"], "listing-1")
+
+    @patch("app.send_whatsapp_text", return_value=[])
+    @patch("app.requests.post")
+    @patch("app.requests.get")
+    @patch("app.normalize_image_for_whatsapp", wraps=app_module.normalize_image_for_whatsapp)
+    def test_recommendation_batch_normalizes_each_image_independently(
+        self, normalize, get, post, _text,
+    ):
+        first = MagicMock()
+        first.content = self.oriented_test_image(6)
+        first.raise_for_status.return_value = None
+        second = MagicMock()
+        second.content = self.oriented_test_image(8)
+        second.raise_for_status.return_value = None
+        get.side_effect = [first, second]
+        upload_one = MagicMock(status_code=200)
+        upload_one.json.return_value = {"id": "media-1"}
+        send_one = MagicMock(status_code=200)
+        send_one.json.return_value = {"messages": [{"id": "wamid-1"}]}
+        upload_two = MagicMock(status_code=200)
+        upload_two.json.return_value = {"id": "media-2"}
+        send_two = MagicMock(status_code=200)
+        send_two.json.return_value = {"messages": [{"id": "wamid-2"}]}
+        post.side_effect = [upload_one, send_one, upload_two, send_two]
+
+        app_module.send_whatsapp_recommendation_batch(
+            "60123456789", "folio-1", [
+                {"listing_id": "one", "coverPhoto": "https://cdn.test/one.jpg"},
+                {"listing_id": "two", "coverPhoto": "https://cdn.test/two.jpg"},
+            ]
+        )
+
+        self.assertEqual(normalize.call_count, 2)
+        self.assertEqual(get.call_count, 2)
 
     @patch("app.send_whatsapp_text")
     @patch("app.send_whatsapp_image")
@@ -2539,7 +2703,8 @@ class WhatsAppTests(unittest.TestCase):
             {
                 "lead": "lead-a", "phone": "60123456789",
                 "direction": "Outbound", "own_Sent?": "No",
-                "messageContent": "", "Conversation": "conversation-1",
+                "messageContent": "", "messageType": "text",
+                "image_URL": "", "Conversation": "conversation-1",
             },
         )
 
@@ -2621,28 +2786,65 @@ class WhatsAppTests(unittest.TestCase):
             {"whatsappMessageId": "wamid.outbound"},
         )
 
-    @patch("app._bubble_create", side_effect=["message-2", "message-3"])
-    @patch("app.save_whatsapp_message_id")
+    @patch("app.conversation_store.update_conversation_last_outbound_at")
+    @patch("app._bubble_patch")
+    @patch("app._bubble_create", side_effect=[
+        "message-2", "message-3", "message-4", "message-5",
+        "message-6", "message-7", "message-8",
+    ])
     def test_recommendation_batch_persists_every_meta_id_independently(
-        self, save_first, create,
+        self, create, patch_first, activity,
     ):
+        deliveries = [
+            {"whatsapp_message_id": "wamid.1", "message_type": "text",
+             "message_content": "I've shortlisted 3 properties."},
+            {"whatsapp_message_id": "wamid.2", "message_type": "image",
+             "image_url": "https://cdn.test/one.jpg", "listing_id": "listing-1"},
+            {"whatsapp_message_id": "wamid.3", "message_type": "text",
+             "message_content": "1. Property One", "listing_id": "listing-1"},
+            {"whatsapp_message_id": "wamid.4", "message_type": "image",
+             "image_url": "https://cdn.test/two.jpg", "listing_id": "listing-2"},
+            {"whatsapp_message_id": "wamid.5", "message_type": "text",
+             "message_content": "2. Property Two", "listing_id": "listing-2"},
+            {"whatsapp_message_id": "wamid.6", "message_type": "image",
+             "image_url": "https://cdn.test/three.jpg", "listing_id": "listing-3"},
+            {"whatsapp_message_id": "wamid.7", "message_type": "text",
+             "message_content": "3. Property Three", "listing_id": "listing-3"},
+            {"whatsapp_message_id": "wamid.8", "message_type": "text",
+             "message_content": "See all with full details."},
+        ]
         persisted = app_module.persist_recommendation_whatsapp_ids(
-            "message-1", ["wamid.A", "wamid.B", "wamid.C"],
-            "60123456789", "Recommendation summary",
+            "message-1", deliveries, "60123456789",
             "conversation-1", "lead-1", "live",
         )
 
-        self.assertEqual(persisted, ["message-1", "message-2", "message-3"])
-        save_first.assert_called_once_with(
-            "message-1", "wamid.A", "live", "conversation-1"
+        self.assertEqual(persisted, [f"message-{index}" for index in range(1, 9)])
+        self.assertEqual(create.call_count, 7)
+        first_payload = patch_first.call_args.args[1]
+        payloads = [first_payload] + [call.args[2] for call in create.call_args_list]
+        self.assertEqual(
+            [payload["whatsappMessageId"] for payload in payloads],
+            [f"wamid.{index}" for index in range(1, 9)],
         )
-        self.assertEqual(create.call_count, 2)
-        for call, meta_id in zip(create.call_args_list, ("wamid.B", "wamid.C")):
-            payload = call.args[2]
-            self.assertEqual(payload["whatsappMessageId"], meta_id)
+        for payload in payloads:
             self.assertEqual(payload["Conversation"], "conversation-1")
             self.assertEqual(payload["lead"], "lead-1")
             self.assertEqual(payload["direction"], "Outbound")
+        for index in (1, 3, 5, 7, 8):
+            payload = payloads[index - 1]
+            self.assertEqual(payload["messageType"], "text")
+            self.assertEqual(payload["messageContent"], deliveries[index - 1]["message_content"])
+            self.assertEqual(payload["image_URL"], "")
+        for index in (2, 4, 6):
+            payload = payloads[index - 1]
+            self.assertEqual(payload["messageType"], "image")
+            self.assertEqual(payload["messageContent"], "")
+            self.assertEqual(payload["image_URL"], deliveries[index - 1]["image_url"])
+        self.assertFalse(any(
+            payload["messageContent"] == "Recommendation summary"
+            for payload in payloads
+        ))
+        activity.assert_called_once_with("conversation-1", "live")
 
     def test_each_recommendation_reply_id_resolves_the_same_conversation(self):
         self.reply_conversation_patcher.stop()
@@ -3146,7 +3348,15 @@ class WhatsAppTests(unittest.TestCase):
             "Three grounded recommendations\n\n"
             "https://www.rentee.asia/folio3/folio-active"
         )
-        mocked_batch.return_value = ["wamid.A", "wamid.B", "wamid.C"]
+        deliveries = [
+            {"whatsapp_message_id": "wamid.A", "message_type": "text",
+             "message_content": "Intro"},
+            {"whatsapp_message_id": "wamid.B", "message_type": "image",
+             "image_url": "https://cdn.test/one.jpg", "listing_id": "listing-1"},
+            {"whatsapp_message_id": "wamid.C", "message_type": "text",
+             "message_content": "1. One Menerung", "listing_id": "listing-1"},
+        ]
+        mocked_batch.return_value = deliveries
         item = webhook_payload(text="Show me the properties")["entry"][0]["changes"][0]["value"]["messages"][0]
 
         app_module._process_whatsapp_message(item)
@@ -3162,8 +3372,7 @@ class WhatsAppTests(unittest.TestCase):
             "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
         )
         persist_ids.assert_called_once_with(
-            "bubble-message-current", ["wamid.A", "wamid.B", "wamid.C"],
-            "60123456789", mocked_summary.return_value,
+            "bubble-message-current", deliveries, "60123456789",
             "conversation-general", "lead-1", "live",
         )
 

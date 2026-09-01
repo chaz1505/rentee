@@ -740,6 +740,11 @@ class SearchFlowStateTests(unittest.TestCase):
             {
                 "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
                 "budgetRent": 12000, "AIsearchtext": "LEGACY GENERATED PROFILE",
+                "furnishingPreference": "Fully Furnished", "pets": "small dog",
+                "LeadDetailsShare": (
+                    "British finance director, two children and a small dog; "
+                    "moving in October."
+                ),
             },
         ]
         mocked_listings.return_value = ([{
@@ -760,6 +765,13 @@ class SearchFlowStateTests(unittest.TestCase):
                     break
         prompt = create.call_args.kwargs["input"]
         self.assertIn('"bedrooms_min": 3.0', prompt)
+        self.assertIn('"furnishing_preference": "Fully Furnished"', prompt)
+        self.assertIn('"pets": "small dog"', prompt)
+        self.assertIn('"structured_search_requirements"', prompt)
+        self.assertIn('"known_tenant_profile"', prompt)
+        self.assertIn("British finance director", prompt)
+        self.assertIn("use it only as Gwen-supplied suitability context", prompt)
+        self.assertIn("do not turn it into hard retrieval criteria", prompt)
         self.assertIn('"listing_id": "listing-1"', prompt)
         self.assertNotIn('"_id": "listing-1"', prompt)
         self.assertIn("A real structured description", prompt)
@@ -773,6 +785,39 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(
             recommendations["items"]["properties"]["reco_summary"]["maxLength"], 240
         )
+
+    def test_missing_lead_details_share_adds_no_profile_context(self):
+        self.assertIsNone(app_module.known_tenant_profile_context({}))
+        self.assertIsNone(app_module.known_tenant_profile_context({
+            "LeadDetailsShare": "   "
+        }))
+
+    def test_lead_details_share_does_not_change_hard_listing_filters(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
+            "budgetRent": 10000, "Geo": ["geo-bangsar"],
+        }
+        listings = [
+            {"_id": "fit", "beds": 3, "priceRent": 9500, "Geo": "geo-bangsar"},
+            {"_id": "wrong-area", "beds": 3, "priceRent": 9500, "Geo": "geo-klcc"},
+            {"_id": "too-small", "beds": 2, "priceRent": 9000, "Geo": "geo-bangsar"},
+        ]
+        without_profile = app_module.shortlist_structured_listings(lead, listings)
+        with_profile = app_module.shortlist_structured_listings({
+            **lead,
+            "LeadDetailsShare": (
+                "British family with a dog, working in finance and moving in October"
+            ),
+        }, listings)
+        self.assertEqual(
+            [item["_id"] for item in with_profile],
+            [item["_id"] for item in without_profile],
+        )
+        requirements = app_module.structured_lead_requirements({
+            **lead, "LeadDetailsShare": "This must not become a filter"
+        })
+        self.assertNotIn("LeadDetailsShare", requirements)
+        self.assertNotIn("known_tenant_profile", requirements)
 
     @patch("app.update_folio_items")
     @patch("app.create_folio_items", return_value=["folio-item-fallback"])
@@ -1358,6 +1403,33 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
         self.assertEqual(requirements["pets"], "small dog")
         resolve.assert_not_called()
+
+    @patch("app.get_valid_geo_names", return_value=["Petaling Jaya"])
+    @patch("app.get_named_object_ids", return_value=["geo-pj"])
+    def test_area_only_correction_merges_with_full_lead_baseline(
+        self, _resolve, _valid_geos,
+    ):
+        active = apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Petaling Jaya"],
+        })
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
+            "budgetRent": 15000, "Geo": ["geo-bangsar"],
+            "furnishingPreference": "Fully Furnished", "pets": "small dog",
+            "adults": 2, "children": 2,
+            "searchActive": dump_search_state(active),
+        }
+        effective = app_module.lead_with_active_search_filters(
+            lead, "https://bubble.test"
+        )
+        requirements = app_module.structured_lead_requirements(effective)
+        self.assertEqual(requirements["geo_ids"], ["geo-pj"])
+        self.assertEqual(requirements["bedrooms_min"], 4)
+        self.assertEqual(requirements["budget_rent"], 15000)
+        self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
+        self.assertEqual(requirements["pets"], "small dog")
+        self.assertEqual(requirements["adults"], 2)
+        self.assertEqual(requirements["children"], 2)
 
     def test_missing_and_malformed_active_state_fall_back_without_crashing(self):
         cumulative = apply_search_update(empty_search_state(), {
