@@ -2069,6 +2069,58 @@ def save_whatsapp_message_id(
         )
 
 
+def persist_recommendation_whatsapp_ids(
+    message_id, whatsapp_message_ids, phone, message_content,
+    conversation_id, lead_id=None, bubble_env="live",
+):
+    """Keep every replyable recommendation send independently resolvable."""
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        raise ValueError("Recommendation messages require a Conversation.")
+    unique_ids = list(dict.fromkeys(
+        str(value or "").strip() for value in whatsapp_message_ids or []
+        if str(value or "").strip()
+    ))
+    persisted = []
+    for index, meta_id in enumerate(unique_ids, start=1):
+        try:
+            if index == 1:
+                save_whatsapp_message_id(
+                    message_id, meta_id, bubble_env, conversation_id
+                )
+                persisted_message_id = message_id
+            else:
+                payload = {
+                    "phone": normalize_phone(phone),
+                    "direction": "Outbound",
+                    "own_Sent?": "No",
+                    "messageContent": str(message_content or ""),
+                    "whatsappMessageId": meta_id,
+                    "Conversation": conversation_id,
+                }
+                if lead_id:
+                    payload["lead"] = lead_id
+                persisted_message_id = _bubble_create(
+                    get_bubble_base_url(bubble_env), "message", payload
+                )
+            persisted.append(persisted_message_id)
+            print(
+                "[WHATSAPP MESSAGE] direction=outbound "
+                f"recommendation_index={index} "
+                f"conversation_id={conversation_id} action=persisted",
+                flush=True,
+            )
+        except Exception as error:
+            print(
+                "[WHATSAPP MESSAGE] direction=outbound "
+                f"recommendation_index={index} "
+                f"conversation_id={conversation_id} action=persist_failed "
+                f"error={type(error).__name__}",
+                flush=True,
+            )
+    return persisted
+
+
 def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
     text = str(text or "").strip()
     if len(text) <= limit:
@@ -2519,6 +2571,17 @@ def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3
             )
             try:
                 response = send_whatsapp_image(to_phone, image_url)
+                try:
+                    image_payload = response.json()
+                    image_message_id = None
+                    if isinstance(image_payload, dict):
+                        image_message_id = (
+                            (image_payload.get("messages") or [{}])[0].get("id")
+                        )
+                    if image_message_id:
+                        sent_text_ids.append(image_message_id)
+                except (AttributeError, TypeError, ValueError, IndexError):
+                    pass
                 print(
                     f"[WHATSAPP MEDIA] listing_id={listing_id or 'unknown'} "
                     f"sent status={response.status_code}",
@@ -4344,7 +4407,11 @@ def _process_whatsapp_message(message):
                     routed_conversation, resolution, candidate_count = (
                         phone_resolution[:3]
                     )
-                    if len(phone_resolution) > 3:
+                    if (
+                        len(phone_resolution) > 3
+                        and resolution == "ambiguous"
+                        and candidate_count > 1
+                    ):
                         ambiguous_candidates = phone_resolution[3]
                     if candidate_count:
                         print(
@@ -4406,7 +4473,7 @@ def _process_whatsapp_message(message):
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
-            if ambiguous_candidates:
+            if len(ambiguous_candidates) > 1:
                 clarification, ambiguity_labels = (
                     build_conversation_ambiguity_message(
                         ambiguous_candidates, "live"
@@ -4797,22 +4864,10 @@ def _process_whatsapp_message(message):
                     phone, folio_id, recommendation_listings
                 )
                 if isinstance(outbound_ids, list) and outbound_ids:
-                    try:
-                        if lead_conversation_id:
-                            save_whatsapp_message_id(
-                                current_message_id, outbound_ids[0], "live",
-                                lead_conversation_id,
-                            )
-                        else:
-                            save_whatsapp_message_id(
-                                current_message_id, outbound_ids[0], "live"
-                            )
-                    except Exception as error:
-                        print(
-                            "[WHATSAPP MESSAGE] outbound_id_persistence_failed "
-                            f"message_id={current_message_id} "
-                            f"error={type(error).__name__}", flush=True,
-                        )
+                    persist_recommendation_whatsapp_ids(
+                        current_message_id, outbound_ids, phone, answer,
+                        lead_conversation_id, lead_id, "live",
+                    )
             else:
                 outbound_ids = send_whatsapp_text(phone, answer)
                 if isinstance(outbound_ids, list) and outbound_ids:

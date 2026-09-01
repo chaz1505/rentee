@@ -1442,7 +1442,7 @@ class WhatsAppTests(unittest.TestCase):
             "Rentee Role": "Enquiry Coordinator",
             "_routing_enquiry_created_at": "2026-08-31T10:00:00Z",
         }
-        active.return_value = (selected, "enquiry_specific", 1)
+        active.return_value = (selected, "single_active", 1, [selected])
         item = webhook_payload(
             message_id="wamid.profile-ok", text="profile Ok"
         )["entry"][0]["changes"][0]["value"]["messages"][0]
@@ -1474,7 +1474,7 @@ class WhatsAppTests(unittest.TestCase):
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn("candidate_count=1", logs)
         self.assertIn(
-            "resolution=enquiry_specific conversation_id=conversation-b "
+            "resolution=single_active conversation_id=conversation-b "
             "enquiry_id=enquiry-b",
             logs,
         )
@@ -2621,6 +2621,56 @@ class WhatsAppTests(unittest.TestCase):
             {"whatsappMessageId": "wamid.outbound"},
         )
 
+    @patch("app._bubble_create", side_effect=["message-2", "message-3"])
+    @patch("app.save_whatsapp_message_id")
+    def test_recommendation_batch_persists_every_meta_id_independently(
+        self, save_first, create,
+    ):
+        persisted = app_module.persist_recommendation_whatsapp_ids(
+            "message-1", ["wamid.A", "wamid.B", "wamid.C"],
+            "60123456789", "Recommendation summary",
+            "conversation-1", "lead-1", "live",
+        )
+
+        self.assertEqual(persisted, ["message-1", "message-2", "message-3"])
+        save_first.assert_called_once_with(
+            "message-1", "wamid.A", "live", "conversation-1"
+        )
+        self.assertEqual(create.call_count, 2)
+        for call, meta_id in zip(create.call_args_list, ("wamid.B", "wamid.C")):
+            payload = call.args[2]
+            self.assertEqual(payload["whatsappMessageId"], meta_id)
+            self.assertEqual(payload["Conversation"], "conversation-1")
+            self.assertEqual(payload["lead"], "lead-1")
+            self.assertEqual(payload["direction"], "Outbound")
+
+    def test_each_recommendation_reply_id_resolves_the_same_conversation(self):
+        self.reply_conversation_patcher.stop()
+        records_by_meta_id = {
+            "wamid.A": "message-1",
+            "wamid.B": "message-2",
+            "wamid.C": "message-3",
+        }
+
+        def records(_base_url, _object_type, constraints):
+            meta_id = constraints[0]["value"]
+            return iter([{
+                "_id": records_by_meta_id[meta_id],
+                "Conversation": "conversation-recommendations",
+            }])
+
+        with patch("app._bubble_records", side_effect=records), patch(
+            "app.bubble", return_value={"_id": "conversation-recommendations"}
+        ):
+            for meta_id in records_by_meta_id:
+                with self.subTest(meta_id=meta_id):
+                    result = app_module.find_reply_to_conversation({
+                        "context": {"id": meta_id},
+                    })
+                    self.assertEqual(
+                        result["_id"], "conversation-recommendations"
+                    )
+
     @patch("app.save_whatsapp_message_id")
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-current")
@@ -2975,6 +3025,7 @@ class WhatsAppTests(unittest.TestCase):
             app_module.build_whatsapp_recommendation_summary("folio-empty")
         )
 
+    @patch("app.persist_recommendation_whatsapp_ids")
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="bubble-message-current")
     @patch("app.find_latest_ai_message", return_value=None)
@@ -2988,7 +3039,8 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.send_whatsapp_typing_indicator")
     def test_recommendation_turn_uses_existing_folio_and_one_coherent_text_message(
         self, _typing, mocked_lead, mocked_folio, mocked_turn, mocked_current,
-        mocked_summary, mocked_batch, mocked_send, _latest, _create, mocked_save
+        mocked_summary, mocked_batch, mocked_send, _latest, _create, mocked_save,
+        persist_ids,
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
@@ -2998,6 +3050,7 @@ class WhatsAppTests(unittest.TestCase):
             "Three grounded recommendations\n\n"
             "https://www.rentee.asia/folio3/folio-active"
         )
+        mocked_batch.return_value = ["wamid.A", "wamid.B", "wamid.C"]
         item = webhook_payload(text="Show me the properties")["entry"][0]["changes"][0]["value"]["messages"][0]
 
         app_module._process_whatsapp_message(item)
@@ -3011,6 +3064,11 @@ class WhatsAppTests(unittest.TestCase):
         mocked_send.assert_not_called()
         mocked_save.assert_called_once_with(
             "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
+        )
+        persist_ids.assert_called_once_with(
+            "bubble-message-current", ["wamid.A", "wamid.B", "wamid.C"],
+            "60123456789", mocked_summary.return_value,
+            "conversation-general", "lead-1", "live",
         )
 
     @patch("app.save_whatsapp_ai_message")
