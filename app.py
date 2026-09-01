@@ -390,7 +390,9 @@ def test_condo():
     return jsonify(result), 200
 
 
-def build_response_args(user_message, previous_response_id=None):
+def build_response_args(
+    user_message, previous_response_id=None, conversation_context=None,
+):
     """Build the deliberately small customer-turn context and stable tool contracts."""
     search_properties = {
         "regular_destinations": {"type": "array", "items": {"type": "string"}},
@@ -436,7 +438,9 @@ def build_response_args(user_message, previous_response_id=None):
     args = {
         "model": "gpt-5-mini",
         "input": user_message,
-        "instructions": rentee_instructions(),
+        "instructions": rentee_instructions() + (
+            f"\n\n{conversation_context}" if conversation_context else ""
+        ),
         "reasoning": {"effort": "low"},
         "max_output_tokens": INITIAL_MAX_OUTPUT_TOKENS,
         "tool_choice": "auto",
@@ -1546,7 +1550,12 @@ def active_conversations_by_phone(phone, bubble_env="live"):
 def find_active_conversation_by_phone(
     phone, message_text="", bubble_env="live", include_candidates=False,
 ):
-    """Select the active enquiry Conversation with the newest Enquiry."""
+    """Conservatively resolve a phone-only enquiry Conversation.
+
+    Phone is an identity hint, not a conversation identity.  Keep the single
+    enquiry fallback for legacy inbound traffic only when it cannot conflict
+    with a general Conversation; never guess between multiple enquiries.
+    """
     all_candidates = active_conversations_by_phone(phone, bubble_env)
     candidates = [
         item for item in all_candidates
@@ -1554,30 +1563,14 @@ def find_active_conversation_by_phone(
     ]
     result = None
     resolution = "none"
-    if len(candidates) == 1:
+    general_candidates = [
+        item for item in all_candidates
+        if not conversation_store.relationship_id(item.get("Enquiry"))
+    ]
+    if len(candidates) == 1 and not general_candidates:
         result, resolution = candidates[0], "single_active"
-    elif len(candidates) > 1:
-        base_url = get_bubble_base_url(bubble_env)
-        ordered = []
-        for conversation in candidates:
-            enquiry_id = conversation_store.relationship_id(
-                conversation.get("Enquiry")
-            )
-            enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
-            created_value = enquiry.get("Created Date") or enquiry.get("created_date")
-            created_at = _bubble_created_at(created_value)
-            ordered.append((
-                created_at or datetime.datetime.min.replace(
-                    tzinfo=datetime.timezone.utc
-                ),
-                str(enquiry_id), str(conversation.get("_id") or ""),
-                conversation, str(created_value or ""),
-            ))
-        ordered.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        _created_at, _enquiry_key, _conversation_key, result, created_value = ordered[0]
-        result = dict(result)
-        result["_routing_enquiry_created_at"] = created_value
-        resolution = "latest_enquiry"
+    elif candidates:
+        resolution = "ambiguous"
     response = (result, resolution, len(candidates))
     return response + (candidates,) if include_candidates else response
 
@@ -3530,6 +3523,9 @@ def chat_stream():
         )
 
         previous = data.get("previous_response_id")
+        conversation_context = str(
+            data.get("conversation_context") or ""
+        ).strip()
 
         if previous in ("", "null"):
             previous = None
@@ -3665,7 +3661,9 @@ def chat_stream():
                 # the user's existing conversation history.
                 try:
                     response, buffered_initial_text = stream_initial_response(
-                        build_response_args(message, previous),
+                        build_response_args(
+                            message, previous, conversation_context
+                        ),
                         "Initial OpenAI/tool selection"
                     )
                 except Exception as error:
@@ -3677,7 +3675,9 @@ def chat_stream():
                         flush=True
                     )
                     response, buffered_initial_text = stream_initial_response(
-                        build_response_args(message, None),
+                        build_response_args(
+                            message, None, conversation_context
+                        ),
                         "Initial OpenAI/tool selection retry"
                     )
                 if any(
@@ -3918,8 +3918,32 @@ def chat_stream():
         return jsonify({"error": str(e)}), 500
 
 
+def conversation_model_context(conversation):
+    """Build compact role grounding without exposing Bubble relationship IDs."""
+    conversation = conversation or {}
+    details = []
+    for label, field in (
+        ("Counterparty role", "CounterParty Role"),
+        ("Rentee role", "Rentee Role"),
+        ("Subject", "Subject"),
+    ):
+        value = " ".join(str(conversation.get(field) or "").split())
+        if value:
+            details.append(f"- {label}: {value[:160]}")
+    if conversation_store.relationship_id(conversation.get("Enquiry")):
+        details.append("- Enquiry: active")
+    if conversation_store.relationship_id(conversation.get("Listing")):
+        details.append("- Listing: linked to this enquiry")
+    if not details:
+        details.append("- Context: general property-search conversation")
+    return (
+        "Current conversation context:\n" + "\n".join(details)
+        + "\nStay within this role and business context."
+    )
+
+
 def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=None,
-                    bubble_env="live"):
+                    bubble_env="live", conversation_context=None):
     """Run the existing customer turn lifecycle and collect its clean final text."""
     payload = {
         "message": message, "folio_id": folio_id, "bubble_env": bubble_env,
@@ -3927,6 +3951,8 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
     }
     if previous_response_id:
         payload["previous_response_id"] = previous_response_id
+    if conversation_context:
+        payload["conversation_context"] = conversation_context
     # Keep one implementation of prompts, tools, retries, and event filtering: the
     # same streaming endpoint is consumed internally and collapsed for WhatsApp.
     with app.test_client() as test_client:
@@ -4038,6 +4064,12 @@ def _process_whatsapp_message(message):
                             "[CONVERSATION ROUTING] direction=inbound "
                             f"candidate_count={candidate_count}", flush=True,
                         )
+                    if resolution == "ambiguous":
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            "resolution=ambiguous "
+                            f"candidate_count={candidate_count}", flush=True,
+                        )
                     routed_conversation_id = conversation_store.relationship_id(
                         (routed_conversation or {}).get("_id")
                     )
@@ -4045,22 +4077,13 @@ def _process_whatsapp_message(message):
                         enquiry_id = conversation_store.relationship_id(
                             routed_conversation.get("Enquiry")
                         )
-                        if resolution == "latest_enquiry":
-                            print(
-                                "[CONVERSATION ROUTING] direction=inbound "
-                                "resolution=latest_enquiry "
-                                f"conversation_id={routed_conversation_id} "
-                                f"enquiry_id={enquiry_id} "
-                                "enquiry_created_at="
-                                f"{routed_conversation.get('_routing_enquiry_created_at') or 'unknown'}",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                "[CONVERSATION ROUTING] direction=inbound "
-                                f"resolution={resolution} "
-                                f"conversation_id={routed_conversation_id}", flush=True,
-                            )
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution={resolution} "
+                            f"conversation_id={routed_conversation_id}"
+                            + (f" enquiry_id={enquiry_id}" if enquiry_id else ""),
+                            flush=True,
+                        )
                         inbound_message_id, _inbound_created = (
                             persist_inbound_whatsapp_message(
                                 phone, message_id, text,
@@ -4322,21 +4345,13 @@ def _process_whatsapp_message(message):
                     flush=True,
                 )
             folio_id, folio_created = find_or_create_lead_folio(lead_id, "live")
-            previous_message = find_latest_ai_message(lead_id, "live")
-            previous_message_id = previous_message.get("_id") if previous_message else None
+            if not lead_conversation_id:
+                raise RuntimeError("Cannot persist WhatsApp turn without Conversation")
             previous_response_id = (
-                str(previous_message.get("response_ID") or "").strip()
-                if previous_message else None
-            )
-            conversation_previous_response_id = (
                 conversation_store.get_conversation_previous_response_id(
                     lead_conversation
                 )
             )
-            if conversation_previous_response_id:
-                previous_response_id = conversation_previous_response_id
-            if not lead_conversation_id:
-                raise RuntimeError("Cannot persist WhatsApp turn without Conversation")
             current_message_id = create_whatsapp_ai_message(
                 lead_id, phone, "live", lead_conversation_id
             )
@@ -4350,7 +4365,6 @@ def _process_whatsapp_message(message):
                 "[WHATSAPP CONVERSATION] "
                 f"phone={safe_phone} lead_id={lead_id} lead_created={lead_created} "
                 f"folio_id={folio_id} folio_created={folio_created} "
-                f"previous_message_id={previous_message_id} "
                 f"previous_response_id={previous_response_id}",
                 flush=True,
             )
@@ -4361,6 +4375,7 @@ def _process_whatsapp_message(message):
             answer, response_id, recommendations_relevant = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
+                conversation_context=conversation_model_context(lead_conversation),
             )
             if _requests_owner_check(answer):
                 owner_check = prepare_owner_check(lead, "live")
@@ -4386,6 +4401,11 @@ def _process_whatsapp_message(message):
                 try:
                     conversation_store.set_conversation_previous_response_id(
                         lead_conversation_id, response_id, "live"
+                    )
+                    print(
+                        "[CONVERSATION ROUTING] direction=outbound "
+                        "action=previous_response_saved "
+                        f"conversation_id={lead_conversation_id}", flush=True,
                     )
                 except Exception as error:
                     print(
