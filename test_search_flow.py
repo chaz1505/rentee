@@ -484,12 +484,53 @@ class SearchFlowStateTests(unittest.TestCase):
 
     def test_active_instructions_are_small_and_skill_based(self):
         instructions = app_module.build_response_args("Help me find a home")["instructions"]
-        self.assertLess(len(instructions), 9000)
+        self.assertLess(len(instructions), 11000)
         self.assertIn("# Forwarded Listing Enquiry", instructions)
         self.assertIn("# Property Search", instructions)
         self.assertIn("# Condo advice", instructions)
         self.assertNotIn("NEW_PROPERTY_SEARCH", instructions)
         self.assertNotIn("function_call_output", instructions)
+
+    def test_core_instructions_prohibit_offers_and_future_promises(self):
+        instructions = app_module.build_response_args(
+            "Is One Menerung pet friendly?"
+        )["instructions"]
+        normalized = " ".join(instructions.split())
+        self.assertIn("Do not proactively offer to do things", normalized)
+        self.assertIn("Answer the user's request directly and stop", normalized)
+        for prohibited_pattern in (
+            '"I can..."', '"Would you like me to..."',
+            '"Let me know if..."', '"I can also..."',
+            '"I\'ll follow up"', '"I\'ll get back to you"',
+            '"I\'ll let you know"', '"I\'ll keep checking"',
+            '"I\'ll contact them"',
+        ):
+            self.assertIn(prohibited_pattern, normalized)
+        self.assertIn(
+            "Never promise future or background actions", normalized
+        )
+
+    def test_guardrail_preserves_explicit_supported_tool_execution(self):
+        args = app_module.build_response_args(
+            "Find me some other 3-bedroom options in Bangsar"
+        )
+        instructions = args["instructions"]
+        normalized = " ".join(instructions.split())
+        search_tool = next(
+            tool for tool in args["tools"]
+            if tool.get("name") == "advance_property_search"
+        )
+        self.assertIn(
+            "explicitly asks Rentee to perform an action", normalized
+        )
+        self.assertIn(
+            "execute that workflow", normalized
+        )
+        self.assertIn("search current listings", search_tool["description"])
+        self.assertIn(
+            "When the customer explicitly requests a supported search action",
+            normalized,
+        )
 
     def test_structured_listing_shortlist_uses_real_fields_and_budget_tier(self):
         lead = {

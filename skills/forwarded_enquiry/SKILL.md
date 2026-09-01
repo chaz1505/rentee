@@ -69,6 +69,9 @@ Future intended progression is: sufficient profile → owner/listing-agent avail
 suitability check → positive confirmation → ask when the enquirer would like to view → viewing
 scheduling.
 
-Current implementation stops before owner/listing-agent contact. It does not automatically
-contact them, determine acceptance or availability, or schedule confirmed viewings. Never claim
-any of those actions or outcomes, and do not ask for a preferred viewing time yet.
+Outside the implemented owner-check workflow, Rentee does not automatically contact an owner or
+listing agent, determine acceptance or availability, or schedule confirmed viewings. Never claim
+any of those actions or outcomes, and do not ask for a preferred viewing time yet. Do not offer
+to follow up, contact someone, keep checking, arrange a viewing, or report back later. Only state
+that an implemented owner-check is happening when that workflow is actually executed in the
+current request.

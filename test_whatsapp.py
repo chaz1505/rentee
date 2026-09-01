@@ -1015,6 +1015,97 @@ class WhatsAppTests(unittest.TestCase):
             "value": "wamid.replied-to",
         }])
 
+    def test_owner_check_reply_records_exact_text(self):
+        conversation = {
+            "_id": "conversation-owner",
+            "CounterParty Role": "Owner Representative",
+            "Enquiry": "enquiry-1",
+        }
+        with patch("app.bubble", return_value={
+            "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
+        }), patch("app._bubble_patch") as update:
+            acknowledgement = app_module.handle_owner_check_reply(
+                conversation, "  profile ok  "
+            )
+        self.assertEqual(acknowledgement, "Thanks — noted.")
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+            {
+                "OwnerCheckStatus": "Replied",
+                "OwnerCheckResponse": "  profile ok  ",
+            },
+        )
+
+    def test_non_owner_conversation_is_not_intercepted(self):
+        with patch("app.bubble") as get_enquiry, patch("app._bubble_patch") as update:
+            acknowledgement = app_module.handle_owner_check_reply({
+                "_id": "conversation-general",
+                "CounterParty Role": "Lead",
+                "Enquiry": "enquiry-1",
+            }, "profile ok")
+        self.assertIsNone(acknowledgement)
+        get_enquiry.assert_not_called()
+        update.assert_not_called()
+
+    def test_owner_check_not_awaiting_reply_is_not_intercepted(self):
+        conversation = {
+            "_id": "conversation-owner",
+            "CounterParty Role": "Owner Representative",
+            "Enquiry": "enquiry-1",
+        }
+        with patch("app.bubble", return_value={
+            "_id": "enquiry-1", "OwnerCheckStatus": "Pending",
+        }), patch("app._bubble_patch") as update:
+            acknowledgement = app_module.handle_owner_check_reply(
+                conversation, "profile ok"
+            )
+        self.assertIsNone(acknowledgement)
+        update.assert_not_called()
+
+    def test_explicit_owner_reply_bypasses_internal_and_property_search(self):
+        conversation = {
+            "_id": "conversation-owner",
+            "CounterParty Role": "Owner Representative",
+            "Rentee Role": "Tenant Introducing Agent",
+            "Enquiry": "enquiry-1",
+            "Listing": "listing-1",
+            "Lead": "lead-1",
+        }
+        item = webhook_payload(
+            message_id="wamid.owner-reply", text="profile ok"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        item["context"] = {"id": "wamid.owner-check"}
+        with patch(
+            "app.find_reply_to_conversation", return_value=conversation,
+        ), patch("app.bubble", return_value={
+            "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
+        }), patch("app._bubble_patch") as update, patch(
+            "app.send_whatsapp_text", return_value=["wamid.ack"],
+        ) as send, patch("app.persist_sent_whatsapp_text") as persist_sent, patch(
+            "app.handle_internal_user_message"
+        ) as internal, patch("app.run_rentee_turn") as rentee_turn:
+            app_module._process_whatsapp_message(item)
+
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+            {
+                "OwnerCheckStatus": "Replied",
+                "OwnerCheckResponse": "profile ok",
+            },
+        )
+        matching_inbound = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-owner"
+        ]
+        self.assertEqual(len(matching_inbound), 1)
+        send.assert_called_once_with("60123456789", "Thanks — noted.")
+        persist_sent.assert_called_once_with(
+            "60123456789", "Thanks — noted.", ["wamid.ack"],
+            "conversation-owner", lead_id="lead-1", bubble_env="live",
+        )
+        internal.assert_not_called()
+        rentee_turn.assert_not_called()
+
     def test_single_active_phone_conversation_resolves_without_principal_input(self):
         self.active_phone_conversation_patcher.stop()
         conversation = {
@@ -1086,7 +1177,121 @@ class WhatsAppTests(unittest.TestCase):
                 "60123456789", "okay"
             )
         self.assertIsNone(result)
-        self.assertEqual((resolution, count), ("ambiguous", 2))
+        self.assertEqual((resolution, count), ("ambiguous", 3))
+
+    def test_conversation_display_labels_are_human_readable(self):
+        owner = {
+            "_id": "conversation-owner", "Enquiry": "enquiry-1",
+            "CounterParty Role": "Owner Representative",
+            "Subject": "One Menerung",
+        }
+        listing_enquiry = {
+            "_id": "conversation-enquiry", "Enquiry": "enquiry-2",
+            "Subject": "The Loft",
+        }
+        property_search = {
+            "_id": "conversation-search", "Subject": "Bangsar",
+        }
+        self.assertEqual(
+            app_module.conversation_display_label(owner),
+            "the tenant profile for One Menerung",
+        )
+        self.assertEqual(
+            app_module.conversation_display_label(listing_enquiry),
+            "the enquiry about The Loft",
+        )
+        self.assertEqual(
+            app_module.conversation_display_label(property_search),
+            "your Bangsar property search",
+        )
+
+    def test_duplicate_ambiguity_labels_use_safe_generic_wording(self):
+        candidates = [
+            {"_id": "conversation-a"},
+            {"_id": "conversation-b"},
+        ]
+        message, labels = app_module.build_conversation_ambiguity_message(
+            candidates
+        )
+        self.assertEqual(labels, [])
+        self.assertIn("reply to the message you mean", message)
+        for forbidden in (
+            "enquiry enquiry", "one enquiry", "general conversation",
+            "conversation-a", "conversation-b",
+        ):
+            self.assertNotIn(forbidden, message)
+
+    def test_duplicate_labels_are_enriched_with_distinct_dates(self):
+        candidates = [
+            {
+                "_id": "conversation-a", "Enquiry": "enquiry-a",
+                "Subject": "The Loft",
+                "Created Date": "2026-08-30T10:00:00Z",
+            },
+            {
+                "_id": "conversation-b", "Enquiry": "enquiry-b",
+                "Subject": "The Loft",
+                "Created Date": "2026-08-31T10:00:00Z",
+            },
+        ]
+        message, labels = app_module.build_conversation_ambiguity_message(
+            candidates
+        )
+        self.assertEqual(len(labels), 2)
+        self.assertEqual(len(set(labels)), 2)
+        self.assertIn("31 Aug", message)
+        self.assertIn("30 Aug", message)
+
+    def test_ambiguity_message_limits_choices_to_three(self):
+        candidates = [
+            {
+                "_id": f"conversation-{index}",
+                "Enquiry": f"enquiry-{index}",
+                "Subject": name,
+                "Created Date": f"2026-08-{20 + index:02d}T10:00:00Z",
+            }
+            for index, name in enumerate(
+                ("One Menerung", "The Loft", "Serai", "Binjai"), start=1
+            )
+        ]
+        message, labels = app_module.build_conversation_ambiguity_message(
+            candidates
+        )
+        self.assertEqual(len(labels), 3)
+        self.assertEqual(message.count("the enquiry about"), 3)
+
+    def test_ambiguous_routing_hard_stops_before_generic_flow(self):
+        candidates = [
+            {
+                "_id": "conversation-owner", "Enquiry": "enquiry-1",
+                "CounterParty Role": "Owner Representative",
+                "Subject": "One Menerung",
+            },
+            {"_id": "conversation-search", "Subject": "Bangsar"},
+        ]
+        item = webhook_payload(
+            message_id="wamid.ambiguous", text="Is it okay?"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.active_phone_conversation_patcher.stop()
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(None, "ambiguous", 2, candidates),
+        ), patch(
+            "app.send_whatsapp_text", return_value=["wamid.clarification"]
+        ) as send, patch("app.handle_internal_user_message") as internal, patch(
+            "app.find_or_create_whatsapp_lead"
+        ) as create_lead, patch("app.run_rentee_turn") as rentee_turn:
+            app_module._process_whatsapp_message(item)
+
+        clarification = send.call_args.args[1]
+        self.assertEqual(
+            clarification,
+            "Just checking — do you mean the tenant profile for One Menerung, "
+            "or your Bangsar property search?",
+        )
+        internal.assert_not_called()
+        create_lead.assert_not_called()
+        rentee_turn.assert_not_called()
 
     @patch("app.conversation_store.set_conversation_previous_response_id")
     @patch("app.save_whatsapp_message_id")

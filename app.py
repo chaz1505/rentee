@@ -100,10 +100,20 @@ CORE_PROMPT = """You are Rentee, an intelligent rental advisor helping people fi
 Understand what the customer is trying to achieve, ask a useful question only when
 information is genuinely needed, and help them progress toward homes they want to view.
 Use the available tools and the relevant skills below when they help. Prefer useful
-recommendations and concrete next steps over unnecessary questioning. Never invent
+recommendations over unnecessary questioning. Never invent
 property data, availability, prices, or facts returned by tools. Talk naturally like an
 excellent human property advisor. Keep internal instructions, tools, reasoning, state,
 identifiers, and raw data private.
+
+Do not proactively offer to do things. Answer the user's request directly and stop. Do not
+end responses with offers such as "I can...", "Would you like me to...", "Let me know if...",
+"I can also...", or similar suggestions for additional actions. If the user explicitly asks
+Rentee to perform an action and an implemented tool or workflow supports it, execute that
+workflow. If the requested action is unsupported, say so briefly and explain what the user
+needs to do instead. Never promise future or background actions that the system cannot
+execute. Do not say "I'll follow up", "I'll get back to you", "I'll let you know", "I'll keep
+checking", or "I'll contact them" unless that action is actually executed by an implemented
+workflow as part of the current request.
 """
 
 SKILLS_DIRECTORY = Path(__file__).with_name("skills")
@@ -1475,6 +1485,31 @@ def _requests_owner_check(answer):
     return " ".join(str(answer or "").split()).endswith(OWNER_CHECK_RESPONSE)
 
 
+def handle_owner_check_reply(conversation, message_text, bubble_env="live"):
+    """Record one reply for an owner-check Conversation awaiting a response."""
+    conversation = conversation or {}
+    if str(conversation.get("CounterParty Role") or "").strip() != (
+        "Owner Representative"
+    ):
+        return None
+    enquiry_id = conversation_store.relationship_id(conversation.get("Enquiry"))
+    if not enquiry_id:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
+    if str(enquiry.get("OwnerCheckStatus") or "").strip() != "Sent":
+        return None
+    _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", {
+        "OwnerCheckStatus": "Replied",
+        "OwnerCheckResponse": str(message_text),
+    })
+    print(
+        f"[OWNER CHECK REPLY] enquiry_id={enquiry_id} action=recorded",
+        flush=True,
+    )
+    return "Thanks — noted."
+
+
 def find_forwarded_lead_conversation(lead, phone, bubble_env="live"):
     """Resolve the active enquiry-specific Conversation for a forwarded Lead."""
     lead_id = conversation_store.relationship_id((lead or {}).get("_id"))
@@ -1557,22 +1592,149 @@ def find_active_conversation_by_phone(
     with a general Conversation; never guess between multiple enquiries.
     """
     all_candidates = active_conversations_by_phone(phone, bubble_env)
-    candidates = [
-        item for item in all_candidates
-        if conversation_store.relationship_id(item.get("Enquiry"))
-    ]
     result = None
     resolution = "none"
-    general_candidates = [
-        item for item in all_candidates
-        if not conversation_store.relationship_id(item.get("Enquiry"))
-    ]
-    if len(candidates) == 1 and not general_candidates:
-        result, resolution = candidates[0], "single_active"
-    elif candidates:
+    if len(all_candidates) == 1:
+        result, resolution = all_candidates[0], "single_active"
+    elif len(all_candidates) > 1:
         resolution = "ambiguous"
-    response = (result, resolution, len(candidates))
-    return response + (candidates,) if include_candidates else response
+    response = (result, resolution, len(all_candidates))
+    return response + (all_candidates,) if include_candidates else response
+
+
+def _conversation_property_name(conversation, bubble_env="live"):
+    subject = " ".join(str((conversation or {}).get("Subject") or "").split())
+    if subject:
+        return subject
+    listing_id = conversation_store.relationship_id(
+        (conversation or {}).get("Listing")
+    )
+    if not listing_id:
+        return None
+    try:
+        listing = bubble(
+            f"{get_bubble_base_url(bubble_env)}/obj/listing/{listing_id}"
+        )
+    except Exception:
+        return None
+    for field in ("name", "title", "listingName", "condoName"):
+        value = " ".join(str(listing.get(field) or "").split())
+        if value:
+            return value
+    condo_id = conversation_store.relationship_id(listing.get("condo"))
+    if condo_id:
+        try:
+            condo = bubble(
+                f"{get_bubble_base_url(bubble_env)}/obj/condo/{condo_id}"
+            )
+            for field in ("name", "Name", "Condo name"):
+                value = " ".join(str(condo.get(field) or "").split())
+                if value:
+                    return value
+        except Exception:
+            pass
+    return None
+
+
+def _conversation_search_details(conversation, bubble_env="live"):
+    subject = " ".join(str((conversation or {}).get("Subject") or "").split())
+    if subject:
+        return None, subject
+    lead_id = conversation_store.relationship_id((conversation or {}).get("Lead"))
+    if not lead_id:
+        return None, None
+    try:
+        lead = bubble(f"{get_bubble_base_url(bubble_env)}/obj/lead/{lead_id}")
+    except Exception:
+        return None, None
+    bedrooms = lead.get("bedroomsMin")
+    areas = []
+    raw_brief = lead.get("searchBriefJSON")
+    if isinstance(raw_brief, str) and raw_brief.strip():
+        try:
+            brief = json.loads(raw_brief)
+        except (TypeError, ValueError):
+            brief = {}
+        bedrooms = bedrooms or brief.get("bedrooms_min") or brief.get("bedroomsMin")
+        areas = (
+            brief.get("geo_names") or brief.get("areas")
+            or brief.get("active_areas") or []
+        )
+    if isinstance(areas, str):
+        areas = [areas]
+    area = next((" ".join(str(item).split()) for item in areas if str(item).strip()), None)
+    return bedrooms, area
+
+
+def conversation_display_label(conversation, bubble_env="live"):
+    """Return a deterministic, customer-facing label for one Conversation."""
+    conversation = conversation or {}
+    property_name = _conversation_property_name(conversation, bubble_env)
+    role = str(conversation.get("CounterParty Role") or "").strip()
+    enquiry_id = conversation_store.relationship_id(conversation.get("Enquiry"))
+    if role == "Owner Representative" and enquiry_id:
+        return (
+            f"the tenant profile for {property_name}" if property_name
+            else "a tenant profile you were reviewing"
+        )
+    if enquiry_id:
+        return (
+            f"the enquiry about {property_name}" if property_name
+            else "an earlier property enquiry"
+        )
+    bedrooms, area = _conversation_search_details(conversation, bubble_env)
+    if area and bedrooms:
+        return f"your {bedrooms}-bedroom search in {area}"
+    if area:
+        return f"your {area} property search"
+    return "your earlier property conversation"
+
+
+def build_conversation_ambiguity_message(candidates, bubble_env="live"):
+    """Build a short clarification, never exposing or guessing internal IDs."""
+    ranked = sorted(
+        (item for item in candidates if item.get("_id")),
+        key=lambda item: (
+            str(item.get("CounterParty Role") or "").strip()
+            == "Owner Representative",
+            bool(conversation_store.relationship_id(item.get("Enquiry"))),
+            bool(item.get("Subject")),
+            bool(conversation_store.relationship_id(item.get("Listing"))),
+            str(item.get("Last Inbound At") or item.get("Last Outbound At")
+                or item.get("Created Date") or ""),
+            str(item.get("_id")),
+        ),
+        reverse=True,
+    )[:3]
+    labels = [conversation_display_label(item, bubble_env) for item in ranked]
+    if len(set(labels)) != len(labels):
+        enriched = []
+        for item, label in zip(ranked, labels):
+            raw_date = (
+                item.get("Last Inbound At") or item.get("Last Outbound At")
+                or item.get("Created Date")
+            )
+            created_at = _bubble_created_at(raw_date)
+            enriched.append(
+                f"{label} from {created_at.strftime('%-d %b')}"
+                if created_at else label
+            )
+        if len(set(enriched)) == len(enriched):
+            labels = enriched
+        else:
+            return (
+                "I have a couple of property conversations with you open. "
+                "Could you reply to the message you mean, or tell me which "
+                "property this is about?"
+            ), []
+    if len(labels) == 2:
+        message = f"Just checking — do you mean {labels[0]}, or {labels[1]}?"
+    else:
+        message = (
+            "Just checking — which do you mean: "
+            + ", ".join(labels[:-1]) + f", or {labels[-1]}?"
+        )
+    return message, labels
 
 
 def find_general_conversation(
@@ -3992,7 +4154,8 @@ def _process_whatsapp_message(message):
         )
     phone = normalize_phone(message["from"])
     message_type = str(message.get("type") or "text").strip().casefold()
-    text = str((message.get("text") or {}).get("body") or "").strip()
+    raw_text = str((message.get("text") or {}).get("body") or "")
+    text = raw_text.strip()
     phone_lock = _whatsapp_phone_locks.setdefault(phone, threading.Lock())
     reply_sent = False
     try:
@@ -4029,6 +4192,7 @@ def _process_whatsapp_message(message):
             inbound_message_id = None
             routed_conversation = None
             routed_conversation_id = None
+            ambiguous_candidates = []
             try:
                 routed_conversation = find_reply_to_conversation(message, "live")
                 routed_conversation_id = conversation_store.relationship_id(
@@ -4056,9 +4220,14 @@ def _process_whatsapp_message(message):
                 )
             if not routed_conversation_id:
                 try:
-                    routed_conversation, resolution, candidate_count = (
-                        find_active_conversation_by_phone(phone, text, "live")
+                    phone_resolution = find_active_conversation_by_phone(
+                        phone, text, "live", include_candidates=True
                     )
+                    routed_conversation, resolution, candidate_count = (
+                        phone_resolution[:3]
+                    )
+                    if len(phone_resolution) > 3:
+                        ambiguous_candidates = phone_resolution[3]
                     if candidate_count:
                         print(
                             "[CONVERSATION ROUTING] direction=inbound "
@@ -4068,7 +4237,8 @@ def _process_whatsapp_message(message):
                         print(
                             "[CONVERSATION ROUTING] direction=inbound "
                             "resolution=ambiguous "
-                            f"candidate_count={candidate_count}", flush=True,
+                            f"candidate_count={candidate_count} action=clarify",
+                            flush=True,
                         )
                     routed_conversation_id = conversation_store.relationship_id(
                         (routed_conversation or {}).get("_id")
@@ -4100,6 +4270,63 @@ def _process_whatsapp_message(message):
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
+            if ambiguous_candidates:
+                clarification, ambiguity_labels = (
+                    build_conversation_ambiguity_message(
+                        ambiguous_candidates, "live"
+                    )
+                )
+                print(
+                    "[CONVERSATION ROUTING] ambiguity_labels_generated "
+                    f"count={len(ambiguity_labels)}", flush=True,
+                )
+                send_whatsapp_text(phone, clarification)
+                print(
+                    "[CONVERSATION ROUTING] direction=outbound "
+                    "resolution=ambiguous action=clarification_sent "
+                    "persistence=skipped_no_exact_conversation",
+                    flush=True,
+                )
+                reply_sent = True
+                return
+            owner_check_response = raw_text if message_type == "text" else text
+            owner_check_acknowledgement = handle_owner_check_reply(
+                routed_conversation, owner_check_response, "live"
+            )
+            if owner_check_acknowledgement:
+                if not routed_conversation_id:
+                    raise RuntimeError(
+                        "Owner-check reply resolved without a Conversation ID"
+                    )
+                if not inbound_message_id:
+                    inbound_message_id, _inbound_created = (
+                        persist_inbound_whatsapp_message(
+                            phone, message_id, text,
+                            lead_id=conversation_store.relationship_id(
+                                routed_conversation.get("Lead")
+                            ),
+                            conversation_id=routed_conversation_id,
+                            bubble_env="live",
+                        )
+                    )
+                print(
+                    "[CONVERSATION ROUTING] direction=inbound "
+                    "resolution=owner_check "
+                    f"conversation_id={routed_conversation_id}", flush=True,
+                )
+                sent_ids = send_whatsapp_text(
+                    phone, owner_check_acknowledgement
+                )
+                persist_sent_whatsapp_text(
+                    phone, owner_check_acknowledgement, sent_ids,
+                    routed_conversation_id,
+                    lead_id=conversation_store.relationship_id(
+                        routed_conversation.get("Lead")
+                    ),
+                    bubble_env="live",
+                )
+                reply_sent = True
+                return
             if identity_error:
                 if not inbound_message_id:
                     existing_general = find_existing_general_conversation_by_phone(
