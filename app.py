@@ -4557,6 +4557,12 @@ def _process_whatsapp_message(message):
                 lead = bubble(f"{base_url}/obj/lead/{routed_lead_id}")
                 lead.setdefault("_id", routed_lead_id)
                 lead_created = False
+                print(
+                    "[LEAD ROUTING] resolution=conversation "
+                    f"lead_id={routed_lead_id} "
+                    f"conversation_id={routed_conversation_id}",
+                    flush=True,
+                )
             else:
                 linked_lead = capture_linked_tenant_profile(phone, text, "live")
                 if linked_lead:
@@ -4565,6 +4571,11 @@ def _process_whatsapp_message(message):
                     lead, lead_created = find_or_create_whatsapp_lead(
                         phone, message.get("customer_name"), "live"
                     )
+                print(
+                    "[LEAD ROUTING] resolution=phone_fallback "
+                    f"lead_id={lead.get('_id')}",
+                    flush=True,
+                )
             lead_id = lead["_id"]
             lead_conversation = routed_conversation
             lead_conversation_id = routed_conversation_id

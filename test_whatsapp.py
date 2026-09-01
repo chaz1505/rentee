@@ -2633,6 +2633,90 @@ class WhatsAppTests(unittest.TestCase):
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn("resolution=single_active conversation_id=conversation-owner", logs)
 
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Reply", "response-new", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-lead-a", False))
+    @patch("app.find_or_create_whatsapp_lead",
+           return_value=({"_id": "lead-b", "searchActive": "search-b"}, False))
+    @patch("app.capture_linked_tenant_profile",
+           return_value={"_id": "lead-b", "searchActive": "search-b"})
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.bubble")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_conversation_lead_is_authoritative_over_same_phone_fallback(
+        self, _typing, bubble, active, capture, phone_lead, folio, turn,
+        _send, create_ai, _save_ai,
+    ):
+        active.return_value = ({
+            "_id": "conversation-a", "Lead": "lead-a", "Status": "Active",
+        }, "single_active", 1)
+        bubble.return_value = {
+            "_id": "lead-a", "searchActive": "search-a",
+            "bedroomsMin": 4, "budgetRent": 15000,
+        }
+        item = webhook_payload(text="Show my current KLCC search")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+
+        with patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
+
+        bubble.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/lead/lead-a"
+        )
+        capture.assert_not_called()
+        phone_lead.assert_not_called()
+        folio.assert_called_once_with("lead-a", "live")
+        self.mocked_forwarded_conversation.assert_not_called()
+        create_ai.assert_called_once_with(
+            "lead-a", "60123456789", "live", "conversation-a"
+        )
+        self.assertEqual(turn.call_args.args[1], "folio-lead-a")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "[LEAD ROUTING] resolution=conversation lead_id=lead-a "
+            "conversation_id=conversation-a",
+            logs,
+        )
+        self.assertNotIn("resolution=phone_fallback", logs)
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Reply", "response-new", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-fallback", False))
+    @patch("app.find_or_create_whatsapp_lead",
+           return_value=({"_id": "lead-fallback"}, False))
+    @patch("app.capture_linked_tenant_profile", return_value=None)
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_missing_conversation_lead_keeps_phone_fallback(
+        self, _typing, capture, phone_lead, folio, turn, _send,
+        create_ai, _save_ai,
+    ):
+        item = webhook_payload(text="Find a property")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+
+        with patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
+
+        capture.assert_called_once_with(
+            "60123456789", "Find a property", "live"
+        )
+        phone_lead.assert_called_once_with("60123456789", None, "live")
+        folio.assert_called_once_with("lead-fallback", "live")
+        create_ai.assert_called_once_with(
+            "lead-fallback", "60123456789", "live", "conversation-general"
+        )
+        self.assertEqual(turn.call_args.args[1], "folio-fallback")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "[LEAD ROUTING] resolution=phone_fallback lead_id=lead-fallback",
+            logs,
+        )
+
     @patch("app.requests.patch")
     def test_completed_ai_message_saves_answer_and_response_id(self, mocked_patch):
         mocked_patch.return_value.raise_for_status.return_value = None
