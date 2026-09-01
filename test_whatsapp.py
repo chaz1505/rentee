@@ -2819,11 +2819,13 @@ class WhatsAppTests(unittest.TestCase):
            return_value=({"_id": "lead-b", "searchActive": "search-b"}, False))
     @patch("app.capture_linked_tenant_profile",
            return_value={"_id": "lead-b", "searchActive": "search-b"})
+    @patch("app.conversation_has_outbound_message", return_value=True)
+    @patch("app.get_valid_geo_names", return_value=["KLCC"])
     @patch("app.find_active_conversation_by_phone")
     @patch("app.bubble")
     @patch("app.send_whatsapp_typing_indicator")
     def test_conversation_lead_is_authoritative_over_same_phone_fallback(
-        self, _typing, bubble, active, capture, phone_lead, folio, turn,
+        self, _typing, bubble, active, _geos, _history, capture, phone_lead, folio, turn,
         _send, create_ai, _save_ai,
     ):
         active.return_value = ({
@@ -2893,6 +2895,100 @@ class WhatsAppTests(unittest.TestCase):
             "[LEAD ROUTING] resolution=phone_fallback lead_id=lead-fallback",
             logs,
         )
+
+    def test_prefilled_search_confirmation_is_concise_and_customer_facing(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
+            "budgetRent": 15000, "Geo": ["geo-bangsar", "geo-klcc"],
+            "furnishingPreference": "Fully Furnished", "pets": "a small dog",
+            "adults": 2, "children": 2,
+            "startDate": "2026-10-15T00:00:00.000Z",
+        }
+        with patch(
+            "app._profile_relationship_names",
+            side_effect=[["Bangsar", "KLCC"], []],
+        ):
+            message = app_module.build_prefilled_search_confirmation(lead)
+        self.assertIn("4-bedroom rental", message)
+        self.assertIn("Bangsar or KLCC", message)
+        self.assertIn("RM15,000/month", message)
+        self.assertIn("fully furnished", message)
+        self.assertIn("2 adults and 2 children", message)
+        self.assertIn("a small dog", message)
+        self.assertIn("October", message)
+        self.assertTrue(message.endswith("Is that still right?"))
+        for internal in ("Lead", "searchActive", "Conversation", "geo-bangsar"):
+            self.assertNotIn(internal, message)
+
+    @patch("app.run_rentee_turn")
+    @patch("app.find_or_create_lead_folio")
+    @patch("app.persist_sent_whatsapp_text")
+    @patch("app.send_whatsapp_text", return_value=["wamid.confirmation"])
+    @patch("app.conversation_has_outbound_message", return_value=False)
+    @patch(
+        "app._profile_relationship_names",
+        side_effect=[["Bangsar"], [], ["Bangsar"], []],
+    )
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.bubble")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_first_search_conversation_confirms_prefilled_profile_once(
+        self, _typing, bubble, active, _names, _history, send, persist,
+        folio, turn,
+    ):
+        active.return_value = ({
+            "_id": "conversation-search", "Lead": "lead-1", "Status": "Active",
+        }, "single_active", 1, [{"_id": "conversation-search", "Lead": "lead-1"}])
+        bubble.return_value = {
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "bedroomsMin": 4, "budgetRent": 15000, "Geo": ["geo-bangsar"],
+        }
+        item = webhook_payload(text="Hi")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        confirmation = send.call_args.args[1]
+        self.assertIn("4-bedroom rental", confirmation)
+        persist.assert_called_once_with(
+            "60123456789", confirmation, ["wamid.confirmation"],
+            "conversation-search", "lead-1", "live",
+        )
+        folio.assert_not_called()
+        turn.assert_not_called()
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text", return_value=["wamid.reply"])
+    @patch("app.run_rentee_turn", return_value=("Normal reply", "resp-1", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
+    @patch("app.conversation_has_outbound_message", return_value=True)
+    @patch(
+        "app._profile_relationship_names",
+        side_effect=[["Bangsar"], [], ["Bangsar"], []],
+    )
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.bubble")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_subsequent_search_turn_does_not_repeat_profile_confirmation(
+        self, _typing, bubble, active, _names, history, folio, turn,
+        send, _create, _save,
+    ):
+        conversation = {
+            "_id": "conversation-search", "Lead": "lead-1", "Status": "Active",
+        }
+        active.return_value = (conversation, "single_active", 1, [conversation])
+        bubble.return_value = {
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "bedroomsMin": 4, "budgetRent": 15000, "Geo": ["geo-bangsar"],
+        }
+        item = webhook_payload(text="Hi again")["entry"][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        history.assert_called_once_with("conversation-search", "live")
+        folio.assert_called_once_with("lead-1", "live")
+        turn.assert_called_once()
+        send.assert_called_once_with("60123456789", "Normal reply")
 
     @patch("app.requests.patch")
     def test_completed_ai_message_saves_answer_and_response_id(self, mocked_patch):

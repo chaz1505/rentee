@@ -1294,7 +1294,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(lead_fields["Geo"], ["geo-bangsar", "geo-klcc"])
 
     @patch("app.get_named_object_ids")
-    def test_active_filters_ignore_cumulative_geo_and_preferred_condos(self, resolve):
+    def test_active_area_overrides_geo_without_erasing_lead_baseline(self, resolve):
         resolve.side_effect = lambda _base, object_type, names: (
             ["geo-klcc"] if object_type == "geo" and names == ["KLCC"] else []
         )
@@ -1313,9 +1313,51 @@ class SearchFlowStateTests(unittest.TestCase):
         )
         requirements = app_module.structured_lead_requirements(filtered)
         self.assertEqual(requirements["geo_ids"], ["geo-klcc"])
-        self.assertEqual(requirements["preferred_condo_ids"], [])
+        self.assertEqual(requirements["preferred_condo_ids"], ["condo-one-menerung"])
         self.assertEqual(requirements["bedrooms_min"], 3)
         self.assertEqual(requirements["budget_rent"], 15000)
+
+    @patch("app.get_valid_geo_names", return_value=[])
+    def test_empty_active_fields_do_not_erase_full_lead_profile(self, _geos):
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
+            "budgetRent": 15000, "Geo": ["geo-bangsar"],
+            "preferredCondos": ["condo-one"],
+            "furnishingPreference": "Fully Furnished", "pets": "a small dog",
+            "searchActive": dump_search_state(empty_search_state()),
+        }
+        effective = app_module.lead_with_active_search_filters(
+            lead, "https://bubble.test"
+        )
+        requirements = app_module.structured_lead_requirements(effective)
+        self.assertEqual(requirements["bedrooms_min"], 4)
+        self.assertEqual(requirements["budget_rent"], 15000)
+        self.assertEqual(requirements["geo_ids"], ["geo-bangsar"])
+        self.assertEqual(requirements["preferred_condo_ids"], ["condo-one"])
+        self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
+        self.assertEqual(requirements["pets"], "a small dog")
+
+    @patch("app.get_named_object_ids")
+    def test_active_budget_override_preserves_other_lead_fields(self, resolve):
+        active = apply_search_update(
+            empty_search_state(), {"budget_requirement": "12000"}
+        )
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
+            "budgetRent": 15000, "Geo": ["geo-bangsar"],
+            "furnishingPreference": "Fully Furnished", "pets": "small dog",
+            "searchActive": dump_search_state(active),
+        }
+        effective = app_module.lead_with_active_search_filters(
+            lead, "https://bubble.test"
+        )
+        requirements = app_module.structured_lead_requirements(effective)
+        self.assertEqual(requirements["budget_rent"], 12000)
+        self.assertEqual(requirements["bedrooms_min"], 4)
+        self.assertEqual(requirements["geo_ids"], ["geo-bangsar"])
+        self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
+        self.assertEqual(requirements["pets"], "small dog")
+        resolve.assert_not_called()
 
     def test_missing_and_malformed_active_state_fall_back_without_crashing(self):
         cumulative = apply_search_update(empty_search_state(), {

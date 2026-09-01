@@ -1806,6 +1806,88 @@ def build_conversation_ambiguity_message(candidates, bubble_env="live"):
     return message, labels
 
 
+def conversation_has_outbound_message(conversation_id, bubble_env="live"):
+    """Use existing durable Message history as the one-time onboarding marker."""
+    conversation_id = conversation_store.relationship_id(conversation_id)
+    if not conversation_id:
+        return False
+    constraints = [
+        {"key": "Conversation", "constraint_type": "equals",
+         "value": conversation_id},
+        {"key": "direction", "constraint_type": "equals", "value": "Outbound"},
+    ]
+    return next(iter(_bubble_records(
+        get_bubble_base_url(bubble_env), "message", constraints
+    )), None) is not None
+
+
+def _profile_relationship_names(lead, field, object_type, bubble_env="live"):
+    ids = list((lead or {}).get(field) or [])
+    if not ids:
+        return []
+    names = get_relationship_names(
+        get_bubble_base_url(bubble_env), object_type, ids
+    )
+    return [names.get(str(value)) for value in ids if names.get(str(value))]
+
+
+def build_prefilled_search_confirmation(lead, bubble_env="live"):
+    """Summarize useful agent-entered search facts without internal field names."""
+    lead = lead or {}
+    transaction_values = " ".join(lead.get("TransactionType") or []).casefold()
+    transaction = (
+        "rental" if "rent" in transaction_values else
+        "property to buy" if "sale" in transaction_values or "purchase" in transaction_values
+        else "property"
+    )
+    bedrooms = _as_number(lead.get("bedroomsMin"))
+    budget = _as_number(
+        lead.get("budgetRent") if transaction == "rental" else lead.get("budgetBuy")
+    )
+    areas = _profile_relationship_names(lead, "Geo", "geo", bubble_env)
+    condos = _profile_relationship_names(
+        lead, "preferredCondos", "condo", bubble_env
+    )
+    details = []
+    if bedrooms is not None:
+        rendered_beds = int(bedrooms) if bedrooms.is_integer() else bedrooms
+        details.append(f"a {rendered_beds}-bedroom {transaction}")
+    elif transaction_values:
+        details.append(f"a {transaction}")
+    if areas:
+        details.append("around " + " or ".join(areas[:3]))
+    if budget is not None:
+        suffix = "/month" if transaction == "rental" else ""
+        details.append(f"up to RM{budget:,.0f}{suffix}")
+    furnishing = " ".join(str(lead.get("furnishingPreference") or "").split())
+    if furnishing:
+        details.append(furnishing.casefold())
+    if condos:
+        details.append("with interest in " + " or ".join(condos[:2]))
+    adults = _as_number(lead.get("adults"))
+    children = _as_number(lead.get("children"))
+    household = []
+    if adults is not None:
+        household.append(f"{int(adults)} adult" + ("s" if adults != 1 else ""))
+    if children is not None:
+        household.append(f"{int(children)} child" + ("ren" if children != 1 else ""))
+    if household:
+        details.append("for " + " and ".join(household))
+    pets = " ".join(str(lead.get("pets") or "").split())
+    if pets and pets.casefold() not in {"no", "none", "no pets"}:
+        details.append("with " + pets)
+    start_date = str(lead.get("startDate") or "").strip()
+    if start_date:
+        try:
+            parsed = datetime.datetime.fromisoformat(start_date.replace("Z", "+00:00"))
+            details.append(f"moving in {parsed.strftime('%B')}")
+        except ValueError:
+            pass
+    if not details:
+        return None
+    return "I understand you're looking for " + ", ".join(details) + ". Is that still right?"
+
+
 def find_general_conversation(
     principal_id, phone, lead_id=None, counterparty_user_id=None,
     counterparty_role=None, rentee_role=None, bubble_env="live",
@@ -2731,6 +2813,13 @@ def structured_lead_requirements(lead):
         "preferred_condo_ids": list(lead.get("preferredCondos") or []),
         "budget_rent": _as_number(lead.get("budgetRent")),
         "budget_buy": _as_number(lead.get("budgetBuy")),
+        "furnishing_preference": lead.get("furnishingPreference"),
+        "pets": lead.get("pets"),
+        "start_date": lead.get("startDate"),
+        "adults": _as_number(lead.get("adults")),
+        "children": _as_number(lead.get("children")),
+        "helpers": _as_number(lead.get("helpers")),
+        "viewing_preference": lead.get("viewingPreference"),
     }
 
 
@@ -3677,7 +3766,7 @@ def apply_cumulative_search_update(cumulative_state, update):
 
 
 def lead_with_active_search_filters(lead, base_url):
-    """Build an isolated Lead-shaped filter view from searchActive only."""
+    """Overlay explicit searchActive refinements on the durable Lead baseline."""
     state = load_active_search_state(lead)
     bubble_env = "development" if "/version-test/" in base_url else "live"
     valid_geo_names = get_valid_geo_names(bubble_env)
@@ -3696,19 +3785,30 @@ def lead_with_active_search_filters(lead, base_url):
         )
         return dict(lead)
     active = dict(lead)
-    active["Geo"] = get_named_object_ids(base_url, "geo", state["areas"])
-    active["preferredCondos"] = get_named_object_ids(
-        base_url, "condo", state["selected_condos"]
-    )
-    active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
+    if state["areas"]:
+        active["Geo"] = get_named_object_ids(base_url, "geo", state["areas"])
+    if state["selected_condos"]:
+        active["preferredCondos"] = get_named_object_ids(
+            base_url, "condo", state["selected_condos"]
+        )
+    if state["bedroom_requirement"]:
+        active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
     transaction = " ".join(state["property_types"]).casefold()
-    active["TransactionType"] = (
-        ["Rent/Let"] if "rent" in transaction else
-        ["Sale/Purchase"] if "buy" in transaction else []
-    )
+    if transaction:
+        active["TransactionType"] = (
+            ["Rent/Let"] if "rent" in transaction else
+            ["Sale/Purchase"] if "buy" in transaction else
+            active.get("TransactionType") or []
+        )
     budget = _as_number(state["budget_requirement"])
-    active["budgetRent"] = budget if "rent" in transaction else None
-    active["budgetBuy"] = budget if "buy" in transaction else None
+    effective_transaction = (
+        transaction or " ".join(active.get("TransactionType") or []).casefold()
+    )
+    if budget is not None:
+        if "rent" in effective_transaction:
+            active["budgetRent"] = budget
+        elif "buy" in effective_transaction or "sale" in effective_transaction:
+            active["budgetBuy"] = budget
     print("[SEARCH ACTIVE] using active filters for recommendation", flush=True)
     return active
 
@@ -4255,7 +4355,7 @@ def chat_stream():
         return jsonify({"error": str(e)}), 500
 
 
-def conversation_model_context(conversation):
+def conversation_model_context(conversation, lead=None, bubble_env="live"):
     """Build compact role grounding without exposing Bubble relationship IDs."""
     conversation = conversation or {}
     details = []
@@ -4273,6 +4373,13 @@ def conversation_model_context(conversation):
         details.append("- Listing: linked to this enquiry")
     if not details:
         details.append("- Context: general property-search conversation")
+    if lead and not conversation_store.relationship_id(conversation.get("Enquiry")):
+        baseline = build_prefilled_search_confirmation(lead, bubble_env)
+        if baseline:
+            details.append(
+                "- Durable customer search baseline: "
+                + baseline.removesuffix(" Is that still right?")
+            )
     return (
         "Current conversation context:\n" + "\n".join(details)
         + "\nStay within this role and business context."
@@ -4785,6 +4892,36 @@ def _process_whatsapp_message(message):
                     f"message_id={message_id} error={type(error).__name__}",
                     flush=True,
                 )
+            is_search_conversation = not conversation_store.relationship_id(
+                (lead_conversation or {}).get("Enquiry")
+            )
+            if is_search_conversation and not _has_strong_property_search_clue(
+                text, "live"
+            ):
+                try:
+                    confirmation = build_prefilled_search_confirmation(lead, "live")
+                    if confirmation and not conversation_has_outbound_message(
+                        lead_conversation_id, "live"
+                    ):
+                        sent_ids = send_whatsapp_text(phone, confirmation)
+                        persist_sent_whatsapp_text(
+                            phone, confirmation, sent_ids,
+                            lead_conversation_id, lead_id, "live",
+                        )
+                        print(
+                            "[SEARCH ONBOARDING] action=baseline_confirmation_sent "
+                            f"conversation_id={lead_conversation_id} lead_id={lead_id}",
+                            flush=True,
+                        )
+                        reply_sent = True
+                        return
+                except Exception as error:
+                    print(
+                        "[SEARCH ONBOARDING] action=baseline_confirmation_failed "
+                        f"conversation_id={lead_conversation_id} "
+                        f"error={type(error).__name__}",
+                        flush=True,
+                    )
             folio_id, folio_created = find_or_create_lead_folio(lead_id, "live")
             if not lead_conversation_id:
                 raise RuntimeError("Cannot persist WhatsApp turn without Conversation")
@@ -4816,7 +4953,9 @@ def _process_whatsapp_message(message):
             answer, response_id, recommendation_run = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
-                conversation_context=conversation_model_context(lead_conversation),
+                conversation_context=conversation_model_context(
+                    lead_conversation, lead, "live"
+                ),
             )
             if _requests_owner_check(answer):
                 owner_check = prepare_owner_check(lead, "live")
