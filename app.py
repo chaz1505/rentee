@@ -138,10 +138,16 @@ class CondoDataError(RuntimeError):
 
 
 class MatchingResult(str):
-    """Customer text with a private signal that grounded Folio matches exist."""
-    def __new__(cls, text, recommendations_available=False):
+    """Customer text plus the exact recommendation set produced by this run."""
+    def __new__(
+        cls, text, recommendations_available=False, recommendations=None,
+        listing_ids=None, folio_item_ids=None,
+    ):
         value = super().__new__(cls, text)
         value.recommendations_available = bool(recommendations_available)
+        value.recommendations = list(recommendations or [])
+        value.listing_ids = list(listing_ids or [])
+        value.folio_item_ids = list(folio_item_ids or [])
         return value
 
 
@@ -2374,9 +2380,11 @@ def build_folio_url(folio_id):
 def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
     shown = listings[:max(1, min(top_count, MAX_WHATSAPP_RECOMMENDATION_IMAGES))]
     total = len(listings)
+    property_word = "property" if total == 1 else "properties"
+    top_verb = "is" if len(shown) == 1 else "are"
     intro = (
-        f"I've shortlisted {total} properties for you. "
-        f"My top {len(shown)} are:"
+        f"I've shortlisted {total} {property_word} for you. "
+        f"My top {len(shown)} {top_verb}:"
     )
     cards = []
     for index, listing in enumerate(shown, start=1):
@@ -2400,10 +2408,7 @@ def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
         link_intro = f"See all {total} with photos and full details here:"
     else:
         link_intro = "See the shortlist with photos and full details here:"
-    footer = (
-        f"{link_intro}\n{build_folio_url(folio_id)}\n\n"
-        "Tell me which ones you like."
-    )
+    footer = f"{link_intro}\n{build_folio_url(folio_id)}"
     return intro, cards, footer, shown
 
 
@@ -2826,8 +2831,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     if not listings:
         log_timing("match_lead TOTAL", match_started)
         return (
-            "I don't have a suitable current property match for that search at the moment. "
-            "We can broaden the area, budget, bedrooms, or preferred condos if you'd like."
+            "I don't have a suitable current property match for that search at the moment."
         )
 
     print(
@@ -2983,8 +2987,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     if not validated_recommendations:
         log_timing("match_lead TOTAL", match_started)
         return (
-            "I don't have a suitable current property match for that search at the moment. "
-            "We can broaden the area, budget, bedrooms, or preferred condos if you'd like."
+            "I don't have a suitable current property match for that search at the moment."
         )
 
     display_names_by_id = {
@@ -3001,6 +3004,10 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     yield "Updating your shortlist..."
 
     recommendations_available = not new_recommendations
+    current_run_recommendations = (
+        new_recommendations if new_recommendations else validated_recommendations
+    )
+    new_folio_item_ids = []
     if new_recommendations:
         folio_items_update_started = time.perf_counter()
         clear_started = time.perf_counter()
@@ -3029,8 +3036,50 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
                 print(f"Failed to update Folio Items: {error}", flush=True)
         log_timing("match_lead - update FolioItems", folio_items_update_started)
 
+    if not recommendations_available:
+        log_timing("match_lead TOTAL", match_started)
+        return customer_response
+
+    facts_by_listing_id = {
+        str(facts.get("listing_id")): facts
+        for facts in grounded_listing_facts if facts.get("listing_id")
+    }
+    source_listing_by_id = {
+        str(listing.get("_id")): listing
+        for listing in listings if listing.get("_id")
+    }
+    current_run_listings = []
+    for position, recommendation in enumerate(current_run_recommendations, start=1):
+        listing_id = str(recommendation["listing_id"])
+        item = dict(facts_by_listing_id.get(listing_id) or {})
+        source_listing = source_listing_by_id.get(listing_id) or {}
+        item.update({
+            "listing_id": listing_id,
+            "position": position,
+            "recommendation_reason": recommendation.get("reco_summary") or "",
+            "coverPhoto": source_listing.get("coverPhoto"),
+            "photos": source_listing.get("photos"),
+        })
+        current_run_listings.append(item)
+    customer_response = build_whatsapp_recommendation_summary(
+        folio_id, bubble_env, listings=current_run_listings
+    ) or customer_response
+    current_listing_ids = [
+        item["listing_id"] for item in current_run_listings
+    ]
+    print(
+        f"[RECOMMENDATION RUN] folio_id={folio_id} "
+        f"current_listing_count={len(current_listing_ids)}",
+        flush=True,
+    )
     log_timing("match_lead TOTAL", match_started)
-    return MatchingResult(customer_response, recommendations_available)
+    return MatchingResult(
+        customer_response,
+        recommendations_available=True,
+        recommendations=current_run_listings,
+        listing_ids=current_listing_ids,
+        folio_item_ids=new_folio_item_ids,
+    )
 
 
 def stream_match_lead(folio_id, bubble_env, message_id, condo_scope=None):
@@ -3883,6 +3932,7 @@ def chat_stream():
                 print(f"Original call_id: {original_call_id}", flush=True)
                 tool_args = parse_completed_tool_arguments(tool_call)
                 follow_up_tools = None
+                current_run_recommendations = []
 
                 if tool_call.name == "advance_property_search":
                     has_match_results = False
@@ -3903,14 +3953,10 @@ def chat_stream():
                         has_match_results = bool(getattr(
                             matching_result, "recommendations_available", False
                         ))
-                        if has_match_results:
-                            tool_result = (
-                                f"{matching_result}\n\nI've put together a curated selection "
-                                "based on your requirements. Please click INTERESTED on the "
-                                "properties you'd like to view."
-                            )
-                        else:
-                            tool_result = str(matching_result)
+                        current_run_recommendations = list(getattr(
+                            matching_result, "recommendations", []
+                        ))
+                        tool_result = str(matching_result)
                     else:
                         tool_result = search_result["text"]
                     follow_up_instructions = (
@@ -3926,6 +3972,9 @@ def chat_stream():
                     )
                     has_match_results = bool(getattr(
                         matching_result, "recommendations_available", False
+                    ))
+                    current_run_recommendations = list(getattr(
+                        matching_result, "recommendations", []
                     ))
                     tool_result = str(matching_result)
                     follow_up_instructions = (
@@ -4057,7 +4106,7 @@ def chat_stream():
 
                 log_timing("TOTAL REQUEST", request_started)
                 yield (
-                    f"data: {json.dumps({'done': True, 'response_id': final.id, 'recommendations_relevant': has_match_results})}\n\n"
+                    f"data: {json.dumps({'done': True, 'response_id': final.id, 'recommendations_relevant': has_match_results, 'recommendations': current_run_recommendations})}\n\n"
                 )
             except Exception as error:
                 print(f"/chat_stream failed: {error}", flush=True)
@@ -4124,6 +4173,7 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
         text_parts = []
         response_id = None
         recommendations_relevant = False
+        current_run_recommendations = []
         for raw_line in response.get_data(as_text=True).splitlines():
             if not raw_line.startswith("data: "):
                 continue
@@ -4136,10 +4186,15 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
                 response_id = event["response_id"]
             if event.get("recommendations_relevant") is True:
                 recommendations_relevant = True
+            if isinstance(event.get("recommendations"), list):
+                current_run_recommendations = event["recommendations"]
     answer = "".join(text_parts).strip()
     if not answer:
         raise RuntimeError("Rentee turn returned no customer-facing text")
-    return answer, response_id, recommendations_relevant
+    return (
+        answer, response_id,
+        current_run_recommendations or recommendations_relevant,
+    )
 
 
 def _process_whatsapp_message(message):
@@ -4599,7 +4654,7 @@ def _process_whatsapp_message(message):
                 f"[WHATSAPP CONVERSATION] current_message_id={current_message_id}",
                 flush=True,
             )
-            answer, response_id, recommendations_relevant = run_rentee_turn(
+            answer, response_id, recommendation_run = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
                 conversation_context=conversation_model_context(lead_conversation),
@@ -4609,18 +4664,18 @@ def _process_whatsapp_message(message):
                 if owner_check:
                     send_pending_owner_check(lead, owner_check, "live")
             recommendation_listings = []
-            if recommendations_relevant:
-                recommendation_result = json.loads(
-                    get_current_recommendations(folio_id, "live", include_media=True)
-                )
-                recommendation_listings = (
-                    recommendation_result.get("current_recommendations") or []
-                )
+            if isinstance(recommendation_run, list):
+                recommendation_listings = recommendation_run
                 recommendation_summary = build_whatsapp_recommendation_summary(
                     folio_id, "live", listings=recommendation_listings
                 )
                 if recommendation_summary:
                     answer = recommendation_summary
+                print(
+                    f"[RECOMMENDATION RUN] folio_id={folio_id} "
+                    f"summary_listing_count={len(recommendation_listings)}",
+                    flush=True,
+                )
             save_whatsapp_ai_message(
                 current_message_id, answer, response_id, "live"
             )

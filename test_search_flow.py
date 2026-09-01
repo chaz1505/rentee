@@ -630,9 +630,60 @@ class SearchFlowStateTests(unittest.TestCase):
                     break
         self.assertNotIn(listing_id, answer)
         self.assertIn("One Menerung", answer)
-        self.assertIn("four bedrooms", answer)
+        self.assertIn("four-bedroom", answer)
         self.assertIn("RM11,500", answer)
+        self.assertIn("https://www.rentee.asia/folio3/folio-1", answer)
         self.assertTrue(answer.recommendations_available)
+        self.assertEqual(answer.listing_ids, [listing_id])
+        self.assertEqual(
+            [item["listing_id"] for item in answer.recommendations],
+            [listing_id],
+        )
+
+    @patch("app.update_folio_items")
+    @patch("app.create_folio_items", return_value=["folio-item-current"])
+    @patch("app.get_plausible_listings")
+    @patch("app.bubble")
+    def test_current_run_result_preserves_but_excludes_historical_folio_items(
+        self, mocked_bubble, mocked_listings, _mocked_create, mocked_update
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": ["folio-item-historical"]},
+            {"listing": "listing-historical", "newlyAdded": False},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 4, "budgetRent": 15000},
+        ]
+        mocked_listings.return_value = ([{
+            "_id": "listing-current", "propertyName": "Ampersand",
+            "beds": 4, "priceRent": 14500,
+        }], 1)
+        response = SimpleNamespace(
+            output_text=json.dumps({
+                "recommendations": [{
+                    "listing_id": "listing-current",
+                    "reco_summary": "Current four-bedroom match.",
+                }],
+                "customer_response": "Ampersand is the current match.",
+            }),
+            usage=None,
+        )
+
+        with patch.object(app_module.client.responses, "create", return_value=response):
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration as completed:
+                    answer = completed.value
+                    break
+
+        mocked_update.assert_called_once_with(
+            "folio-1",
+            ["folio-item-historical", "folio-item-current"],
+            app_module.get_bubble_base_url("live"),
+        )
+        self.assertEqual(answer.listing_ids, ["listing-current"])
+        self.assertEqual(answer.folio_item_ids, ["folio-item-current"])
+        self.assertNotIn("listing-historical", answer)
 
     @patch("app.bubble", return_value={"folioItems": []})
     def test_empty_current_recommendations_always_return_json(self, _mocked_bubble):
@@ -762,7 +813,7 @@ class SearchFlowStateTests(unittest.TestCase):
             [item["listing_id"] for item in fallback],
             ["listing-1", "listing-2"],
         )
-        self.assertIn("match your active search filters", answer)
+        self.assertIn("Matches the current structured property search filters", answer)
         self.assertTrue(answer.recommendations_available)
         mocked_update.assert_called_once()
         logs = " ".join(str(call) for call in mocked_print.call_args_list)

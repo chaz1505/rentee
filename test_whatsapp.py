@@ -2781,9 +2781,8 @@ class WhatsAppTests(unittest.TestCase):
     ):
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_lead.return_value = (lead, False)
-        mocked_turn.return_value = ("Model recommendation", "resp-1", True)
         listings = [{"listing_id": "listing-1", "property_name": "One Menerung"}]
-        mocked_current.return_value = json.dumps({"current_recommendations": listings})
+        mocked_turn.return_value = ("Model recommendation", "resp-1", listings)
         mocked_summary.return_value = (
             "Three grounded recommendations\n\n"
             "https://www.rentee.asia/folio3/folio-active"
@@ -2793,9 +2792,7 @@ class WhatsAppTests(unittest.TestCase):
         app_module._process_whatsapp_message(item)
 
         mocked_folio.assert_called_once_with("lead-1", "live")
-        mocked_current.assert_called_once_with(
-            "folio-active", "live", include_media=True
-        )
+        mocked_current.assert_not_called()
         mocked_summary.assert_called_once_with(
             "folio-active", "live", listings=listings
         )
@@ -2804,6 +2801,49 @@ class WhatsAppTests(unittest.TestCase):
         mocked_save.assert_called_once_with(
             "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
         )
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text")
+    @patch("app.send_whatsapp_recommendation_batch")
+    @patch("app.run_rentee_turn")
+    @patch("app.find_or_create_lead_folio", return_value=("folio-current", False))
+    @patch("app.find_or_create_whatsapp_lead", return_value=({"_id": "lead-1"}, False))
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_current_run_listings_exclude_stale_history_from_text_and_cards(
+        self, _typing, _lead, _folio, turn, batch, send, _create, save,
+    ):
+        current = [
+            {
+                "listing_id": "listing-ampersand", "property_name": "Ampersand",
+                "beds": 4, "priceRent": 16500,
+                "recommendation_reason": "Current four-bedroom match.",
+            },
+            {
+                "listing_id": "listing-kia-peng", "property_name": "3 Kia Peng",
+                "beds": 5, "priceRent": 10000,
+                "recommendation_reason": "Current KLCC match.",
+            },
+        ]
+        turn.return_value = ("Ignored model text", "resp-current", current)
+        item = webhook_payload(text="Show 4-bedroom KLCC matches")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+
+        app_module._process_whatsapp_message(item)
+
+        saved_text = save.call_args.args[1]
+        self.assertIn("shortlisted 2 properties", saved_text)
+        self.assertIn("Ampersand", saved_text)
+        self.assertIn("3 Kia Peng", saved_text)
+        self.assertIn("4 bed", saved_text)
+        self.assertNotIn("One Menerung", saved_text)
+        self.assertNotIn("3 bed", saved_text)
+        self.assertIn(
+            "https://www.rentee.asia/folio3/folio-current", saved_text
+        )
+        batch.assert_called_once_with("60123456789", "folio-current", current)
+        send.assert_not_called()
 
 
 if __name__ == "__main__":
