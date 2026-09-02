@@ -59,6 +59,9 @@ class ToolOrchestrationTests(unittest.TestCase):
             ["driving", "walking"],
         )
         self.assertIn("find_nearby_places", tools)
+        nearby_properties = tools["find_nearby_places"]["parameters"]["properties"]
+        self.assertNotIn("origin_latitude", nearby_properties)
+        self.assertNotIn("origin_longitude", nearby_properties)
         comparison_tools = {
             tool.get("name") for tool in comparison["tools"] if tool.get("name")
         }
@@ -129,7 +132,6 @@ class ToolOrchestrationTests(unittest.TestCase):
             "9 Beringin, Jalan Beringin, Damansara Heights",
             ["shopping_mall", "supermarket", "grocery_store", "convenience_store"],
             "walking", None, None,
-            origin_latitude=3.145, origin_longitude=101.658,
         )
         initial_request = responses.stream.call_args_list[0].kwargs
         self.assertEqual(initial_request["tool_choice"], {
@@ -203,20 +205,63 @@ class ToolOrchestrationTests(unittest.TestCase):
             user_message="What shops are around 9 Beringin?",
         )
         nearby.assert_called_once_with(
-            "9 Beringin, Jalan Beringin, Damansara Heights",
+            "9 Beringin",
             ["shop"], "walking", None, None,
         )
 
     def test_explicit_known_building_name_is_preserved(self):
-        with patch("app._get_condo_lookup", return_value={
-            "one": {"Condo name": "One Menerung"},
-        }):
-            self.assertEqual(
-                app_module._exact_property_name_for_location(
-                    "What cafes are around one menerung?"
-                ),
-                "One Menerung",
+        self.assertEqual(
+            app_module._exact_property_name_for_location(
+                "What cafes are around One Menerung?"
+            ),
+            "One Menerung",
+        )
+
+    @patch("app.resolve_condo_mentions")
+    def test_nearby_routing_bypasses_condo_recognition(self, condo_mentions):
+        for message in (
+            "What's closest grocery store to 9 Beringin?",
+            "What's near 9 Beringin?",
+            "What's nearby?",
+        ):
+            with self.subTest(message=message):
+                nearby = app_module.build_response_args(message)
+                self.assertEqual(nearby["tool_choice"], {
+                    "type": "function", "name": "find_nearby_places",
+                })
+        condo_mentions.assert_not_called()
+
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "error", "reason": "origin_not_resolved",
+    }))
+    def test_nearby_retry_keeps_explicit_origin_pinned(self, nearby):
+        for invented_origin in (
+            "Jalan Beringin, Damansara Heights",
+            "9 Beringin, Jalan Damanlela",
+        ):
+            call = SimpleNamespace(
+                name="find_nearby_places", call_id="nearby-retry",
+                arguments=json.dumps({
+                    "origin": invented_origin, "categories": ["grocery"],
+                    "travel_mode": "walking",
+                }),
             )
+            app_module.execute_chat_tool(
+                call, None, "live", None,
+                user_message="What's closest grocery store to 9 Beringin?",
+            )
+        self.assertEqual(
+            [call.args[0] for call in nearby.call_args_list],
+            ["9 Beringin", "9 Beringin"],
+        )
+
+    @patch("app.resolve_condo_mentions", return_value=["9 Beringin"])
+    def test_condo_info_still_applies_without_nearby_intent(self, condo_mentions):
+        condo = app_module.build_response_args("Tell me about 9 Beringin")
+        self.assertEqual(condo["tool_choice"], {
+            "type": "function", "name": "get_condo_info",
+        })
+        condo_mentions.assert_called_once()
 
     @patch("app.get_travel_time", return_value=json.dumps({"status": "ok"}))
     @patch("app.bubble", return_value={

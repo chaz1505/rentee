@@ -527,33 +527,16 @@ def get_travel_time(origin, destination, mode="driving",
 
 
 def find_nearby_places(origin, categories, travel_mode="walking",
-                       max_travel_minutes=None, max_results=None,
-                       origin_latitude=None, origin_longitude=None):
+                       max_travel_minutes=None, max_results=None):
     """Application wrapper for grounded amenity discovery and route filtering."""
     print(
         "[NEARBY TOOL] "
         f"origin={origin!r} categories={categories!r} mode={travel_mode} "
         f"max_minutes={max_travel_minutes}", flush=True,
     )
-    def resolve_origin(value):
-        if origin_latitude is not None and origin_longitude is not None:
-            try:
-                return {
-                    "canonical_name": " ".join(str(origin or "").split()),
-                    "resolved_name": " ".join(str(origin or "").split()),
-                    "latitude": float(origin_latitude),
-                    "longitude": float(origin_longitude),
-                    "resolution_level": "exact_property", "match_type": "exact",
-                }
-            except (TypeError, ValueError):
-                pass
-        return _known_location_coordinates(value)
-
     result = find_grounded_nearby_places(
         origin, categories, travel_mode=travel_mode,
         max_travel_minutes=max_travel_minutes, max_results=max_results,
-        coordinate_resolver=resolve_origin,
-        web_resolver=_resolve_location_identity_with_web,
     )
     print(
         "[NEARBY RESOLVE] "
@@ -643,12 +626,13 @@ def _requires_nearby_places_tool(message):
         text,
     )
     proximity = re.search(
-        r"\b(nearby|near|close to|close by|around|walking distance|"
+        r"\b(nearby|nearest|closest|near|close to|close by|around|walking distance|"
         r"within .*?(?:walk|drive|minutes?))\b",
         text,
     )
     broad_around_request = re.search(
-        r"\bwhat(?:'s| is) (?:there )?(?:nearby|around (?:here|this|the))\b",
+        r"\bwhat(?:'s| is) (?:there )?(?:nearby|closest|nearest|"
+        r"near|around|within (?:walking|driving) distance)\b",
         text,
     )
     return bool((category and proximity) or broad_around_request)
@@ -794,7 +778,8 @@ def build_response_args(
     user_message, previous_response_id=None, conversation_context=None,
 ):
     """Build the deliberately small customer-turn context and stable tool contracts."""
-    recognized_condos = resolve_condo_mentions(user_message)
+    nearby_required = _requires_nearby_places_tool(user_message)
+    recognized_condos = [] if nearby_required else resolve_condo_mentions(user_message)
     search_properties = {
         "regular_destinations": {
             "type": "array", "items": {"type": "string"},
@@ -960,9 +945,8 @@ def build_response_args(
                     "by walking or driving time. Use for nearby supermarkets, groceries, cafes, "
                     "pharmacies, parks, schools, restaurants, shops, clinics, transport, and "
                     "similar categories. Do not use get_travel_time unless both endpoints are "
-                    "already named. If trusted current listing context includes coordinates, "
-                    "pass them in origin_latitude/origin_longitude so no geocoding is needed. "
-                    "Preserve the full property name and address in origin. If walking distance "
+                    "already named. Preserve the full authoritative property name and address "
+                    "in origin; Google resolves it to coordinates. If walking distance "
                     "has no stated threshold, use 10 minutes. For broad shops, refresh without "
                     "clarification using shopping_mall, supermarket, grocery_store, and "
                     "convenience_store."
@@ -978,10 +962,6 @@ def build_response_args(
                                                "minimum": 1, "maximum": 60},
                         "max_results": {"type": ["integer", "null"],
                                         "minimum": 1, "maximum": 20},
-                        "origin_latitude": {"type": ["number", "null"],
-                                            "description": "Trusted exact listing latitude, when present in current listing context."},
-                        "origin_longitude": {"type": ["number", "null"],
-                                             "description": "Trusted exact listing longitude, when present in current listing context."},
                     }, "required": ["origin", "categories", "travel_mode"],
                     "additionalProperties": False,
                 },
@@ -1017,7 +997,7 @@ def build_response_args(
         args["tool_choice"] = {"type": "function", "name": "get_condo_info"}
     if _requires_location_comparison_tool(user_message):
         args["tool_choice"] = {"type": "function", "name": "compare_locations"}
-    elif _requires_nearby_places_tool(user_message):
+    elif nearby_required:
         args["tool_choice"] = {"type": "function", "name": "find_nearby_places"}
     elif _requires_travel_time_tool(user_message):
         args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
@@ -4675,26 +4655,37 @@ def advance_property_search(folio_id, bubble_env, update):
 def _message_refers_to_reply_listing(message):
     text = normalize_condo_name(message)
     return bool(re.search(
-        r"\b(this(?: one| property| house| home| condo)?|here|around here|near this)\b",
+        r"\b(this(?: one| property| house| home| condo)?|here|around here|near this|"
+        r"nearby|closest|within (?:walking|driving) distance)\b",
         text,
     ))
 
 
-def _exact_property_name_for_location(message, conversation_context=None):
-    """Return only a high-confidence exact name from this turn or trusted context."""
+def _explicit_nearby_place(message):
+    """Extract a place the customer explicitly pins after nearby phrasing."""
     text = " ".join(str(message or "").split())
     explicit = re.search(
         r"\b(?:around|near|close to|close by)\s+"
-        r"(\d+[a-z]?(?:[-/]\d+[a-z]?)?\s+[^?,.]+?)"
+        r"(?!this\b|here\b)([^?,.]+?)"
         r"(?=\s+(?:from|to|within)\b|[?,.]|$)",
         text, flags=re.IGNORECASE,
     )
+    if not explicit:
+        explicit = re.search(
+            r"\b(?:closest|nearest)\b.*?\bto\s+"
+            r"(?!this\b|here\b)([^?,.]+?)(?=[?,.]|$)",
+            text, flags=re.IGNORECASE,
+        )
     if explicit:
         return " ".join(explicit.group(1).split())
-    if re.search(r"\b(?:around|near|close to|close by)\b", text, re.IGNORECASE):
-        recognized = resolve_condo_mentions(text)
-        if len(recognized) == 1:
-            return recognized[0]
+    return None
+
+
+def _exact_property_name_for_location(message, conversation_context=None):
+    """Return only a high-confidence exact name from this turn or trusted context."""
+    explicit = _explicit_nearby_place(message)
+    if explicit:
+        return explicit
     if not _message_refers_to_reply_listing(message):
         return None
     context = str(conversation_context or "")
@@ -4714,7 +4705,25 @@ def _preserve_exact_property_name(location, property_name):
     return ", ".join(part for part in (property_name, location) if part)
 
 
-def _trusted_reply_listing_location(listing_id, bubble_env="live"):
+def _trusted_location_from_context(message, conversation_context=None):
+    if not _message_refers_to_reply_listing(message):
+        return None
+    context = str(conversation_context or "")
+    values = []
+    for label in ("Property", "Address", "Location"):
+        match = re.search(rf"(?m)^- {label}:\s*(.+?)\s*$", context)
+        if not match:
+            continue
+        value = " ".join(match.group(1).split())
+        normalized = _normalized_location_entity_name(value)
+        if any(normalized in _normalized_location_entity_name(item) for item in values):
+            continue
+        values.append(value)
+    return ", ".join(values) if values else None
+
+
+def _trusted_reply_listing_location(listing_id, bubble_env="live",
+                                    include_coordinates=True):
     """Load the exact reply Listing and build its most-specific trusted location."""
     listing_id = conversation_store.relationship_id(listing_id)
     if not listing_id:
@@ -4741,17 +4750,18 @@ def _trusted_reply_listing_location(listing_id, bubble_env="live"):
         components.append(value)
     if not components:
         return None
-    latitude = next((listing.get(field) for field in
-                     ("latitude", "Latitude", "lat", "Lat")
-                     if listing.get(field) not in (None, "")), None)
-    longitude = next((listing.get(field) for field in
-                      ("longitude", "Longitude", "lng", "Lng", "lon", "Lon")
-                      if listing.get(field) not in (None, "")), None)
     coordinates = None
-    try:
-        coordinates = (float(latitude), float(longitude))
-    except (TypeError, ValueError):
-        pass
+    if include_coordinates:
+        latitude = next((listing.get(field) for field in
+                         ("latitude", "Latitude", "lat", "Lat")
+                         if listing.get(field) not in (None, "")), None)
+        longitude = next((listing.get(field) for field in
+                          ("longitude", "Longitude", "lng", "Lng", "lon", "Lon")
+                          if listing.get(field) not in (None, "")), None)
+        try:
+            coordinates = (float(latitude), float(longitude))
+        except (TypeError, ValueError):
+            pass
     return {"listing_id": listing_id, "location": ", ".join(components),
             "coordinates": coordinates}
 
@@ -4761,10 +4771,19 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
                       conversation_context=None):
     """Execute one supported chat tool and return neutral continuation grounding."""
     tool_args = parse_completed_tool_arguments(tool_call)
+    explicit_nearby_place = _explicit_nearby_place(user_message)
     trusted_listing = None
     if (tool_call.name in {"find_nearby_places", "get_travel_time", "compare_locations"}
-            and reply_listing_id and _message_refers_to_reply_listing(user_message)):
-        trusted_listing = _trusted_reply_listing_location(reply_listing_id, bubble_env)
+            and reply_listing_id and not explicit_nearby_place
+            and _message_refers_to_reply_listing(user_message)):
+        trusted_listing = _trusted_reply_listing_location(
+            reply_listing_id, bubble_env,
+            include_coordinates=tool_call.name != "find_nearby_places",
+        )
+    trusted_context_location = (
+        None if explicit_nearby_place or trusted_listing
+        else _trusted_location_from_context(user_message, conversation_context)
+    )
     exact_property_name = _exact_property_name_for_location(
         user_message, conversation_context
     )
@@ -4871,28 +4890,18 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
             "unit number, floor, or apartment details."
         )
     elif tool_call.name == "find_nearby_places":
-        origin = (trusted_listing or {}).get("location") or tool_args.get("origin")
-        if not trusted_listing:
-            origin = _preserve_exact_property_name(origin, exact_property_name)
+        origin = (
+            explicit_nearby_place
+            or (trusted_listing or {}).get("location")
+            or trusted_context_location
+            or tool_args.get("origin")
+        )
         nearby_args = (
             origin, tool_args.get("categories") or [],
             tool_args.get("travel_mode", "walking"),
             tool_args.get("max_travel_minutes"), tool_args.get("max_results"),
         )
-        trusted_coordinates = (trusted_listing or {}).get("coordinates")
-        if trusted_coordinates:
-            output = find_nearby_places(
-                *nearby_args, origin_latitude=trusted_coordinates[0],
-                origin_longitude=trusted_coordinates[1],
-            )
-        elif (tool_args.get("origin_latitude") is not None
-                and tool_args.get("origin_longitude") is not None):
-            output = find_nearby_places(
-                *nearby_args, origin_latitude=tool_args["origin_latitude"],
-                origin_longitude=tool_args["origin_longitude"],
-            )
-        else:
-            output = find_nearby_places(*nearby_args)
+        output = find_nearby_places(*nearby_args)
         instructions = (
             "Use only the supplied nearby-place results for business identity, address, "
             "distance, and travel time. Summarize confirmed results naturally and do not "

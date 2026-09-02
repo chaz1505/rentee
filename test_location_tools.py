@@ -675,17 +675,16 @@ class LocationToolTests(unittest.TestCase):
         self.assertIn("Longitude: 101.658", context)
         self.assertIn("never drop a house number", context)
 
+    @patch("app._known_location_coordinates")
     @patch("app.find_grounded_nearby_places")
-    def test_nearby_wrapper_uses_trusted_listing_coordinates_directly(self, grounded):
+    def test_nearby_wrapper_bypasses_rentee_entity_resolution(self, grounded, known):
         grounded.return_value = {"status": "ok", "origin": {}, "places": []}
         app_module.find_nearby_places(
             "9 Beringin, Jalan Beringin, Damansara Heights", ["shops"],
-            origin_latitude=3.145, origin_longitude=101.658,
         )
-        resolver = grounded.call_args.kwargs["coordinate_resolver"]
-        known = resolver("9 Beringin, Jalan Beringin, Damansara Heights")
-        self.assertEqual((known["latitude"], known["longitude"]), (3.145, 101.658))
-        self.assertEqual(known["resolution_level"], "exact_property")
+        known.assert_not_called()
+        self.assertNotIn("coordinate_resolver", grounded.call_args.kwargs)
+        self.assertNotIn("web_resolver", grounded.call_args.kwargs)
 
     def test_compare_locations_uses_the_same_web_resolution_pipeline(self):
         provider = FakeProvider({
