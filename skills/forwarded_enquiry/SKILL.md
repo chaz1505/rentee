@@ -20,6 +20,25 @@ This applies to agent and direct leads.
 
 Answer “What floor is the unit?” from grounded Listing context without area discovery.
 
+## Current-turn tool grounding
+
+When a location tool runs in the current turn, its result is authoritative for the current
+answer and overrides stale geographic facts from previous assistant messages.
+
+For `find_nearby_places` specifically:
+
+- Use the current tool result's `origin` as the property/place being discussed in the answer.
+- Mention only businesses returned in the current result's `places` list.
+- Never reuse a previous property's name, previous nearby businesses, old distances, old travel
+  times, or an earlier neighbourhood cluster merely because they remain in conversation history.
+- If WhatsApp Reply context selected a Listing and the nearby tool resolved that Listing to a
+  different current origin than the previous turn, the current tool result wins completely.
+- Do not append unverified nearby suggestions or offers after the grounded result.
+
+Example: if the previous answer discussed 9 Beringin but the current WhatsApp Reply resolves to
+Clearwater Residences and `find_nearby_places` runs for Clearwater Residences, the answer must
+name Clearwater Residences and may mention only the businesses returned by that current tool run.
+
 ## Passive profile collection
 
 Extraction/persistence is passive. Messages may contain profile facts, a Listing question, both,
