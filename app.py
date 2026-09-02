@@ -491,13 +491,28 @@ def _resolve_location_identity_with_web(location_name, known_entity=None):
     return result
 
 
-def get_travel_time(origin, destination, mode="driving"):
+def get_travel_time(origin, destination, mode="driving",
+                    origin_coordinates=None, destination_coordinates=None):
     """Application wrapper for provider-neutral grounded route information."""
     print(f"[LOCATION TOOL] name=get_travel_time origin={origin!r} destination={destination!r}",
           flush=True)
+    def resolve_endpoint(value):
+        normalized = _normalized_location_entity_name(value)
+        for expected, coordinates in (
+            (origin, origin_coordinates), (destination, destination_coordinates),
+        ):
+            if (coordinates and normalized == _normalized_location_entity_name(expected)):
+                return {
+                    "canonical_name": " ".join(str(expected or "").split()),
+                    "resolved_name": " ".join(str(expected or "").split()),
+                    "latitude": coordinates[0], "longitude": coordinates[1],
+                    "resolution_level": "exact_property", "match_type": "exact",
+                }
+        return _known_location_coordinates(value)
+
     result = get_grounded_travel_time(
         origin, destination, mode=mode,
-        coordinate_resolver=_known_location_coordinates,
+        coordinate_resolver=resolve_endpoint,
         web_resolver=_resolve_location_identity_with_web,
     )
     print(
@@ -564,16 +579,29 @@ def find_nearby_places(origin, categories, travel_mode="walking",
     return json.dumps(result, ensure_ascii=False)
 
 
-def compare_locations(candidate_locations, destinations):
+def compare_locations(candidate_locations, destinations, trusted_coordinates=None):
     """Application wrapper for a batched residential-location comparison."""
     print(
         "[LOCATION TOOL] name=compare_locations "
         f"candidate_count={len(candidate_locations or [])} "
         f"destination_count={len(destinations or [])}", flush=True,
     )
+    trusted_coordinates = trusted_coordinates or {}
+
+    def resolve_location(value):
+        coordinates = trusted_coordinates.get(_normalized_location_entity_name(value))
+        if coordinates:
+            return {
+                "canonical_name": " ".join(str(value or "").split()),
+                "resolved_name": " ".join(str(value or "").split()),
+                "latitude": coordinates[0], "longitude": coordinates[1],
+                "resolution_level": "exact_property", "match_type": "exact",
+            }
+        return _known_location_coordinates(value)
+
     result = compare_grounded_locations(
         candidate_locations, destinations,
-        coordinate_resolver=_known_location_coordinates,
+        coordinate_resolver=resolve_location,
         web_resolver=_resolve_location_identity_with_web,
     )
     print(
@@ -4644,9 +4672,64 @@ def advance_property_search(folio_id, bubble_env, update):
     }
 
 
-def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
+def _message_refers_to_reply_listing(message):
+    text = normalize_condo_name(message)
+    return bool(re.search(
+        r"\b(this(?: one| property| house| home| condo)?|here|around here|near this)\b",
+        text,
+    ))
+
+
+def _trusted_reply_listing_location(listing_id, bubble_env="live"):
+    """Load the exact reply Listing and build its most-specific trusted location."""
+    listing_id = conversation_store.relationship_id(listing_id)
+    if not listing_id:
+        return None
+    try:
+        listing = bubble(f"{get_bubble_base_url(bubble_env)}/obj/listing/{listing_id}")
+    except Exception as error:
+        print(
+            "[LOCATION REPLY CONTEXT] action=listing_lookup_failed "
+            f"listing_id={listing_id} error={type(error).__name__}", flush=True,
+        )
+        return None
+    components = []
+    for field in (
+        "name", "title", "condoName", "Address", "address", "Full Address",
+        "street", "Street", "Location", "area", "Area",
+    ):
+        value = " ".join(str(listing.get(field) or "").split())
+        if not value:
+            continue
+        normalized = _normalized_location_entity_name(value)
+        if any(normalized in _normalized_location_entity_name(item) for item in components):
+            continue
+        components.append(value)
+    if not components:
+        return None
+    latitude = next((listing.get(field) for field in
+                     ("latitude", "Latitude", "lat", "Lat")
+                     if listing.get(field) not in (None, "")), None)
+    longitude = next((listing.get(field) for field in
+                      ("longitude", "Longitude", "lng", "Lng", "lon", "Lon")
+                      if listing.get(field) not in (None, "")), None)
+    coordinates = None
+    try:
+        coordinates = (float(latitude), float(longitude))
+    except (TypeError, ValueError):
+        pass
+    return {"listing_id": listing_id, "location": ", ".join(components),
+            "coordinates": coordinates}
+
+
+def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
+                      user_message=None, reply_listing_id=None):
     """Execute one supported chat tool and return neutral continuation grounding."""
     tool_args = parse_completed_tool_arguments(tool_call)
+    trusted_listing = None
+    if (tool_call.name in {"find_nearby_places", "get_travel_time", "compare_locations"}
+            and reply_listing_id and _message_refers_to_reply_listing(user_message)):
+        trusted_listing = _trusted_reply_listing_location(reply_listing_id, bubble_env)
     has_match_results = False
     recommendations = []
     if tool_call.name == "advance_property_search":
@@ -4714,10 +4797,27 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
             "do not invent missing facts, and never expose tool or state fields."
         )
     elif tool_call.name == "get_travel_time":
-        output = get_travel_time(
-            tool_args.get("origin"), tool_args.get("destination"),
-            tool_args.get("mode", "driving"),
-        )
+        origin = tool_args.get("origin")
+        destination = tool_args.get("destination")
+        origin_coordinates = destination_coordinates = None
+        if trusted_listing:
+            if re.search(r"\b(?:from|to) (?:this|here)\b",
+                         normalize_condo_name(user_message)):
+                destination = trusted_listing["location"]
+                destination_coordinates = trusted_listing["coordinates"]
+            else:
+                origin = trusted_listing["location"]
+                origin_coordinates = trusted_listing["coordinates"]
+        if origin_coordinates or destination_coordinates:
+            output = get_travel_time(
+                origin, destination, tool_args.get("mode", "driving"),
+                origin_coordinates=origin_coordinates,
+                destination_coordinates=destination_coordinates,
+            )
+        else:
+            output = get_travel_time(
+                origin, destination, tool_args.get("mode", "driving")
+            )
         instructions = (
             "Use the supplied grounded result for distance, driving time, place identity, and "
             "traffic basis. Surface ambiguity and area-level approximation. Call another "
@@ -4725,12 +4825,19 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
             "unit number, floor, or apartment details."
         )
     elif tool_call.name == "find_nearby_places":
+        origin = (trusted_listing or {}).get("location") or tool_args.get("origin")
         nearby_args = (
-            tool_args.get("origin"), tool_args.get("categories") or [],
+            origin, tool_args.get("categories") or [],
             tool_args.get("travel_mode", "walking"),
             tool_args.get("max_travel_minutes"), tool_args.get("max_results"),
         )
-        if (tool_args.get("origin_latitude") is not None
+        trusted_coordinates = (trusted_listing or {}).get("coordinates")
+        if trusted_coordinates:
+            output = find_nearby_places(
+                *nearby_args, origin_latitude=trusted_coordinates[0],
+                origin_longitude=trusted_coordinates[1],
+            )
+        elif (tool_args.get("origin_latitude") is not None
                 and tool_args.get("origin_longitude") is not None):
             output = find_nearby_places(
                 *nearby_args, origin_latitude=tool_args["origin_latitude"],
@@ -4747,10 +4854,27 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
             "could not verify the requested threshold."
         )
     elif tool_call.name == "compare_locations":
-        output = compare_locations(
-            tool_args.get("candidate_locations") or [],
-            tool_args.get("destinations") or [],
-        )
+        candidate_locations = list(tool_args.get("candidate_locations") or [])
+        coordinate_map = None
+        if trusted_listing:
+            if candidate_locations:
+                candidate_locations[0] = trusted_listing["location"]
+            else:
+                candidate_locations = [trusted_listing["location"]]
+            if trusted_listing["coordinates"]:
+                coordinate_map = {
+                    _normalized_location_entity_name(trusted_listing["location"]):
+                    trusted_listing["coordinates"]
+                }
+        if coordinate_map:
+            output = compare_locations(
+                candidate_locations, tool_args.get("destinations") or [],
+                trusted_coordinates=coordinate_map,
+            )
+        else:
+            output = compare_locations(
+                candidate_locations, tool_args.get("destinations") or []
+            )
         instructions = (
             "Use the supplied grounded matrix for every geographic claim. Surface unresolved "
             "or ambiguous places and area-level approximations. Combine it with the customer's "
@@ -4791,6 +4915,9 @@ def chat_stream():
         )
 
         previous = data.get("previous_response_id")
+        reply_listing_id = conversation_store.relationship_id(
+            data.get("reply_listing_id")
+        )
         conversation_context = str(
             data.get("conversation_context") or ""
         ).strip()
@@ -5081,7 +5208,8 @@ def chat_stream():
                             flush=True,
                         )
                     execution = execute_chat_tool(
-                        tool_call, folio_id, bubble_env, message_id
+                        tool_call, folio_id, bubble_env, message_id,
+                        user_message=message, reply_listing_id=reply_listing_id,
                     )
                     if execution["has_match_results"]:
                         has_match_results = True
@@ -5232,7 +5360,8 @@ def whatsapp_reply_listing_context(listing_id, bubble_env="live"):
 
 
 def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=None,
-                    bubble_env="live", conversation_context=None):
+                    bubble_env="live", conversation_context=None,
+                    reply_listing_id=None):
     """Run the existing customer turn lifecycle and collect its clean final text."""
     payload = {
         "message": message, "folio_id": folio_id, "bubble_env": bubble_env,
@@ -5242,6 +5371,8 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
         payload["previous_response_id"] = previous_response_id
     if conversation_context:
         payload["conversation_context"] = conversation_context
+    if reply_listing_id:
+        payload["reply_listing_id"] = reply_listing_id
     # Keep one implementation of prompts, tools, retries, and event filtering: the
     # same streaming endpoint is consumed internally and collapsed for WhatsApp.
     with app.test_client() as test_client:
@@ -5816,6 +5947,7 @@ def _process_whatsapp_message(message):
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
                 conversation_context=model_context,
+                **({"reply_listing_id": reply_listing_id} if reply_listing_id else {}),
             )
             if _requests_owner_check(answer):
                 owner_check = prepare_owner_check(lead, "live")

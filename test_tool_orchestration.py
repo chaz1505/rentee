@@ -107,8 +107,7 @@ class ToolOrchestrationTests(unittest.TestCase):
         responses.stream.side_effect = [
             FakeStream(function_response(
                 "nearby-call-response", "find_nearby_places", "nearby-call", {
-                    "origin": "9 Beringin, Jalan Beringin, Damansara Heights",
-                    "origin_latitude": 3.145, "origin_longitude": 101.658,
+                    "origin": "Jalan Beringin, Damansara Heights",
                     "categories": ["shopping_mall", "supermarket", "grocery_store",
                                    "convenience_store"],
                     "travel_mode": "walking",
@@ -118,11 +117,13 @@ class ToolOrchestrationTests(unittest.TestCase):
                 "Village Grocer is an 8-minute walk from 9 Beringin."
             ]),
         ]
-        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+        with patch("app.bubble", return_value=listing), patch.object(
+                app_module, "client", SimpleNamespace(responses=responses)):
             body = app_module.app.test_client().post("/chat_stream", json={
                 "message": "What shops are close to this one",
                 "previous_response_id": "previous-nearby-results",
                 "conversation_context": context,
+                "reply_listing_id": "listing-9",
             }).get_data(as_text=True)
         nearby.assert_called_once_with(
             "9 Beringin, Jalan Beringin, Damansara Heights",
@@ -139,6 +140,74 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertIn("Property: 9 Beringin", initial_request["instructions"])
         self.assertNotIn("earlier search origin", body)
         self.assertIn("8-minute walk from 9 Beringin", body)
+
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "ok", "places": [],
+    }))
+    @patch("app.bubble")
+    def test_explicit_different_nearby_location_is_not_overridden(self, bubble, nearby):
+        call = SimpleNamespace(
+            name="find_nearby_places", call_id="nearby-bsc",
+            arguments=json.dumps({
+                "origin": "Bangsar Shopping Centre", "categories": ["cafe"],
+                "travel_mode": "walking",
+            }),
+        )
+        app_module.execute_chat_tool(
+            call, None, "live", None,
+            user_message="What shops are near Bangsar Shopping Centre?",
+            reply_listing_id="listing-9",
+        )
+        nearby.assert_called_once_with(
+            "Bangsar Shopping Centre", ["cafe"], "walking", None, None,
+        )
+        bubble.assert_not_called()
+
+    @patch("app.get_travel_time", return_value=json.dumps({"status": "ok"}))
+    @patch("app.bubble", return_value={
+        "name": "9 Beringin", "Address": "Jalan Beringin, Damansara Heights",
+        "latitude": 3.145, "longitude": 101.658,
+    })
+    def test_reply_listing_enriches_travel_origin(self, _bubble, travel):
+        call = SimpleNamespace(
+            name="get_travel_time", call_id="travel-listing",
+            arguments=json.dumps({
+                "origin": "Jalan Beringin, Damansara Heights",
+                "destination": "Alice Smith School", "mode": "driving",
+            }),
+        )
+        app_module.execute_chat_tool(
+            call, None, "live", None,
+            user_message="How far is this from Alice Smith?",
+            reply_listing_id="listing-9",
+        )
+        travel.assert_called_once_with(
+            "9 Beringin, Jalan Beringin, Damansara Heights",
+            "Alice Smith School", "driving",
+            origin_coordinates=(3.145, 101.658), destination_coordinates=None,
+        )
+
+    @patch("app.compare_locations", return_value=json.dumps({"status": "ok"}))
+    @patch("app.bubble", return_value={
+        "name": "9 Beringin", "Address": "Jalan Beringin, Damansara Heights",
+    })
+    def test_reply_listing_enriches_comparison_candidate(self, _bubble, compare):
+        call = SimpleNamespace(
+            name="compare_locations", call_id="compare-listing",
+            arguments=json.dumps({
+                "candidate_locations": ["Jalan Beringin", "One Menerung"],
+                "destinations": [{"name": "Alice Smith School"}],
+            }),
+        )
+        app_module.execute_chat_tool(
+            call, None, "live", None,
+            user_message="Compare this with One Menerung for Alice Smith",
+            reply_listing_id="listing-9",
+        )
+        compare.assert_called_once_with(
+            ["9 Beringin, Jalan Beringin, Damansara Heights", "One Menerung"],
+            [{"name": "Alice Smith School"}],
+        )
 
     @patch("app.find_nearby_places", return_value=json.dumps({
         "status": "ok", "places": [{"name": "Village Grocer", "duration_minutes": 8}]
