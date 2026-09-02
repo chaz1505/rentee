@@ -163,6 +163,50 @@ class ToolOrchestrationTests(unittest.TestCase):
         )
         bubble.assert_not_called()
 
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "ok", "places": [],
+    }))
+    def test_current_property_context_preserves_exact_name_without_reply_id(self, nearby):
+        call = SimpleNamespace(
+            name="find_nearby_places", call_id="nearby-current-property",
+            arguments=json.dumps({
+                "origin": "Jalan Beringin, Damansara Heights",
+                "categories": ["shop"], "travel_mode": "walking",
+            }),
+        )
+        app_module.execute_chat_tool(
+            call, None, "live", None,
+            user_message="What shops are around this one?",
+            conversation_context=(
+                "Current listing context:\n- Property: 9 Beringin\n"
+                "- Address: Jalan Beringin, Damansara Heights"
+            ),
+        )
+        nearby.assert_called_once_with(
+            "9 Beringin, Jalan Beringin, Damansara Heights",
+            ["shop"], "walking", None, None,
+        )
+
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "ok", "places": [],
+    }))
+    def test_explicit_numbered_property_name_is_preserved(self, nearby):
+        call = SimpleNamespace(
+            name="find_nearby_places", call_id="nearby-explicit-property",
+            arguments=json.dumps({
+                "origin": "Jalan Beringin, Damansara Heights",
+                "categories": ["shop"], "travel_mode": "walking",
+            }),
+        )
+        app_module.execute_chat_tool(
+            call, None, "live", None,
+            user_message="What shops are around 9 Beringin?",
+        )
+        nearby.assert_called_once_with(
+            "9 Beringin, Jalan Beringin, Damansara Heights",
+            ["shop"], "walking", None, None,
+        )
+
     @patch("app.get_travel_time", return_value=json.dumps({"status": "ok"}))
     @patch("app.bubble", return_value={
         "name": "9 Beringin", "Address": "Jalan Beringin, Damansara Heights",

@@ -4680,6 +4680,36 @@ def _message_refers_to_reply_listing(message):
     ))
 
 
+def _exact_property_name_for_location(message, conversation_context=None):
+    """Return only a high-confidence exact name from this turn or trusted context."""
+    text = " ".join(str(message or "").split())
+    explicit = re.search(
+        r"\b(?:around|near|close to|close by)\s+"
+        r"(\d+[a-z]?(?:[-/]\d+[a-z]?)?\s+[^?,.]+?)"
+        r"(?=\s+(?:from|to|within)\b|[?,.]|$)",
+        text, flags=re.IGNORECASE,
+    )
+    if explicit:
+        return " ".join(explicit.group(1).split())
+    if not _message_refers_to_reply_listing(message):
+        return None
+    context = str(conversation_context or "")
+    trusted = re.search(r"(?m)^- (?:Property|Subject):\s*(.+?)\s*$", context)
+    return " ".join(trusted.group(1).split()) if trusted else None
+
+
+def _preserve_exact_property_name(location, property_name):
+    location = " ".join(str(location or "").split())
+    property_name = " ".join(str(property_name or "").split())
+    if not property_name:
+        return location
+    normalized_location = _normalized_location_entity_name(location)
+    normalized_property = _normalized_location_entity_name(property_name)
+    if normalized_property and normalized_property in normalized_location:
+        return location
+    return ", ".join(part for part in (property_name, location) if part)
+
+
 def _trusted_reply_listing_location(listing_id, bubble_env="live"):
     """Load the exact reply Listing and build its most-specific trusted location."""
     listing_id = conversation_store.relationship_id(listing_id)
@@ -4723,13 +4753,17 @@ def _trusted_reply_listing_location(listing_id, bubble_env="live"):
 
 
 def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
-                      user_message=None, reply_listing_id=None):
+                      user_message=None, reply_listing_id=None,
+                      conversation_context=None):
     """Execute one supported chat tool and return neutral continuation grounding."""
     tool_args = parse_completed_tool_arguments(tool_call)
     trusted_listing = None
     if (tool_call.name in {"find_nearby_places", "get_travel_time", "compare_locations"}
             and reply_listing_id and _message_refers_to_reply_listing(user_message)):
         trusted_listing = _trusted_reply_listing_location(reply_listing_id, bubble_env)
+    exact_property_name = _exact_property_name_for_location(
+        user_message, conversation_context
+    )
     has_match_results = False
     recommendations = []
     if tool_call.name == "advance_property_search":
@@ -4808,6 +4842,14 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
             else:
                 origin = trusted_listing["location"]
                 origin_coordinates = trusted_listing["coordinates"]
+        elif exact_property_name:
+            if re.search(r"\b(?:from|to) (?:this|here)\b",
+                         normalize_condo_name(user_message)):
+                destination = _preserve_exact_property_name(
+                    destination, exact_property_name
+                )
+            else:
+                origin = _preserve_exact_property_name(origin, exact_property_name)
         if origin_coordinates or destination_coordinates:
             output = get_travel_time(
                 origin, destination, tool_args.get("mode", "driving"),
@@ -4826,6 +4868,8 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
         )
     elif tool_call.name == "find_nearby_places":
         origin = (trusted_listing or {}).get("location") or tool_args.get("origin")
+        if not trusted_listing:
+            origin = _preserve_exact_property_name(origin, exact_property_name)
         nearby_args = (
             origin, tool_args.get("categories") or [],
             tool_args.get("travel_mode", "walking"),
@@ -4866,6 +4910,13 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
                     _normalized_location_entity_name(trusted_listing["location"]):
                     trusted_listing["coordinates"]
                 }
+        elif exact_property_name:
+            if candidate_locations:
+                candidate_locations[0] = _preserve_exact_property_name(
+                    candidate_locations[0], exact_property_name
+                )
+            else:
+                candidate_locations = [exact_property_name]
         if coordinate_map:
             output = compare_locations(
                 candidate_locations, tool_args.get("destinations") or [],
@@ -5210,6 +5261,7 @@ def chat_stream():
                     execution = execute_chat_tool(
                         tool_call, folio_id, bubble_env, message_id,
                         user_message=message, reply_listing_id=reply_listing_id,
+                        conversation_context=conversation_context,
                     )
                     if execution["has_match_results"]:
                         has_match_results = True
@@ -5943,11 +5995,15 @@ def _process_whatsapp_message(message):
             )
             if exact_listing_context:
                 model_context += "\n\n" + exact_listing_context
+            location_listing_id = reply_listing_id or conversation_store.relationship_id(
+                (lead_conversation or {}).get("Listing")
+            )
             answer, response_id, recommendation_run = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
                 conversation_context=model_context,
-                **({"reply_listing_id": reply_listing_id} if reply_listing_id else {}),
+                **({"reply_listing_id": location_listing_id}
+                   if location_listing_id else {}),
             )
             if _requests_owner_check(answer):
                 owner_check = prepare_owner_check(lead, "live")
