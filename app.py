@@ -101,6 +101,8 @@ _whatsapp_processing_lock = threading.Lock()
 _whatsapp_phone_locks = {}
 _geo_name_cache = {}
 _geo_name_cache_lock = threading.Lock()
+_location_web_identity_cache = {}
+_location_web_identity_lock = threading.Lock()
 
 CORE_PROMPT = """You are Rentee, an intelligent rental advisor helping people find a home.
 
@@ -127,7 +129,9 @@ relative geographic convenience. Call `get_travel_time` whenever a claim materia
 on them; call `compare_locations` before ranking where to live against school, work, hospital,
 family, or other destinations. Use the returned geographic facts with the customer's broader
 needs. Check resolved names, surface ambiguous branches/campuses, label area-level results as
-approximations, use only the returned traffic basis, and never invent commute ranges.
+approximations, use only the returned traffic basis, and never invent commute ranges. Resolve
+obvious place identity and area context through the tools before asking for clarification.
+Never ask for a unit number, floor, or apartment details merely to calculate travel time.
 """
 
 SKILLS_DIRECTORY = Path(__file__).with_name("skills")
@@ -326,30 +330,112 @@ def get_condo_infos(condo_names):
     return json.dumps({"condos": results}, ensure_ascii=False)
 
 
+def _normalized_location_entity_name(value):
+    value = str(value or "").casefold().replace("’", "'")
+    return " ".join(re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).split())
+
+
 def _known_location_coordinates(location_name):
-    """Use optional reliable coordinates already present in condo knowledge."""
-    normalized = normalize_condo_name(location_name)
+    """Resolve conservative Rentee entity matches, stored addresses and coordinates."""
+    normalized = _normalized_location_entity_name(location_name)
     if not normalized:
         return None
     try:
-        row = _get_condo_lookup().get(normalized)
+        rows = list(_get_condo_lookup().values())
     except CondoDataError:
         return None
-    if not row:
+    matches = []
+    padded_input = f" {normalized} "
+    for row in rows:
+        canonical = " ".join(str(row.get("Condo name") or "").split())
+        normalized_canonical = _normalized_location_entity_name(canonical)
+        if normalized_canonical and (
+            normalized == normalized_canonical
+            or f" {normalized_canonical} " in padded_input
+        ):
+            matches.append((row, canonical))
+    if len(matches) > 1:
+        return {"status": "ambiguous", "candidates": [
+            {"name": canonical,
+             "formatted_address": next((row.get(field) for field in
+                 ("Address", "address", "Full Address", "formattedAddress")
+                 if row.get(field)), None)}
+            for row, canonical in matches[:5]
+        ]}
+    if not matches:
         return None
+    row, canonical = matches[0]
     latitude = next((row.get(field) for field in
                      ("latitude", "Latitude", "lat", "Lat")
                      if row.get(field) not in (None, "")), None)
     longitude = next((row.get(field) for field in
                       ("longitude", "Longitude", "lng", "Lng", "lon", "Lon")
                       if row.get(field) not in (None, "")), None)
+    address = next((str(row.get(field)).strip() for field in
+                    ("Address", "address", "Full Address", "formattedAddress", "Location")
+                    if str(row.get(field) or "").strip()), None)
+    area = next((str(row.get(field)).strip() for field in
+                 ("Area", "area", "Neighbourhood", "Neighborhood", "Geo")
+                 if str(row.get(field) or "").strip()), None)
+    entity = {"canonical_name": canonical, "resolved_name": canonical,
+              "formatted_address": address, "area": area,
+              "resolution_level": "building"}
     try:
-        latitude, longitude = float(latitude), float(longitude)
+        entity.update(latitude=float(latitude), longitude=float(longitude))
     except (TypeError, ValueError):
-        return None
-    canonical = " ".join(str(row.get("Condo name") or location_name).split())
-    return {"resolved_name": canonical, "latitude": latitude,
-            "longitude": longitude, "location_level": "property"}
+        pass
+    return entity
+
+
+def _resolve_location_identity_with_web(location_name, known_entity=None):
+    """Use web search only to identify a canonical place/address, never travel time."""
+    cache_key = tuple(_normalized_location_entity_name(value) for value in (
+        location_name, (known_entity or {}).get("canonical_name"),
+        (known_entity or {}).get("formatted_address"), (known_entity or {}).get("area"),
+    ))
+    with _location_web_identity_lock:
+        cached = _location_web_identity_cache.get(cache_key)
+    if cached:
+        return dict(cached)
+    context = {
+        "input": " ".join(str(location_name or "").split()),
+        "known_canonical_name": (known_entity or {}).get("canonical_name"),
+        "known_address": (known_entity or {}).get("formatted_address"),
+        "known_area": (known_entity or {}).get("area"),
+    }
+    response = client.responses.create(
+        model="gpt-5-mini",
+        tools=[{"type": "web_search"}],
+        input=(
+            "Identify the physical place and canonical postal/street address in Malaysia. "
+            "Search only for identity/address, never travel time. Prefer official developer "
+            "or institution sources, then established property portals. If materially "
+            "different branches/campuses remain plausible, return ambiguous. Ignore all "
+            "marketing commute or travel-time claims.\n\n"
+            f"LOCATION CONTEXT:\n{json.dumps(context, ensure_ascii=False)}"
+        ),
+        text={"format": {"type": "json_schema", "name": "location_identity",
+                         "strict": True, "schema": {
+            "type": "object", "properties": {
+                "status": {"type": "string", "enum": ["resolved", "ambiguous", "error"]},
+                "canonical_name": {"type": ["string", "null"]},
+                "formatted_address": {"type": ["string", "null"]},
+                "area": {"type": ["string", "null"]},
+                "candidates": {"type": "array", "items": {"type": "object",
+                    "properties": {"name": {"type": "string"},
+                                   "formatted_address": {"type": ["string", "null"]}},
+                    "required": ["name", "formatted_address"],
+                    "additionalProperties": False}},
+                "source_urls": {"type": "array", "items": {"type": "string"}},
+            }, "required": ["status", "canonical_name", "formatted_address", "area",
+                            "candidates", "source_urls"], "additionalProperties": False,
+        }}},
+    )
+    result = json.loads(response.output_text)
+    if result.get("status") == "resolved":
+        with _location_web_identity_lock:
+            _location_web_identity_cache[cache_key] = dict(result)
+    return result
 
 
 def get_travel_time(origin, destination, mode="driving"):
@@ -359,6 +445,7 @@ def get_travel_time(origin, destination, mode="driving"):
     result = get_grounded_travel_time(
         origin, destination, mode=mode,
         coordinate_resolver=_known_location_coordinates,
+        web_resolver=_resolve_location_identity_with_web,
     )
     print(
         "[LOCATION TOOL] name=get_travel_time "
@@ -381,6 +468,7 @@ def compare_locations(candidate_locations, destinations):
     result = compare_grounded_locations(
         candidate_locations, destinations,
         coordinate_resolver=_known_location_coordinates,
+        web_resolver=_resolve_location_identity_with_web,
     )
     print(
         "[LOCATION TOOL] name=compare_locations "
@@ -683,11 +771,14 @@ def build_response_args(
                 "description": (
                     "Get grounded driving distance and estimated time between two specific "
                     "places. Required before claims about commute time, school-run time, "
-                    "distance, proximity, accessibility, or relative convenience."
+                    "distance, proximity, accessibility, or relative convenience. If the "
+                    "customer says this property/home, use the trusted current listing "
+                    "context as the origin; a unit number or floor is never required."
                 ),
                 "parameters": {
                     "type": "object", "properties": {
-                        "origin": {"type": "string", "description": "Specific origin place."},
+                        "origin": {"type": "string", "description":
+                                   "Property/building, area, or trusted current listing place."},
                         "destination": {"type": "string", "description": "Specific destination place."},
                         "mode": {"type": "string", "enum": ["driving"]},
                     }, "required": ["origin", "destination"],
@@ -3256,7 +3347,8 @@ def listing_facts(listing, condo_names=None, geo_names=None):
     """Compact grounded listing context; excludes generated listing-search prose."""
     fields = (
         "_id", "name", "title", "beds", "baths", "priceRent", "priceSale",
-        "propertyType", "condo", "Geo", "Furnishing", "furnished",
+        "propertyType", "condo", "Geo", "Address", "address", "Location",
+        "Furnishing", "furnished",
         "availability", "balcony", "family room", "maid room", "outdoor area",
         "Landed_sqft", "Sq Ft", "keyFacts", "Description", "Notes",
     )
@@ -4671,7 +4763,8 @@ def chat_stream():
                         "an alternative silently. Do not invent ranges. If a resolved origin "
                         "is area-level, explain that the estimate uses a representative point "
                         "and exact building times vary. Apply higher-level property judgement "
-                        "yourself, but do not alter the geographic facts."
+                        "yourself, but do not alter the geographic facts. Never ask for a unit "
+                        "number, floor, or apartment details for this calculation."
                     )
                 elif tool_call.name == "compare_locations":
                     has_match_results = False
@@ -4856,6 +4949,7 @@ def whatsapp_reply_listing_context(listing_id, bubble_env="live"):
         ("Sale price", "priceSale"), ("Property type", "propertyType"),
         ("Furnishing", "Furnishing"), ("Furnishing", "furnished"),
         ("Availability", "availability"), ("Size", "Sq Ft"),
+        ("Address", "Address"), ("Address", "address"), ("Location", "Location"),
         ("Land size", "Landed_sqft"), ("Key facts", "keyFacts"),
         ("Description", "Description"), ("Notes", "Notes"),
     )

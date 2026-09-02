@@ -7,12 +7,23 @@ import requests
 
 
 GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 GOOGLE_ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 LOCATION_TIMEOUT_SECONDS = 15
 
 
+def _normalize_place_text(value):
+    """Normalize presentation differences without enabling fuzzy matching."""
+    value = str(value or "").casefold().replace("’", "'")
+    return " ".join("".join(
+        character if character.isalnum() else " " for character in value
+    ).split())
+
+
 class LocationProviderError(RuntimeError):
-    pass
+    def __init__(self, message, reason="provider_error"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def _duration_seconds(value):
@@ -36,67 +47,145 @@ class GoogleMapsProvider:
         if not self.api_key:
             raise LocationProviderError("GOOGLE_MAPS_API_KEY is not configured.")
 
+    def _place_result(self, clean_query, item, method):
+        point = ((item.get("location") or (item.get("geometry") or {}).get("location")) or {})
+        latitude = point.get("latitude", point.get("lat"))
+        longitude = point.get("longitude", point.get("lng"))
+        if latitude is None or longitude is None:
+            return {"status": "error", "reason": "missing_coordinates",
+                    "input": clean_query, "error": "Resolved location has no coordinates."}
+        display = item.get("displayName") or {}
+        display_name = display.get("text") if isinstance(display, dict) else display
+        formatted = item.get("formattedAddress") or item.get("formatted_address")
+        types = set(item.get("types") or [])
+        area_types = {"locality", "sublocality", "neighborhood", "administrative_area_level_3"}
+        level = "area" if types & area_types else "exact"
+        return {
+            "status": "resolved", "input": clean_query,
+            "resolved_name": display_name or formatted or clean_query,
+            "formatted_address": formatted,
+            "latitude": float(latitude), "longitude": float(longitude),
+            "place_id": item.get("id") or item.get("place_id"),
+            "resolution_level": level, "location_level": level,
+            "resolution_method": method, "resolution_source": method,
+            "approximate": level == "area",
+        }
+
+    def search_places(self, query):
+        self._require_key()
+        try:
+            response = self.session.post(
+                GOOGLE_PLACES_TEXT_SEARCH_URL,
+                headers={
+                    "X-Goog-Api-Key": self.api_key,
+                    "X-Goog-FieldMask": (
+                        "places.id,places.displayName,places.formattedAddress,"
+                        "places.location,places.types"
+                    ),
+                    "Content-Type": "application/json",
+                },
+                json={"textQuery": query, "regionCode": "MY", "languageCode": "en"},
+                timeout=LOCATION_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.Timeout as error:
+            raise LocationProviderError("Places search timed out.", "timeout") from error
+        except requests.RequestException as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            reason = "authentication" if status in {401, 403} else "quota" if status == 429 else "http_error"
+            raise LocationProviderError(
+                f"Places search failed with HTTP {status or 'unknown'}.", reason
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise LocationProviderError("Places search returned invalid JSON.", "parsing_error") from error
+        places = payload.get("places") or []
+        if not places:
+            return {"status": "error", "reason": "zero_results", "input": query,
+                    "error": "Places search returned no results."}
+        if len(places) > 1:
+            normalized_query = _normalize_place_text(query)
+            contextual = [item for item in places if normalized_query and normalized_query in
+                          _normalize_place_text(
+                              f"{(item.get('displayName') or {}).get('text') or ''} "
+                              f"{item.get('formattedAddress') or ''}"
+                          )]
+            if len(contextual) == 1:
+                return self._place_result(query, contextual[0], "places_text_search")
+            return {"status": "ambiguous", "input": query, "candidates": [
+                {"name": ((item.get("displayName") or {}).get("text")),
+                 "formatted_address": item.get("formattedAddress"),
+                 "place_id": item.get("id")}
+                for item in places[:5]
+            ]}
+        return self._place_result(query, places[0], "places_text_search")
+
+    def geocode(self, query):
+        self._require_key()
+        try:
+            response = self.session.get(
+                GOOGLE_GEOCODING_URL,
+                params={"address": query, "key": self.api_key,
+                        "region": "my", "components": "country:MY"},
+                timeout=LOCATION_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.Timeout as error:
+            raise LocationProviderError("Geocoding timed out.", "timeout") from error
+        except requests.RequestException as error:
+            raise LocationProviderError(
+                f"Geocoding request failed: {type(error).__name__}", "http_error"
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise LocationProviderError("Geocoding returned invalid JSON.", "parsing_error") from error
+        status = payload.get("status")
+        results = payload.get("results") or []
+        if status == "ZERO_RESULTS" or not results:
+            return {"status": "error", "reason": "zero_results", "input": query,
+                    "error": "Geocoding returned no results."}
+        if status != "OK":
+            reason = "authentication" if status == "REQUEST_DENIED" else "quota" if status == "OVER_QUERY_LIMIT" else "provider_error"
+            raise LocationProviderError(
+                f"Geocoding returned {status or 'an unknown error'}: "
+                f"{payload.get('error_message') or 'no details'}", reason
+            )
+        if len(results) != 1 or results[0].get("partial_match"):
+            return {"status": "ambiguous", "input": query, "candidates": [
+                {"name": item.get("formatted_address"),
+                 "formatted_address": item.get("formatted_address"),
+                 "place_id": item.get("place_id")}
+                for item in results[:5]
+            ]}
+        return self._place_result(query, results[0], "geocode")
+
     def resolve_place(self, query, known_location=None):
         clean_query = " ".join(str(query or "").split())
         if not clean_query:
             return {"status": "error", "input": clean_query,
                     "error": "A location is required."}
-        if known_location:
+        if (known_location and known_location.get("latitude") is not None
+                and known_location.get("longitude") is not None):
             return {
                 "status": "resolved", "input": clean_query,
                 "resolved_name": known_location["resolved_name"],
+                "formatted_address": known_location.get("formatted_address"),
                 "latitude": float(known_location["latitude"]),
                 "longitude": float(known_location["longitude"]),
                 "place_id": known_location.get("place_id"),
-                "location_level": known_location.get("location_level", "property"),
-                "resolution_source": "existing_coordinates",
+                "location_level": known_location.get("resolution_level", "building"),
+                "resolution_level": known_location.get("resolution_level", "building"),
+                "resolution_source": "stored_coordinates",
+                "resolution_method": "stored_coordinates", "approximate": False,
             }
-        self._require_key()
-        try:
-            response = self.session.get(
-                GOOGLE_GEOCODING_URL,
-                params={"address": clean_query, "key": self.api_key, "region": "my"},
-                timeout=LOCATION_TIMEOUT_SECONDS,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as error:
-            raise LocationProviderError(
-                f"Location resolution request failed: {type(error).__name__}"
-            ) from error
-        status = payload.get("status")
-        results = payload.get("results") or []
-        if status == "ZERO_RESULTS" or not results:
-            return {"status": "error", "input": clean_query,
-                    "error": "Location could not be resolved."}
-        if status != "OK":
-            raise LocationProviderError(
-                f"Location provider returned {status or 'an unknown error'}."
-            )
-        alternatives = [
-            {"resolved_name": item.get("formatted_address"),
-             "place_id": item.get("place_id")}
-            for item in results[:5]
-        ]
-        if len(results) != 1 or results[0].get("partial_match"):
-            return {"status": "ambiguous", "input": clean_query,
-                    "alternatives": alternatives,
-                    "error": "Location is ambiguous; a more specific place is required."}
-        item = results[0]
-        point = ((item.get("geometry") or {}).get("location") or {})
-        if point.get("lat") is None or point.get("lng") is None:
-            return {"status": "error", "input": clean_query,
-                    "error": "Resolved location has no coordinates."}
-        types = set(item.get("types") or [])
-        area_types = {"locality", "sublocality", "neighborhood", "administrative_area_level_3"}
-        return {
-            "status": "resolved", "input": clean_query,
-            "resolved_name": item.get("formatted_address") or clean_query,
-            "latitude": float(point["lat"]), "longitude": float(point["lng"]),
-            "place_id": item.get("place_id"),
-            "location_level": "area" if types & area_types else "specific_place",
-            "resolution_source": self.name,
-        }
+        search_query = ((known_location or {}).get("formatted_address")
+                        or (known_location or {}).get("canonical_name") or clean_query)
+        places = self.search_places(search_query)
+        if places.get("status") in {"resolved", "ambiguous"}:
+            if known_location and places.get("status") == "resolved":
+                places["resolution_method"] = "stored_address" if known_location.get("formatted_address") else "rentee_entity_match"
+            return places
+        return self.geocode(search_query)
 
     def route_matrix(self, origins, destinations):
         self._require_key()
@@ -157,23 +246,121 @@ class GoogleMapsProvider:
         return matrix
 
 
-def _safe_resolve(provider, query, coordinate_resolver=None):
+def _log_resolution(query, attempt, result, detail=""):
+    print(
+        f"[LOCATION RESOLVE] input={str(query)!r} attempt={attempt} "
+        f"result={result}{(' ' + detail) if detail else ''}", flush=True,
+    )
+
+
+def _safe_resolve(provider, query, coordinate_resolver=None, web_resolver=None):
+    attempts = []
     known = coordinate_resolver(query) if coordinate_resolver else None
+    attempts.extend(["stored_coordinates", "stored_address", "rentee_entity_match"])
+    has_coordinates = bool(
+        known and known.get("latitude") is not None and known.get("longitude") is not None
+    )
+    _log_resolution(query, "stored_coordinates", "matched" if has_coordinates else "miss")
+    _log_resolution(query, "stored_address",
+                    "matched" if known and known.get("formatted_address") else "miss")
+    _log_resolution(query, "rentee_entity_match", "matched" if known else "miss",
+                    f"canonical_name={(known or {}).get('canonical_name')!r}" if known else "")
+    if known and known.get("status") == "ambiguous":
+        return {**known, "input": query, "attempts": attempts}
     try:
-        return provider.resolve_place(query, known)
+        result = provider.resolve_place(query, known)
     except LocationProviderError as error:
-        return {"status": "error", "input": " ".join(str(query or "").split()),
-                "error": str(error)}
+        _log_resolution(query, "google", "failed", f"reason={error.reason}")
+        return {"status": "error", "reason": error.reason,
+                "input": " ".join(str(query or "").split()),
+                "error": str(error), "attempts": attempts + ["places_text_search", "geocode"]}
+    method = result.get("resolution_method") or result.get("resolution_source")
+    if method != "stored_coordinates":
+        attempts.append("places_text_search")
+        if method == "geocode" or result.get("status") == "error":
+            attempts.append("geocode")
+    if result.get("status") == "resolved":
+        result["attempts"] = attempts
+        _log_resolution(query, result.get("resolution_method", "google"), "success",
+                        f"resolved_name={result.get('resolved_name')!r}")
+        return result
+    if result.get("status") == "ambiguous":
+        result["attempts"] = attempts
+        _log_resolution(query, "google", "ambiguous")
+        return result
+
+    web_identity = None
+    if web_resolver:
+        attempts.append("web_search")
+        _log_resolution(query, "web_search", "started")
+        try:
+            web_identity = web_resolver(query, known)
+        except Exception as error:
+            _log_resolution(query, "web_search", "failed",
+                            f"error={type(error).__name__}")
+        if web_identity and web_identity.get("status") == "resolved":
+            retry_query = web_identity.get("formatted_address") or web_identity.get("canonical_name")
+            _log_resolution(query, "web_search", "address_found",
+                            f"canonical={retry_query!r}")
+            attempts.append("web_address_retry")
+            try:
+                retry = provider.resolve_place(retry_query)
+            except LocationProviderError as error:
+                retry = {"status": "error", "reason": error.reason, "error": str(error)}
+            if retry.get("status") == "resolved":
+                retry.update({
+                    "input": " ".join(str(query or "").split()),
+                    "resolution_method": "web_address_retry",
+                    "web_identity_source_urls": web_identity.get("source_urls") or [],
+                    "attempts": attempts,
+                })
+                _log_resolution(query, "web_address_retry", "success",
+                                f"resolved_name={retry.get('resolved_name')!r}")
+                return retry
+        elif web_identity and web_identity.get("status") == "ambiguous":
+            return {**web_identity, "input": query, "attempts": attempts}
+
+    area = ((known or {}).get("area") or (web_identity or {}).get("area"))
+    if not area:
+        parts = [part.strip() for part in str(query or "").split(",") if part.strip()]
+        if len(parts) >= 2:
+            area = ", ".join(parts[1:])
+    attempts.append("area_fallback")
+    if area:
+        try:
+            fallback = provider.resolve_place(area)
+        except LocationProviderError as error:
+            fallback = {"status": "error", "reason": error.reason, "error": str(error)}
+        if fallback.get("status") == "resolved":
+            fallback.update({
+                "input": " ".join(str(query or "").split()),
+                "resolved_name": fallback.get("resolved_name") or area,
+                "resolution_level": "area", "location_level": "area",
+                "resolution_method": "area_fallback", "approximate": True,
+                "attempts": attempts,
+            })
+            _log_resolution(query, "area_fallback", "success",
+                            f"resolved_name={fallback.get('resolved_name')!r}")
+            return fallback
+    _log_resolution(query, "area_fallback", "miss")
+    return {"status": "error", "reason": "location_not_resolved",
+            "input": " ".join(str(query or "").split()),
+            "error": result.get("error") or "Location could not be resolved.",
+            "attempts": attempts}
 
 
 def get_travel_time(origin, destination, mode="driving", provider=None,
-                    coordinate_resolver=None):
+                    coordinate_resolver=None, web_resolver=None):
     started = time.perf_counter()
     provider = provider or GoogleMapsProvider()
     if mode != "driving":
         return {"status": "error", "error": "Only driving mode is supported."}
-    resolved_origin = _safe_resolve(provider, origin, coordinate_resolver)
-    resolved_destination = _safe_resolve(provider, destination, coordinate_resolver)
+    resolved_origin = _safe_resolve(
+        provider, origin, coordinate_resolver, web_resolver
+    )
+    resolved_destination = _safe_resolve(
+        provider, destination, coordinate_resolver, web_resolver
+    )
     if resolved_origin.get("status") != "resolved" or resolved_destination.get("status") != "resolved":
         return {"status": "error", "origin": resolved_origin,
                 "destination": resolved_destination, "source": provider.name}
@@ -182,6 +369,7 @@ def get_travel_time(origin, destination, mode="driving", provider=None,
     except LocationProviderError as error:
         return {"status": "error", "origin": resolved_origin,
                 "destination": resolved_destination, "error": str(error),
+                "reason": error.reason,
                 "source": provider.name}
     result = {"status": "ok", "origin": resolved_origin,
               "destination": resolved_destination, "source": provider.name,
@@ -191,16 +379,16 @@ def get_travel_time(origin, destination, mode="driving", provider=None,
 
 
 def compare_locations(candidate_locations, destinations, provider=None,
-                      coordinate_resolver=None):
+                      coordinate_resolver=None, web_resolver=None):
     started = time.perf_counter()
     provider = provider or GoogleMapsProvider()
     destination_items = [item for item in destinations or [] if isinstance(item, dict)]
     resolved_candidates = [
-        _safe_resolve(provider, name, coordinate_resolver)
+        _safe_resolve(provider, name, coordinate_resolver, web_resolver)
         for name in candidate_locations or []
     ]
     resolved_destinations = [
-        _safe_resolve(provider, item.get("name"), coordinate_resolver)
+        _safe_resolve(provider, item.get("name"), coordinate_resolver, web_resolver)
         for item in destination_items
     ]
     valid_candidates = [(index, item) for index, item in enumerate(resolved_candidates)

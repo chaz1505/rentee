@@ -29,10 +29,14 @@ class FakeProvider:
         self.matrix_calls = []
 
     def resolve_place(self, query, known_location=None):
-        if known_location:
+        if known_location and known_location.get("latitude") is not None:
             return resolved(known_location["resolved_name"],
                             known_location["latitude"], known_location["longitude"])
+        if known_location:
+            query = (known_location.get("formatted_address")
+                     or known_location.get("canonical_name") or query)
         return self.places.get(query, {"status": "error", "input": query,
+                                       "reason": "zero_results",
                                        "error": "Location could not be resolved."})
 
     def route_matrix(self, origins, destinations):
@@ -63,9 +67,24 @@ class LocationToolTests(unittest.TestCase):
         known = {"resolved_name": "Canonical Condo", "latitude": 3.1,
                  "longitude": 101.6, "location_level": "property"}
         result = provider.resolve_place("canonical condo", known)
-        self.assertEqual(result["resolution_source"], "existing_coordinates")
+        self.assertEqual(result["resolution_source"], "stored_coordinates")
         self.assertEqual(result["resolved_name"], "Canonical Condo")
+        session.post.assert_not_called()
         session.get.assert_not_called()
+
+    def test_stored_canonical_address_is_used_before_raw_input(self):
+        provider = FakeProvider({
+            "1 Jalan Example, Kuala Lumpur": resolved("Canonical Condo", 3.1, 101.6)
+        }, {(0, 0): {"status": "ok", "duration_minutes": 0}})
+        result = location_tools.get_travel_time(
+            "canonical condo", "1 Jalan Example, Kuala Lumpur", provider=provider,
+            coordinate_resolver=lambda value: ({
+                "canonical_name": "Canonical Condo",
+                "resolved_name": "Canonical Condo",
+                "formatted_address": "1 Jalan Example, Kuala Lumpur",
+            } if value == "canonical condo" else None),
+        )
+        self.assertEqual(result["status"], "ok")
 
     def test_ambiguous_destination_is_returned_without_routing(self):
         provider = FakeProvider({
@@ -82,11 +101,132 @@ class LocationToolTests(unittest.TestCase):
 
     def test_provider_timeout_returns_error_instead_of_raising(self):
         session = MagicMock()
-        session.get.side_effect = requests.Timeout("slow")
+        session.post.side_effect = requests.Timeout("slow")
         provider = location_tools.GoogleMapsProvider("key", session=session)
         result = location_tools.get_travel_time("A", "B", provider=provider)
         self.assertEqual(result["status"], "error")
-        self.assertIn("request failed", result["origin"]["error"])
+        self.assertEqual(result["origin"]["reason"], "timeout")
+        self.assertIn("timed out", result["origin"]["error"])
+
+    def test_places_text_search_resolves_poi_without_geocoding(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [{
+            "id": "alice-primary", "displayName": {"text": "The Alice Smith School"},
+            "formattedAddress": "Jalan Bellamy, Kuala Lumpur",
+            "location": {"latitude": 3.12, "longitude": 101.69},
+            "types": ["school"],
+        }]}
+        provider = location_tools.GoogleMapsProvider("key", session=session)
+        result = provider.resolve_place("Alice Smith School")
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["resolution_method"], "places_text_search")
+        session.get.assert_not_called()
+
+    def test_google_failure_reasons_are_distinguishable(self):
+        cases = {}
+        denied = MagicMock()
+        denied.raise_for_status.side_effect = requests.HTTPError(
+            response=SimpleNamespace(status_code=403)
+        )
+        cases["authentication"] = denied
+        quota = MagicMock()
+        quota.raise_for_status.side_effect = requests.HTTPError(
+            response=SimpleNamespace(status_code=429)
+        )
+        cases["quota"] = quota
+        invalid = MagicMock()
+        invalid.json.side_effect = ValueError("bad json")
+        cases["parsing_error"] = invalid
+        for expected_reason, response in cases.items():
+            with self.subTest(reason=expected_reason):
+                session = MagicMock()
+                session.post.return_value = response
+                result = location_tools.get_travel_time(
+                    "A", "B", provider=location_tools.GoogleMapsProvider("key", session)
+                )
+                self.assertEqual(result["origin"]["reason"], expected_reason)
+
+    def test_zero_results_is_reported_after_places_and_geocoding(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": []}
+        session.get.return_value.json.return_value = {"status": "ZERO_RESULTS", "results": []}
+        result = location_tools.get_travel_time(
+            "A", "B", provider=location_tools.GoogleMapsProvider("key", session)
+        )
+        self.assertEqual(result["origin"]["reason"], "location_not_resolved")
+        self.assertIn("places_text_search", result["origin"]["attempts"])
+        self.assertIn("geocode", result["origin"]["attempts"])
+
+    def test_multiple_campuses_remain_ambiguous_without_context(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [
+            {"id": "primary", "displayName": {"text": "Alice Smith Primary Campus"},
+             "formattedAddress": "Jalan Bellamy", "location": {"latitude": 1, "longitude": 1}},
+            {"id": "secondary", "displayName": {"text": "Alice Smith Secondary Campus"},
+             "formattedAddress": "Seri Kembangan", "location": {"latitude": 2, "longitude": 2}},
+        ]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "Alice Smith"
+        )
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(len(result["candidates"]), 2)
+
+    def test_unique_street_context_disambiguates_places_results(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [
+            {"id": "primary", "displayName": {"text": "Alice Smith Primary Campus"},
+             "formattedAddress": "Alice Smith Jalan Bellamy Kuala Lumpur",
+             "location": {"latitude": 1, "longitude": 1}},
+            {"id": "secondary", "displayName": {"text": "Alice Smith Secondary Campus"},
+             "formattedAddress": "Seri Kembangan", "location": {"latitude": 2, "longitude": 2}},
+        ]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "Alice Smith Jalan Bellamy"
+        )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["place_id"], "primary")
+
+    def test_web_identity_retries_google_and_ignores_web_travel_claim(self):
+        canonical = "Alice Smith School, Jalan Bellamy"
+        provider = FakeProvider({
+            canonical: resolved(canonical, 3.1, 101.7),
+            "Condo": resolved("Condo", 3.2, 101.6),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 17}})
+        result = location_tools.get_travel_time(
+            "Condo", "obscure school", provider=provider,
+            web_resolver=lambda *_args: {
+                "status": "resolved", "canonical_name": "Alice Smith School",
+                "formatted_address": canonical, "area": "Kuala Lumpur",
+                "marketing_travel_minutes": 5, "source_urls": ["https://school.example"],
+            },
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["duration_minutes"], 17)
+        self.assertEqual(result["destination"]["resolution_method"], "web_address_retry")
+
+    def test_area_fallback_is_explicitly_approximate(self):
+        provider = FakeProvider({
+            "Bangsar, Kuala Lumpur": resolved("Bangsar", 3.13, 101.67, "area"),
+            "School": resolved("School", 3.2, 101.7),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 20}})
+        result = location_tools.get_travel_time(
+            "Unknown Building, Bangsar, Kuala Lumpur", "School", provider=provider
+        )
+        self.assertEqual(result["origin"]["resolution_method"], "area_fallback")
+        self.assertTrue(result["origin"]["approximate"])
+        self.assertEqual(result["origin"]["resolution_level"], "area")
+
+    def test_rentee_entity_matching_normalizes_case_spacing_and_punctuation(self):
+        condo = {"Condo name": "Trinity Pentamont", "Address": "Mont Kiara, Kuala Lumpur"}
+        with patch("app._get_condo_lookup", return_value={"trinity pentamont": condo}):
+            for value in ("trinity pentamont", " TRINITY   PENTAMONT ",
+                          "Trinity-Pentamont", "Trinity ’ Pentamont"):
+                result = app_module._known_location_coordinates(value)
+                self.assertEqual(result["canonical_name"], "Trinity Pentamont")
+                self.assertEqual(result["formatted_address"], "Mont Kiara, Kuala Lumpur")
+        normalized = app_module._normalized_location_entity_name
+        self.assertEqual(normalized("Mont' Kiara"), normalized("Mont’ Kiara"))
+        self.assertEqual(normalized("Mont’ Kiara"), normalized("Mont Kiara"))
 
     def test_missing_api_key_fails_gracefully(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -150,6 +290,42 @@ class LocationToolTests(unittest.TestCase):
             app_module.build_response_args("What is Bangsar like?")["tool_choice"], "auto"
         )
         self.assertIn("Never guess travel times", benchmark["instructions"])
+        self.assertIn("Never ask for a unit number, floor", benchmark["instructions"])
+        travel_description = tools["get_travel_time"]["description"]
+        self.assertIn("trusted current listing context", travel_description)
+
+    def test_reply_listing_address_is_available_for_this_property_tool_routing(self):
+        listing = {"name": "Trinity Pentamont Mont' Kiara",
+                   "Address": "Mont Kiara, Kuala Lumpur"}
+        with patch("app.bubble", return_value=listing):
+            context = app_module.whatsapp_reply_listing_context("listing-1")
+        args = app_module.build_response_args(
+            "How far is this from Alice Smith School, Jalan Bellamy, Kuala Lumpur?",
+            conversation_context=context,
+        )
+        self.assertEqual(args["tool_choice"], {"type": "function", "name": "get_travel_time"})
+        self.assertIn("Trinity Pentamont", args["instructions"])
+        self.assertIn("Address: Mont Kiara, Kuala Lumpur", args["instructions"])
+        self.assertIn("apartment details", args["instructions"])
+
+    def test_compare_locations_uses_the_same_web_resolution_pipeline(self):
+        provider = FakeProvider({
+            "Canonical Condo Address": resolved("Canonical Condo", 1, 1),
+            "School": resolved("School", 2, 2),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 13}})
+        result = location_tools.compare_locations(
+            ["Obscure Condo"], [{"name": "School"}], provider=provider,
+            web_resolver=lambda query, _known: ({
+                "status": "resolved", "canonical_name": "Canonical Condo",
+                "formatted_address": "Canonical Condo Address", "area": "Bangsar",
+                "source_urls": [],
+            } if query == "Obscure Condo" else None),
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["candidates"][0]["resolution"]["resolution_method"],
+            "web_address_retry",
+        )
 
     @patch("app.compare_locations")
     def test_chat_stream_executes_comparison_before_final_text(self, compare):
