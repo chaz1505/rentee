@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 import unittest
 import requests
 from io import BytesIO
@@ -1737,6 +1739,146 @@ class WhatsAppTests(unittest.TestCase):
             },
             timeout=30,
         )
+
+    def test_typing_keepalive_sends_immediately_and_refreshes(self):
+        calls = []
+        refreshed = threading.Event()
+
+        def record(message_id):
+            calls.append(message_id)
+            if len(calls) >= 2:
+                refreshed.set()
+
+        with patch("app.send_whatsapp_typing_indicator", side_effect=record):
+            keepalive = app_module.whatsapp_typing_keepalive(
+                "wamid.long", refresh_seconds=0.01
+            )
+            self.assertEqual(calls, ["wamid.long"])
+            self.assertTrue(refreshed.wait(0.3))
+            keepalive.stop()
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_typing_keepalive_refreshes_multiple_times(self):
+        calls = []
+        multiple = threading.Event()
+
+        def record(message_id):
+            calls.append(message_id)
+            if len(calls) >= 3:
+                multiple.set()
+
+        with patch("app.send_whatsapp_typing_indicator", side_effect=record):
+            keepalive = app_module.whatsapp_typing_keepalive(
+                "wamid.multiple", refresh_seconds=0.01
+            )
+            self.assertTrue(multiple.wait(0.3))
+            keepalive.stop()
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_typing_refresh_failure_is_best_effort_and_loop_continues(self):
+        calls = []
+        recovered = threading.Event()
+
+        def record(message_id):
+            calls.append(message_id)
+            if len(calls) == 2:
+                raise requests.RequestException("refresh failed")
+            if len(calls) >= 3:
+                recovered.set()
+
+        with patch("app.send_whatsapp_typing_indicator", side_effect=record):
+            keepalive = app_module.whatsapp_typing_keepalive(
+                "wamid.retry", refresh_seconds=0.01
+            )
+            self.assertTrue(recovered.wait(0.3))
+            keepalive.stop()
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_typing_stop_prevents_refresh_after_customer_reply(self):
+        events = []
+        refreshed = threading.Event()
+
+        def record(_message_id):
+            events.append("typing")
+            if events.count("typing") >= 2:
+                refreshed.set()
+
+        with patch("app.send_whatsapp_typing_indicator", side_effect=record):
+            keepalive = app_module.whatsapp_typing_keepalive(
+                "wamid.stop", refresh_seconds=0.01
+            )
+            self.assertTrue(refreshed.wait(0.3))
+            keepalive.stop()
+            events.append("reply")
+            time.sleep(0.03)
+        self.assertEqual(events[-1], "reply")
+
+    def test_simultaneous_typing_keepalives_have_independent_stop_events(self):
+        counts = {"wamid.a": 0, "wamid.b": 0}
+        both_refreshed = threading.Event()
+
+        def record(message_id):
+            counts[message_id] += 1
+            if min(counts.values()) >= 2:
+                both_refreshed.set()
+
+        with patch("app.send_whatsapp_typing_indicator", side_effect=record):
+            first = app_module.whatsapp_typing_keepalive(
+                "wamid.a", refresh_seconds=0.01
+            )
+            second = app_module.whatsapp_typing_keepalive(
+                "wamid.b", refresh_seconds=0.01
+            )
+            self.assertTrue(both_refreshed.wait(0.3))
+            first.stop()
+            first_count = counts["wamid.a"]
+            second_target = counts["wamid.b"] + 1
+            deadline = time.monotonic() + 0.3
+            while counts["wamid.b"] < second_target and time.monotonic() < deadline:
+                time.sleep(0.005)
+            second.stop()
+        self.assertEqual(counts["wamid.a"], first_count)
+        self.assertGreaterEqual(counts["wamid.b"], second_target)
+
+    def test_short_typing_lifecycle_stops_without_waiting_for_interval(self):
+        with patch("app.send_whatsapp_typing_indicator"):
+            keepalive = app_module.whatsapp_typing_keepalive(
+                "wamid.short", refresh_seconds=10
+            )
+            started = time.monotonic()
+            keepalive.stop()
+        self.assertLess(time.monotonic() - started, 0.1)
+
+    def test_processing_failure_stops_typing_before_fallback_send(self):
+        keepalive = MagicMock()
+        events = []
+        keepalive.stop.side_effect = lambda: events.append("stop")
+        item = audio_webhook_payload(message_id="wamid.failed-processing")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        with patch("app.whatsapp_typing_keepalive", return_value=keepalive), patch(
+            "app.transcribe_whatsapp_audio", side_effect=RuntimeError("failed")
+        ), patch("app.send_whatsapp_text", side_effect=lambda *_args: events.append("reply")):
+            app_module._process_whatsapp_message(item)
+        self.assertIn("stop", events)
+        self.assertLess(events.index("stop"), events.index("reply"))
+
+    def test_normal_processing_stops_typing_before_final_whatsapp_send(self):
+        events = []
+        keepalive = MagicMock()
+        keepalive.stop.side_effect = lambda: events.append("stop")
+        self.mocked_internal_user.return_value = {"_id": "user-1"}
+        workflow = MagicMock(
+            handled=True, response_text="Handled", complete=MagicMock()
+        )
+        item = webhook_payload(message_id="wamid.stop-before-send")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        with patch("app.whatsapp_typing_keepalive", return_value=keepalive), patch(
+            "app.handle_internal_user_message", return_value=workflow
+        ), patch("app.send_whatsapp_text", side_effect=lambda *_args: events.append("send")):
+            app_module._process_whatsapp_message(item)
+        self.assertLess(events.index("stop"), events.index("send"))
 
     @patch("app.threading.Thread", ImmediateThread)
     @patch("app._process_whatsapp_message")

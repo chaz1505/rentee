@@ -76,6 +76,8 @@ CONDO_CACHE_TTL_SECONDS = 300
 CONDO_SHEET_TIMEOUT_SECONDS = 15
 WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
+WHATSAPP_TYPING_REFRESH_SECONDS = 20
+WHATSAPP_TYPING_THREAD_FACTORY = threading.Thread
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
 WHATSAPP_LEAD_NAME_FIELD = "name"
 WHATSAPP_LEAD_OWNER_FIELD = "owner"
@@ -2637,10 +2639,78 @@ def send_whatsapp_typing_indicator(whatsapp_message_id):
             flush=True,
         )
         raise
-    print(
-        f"[WHATSAPP] Typing indicator sent message_id={whatsapp_message_id}",
-        flush=True,
-    )
+
+
+class WhatsAppTypingKeepalive:
+    """Best-effort, per-message lifecycle for Meta's expiring typing state."""
+
+    def __init__(self, message_id, refresh_seconds=WHATSAPP_TYPING_REFRESH_SECONDS):
+        self.message_id = str(message_id)
+        self.refresh_seconds = refresh_seconds
+        self.stop_event = threading.Event()
+        self.request_lock = threading.Lock()
+        self.thread = None
+        self.thread_started = False
+        self._stopped = False
+
+    def _send(self, action):
+        try:
+            send_whatsapp_typing_indicator(self.message_id)
+            print(f"WA typing {action} message_id={self.message_id}", flush=True)
+        except Exception as error:
+            print(
+                f"WA typing {action} failed message_id={self.message_id} "
+                f"error={type(error).__name__}", flush=True,
+            )
+
+    def _run(self):
+        while not self.stop_event.wait(self.refresh_seconds):
+            with self.request_lock:
+                if self.stop_event.is_set():
+                    break
+                self._send("refreshed")
+
+    def start(self):
+        with self.request_lock:
+            self._send("started")
+        try:
+            self.thread = WHATSAPP_TYPING_THREAD_FACTORY(
+                target=self._run, daemon=True,
+                name=f"whatsapp-typing-{self.message_id[-12:]}",
+            )
+            self.thread.start()
+            self.thread_started = True
+        except Exception as error:
+            print(
+                f"WA typing keepalive start failed message_id={self.message_id} "
+                f"error={type(error).__name__}", flush=True,
+            )
+        return self
+
+    def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
+        self.stop_event.set()
+        # Wait for any refresh already inside the request boundary. Once this lock
+        # is acquired, no typing request can race a subsequent customer reply.
+        with self.request_lock:
+            pass
+        if (self.thread_started and self.thread
+                and self.thread is not threading.current_thread()):
+            self.thread.join()
+        print(f"WA typing stopped message_id={self.message_id}", flush=True)
+
+
+def whatsapp_typing_keepalive(
+    message_id, refresh_seconds=WHATSAPP_TYPING_REFRESH_SECONDS,
+):
+    return WhatsAppTypingKeepalive(message_id, refresh_seconds).start()
+
+
+def _stop_whatsapp_typing(keepalive):
+    if keepalive:
+        keepalive.stop()
 
 
 def get_plausible_listings(
@@ -4857,14 +4927,7 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
 
 def _process_whatsapp_message(message):
     message_id = str(message["id"])
-    try:
-        send_whatsapp_typing_indicator(message_id)
-    except Exception as error:
-        print(
-            "[WHATSAPP] Typing indicator error ignored "
-            f"message_id={message_id} error={type(error).__name__}",
-            flush=True,
-        )
+    typing_keepalive = whatsapp_typing_keepalive(message_id)
     phone = normalize_phone(message["from"])
     message_type = str(message.get("type") or "text").strip().casefold()
     raw_text = str((message.get("text") or {}).get("body") or "")
@@ -5026,6 +5089,7 @@ def _process_whatsapp_message(message):
                     "[CONVERSATION ROUTING] ambiguity_labels_generated "
                     f"count={len(ambiguity_labels)}", flush=True,
                 )
+                _stop_whatsapp_typing(typing_keepalive)
                 send_whatsapp_text(phone, clarification)
                 print(
                     "[CONVERSATION ROUTING] direction=outbound "
@@ -5060,6 +5124,7 @@ def _process_whatsapp_message(message):
                     "resolution=owner_check "
                     f"conversation_id={routed_conversation_id}", flush=True,
                 )
+                _stop_whatsapp_typing(typing_keepalive)
                 sent_ids = send_whatsapp_text(
                     phone, owner_check_acknowledgement
                 )
@@ -5154,6 +5219,7 @@ def _process_whatsapp_message(message):
                             f"operation=handoff_association "
                             f"error={type(error).__name__}", flush=True,
                         )
+                _stop_whatsapp_typing(typing_keepalive)
                 sent_ids = send_whatsapp_text(phone, handoff_result.response_text)
                 if lead_conversation_id:
                     persist_sent_whatsapp_text(
@@ -5223,6 +5289,7 @@ def _process_whatsapp_message(message):
                             f"resolution=general conversation_id={general_conversation_id}",
                             flush=True,
                         )
+                    _stop_whatsapp_typing(typing_keepalive)
                     sent_ids = send_whatsapp_text(phone, workflow_result.response_text)
                     if general_conversation_id:
                         persist_sent_whatsapp_text(
@@ -5339,6 +5406,7 @@ def _process_whatsapp_message(message):
                     if confirmation and not conversation_has_outbound_message(
                         lead_conversation_id, "live"
                     ):
+                        _stop_whatsapp_typing(typing_keepalive)
                         sent_ids = send_whatsapp_text(phone, confirmation)
                         persist_sent_whatsapp_text(
                             phone, confirmation, sent_ids,
@@ -5440,6 +5508,7 @@ def _process_whatsapp_message(message):
                 f"destination=enquirer phone={_masked_whatsapp_phone(phone)}",
                 flush=True,
             )
+            _stop_whatsapp_typing(typing_keepalive)
             if recommendation_listings:
                 outbound_deliveries = send_whatsapp_recommendation_batch(
                     phone, folio_id, recommendation_listings
@@ -5485,6 +5554,7 @@ def _process_whatsapp_message(message):
             print(f"WhatsApp message {message_id} failed: {error}", flush=True)
         if not reply_sent:
             try:
+                _stop_whatsapp_typing(typing_keepalive)
                 send_whatsapp_text(
                     phone,
                     WHATSAPP_AUDIO_ERROR_RESPONSE if message_type == "audio" else
@@ -5493,6 +5563,7 @@ def _process_whatsapp_message(message):
             except Exception as send_error:
                 print(f"WhatsApp fallback send failed: {send_error}", flush=True)
     finally:
+        _stop_whatsapp_typing(typing_keepalive)
         with _whatsapp_processing_lock:
             _whatsapp_processing_ids.discard(message_id)
             if message_id not in _whatsapp_processed_ids:
