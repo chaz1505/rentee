@@ -4691,6 +4691,10 @@ def _exact_property_name_for_location(message, conversation_context=None):
     )
     if explicit:
         return " ".join(explicit.group(1).split())
+    if re.search(r"\b(?:around|near|close to|close by)\b", text, re.IGNORECASE):
+        recognized = resolve_condo_mentions(text)
+        if len(recognized) == 1:
+            return recognized[0]
     if not _message_refers_to_reply_listing(message):
         return None
     context = str(conversation_context or "")

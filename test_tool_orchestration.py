@@ -207,6 +207,17 @@ class ToolOrchestrationTests(unittest.TestCase):
             ["shop"], "walking", None, None,
         )
 
+    def test_explicit_known_building_name_is_preserved(self):
+        with patch("app._get_condo_lookup", return_value={
+            "one": {"Condo name": "One Menerung"},
+        }):
+            self.assertEqual(
+                app_module._exact_property_name_for_location(
+                    "What cafes are around one menerung?"
+                ),
+                "One Menerung",
+            )
+
     @patch("app.get_travel_time", return_value=json.dumps({"status": "ok"}))
     @patch("app.bubble", return_value={
         "name": "9 Beringin", "Address": "Jalan Beringin, Damansara Heights",
