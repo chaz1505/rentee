@@ -101,7 +101,10 @@ class CondoInfoTests(unittest.TestCase):
         args = app_module.build_response_args(
             "Find available units to rent in one menerung"
         )
-        self.assertEqual(args["tool_choice"], "auto")
+        self.assertEqual(
+            args["tool_choice"],
+            {"type": "function", "name": "advance_property_search"},
+        )
         self.assertIn('Canonical names: ["One Menerung"]', args["instructions"])
 
     @patch("app.time.monotonic", side_effect=[0.0, 0.0, 301.0, 301.0])

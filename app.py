@@ -209,6 +209,41 @@ def _is_clear_condo_information_question(user_message, canonical_names):
     return not listing_intent
 
 
+def _is_explicit_inventory_search(user_message):
+    """Recognize unambiguous requests for current property inventory."""
+    text = normalize_condo_name(user_message)
+    patterns = (
+        r"\bwhat (?:have|do) you got\b",
+        r"\banything available\b",
+        r"\bfind me\b",
+        r"\bshow me\b.*\b(home|homes|house|houses|propert(?:y|ies)|listing|listings|unit|units|matches)\b",
+        r"\bany\b.*\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\bavailable\b",
+        r"\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\b(in|around|under)\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+INTERNAL_ORCHESTRATION_FIELDS = frozenset({
+    "search_listings", "recommend_areas", "recommend_condos", "geo_names",
+    "preferred_condo_names", "area_update_mode", "condo_update_mode",
+    "transaction_type", "budget_rent", "budget_buy", "use_full_shortlist",
+    "new_search",
+})
+MAX_TOOL_ROUNDS = 4
+
+
+def resembles_internal_orchestration_payload(text):
+    """Identify leaked Rentee search arguments without blocking ordinary customer JSON."""
+    candidate = str(text or "").strip()
+    if "{" not in candidate or "}" not in candidate:
+        return False
+    mentioned = {
+        field for field in INTERNAL_ORCHESTRATION_FIELDS
+        if re.search(rf'["\']{re.escape(field)}["\']\s*:', candidate)
+    }
+    return len(mentioned) >= 2
+
+
 def _download_condo_lookup():
     response = requests.get(
         CONDO_SHEET_CSV_URL,
@@ -641,7 +676,14 @@ def build_response_args(
     """Build the deliberately small customer-turn context and stable tool contracts."""
     recognized_condos = resolve_condo_mentions(user_message)
     search_properties = {
-        "regular_destinations": {"type": "array", "items": {"type": "string"}},
+        "regular_destinations": {
+            "type": "array", "items": {"type": "string"},
+            "description": (
+                "Places the customer regularly needs to reach, such as a workplace, school, "
+                "hospital, or family location. Never put a requested home-search area here "
+                "unless it was independently stated as a recurring destination."
+            ),
+        },
         "property_types": {"type": "array", "items": {"type": "string"}},
         "liked_condos": {"type": "array", "items": {"type": "string"}},
         "disliked_condos": {"type": "array", "items": {"type": "string"}},
@@ -707,7 +749,10 @@ def build_response_args(
                 "description": (
                     "Save new or refined search requirements, recommend areas or condos, or "
                     "search current listings within named or previously recommended condos. "
-                    "Use it when the current message changes the search or constrains listings. "
+                    "Use it for what-have-you-got, properties, homes, houses, landed homes, "
+                    "listings, units, options, rentals, sales, or availability, and whenever "
+                    "the current message changes the search or constrains listings. Put search "
+                    "areas only in geo_names, not regular_destinations. "
                     "Returns a customer response or grounded listing-search scope."
                 ),
                 "parameters": {
@@ -732,8 +777,11 @@ def build_response_args(
                 "type": "function", "name": "get_condo_info",
                 "description": (
                     "Retrieve Rentee's knowledge rows for named condos or developments. Use "
-                    "for condo facts, suitability, pros and cons, or comparisons. Provide all "
-                    "names in one call. Returns found rows and explicit not-found results."
+                    "only for condo facts or qualitative questions about a development: facilities, "
+                    "age, character, suitability, pros and cons, or comparisons. Never use this "
+                    "for current properties, inventory, listings, units, options, houses, landed "
+                    "homes, rentals, sales, or availability; use advance_property_search for "
+                    "those requests. Provide all names in one call."
                 ),
                 "parameters": {
                     "type": "object", "properties": {"condo_names": {
@@ -810,7 +858,9 @@ def build_response_args(
     }
     if previous_response_id:
         args["previous_response_id"] = previous_response_id
-    if _is_clear_condo_information_question(user_message, recognized_condos):
+    if _is_explicit_inventory_search(user_message):
+        args["tool_choice"] = {"type": "function", "name": "advance_property_search"}
+    elif _is_clear_condo_information_question(user_message, recognized_condos):
         args["tool_choice"] = {"type": "function", "name": "get_condo_info"}
     if _requires_travel_time_tool(user_message):
         args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
@@ -3855,6 +3905,14 @@ def _normalized_geo_name(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
 
 
+def remove_search_areas_from_regular_destinations(destinations, search_areas):
+    area_keys = {_normalized_geo_name(value) for value in search_areas or []}
+    return [
+        value for value in destinations or []
+        if _normalized_geo_name(value) not in area_keys
+    ]
+
+
 def get_valid_geo_names(bubble_env="live", now=None):
     """Return cached canonical names from Bubble's actual Geo objects."""
     current = time.monotonic() if now is None else float(now)
@@ -4211,8 +4269,25 @@ def apply_active_search_update(active_state, update):
     if relevant_budget is not None:
         scalar_update["budget_requirement"] = str(relevant_budget)
     transaction = scalar_update.get("transaction_type")
+    incoming_property_types = _unique_search_values(
+        scalar_update.get("property_types") or []
+    )
+    existing_transaction_types = [
+        value for value in state["property_types"]
+        if value.casefold() in {"rent", "buy", "both"}
+    ]
+    existing_home_types = [
+        value for value in state["property_types"]
+        if value.casefold() not in {"rent", "buy", "both"}
+    ]
     if transaction and transaction != "unchanged":
-        scalar_update["property_types"] = [transaction]
+        scalar_update["property_types"] = _unique_search_values(
+            (incoming_property_types or existing_home_types) + [transaction]
+        )
+    elif incoming_property_types:
+        scalar_update["property_types"] = _unique_search_values(
+            incoming_property_types + existing_transaction_types
+        )
     preserved_recommended = list(state["recommended_condos"])
     preserved_selected = list(state["selected_condos"])
     state = apply_search_update(state, scalar_update)
@@ -4237,6 +4312,7 @@ def apply_active_search_update(active_state, update):
 
 def apply_cumulative_search_update(cumulative_state, update):
     """Retain historical search knowledge while accepting this turn's new facts."""
+    prior_state = load_search_state(cumulative_state)
     cumulative_update = dict(update)
     new_areas = _unique_search_values(update.get("geo_names") or [])
     if new_areas:
@@ -4251,7 +4327,13 @@ def apply_cumulative_search_update(cumulative_state, update):
         cumulative_update["budget_requirement"] = str(relevant_budget)
     transaction = cumulative_update.get("transaction_type")
     if transaction and transaction != "unchanged":
-        cumulative_update["property_types"] = [transaction]
+        home_types = [
+            value for value in (cumulative_update.get("property_types") or prior_state["property_types"])
+            if value.casefold() not in {"rent", "buy", "both"}
+        ]
+        cumulative_update["property_types"] = _unique_search_values(
+            home_types + [transaction]
+        )
     state = apply_search_update(cumulative_state, cumulative_update)
     preferred = _unique_search_values(update.get("preferred_condo_names") or [])
     if preferred:
@@ -4321,6 +4403,9 @@ def advance_property_search(folio_id, bubble_env, update):
     )
     safe_update = dict(update)
     safe_update["geo_names"] = geo_resolution["resolved"]
+    safe_update["regular_destinations"] = remove_search_areas_from_regular_destinations(
+        safe_update.get("regular_destinations"), safe_update["geo_names"]
+    )
     cumulative_source = load_search_state(lead.get("searchBriefJSON"))
     cumulative_source["areas"] = resolve_geo_names(
         cumulative_source["areas"], valid_geo_names
@@ -4427,6 +4512,105 @@ def advance_property_search(folio_id, bubble_env, update):
         "text": question,
         "state": cumulative_state, "active_state": active_state,
         "lead_id": lead_id,
+    }
+
+
+def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
+    """Execute one supported chat tool and return neutral continuation grounding."""
+    tool_args = parse_completed_tool_arguments(tool_call)
+    has_match_results = False
+    recommendations = []
+    if tool_call.name == "advance_property_search":
+        search_result = advance_property_search(folio_id, bubble_env, tool_args)
+        if search_result["action"] == "search_listings":
+            matching_result = execute_match_lead_silently(
+                folio_id, bubble_env, message_id, search_result["scope"]
+            )
+            save_search_state(
+                search_result["lead_id"], search_result["state"],
+                get_bubble_base_url(bubble_env),
+            )
+            has_match_results = bool(getattr(
+                matching_result, "recommendations_available", False
+            ))
+            recommendations = list(getattr(matching_result, "recommendations", []))
+            output = str(matching_result)
+        else:
+            output = search_result["text"]
+        instructions = (
+            "The supplied result is grounded property-search output. Use it if it answers "
+            "the customer's request. If another supported tool is genuinely required, call "
+            "that tool. Never expose search arguments or internal state."
+        )
+    elif tool_call.name == "match_lead":
+        matching_result = execute_match_lead_silently(
+            folio_id, bubble_env, message_id
+        )
+        has_match_results = bool(getattr(
+            matching_result, "recommendations_available", False
+        ))
+        recommendations = list(getattr(matching_result, "recommendations", []))
+        output = str(matching_result)
+        instructions = (
+            "The supplied result contains grounded current-listing output. Return its "
+            "customer-facing answer faithfully unless another supported tool is genuinely "
+            "required. Never expose tool arguments or internal state."
+        )
+    elif tool_call.name == "get_property_details":
+        output = get_property_details(
+            folio_id, tool_args["property_reference"], bubble_env
+        )
+        instructions = (
+            "The supplied result contains authoritative details for a current listing. Use it "
+            "only to the extent it answers the request. For a missing public external fact, "
+            "web search may be used; never search for or guess missing unit-specific facts. "
+            "Call another supported tool if the actual request requires it."
+        )
+    elif tool_call.name == "get_current_recommendations":
+        output = get_current_recommendations(folio_id, bubble_env)
+        instructions = (
+            "The supplied result contains current recommendations. Use customer-facing names "
+            "and say when a field is unavailable. Call another supported tool only if the "
+            "customer's actual request requires it; do not imply this read-only result changed "
+            "the shortlist."
+        )
+    elif tool_call.name == "get_condo_info":
+        condo_names = tool_args.get("condo_names")
+        output = get_condo_infos(condo_names if isinstance(condo_names, list) else [])
+        instructions = (
+            "The supplied result contains condo information. Use it only if it actually "
+            "answers the customer's request. If the request instead concerns current "
+            "properties, listings, units, options, houses, landed homes, rentals, sales, or "
+            "availability, call advance_property_search. Treat Persona as qualitative insight, "
+            "do not invent missing facts, and never expose tool or state fields."
+        )
+    elif tool_call.name == "get_travel_time":
+        output = get_travel_time(
+            tool_args.get("origin"), tool_args.get("destination"),
+            tool_args.get("mode", "driving"),
+        )
+        instructions = (
+            "Use the supplied grounded result for distance, driving time, place identity, and "
+            "traffic basis. Surface ambiguity and area-level approximation. Call another "
+            "supported tool only when genuinely required. Never invent ranges or ask for a "
+            "unit number, floor, or apartment details."
+        )
+    elif tool_call.name == "compare_locations":
+        output = compare_locations(
+            tool_args.get("candidate_locations") or [],
+            tool_args.get("destinations") or [],
+        )
+        instructions = (
+            "Use the supplied grounded matrix for every geographic claim. Surface unresolved "
+            "or ambiguous places and area-level approximations. Combine it with the customer's "
+            "needs, or call another supported tool if the actual request genuinely requires it."
+        )
+    else:
+        raise ValueError(f"Unsupported tool: {tool_call.name}")
+    return {
+        "output": output, "instructions": instructions,
+        "has_match_results": has_match_results,
+        "recommendations": recommendations,
     }
 
 
@@ -4590,287 +4774,146 @@ def chat_stream():
                     log_timing(f"{timing_label} complete", initial_started)
                     return final_response, buffered_text_deltas
 
-                # The initial turn carries the incoming response ID, preserving
-                # the user's existing conversation history.
+                # Every model round is buffered until its completed response proves that
+                # no function call follows. This prevents orchestration prose from leaking.
+                initial_args = build_response_args(
+                    message, previous, conversation_context
+                )
+                normal_tools = initial_args["tools"]
                 try:
-                    response, buffered_initial_text = stream_initial_response(
-                        build_response_args(
-                            message, previous, conversation_context
-                        ),
-                        "Initial OpenAI/tool selection"
+                    response, buffered_text = stream_initial_response(
+                        initial_args, "Initial OpenAI/tool selection"
                     )
                 except Exception as error:
                     if "No tool output found for function call" not in str(error):
                         raise
-
                     print(
                         "Broken previous_response_id detected; starting a fresh conversation",
-                        flush=True
+                        flush=True,
                     )
-                    response, buffered_initial_text = stream_initial_response(
-                        build_response_args(
-                            message, None, conversation_context
-                        ),
-                        "Initial OpenAI/tool selection retry"
+                    retry_args = build_response_args(
+                        message, None, conversation_context
                     )
-                if any(
-                    output_item.type == "web_search_call"
-                    for output_item in response.output
-                ) and not web_search_status_sent:
-                    print("Web search used", flush=True)
-                    web_search_status_sent = True
-                tool_call = next(
-                    (x for x in response.output if x.type == "function_call"),
-                    None
-                )
-
-                if tool_call is None:
-                    print("No tool call requested", flush=True)
-                    for delta in buffered_initial_text:
-                        if not first_delta_sent:
-                            log_timing("FIRST DELTA", request_started)
-                            first_delta_sent = True
-                        yield f"data: {json.dumps({'delta': delta})}\n\n"
-                    citations = get_web_citations(response)
-
-                    if citations:
-                        yield f"data: {json.dumps({'citations': citations})}\n\n"
-                    log_timing("TOTAL REQUEST", request_started)
-                    yield (
-                        f"data: {json.dumps({'done': True, 'response_id': response.id, 'recommendations_relevant': False})}\n\n"
-                    )
-                    return
-
-                if buffered_initial_text:
-                    print(
-                        "WARNING: Suppressed initial OpenAI text emitted before tool "
-                        f"{tool_call.name}; internal orchestration was not sent to Bubble.",
-                        flush=True
+                    normal_tools = retry_args["tools"]
+                    response, buffered_text = stream_initial_response(
+                        retry_args, "Initial OpenAI/tool selection retry"
                     )
 
-                original_response_id = response.id
-                original_call_id = tool_call.call_id
-                print(f"Tool selected: {tool_call.name}", flush=True)
-                print(f"Original call_id: {original_call_id}", flush=True)
-                tool_args = parse_completed_tool_arguments(tool_call)
-                follow_up_tools = None
+                tool_round = 0
+                has_match_results = False
                 current_run_recommendations = []
-
-                if tool_call.name == "advance_property_search":
-                    has_match_results = False
-                    search_result = advance_property_search(
-                        folio_id, bubble_env, tool_args
+                while True:
+                    if any(
+                        getattr(item, "type", None) == "web_search_call"
+                        for item in response.output
+                    ) and not web_search_status_sent:
+                        print("Web search used", flush=True)
+                        web_search_status_sent = True
+                    tool_call = next(
+                        (item for item in response.output
+                         if getattr(item, "type", None) == "function_call"),
+                        None,
                     )
-                    if search_result["action"] == "search_listings":
-                        matching_result = execute_match_lead_silently(
-                            folio_id,
-                            bubble_env,
-                            message_id,
-                            search_result["scope"],
+                    if tool_call is None:
+                        final_text = "".join(buffered_text)
+                        if resembles_internal_orchestration_payload(final_text):
+                            print(
+                                "[ORCHESTRATION GUARD] "
+                                "suppressed_internal_payload=true",
+                                flush=True,
+                            )
+                            buffered_text = [
+                                "Sorry, I couldn’t complete that property request safely. "
+                                "Please try again."
+                            ]
+                            has_match_results = False
+                            current_run_recommendations = []
+                        print(
+                            f"[TOOL LOOP] round={tool_round + 1} "
+                            f"final_text chars={sum(len(x) for x in buffered_text)}",
+                            flush=True,
                         )
-                        save_search_state(
-                            search_result["lead_id"], search_result["state"],
-                            get_bubble_base_url(bubble_env),
-                        )
-                        has_match_results = bool(getattr(
-                            matching_result, "recommendations_available", False
-                        ))
-                        current_run_recommendations = list(getattr(
-                            matching_result, "recommendations", []
-                        ))
-                        tool_result = str(matching_result)
-                    else:
-                        tool_result = search_result["text"]
-                    follow_up_instructions = (
-                        "Return the supplied customer-facing search-flow response faithfully. "
-                        "Ask no more than the single question it contains. Do not invent "
-                        "listings, condos, requirements, or internal state."
-                    )
-                elif tool_call.name == "match_lead":
-                    matching_result = execute_match_lead_silently(
-                        folio_id, 
-                        bubble_env,
-                        message_id
-                    )
-                    has_match_results = bool(getattr(
-                        matching_result, "recommendations_available", False
-                    ))
-                    current_run_recommendations = list(getattr(
-                        matching_result, "recommendations", []
-                    ))
-                    tool_result = str(matching_result)
-                    follow_up_instructions = (
-                        "The tool output already contains the final customer-facing answer. "
-                        "Return it faithfully. Do not add, remove, reinterpret, embellish, "
-                        "or invent property information."
-                    )
-                elif tool_call.name == "get_property_details":
-                    has_match_results = False
-                    tool_result = get_property_details(
-                        folio_id,
-                        tool_args["property_reference"],
-                        bubble_env
-                    )
-                    follow_up_instructions = (
-                        "Check whether the authoritative Rentee details in the tool output "
-                        "actually answer the customer's question. If a requested general "
-                        "building, development, location, neighbourhood, transport, school, "
-                        "amenity, developer, historical, regulatory, or other public external "
-                        "fact is missing, use web search immediately before answering. If a "
-                        "missing fact is specific to this available unit, do not search or "
-                        "guess; say the current listing information does not specify it. Do "
-                        "not expose internal identifiers or offer unsupported actions."
-                    )
-                    # The model decides whether the returned details are incomplete
-                    # and whether a public web lookup is appropriate. The streamed
-                    # web-search event below then selects the customer-facing status.
-                    property_details_web_fallback = True
-                    follow_up_tools = [{"type": "web_search"}]
-                elif tool_call.name == "get_current_recommendations":
-                    has_match_results = False
-                    tool_result = get_current_recommendations(folio_id, bubble_env)
-                    follow_up_instructions = (
-                        "Answer using only the supplied current recommendations. Compare or "
-                        "filter them as requested. Use customer-facing names, never internal "
-                        "IDs. Say when a field is unavailable. Do not start a new search, "
-                        "change requirements, or imply that the shortlist was modified."
-                    )
-                elif tool_call.name == "get_condo_info":
-                    has_match_results = False
-                    condo_names = tool_args.get("condo_names")
-                    if not isinstance(condo_names, list):
-                        condo_names = []
-                    tool_result = get_condo_infos(condo_names)
-                    follow_up_instructions = (
-                        "Answer the customer's condo question using the supplied condo data. "
-                        "Use factual fields as facts. Treat Persona as qualitative expert "
-                        "insight and phrase opinions, suitability, strengths, weaknesses, and "
-                        "trade-offs accordingly. For comparisons, compare only the returned "
-                        "data. Clearly identify condos that were not found and say when the "
-                        "requested information is unavailable. Do not invent missing details, "
-                        "claim current listing availability, or expose tool/internal field names."
-                    )
-                elif tool_call.name == "get_travel_time":
-                    has_match_results = False
-                    tool_result = get_travel_time(
-                        tool_args.get("origin"), tool_args.get("destination"),
-                        tool_args.get("mode", "driving"),
-                    )
-                    follow_up_instructions = (
-                        "Answer using only the supplied grounded geographic result for "
-                        "distance, driving time, place identity, and traffic basis. If either "
-                        "place is ambiguous or unresolved, state that briefly and do not pick "
-                        "an alternative silently. Do not invent ranges. If a resolved origin "
-                        "is area-level, explain that the estimate uses a representative point "
-                        "and exact building times vary. Apply higher-level property judgement "
-                        "yourself, but do not alter the geographic facts. Never ask for a unit "
-                        "number, floor, or apartment details for this calculation."
-                    )
-                elif tool_call.name == "compare_locations":
-                    has_match_results = False
-                    tool_result = compare_locations(
-                        tool_args.get("candidate_locations") or [],
-                        tool_args.get("destinations") or [],
-                    )
-                    follow_up_instructions = (
-                        "Use the supplied grounded location matrix for every geographic claim. "
-                        "First verify the resolved place names; surface ambiguous or unresolved "
-                        "campuses, branches, offices, and candidates rather than guessing. "
-                        "Use only returned point estimates and traffic metadata—never invent "
-                        "ranges. Explain that area-level results use representative points. "
-                        "Then make the personalised recommendation by combining these facts "
-                        "with the customer's stated lifestyle and property needs."
-                    )
-                else:
-                    raise ValueError(f"Unsupported tool: {tool_call.name}")
-
-                # Continue the same response chain with the function result,
-                # then stream the final assistant answer back to Bubble.
-                if tool_call.name == "advance_property_search":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"advance_property_search call {original_call_id}",
-                        flush=True
-                    )
-                elif tool_call.name == "match_lead":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"match_lead call {original_call_id}",
-                        flush=True
-                    )
-                elif tool_call.name == "get_condo_info":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"get_condo_info call {original_call_id}",
-                        flush=True
-                    )
-                elif tool_call.name == "get_travel_time":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"get_travel_time call {original_call_id}", flush=True
-                    )
-                elif tool_call.name == "compare_locations":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"compare_locations call {original_call_id}", flush=True
-                    )
-                elif tool_call.name == "get_current_recommendations":
-                    print(
-                        "Submitting function_call_output for original "
-                        f"get_current_recommendations call {original_call_id}", flush=True
-                    )
-                else:
-                    print(
-                        "Submitting function_call_output for original "
-                        f"get_property_details call {original_call_id}",
-                        flush=True
-                    )
-                continuation_args = {
-                    "model": "gpt-5-mini",
-                    "reasoning": {"effort": "low"},
-                    "max_output_tokens": FINAL_MAX_OUTPUT_TOKENS,
-                    "previous_response_id": original_response_id,
-                    "instructions": follow_up_instructions,
-                    "input": [{
-                        "type": "function_call_output",
-                        "call_id": original_call_id,
-                        "output": tool_result
-                    }]
-                }
-
-                if follow_up_tools:
-                    continuation_args["tools"] = follow_up_tools
-
-                final_openai_started = time.perf_counter()
-                with client.responses.stream(**continuation_args) as stream:
-                    for event in stream:
-                        if (
-                            event.type.startswith("response.web_search_call.")
-                            and not web_search_status_sent
-                        ):
-                            print("Web search used", flush=True)
-                            web_search_status_sent = True
-                        if event.type == "response.output_text.delta":
+                        for delta in buffered_text:
                             if not first_delta_sent:
                                 log_timing("FIRST DELTA", request_started)
                                 first_delta_sent = True
-                            yield f"data: {json.dumps({'delta': event.delta})}\n\n"
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+                        citations = get_web_citations(response)
+                        if citations:
+                            yield f"data: {json.dumps({'citations': citations})}\n\n"
+                        log_timing("TOTAL REQUEST", request_started)
+                        yield (
+                            f"data: {json.dumps({'done': True, 'response_id': response.id, 'recommendations_relevant': has_match_results, 'recommendations': current_run_recommendations})}\n\n"
+                        )
+                        return
 
-                    final = stream.get_final_response()
-                log_token_usage("Final", final)
-                log_timing("Final OpenAI completion", final_openai_started)
+                    if tool_round >= MAX_TOOL_ROUNDS:
+                        print(
+                            f"[TOOL LOOP] max_rounds_reached={MAX_TOOL_ROUNDS}",
+                            flush=True,
+                        )
+                        yield f"data: {json.dumps({'delta': 'Sorry, I couldn’t complete that request safely. Please try again.'})}\n\n"
+                        yield f"data: {json.dumps({'done': True, 'response_id': response.id, 'recommendations_relevant': False, 'recommendations': []})}\n\n"
+                        return
 
-                print("Tool lifecycle completed", flush=True)
+                    tool_round += 1
+                    print(
+                        f"[TOOL LOOP] round={tool_round} selected={tool_call.name}",
+                        flush=True,
+                    )
+                    buffered_chars = sum(len(delta) for delta in buffered_text)
+                    if buffered_chars:
+                        if tool_round == 1:
+                            print(
+                                "WARNING: Suppressed initial OpenAI text emitted before tool "
+                                f"{tool_call.name}; internal orchestration was not sent to Bubble.",
+                                flush=True,
+                            )
+                        print(
+                            f"[TOOL LOOP] round={tool_round} "
+                            f"buffered_text_discarded chars={buffered_chars}",
+                            flush=True,
+                        )
+                    execution = execute_chat_tool(
+                        tool_call, folio_id, bubble_env, message_id
+                    )
+                    if execution["has_match_results"]:
+                        has_match_results = True
+                    if execution["recommendations"]:
+                        current_run_recommendations = execution["recommendations"]
+                    tool_output = execution["output"]
+                    if not isinstance(tool_output, str):
+                        tool_output = json.dumps(tool_output, ensure_ascii=False)
+                    continuation_args = {
+                        "model": "gpt-5-mini",
+                        "reasoning": {"effort": "low"},
+                        "max_output_tokens": FINAL_MAX_OUTPUT_TOKENS,
+                        "previous_response_id": response.id,
+                        "instructions": (
+                            rentee_instructions() + "\n\n" + execution["instructions"]
+                            + "\nThe tool result does not determine customer intent. If "
+                            "another supported tool is needed, call it. Emit customer-facing "
+                            "text only when the task is complete."
+                        ),
+                        "input": [{
+                            "type": "function_call_output",
+                            "call_id": tool_call.call_id,
+                            "output": tool_output,
+                        }],
+                    }
+                    if tool_round < MAX_TOOL_ROUNDS:
+                        continuation_args["tools"] = normal_tools
+                        continuation_args["tool_choice"] = "auto"
+                    else:
+                        continuation_args["instructions"] += (
+                            " No further function calls are available in this turn; provide "
+                            "only a safe customer-facing answer based on completed results."
+                        )
+                    response, buffered_text = stream_initial_response(
+                        continuation_args,
+                        f"Tool continuation round {tool_round}",
+                    )
 
-                citations = get_web_citations(final)
-
-                if citations:
-                    yield f"data: {json.dumps({'citations': citations})}\n\n"
-
-                log_timing("TOTAL REQUEST", request_started)
-                yield (
-                    f"data: {json.dumps({'done': True, 'response_id': final.id, 'recommendations_relevant': has_match_results, 'recommendations': current_run_recommendations})}\n\n"
-                )
             except Exception as error:
                 print(f"/chat_stream failed: {error}", flush=True)
                 log_timing("TOTAL REQUEST BEFORE ERROR", request_started)
