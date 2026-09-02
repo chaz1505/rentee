@@ -27,6 +27,7 @@ class FakeProvider:
         self.places = places
         self.matrix = matrix or {}
         self.matrix_calls = []
+        self.matrix_modes = []
 
     def resolve_place(self, query, known_location=None):
         if known_location and known_location.get("latitude") is not None:
@@ -39,12 +40,163 @@ class FakeProvider:
                                        "reason": "zero_results",
                                        "error": "Location could not be resolved."})
 
-    def route_matrix(self, origins, destinations):
+    def route_matrix(self, origins, destinations, mode="driving"):
         self.matrix_calls.append((origins, destinations))
+        self.matrix_modes.append(mode)
         return self.matrix
 
 
+class NearbyFakeProvider(FakeProvider):
+    def __init__(self, places, nearby, matrix=None, nearby_error=None,
+                 route_error=None):
+        super().__init__(places, matrix)
+        self.nearby = nearby
+        self.nearby_error = nearby_error
+        self.route_error = route_error
+        self.nearby_calls = []
+
+    def search_nearby(self, origin, included_types, radius_m, max_results):
+        self.nearby_calls.append((origin, included_types, radius_m, max_results))
+        if self.nearby_error:
+            raise self.nearby_error
+        return self.nearby
+
+    def route_matrix(self, origins, destinations, mode="driving"):
+        if self.route_error:
+            raise self.route_error
+        return super().route_matrix(origins, destinations, mode)
+
+
 class LocationToolTests(unittest.TestCase):
+    def test_nearby_categories_map_only_to_supported_google_types(self):
+        self.assertEqual(
+            location_tools.nearby_place_types([
+                "supermarkets", "groceries", "convenience store", "pharmacy"
+            ]),
+            ["supermarket", "grocery_store", "convenience_store", "pharmacy"],
+        )
+
+    def test_nearby_search_deduplicates_batch_routes_filters_and_sorts(self):
+        origin = resolved("9 Beringin", 3.15, 101.66)
+        nearby = [
+            {"id": "slow", "displayName": {"text": "Slow Grocer"},
+             "formattedAddress": "Slow Street", "primaryType": "supermarket",
+             "location": {"latitude": 3.16, "longitude": 101.67}},
+            {"id": "fast", "displayName": {"text": "Fast Grocer"},
+             "formattedAddress": "Fast Street", "primaryType": "grocery_store",
+             "rating": 4.4, "userRatingCount": 25,
+             "location": {"latitude": 3.151, "longitude": 101.661}},
+            {"id": "fast", "displayName": {"text": "Fast Grocer duplicate"},
+             "location": {"latitude": 3.151, "longitude": 101.661}},
+            {"id": "outside", "displayName": {"text": "Outside Grocer"},
+             "location": {"latitude": 3.17, "longitude": 101.68}},
+        ]
+        matrix = {
+            (0, 0): {"status": "ok", "duration_minutes": 9, "distance_m": 700},
+            (0, 1): {"status": "ok", "duration_minutes": 5, "distance_m": 500},
+            # Rounded minutes alone would look eligible; exact seconds must exclude it.
+            (0, 2): {"status": "ok", "duration_minutes": 10,
+                     "duration_seconds": 601, "distance_m": 900},
+        }
+        provider = NearbyFakeProvider({"9 Beringin": origin}, nearby, matrix)
+        result = location_tools.find_nearby_places(
+            "9 Beringin", ["supermarkets", "groceries", "convenience store"],
+            travel_mode="walking", max_travel_minutes=10, max_results=10,
+            provider=provider,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual([item["name"] for item in result["places"]],
+                         ["Fast Grocer", "Slow Grocer"])
+        self.assertEqual(result["candidate_count"], 3)
+        self.assertEqual(result["within_threshold"], 2)
+        self.assertEqual(provider.matrix_modes, ["walking"])
+        self.assertEqual(len(provider.matrix_calls), 1)
+        self.assertEqual(provider.nearby_calls[0][2], 2000)
+        self.assertEqual(provider.nearby_calls[0][3], 20)
+
+    def test_nearby_origin_ambiguity_short_circuits_discovery(self):
+        provider = NearbyFakeProvider({
+            "School": {"status": "ambiguous", "candidates": [{"name": "A"}, {"name": "B"}]}
+        }, [])
+        result = location_tools.find_nearby_places(
+            "School", ["cafe"], provider=provider
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["origin"]["status"], "ambiguous")
+        self.assertEqual(provider.nearby_calls, [])
+
+    def test_nearby_zero_results_is_grounded_empty_success(self):
+        provider = NearbyFakeProvider({
+            "Condo": resolved("Condo", 3.1, 101.6)
+        }, [])
+        result = location_tools.find_nearby_places(
+            "Condo", ["park"], provider=provider
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["places"], [])
+        self.assertEqual(result["candidate_count"], 0)
+
+    def test_nearby_provider_and_route_failures_are_structured(self):
+        origin = {"Condo": resolved("Condo", 3.1, 101.6)}
+        place = [{"id": "shop", "displayName": {"text": "Shop"},
+                  "location": {"latitude": 3.11, "longitude": 101.61}}]
+        search_failed = NearbyFakeProvider(
+            origin, place,
+            nearby_error=location_tools.LocationProviderError("quota", "quota"),
+        )
+        self.assertEqual(location_tools.find_nearby_places(
+            "Condo", ["cafe"], provider=search_failed
+        )["reason"], "quota")
+        route_failed = NearbyFakeProvider(
+            origin, place,
+            route_error=location_tools.LocationProviderError("route down", "timeout"),
+        )
+        result = location_tools.find_nearby_places(
+            "Condo", ["cafe"], max_travel_minutes=10, provider=route_failed
+        )
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["places"], [])
+        self.assertEqual(result["reason"], "routing_failed")
+
+    def test_google_route_matrix_uses_walk_without_traffic_preference(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = []
+        provider = location_tools.GoogleMapsProvider("key", session=session)
+        provider.route_matrix(
+            [resolved("A", 1, 1)], [resolved("B", 2, 2)], mode="walking"
+        )
+        request_body = session.post.call_args.kwargs["json"]
+        self.assertEqual(request_body["travelMode"], "WALK")
+        self.assertNotIn("routingPreference", request_body)
+
+    def test_google_nearby_search_uses_new_endpoint_and_distance_ranking(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": []}
+        provider = location_tools.GoogleMapsProvider("key", session=session)
+        result = provider.search_nearby(
+            {"latitude": 3.15, "longitude": 101.66},
+            ["supermarket", "grocery_store"], 2000, 20,
+        )
+        self.assertEqual(result, [])
+        call = session.post.call_args
+        self.assertEqual(call.args[0], location_tools.GOOGLE_PLACES_NEARBY_SEARCH_URL)
+        self.assertEqual(call.kwargs["json"]["includedTypes"],
+                         ["supermarket", "grocery_store"])
+        self.assertEqual(call.kwargs["json"]["rankPreference"], "DISTANCE")
+        self.assertEqual(
+            call.kwargs["json"]["locationRestriction"]["circle"]["radius"], 2000.0
+        )
+
+    def test_get_travel_time_supports_walking(self):
+        provider = FakeProvider({
+            "A": resolved("A", 1, 1), "B": resolved("B", 2, 2),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 8}})
+        result = location_tools.get_travel_time(
+            "A", "B", mode="walking", provider=provider
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["mode"], "walking")
+        self.assertEqual(provider.matrix_modes, ["walking"])
     def test_get_travel_time_returns_structured_grounded_result(self):
         provider = FakeProvider({
             "One Menerung": resolved("One Menerung, Bangsar", 3.13, 101.67),

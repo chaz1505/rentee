@@ -36,6 +36,63 @@ def text_response(response_id):
 
 
 class ToolOrchestrationTests(unittest.TestCase):
+    def test_location_intents_select_nearby_point_to_point_and_comparison_tools(self):
+        nearby = app_module.build_response_args(
+            "What supermarkets are within a 10-minute walk of 9 Beringin?"
+        )
+        travel = app_module.build_response_args(
+            "How long does it take to walk from 9 Beringin to BSC?"
+        )
+        comparison = app_module.build_response_args(
+            "Which of these condos has better supermarket access?"
+        )
+        self.assertEqual(nearby["tool_choice"], {
+            "type": "function", "name": "find_nearby_places",
+        })
+        self.assertEqual(travel["tool_choice"], {
+            "type": "function", "name": "get_travel_time",
+        })
+        self.assertEqual(comparison["tool_choice"], "auto")
+        tools = {tool.get("name"): tool for tool in nearby["tools"] if tool.get("name")}
+        self.assertEqual(
+            tools["get_travel_time"]["parameters"]["properties"]["mode"]["enum"],
+            ["driving", "walking"],
+        )
+        self.assertIn("find_nearby_places", tools)
+        comparison_tools = {
+            tool.get("name") for tool in comparison["tools"] if tool.get("name")
+        }
+        self.assertIn("find_nearby_places", comparison_tools)
+        self.assertIn("compare_locations", comparison_tools)
+
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "ok", "places": [{"name": "Village Grocer", "duration_minutes": 8}]
+    }))
+    def test_short_follow_up_executes_nearby_tool_without_confirmation(self, nearby):
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(function_response(
+                "nearby-call-response", "find_nearby_places", "nearby-call", {
+                    "origin": "9 Beringin", "categories": [
+                        "supermarket", "grocery store", "convenience store"
+                    ], "travel_mode": "walking", "max_travel_minutes": 10,
+                },
+            ), ["I can check that..."]),
+            FakeStream(text_response("nearby-final"), [
+                "Village Grocer is an 8-minute walk."
+            ]),
+        ]
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            body = app_module.app.test_client().post("/chat_stream", json={
+                "message": "10 mins", "previous_response_id": "nearby-context",
+            }).get_data(as_text=True)
+        nearby.assert_called_once_with(
+            "9 Beringin", ["supermarket", "grocery store", "convenience store"],
+            "walking", 10, None,
+        )
+        self.assertNotIn("I can check that", body)
+        self.assertIn("8-minute walk", body)
+
     def test_incomplete_completed_web_search_preserves_text_id_and_citations(self):
         citation = SimpleNamespace(
             type="url_citation",

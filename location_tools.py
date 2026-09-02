@@ -8,8 +8,37 @@ import requests
 
 GOOGLE_GEOCODING_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+GOOGLE_PLACES_NEARBY_SEARCH_URL = "https://places.googleapis.com/v1/places:searchNearby"
 GOOGLE_ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 LOCATION_TIMEOUT_SECONDS = 15
+
+NEARBY_CATEGORY_TYPES = {
+    "supermarket": ("supermarket",),
+    "supermarkets": ("supermarket",),
+    "grocery": ("grocery_store", "supermarket"),
+    "groceries": ("grocery_store", "supermarket"),
+    "grocery store": ("grocery_store", "supermarket"),
+    "convenience store": ("convenience_store",),
+    "pharmacy": ("pharmacy",),
+    "cafe": ("cafe",),
+    "coffee shop": ("coffee_shop", "cafe"),
+    "restaurant": ("restaurant",),
+    "school": ("school",),
+    "nursery": ("preschool", "child_care_agency"),
+    "kindergarten": ("preschool",),
+    "gym": ("gym",),
+    "park": ("park",),
+    "mall": ("shopping_mall",),
+    "clinic": ("medical_clinic",),
+    "hospital": ("hospital",),
+    "public transport": ("bus_station", "train_station", "subway_station"),
+    "petrol station": ("gas_station",),
+    "gas station": ("gas_station",),
+    "laundromat": ("laundry",),
+    "specialty food shop": ("food_store",),
+    "shop": ("store",),
+    "shops": ("store",),
+}
 
 
 def _normalize_place_text(value):
@@ -18,6 +47,30 @@ def _normalize_place_text(value):
     return " ".join("".join(
         character if character.isalnum() else " " for character in value
     ).split())
+
+
+def nearby_place_types(categories):
+    """Map conservative customer category labels to supported Places API types."""
+    result = []
+    for category in categories or []:
+        normalized = _normalize_place_text(category)
+        mapped = NEARBY_CATEGORY_TYPES.get(normalized)
+        if mapped is None and normalized in {
+            place_type for values in NEARBY_CATEGORY_TYPES.values() for place_type in values
+        }:
+            mapped = (normalized,)
+        for place_type in mapped or ():
+            if place_type not in result:
+                result.append(place_type)
+    return result
+
+
+def nearby_search_radius(travel_mode, max_travel_minutes):
+    """Use a deliberately broad discovery circle; route time does final inclusion."""
+    minutes = int(max_travel_minutes) if max_travel_minutes else None
+    if travel_mode == "walking":
+        return 2000 if minutes is None or minutes <= 10 else 3000 if minutes <= 20 else 5000
+    return 10000 if minutes is None or minutes <= 10 else 20000 if minutes <= 20 else 30000
 
 
 class LocationProviderError(RuntimeError):
@@ -159,6 +212,49 @@ class GoogleMapsProvider:
             ]}
         return self._place_result(query, results[0], "geocode")
 
+    def search_nearby(self, origin, included_types, radius_m, max_results):
+        self._require_key()
+        try:
+            response = self.session.post(
+                GOOGLE_PLACES_NEARBY_SEARCH_URL,
+                headers={
+                    "X-Goog-Api-Key": self.api_key,
+                    "X-Goog-FieldMask": (
+                        "places.id,places.displayName,places.formattedAddress,"
+                        "places.location,places.primaryType,places.rating,"
+                        "places.userRatingCount,places.businessStatus"
+                    ),
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "includedTypes": included_types,
+                    "maxResultCount": max_results,
+                    "rankPreference": "DISTANCE",
+                    "languageCode": "en", "regionCode": "MY",
+                    "locationRestriction": {"circle": {
+                        "center": {"latitude": origin["latitude"],
+                                   "longitude": origin["longitude"]},
+                        "radius": float(radius_m),
+                    }},
+                },
+                timeout=LOCATION_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.Timeout as error:
+            raise LocationProviderError("Nearby search timed out.", "timeout") from error
+        except requests.RequestException as error:
+            status = getattr(getattr(error, "response", None), "status_code", None)
+            reason = "authentication" if status in {401, 403} else "quota" if status == 429 else "http_error"
+            raise LocationProviderError(
+                f"Nearby search failed with HTTP {status or 'unknown'}.", reason
+            ) from error
+        except (TypeError, ValueError) as error:
+            raise LocationProviderError(
+                "Nearby search returned invalid JSON.", "parsing_error"
+            ) from error
+        return payload.get("places") or []
+
     def resolve_place(self, query, known_location=None):
         clean_query = " ".join(str(query or "").split())
         if not clean_query:
@@ -187,8 +283,11 @@ class GoogleMapsProvider:
             return places
         return self.geocode(search_query)
 
-    def route_matrix(self, origins, destinations):
+    def route_matrix(self, origins, destinations, mode="driving"):
         self._require_key()
+        travel_mode = {"driving": "DRIVE", "walking": "WALK"}.get(mode)
+        if not travel_mode:
+            raise LocationProviderError(f"Unsupported travel mode: {mode}.", "unsupported_mode")
         body = {
             "origins": [{"waypoint": {"location": {"latLng": {
                 "latitude": item["latitude"], "longitude": item["longitude"],
@@ -196,8 +295,10 @@ class GoogleMapsProvider:
             "destinations": [{"waypoint": {"location": {"latLng": {
                 "latitude": item["latitude"], "longitude": item["longitude"],
             }}}} for item in destinations],
-            "travelMode": "DRIVE", "routingPreference": "TRAFFIC_AWARE",
+            "travelMode": travel_mode,
         }
+        if mode == "driving":
+            body["routingPreference"] = "TRAFFIC_AWARE"
         headers = {
             "X-Goog-Api-Key": self.api_key,
             "X-Goog-FieldMask": (
@@ -239,9 +340,14 @@ class GoogleMapsProvider:
                 continue
             minutes = round(seconds / 60)
             matrix[(origin_index, destination_index)] = {
-                "status": "ok", "distance_km": round(float(metres) / 1000, 1),
+                "status": "ok", "distance_m": int(metres),
+                "distance_km": round(float(metres) / 1000, 1),
+                "duration_seconds": seconds,
                 "duration_minutes": minutes, "duration_text": f"{minutes} min",
-                "traffic_basis": "current_traffic_aware",
+                "traffic_basis": (
+                    "current_traffic_aware" if mode == "driving"
+                    else "walking_route_estimate"
+                ),
             }
         return matrix
 
@@ -353,8 +459,9 @@ def get_travel_time(origin, destination, mode="driving", provider=None,
                     coordinate_resolver=None, web_resolver=None):
     started = time.perf_counter()
     provider = provider or GoogleMapsProvider()
-    if mode != "driving":
-        return {"status": "error", "error": "Only driving mode is supported."}
+    if mode not in {"driving", "walking"}:
+        return {"status": "error", "reason": "unsupported_mode",
+                "error": "Only driving and walking modes are supported."}
     resolved_origin = _safe_resolve(
         provider, origin, coordinate_resolver, web_resolver
     )
@@ -365,7 +472,9 @@ def get_travel_time(origin, destination, mode="driving", provider=None,
         return {"status": "error", "origin": resolved_origin,
                 "destination": resolved_destination, "source": provider.name}
     try:
-        route = provider.route_matrix([resolved_origin], [resolved_destination]).get((0, 0))
+        route = provider.route_matrix(
+            [resolved_origin], [resolved_destination], mode=mode
+        ).get((0, 0))
     except LocationProviderError as error:
         return {"status": "error", "origin": resolved_origin,
                 "destination": resolved_destination, "error": str(error),
@@ -373,9 +482,131 @@ def get_travel_time(origin, destination, mode="driving", provider=None,
                 "source": provider.name}
     result = {"status": "ok", "origin": resolved_origin,
               "destination": resolved_destination, "source": provider.name,
-              "mode": "driving", "provider_duration_ms": round((time.perf_counter() - started) * 1000)}
+              "mode": mode, "provider_duration_ms": round((time.perf_counter() - started) * 1000)}
     result.update(route or {"status": "error", "error": "No route was returned."})
     return result
+
+
+def find_nearby_places(origin, categories, travel_mode="walking",
+                       max_travel_minutes=None, max_results=None, provider=None,
+                       coordinate_resolver=None, web_resolver=None):
+    """Discover nearby amenities, batch-route them, then apply route-time filtering."""
+    started = time.perf_counter()
+    provider = provider or GoogleMapsProvider()
+    if travel_mode not in {"walking", "driving"}:
+        return {"status": "error", "reason": "unsupported_mode",
+                "error": "Only walking and driving modes are supported."}
+    try:
+        max_minutes = int(max_travel_minutes) if max_travel_minutes is not None else None
+        result_limit = int(max_results) if max_results is not None else 10
+    except (TypeError, ValueError):
+        return {"status": "error", "reason": "invalid_request",
+                "error": "Travel minutes and result limit must be integers."}
+    if max_minutes is not None and not 1 <= max_minutes <= 60:
+        return {"status": "error", "reason": "invalid_request",
+                "error": "Maximum travel time must be between 1 and 60 minutes."}
+    if not 1 <= result_limit <= 20:
+        return {"status": "error", "reason": "invalid_request",
+                "error": "Maximum results must be between 1 and 20."}
+    if max_minutes is None and travel_mode == "walking":
+        max_minutes = 10
+    place_types = nearby_place_types(categories)
+    if not place_types:
+        return {"status": "error", "reason": "unsupported_categories",
+                "error": "No supported nearby-place category was supplied."}
+    resolved_origin = _safe_resolve(
+        provider, origin, coordinate_resolver, web_resolver
+    )
+    if resolved_origin.get("status") != "resolved":
+        return {"status": "error", "reason": "origin_not_resolved",
+                "origin": resolved_origin, "source": provider.name}
+    radius_m = nearby_search_radius(travel_mode, max_minutes)
+    discovery_limit = min(20, max(10, result_limit * 2))
+    try:
+        raw_places = provider.search_nearby(
+            resolved_origin, place_types, radius_m, discovery_limit
+        )
+    except LocationProviderError as error:
+        return {"status": "error", "reason": error.reason,
+                "error": str(error), "origin": resolved_origin,
+                "source": provider.name}
+    deduplicated = []
+    seen = set()
+    for item in raw_places:
+        display = item.get("displayName") or {}
+        name = display.get("text") if isinstance(display, dict) else display
+        location = item.get("location") or {}
+        latitude, longitude = location.get("latitude"), location.get("longitude")
+        identity = item.get("id") or (
+            _normalize_place_text(name), _normalize_place_text(item.get("formattedAddress"))
+        )
+        if identity in seen or latitude is None or longitude is None:
+            continue
+        seen.add(identity)
+        deduplicated.append({
+            "name": name or item.get("formattedAddress") or "Unnamed place",
+            "place_id": item.get("id"), "primary_type": item.get("primaryType"),
+            "formatted_address": item.get("formattedAddress"),
+            "latitude": float(latitude), "longitude": float(longitude),
+            "rating": item.get("rating"),
+            "user_rating_count": item.get("userRatingCount"),
+            "business_status": item.get("businessStatus"),
+        })
+    if not deduplicated:
+        return {"status": "ok", "origin": resolved_origin,
+                "travel_mode": travel_mode, "max_travel_minutes": max_minutes,
+                "categories": list(categories or []), "google_place_types": place_types,
+                "places": [], "candidate_count": 0, "radius_m": radius_m,
+                "source": provider.name,
+                "provider_duration_ms": round((time.perf_counter() - started) * 1000)}
+    try:
+        matrix = provider.route_matrix(
+            [resolved_origin], deduplicated, mode=travel_mode
+        )
+    except LocationProviderError as error:
+        return {"status": "partial", "reason": "routing_failed",
+                "error": str(error), "origin": resolved_origin,
+                "travel_mode": travel_mode, "max_travel_minutes": max_minutes,
+                "categories": list(categories or []), "google_place_types": place_types,
+                "places": [], "unrouted_places": [
+                    {key: value for key, value in item.items()
+                     if key not in {"latitude", "longitude"}}
+                    for item in deduplicated
+                ], "candidate_count": len(deduplicated), "radius_m": radius_m,
+                "source": provider.name}
+    places, unrouted = [], []
+    for index, item in enumerate(deduplicated):
+        route = matrix.get((0, index))
+        public_item = {key: value for key, value in item.items()
+                       if key not in {"latitude", "longitude"} and value is not None}
+        if not route or route.get("status") != "ok":
+            unrouted.append(public_item)
+            continue
+        public_item.update(route)
+        duration_within_limit = (
+            max_minutes is None
+            or (route.get("duration_seconds") is not None
+                and route["duration_seconds"] <= max_minutes * 60)
+            or (route.get("duration_seconds") is None
+                and route["duration_minutes"] <= max_minutes)
+        )
+        if duration_within_limit:
+            places.append(public_item)
+    places.sort(key=lambda item: (
+        item.get("duration_minutes", float("inf")),
+        item.get("distance_m", float("inf")), item["name"].casefold(),
+    ))
+    return {
+        "status": "ok" if places or not unrouted else "partial",
+        "origin": resolved_origin, "travel_mode": travel_mode,
+        "max_travel_minutes": max_minutes,
+        "categories": list(categories or []), "google_place_types": place_types,
+        "places": places[:result_limit], "unrouted_places": unrouted,
+        "candidate_count": len(deduplicated), "routed_count": len(deduplicated) - len(unrouted),
+        "within_threshold": len(places), "radius_m": radius_m,
+        "source": provider.name,
+        "provider_duration_ms": round((time.perf_counter() - started) * 1000),
+    }
 
 
 def compare_locations(candidate_locations, destinations, provider=None,
@@ -402,6 +633,7 @@ def compare_locations(candidate_locations, destinations, provider=None,
             matrix = provider.route_matrix(
                 [item for _, item in valid_candidates],
                 [item for _, item in valid_destinations],
+                mode="driving",
             )
         except LocationProviderError as error:
             provider_error = str(error)

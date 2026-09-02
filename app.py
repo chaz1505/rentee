@@ -20,6 +20,7 @@ from pathlib import Path
 import conversation as conversation_store
 from location_tools import (
     compare_locations as compare_grounded_locations,
+    find_nearby_places as find_grounded_nearby_places,
     get_travel_time as get_grounded_travel_time,
 )
 
@@ -132,6 +133,8 @@ needs. Check resolved names, surface ambiguous branches/campuses, label area-lev
 approximations, use only the returned traffic basis, and never invent commute ranges. Resolve
 obvious place identity and area context through the tools before asking for clarification.
 Never ask for a unit number, floor, or apartment details merely to calculate travel time.
+Use `find_nearby_places` for nearby amenities, not point-to-point tools or web search. When
+origin, category, mode, and threshold are known, execute without further clarification.
 """
 
 SKILLS_DIRECTORY = Path(__file__).with_name("skills")
@@ -474,7 +477,7 @@ def _resolve_location_identity_with_web(location_name, known_entity=None):
 
 
 def get_travel_time(origin, destination, mode="driving"):
-    """Application wrapper for provider-neutral grounded driving information."""
+    """Application wrapper for provider-neutral grounded route information."""
     print(f"[LOCATION TOOL] name=get_travel_time origin={origin!r} destination={destination!r}",
           flush=True)
     result = get_grounded_travel_time(
@@ -489,6 +492,44 @@ def get_travel_time(origin, destination, mode="driving"):
         f"destination_resolved={(result.get('destination') or {}).get('resolved_name')} "
         f"duration_minutes={result.get('duration_minutes')} source={result.get('source')}",
         flush=True,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+def find_nearby_places(origin, categories, travel_mode="walking",
+                       max_travel_minutes=None, max_results=None):
+    """Application wrapper for grounded amenity discovery and route filtering."""
+    print(
+        "[NEARBY TOOL] "
+        f"origin={origin!r} categories={categories!r} mode={travel_mode} "
+        f"max_minutes={max_travel_minutes}", flush=True,
+    )
+    result = find_grounded_nearby_places(
+        origin, categories, travel_mode=travel_mode,
+        max_travel_minutes=max_travel_minutes, max_results=max_results,
+        coordinate_resolver=_known_location_coordinates,
+        web_resolver=_resolve_location_identity_with_web,
+    )
+    print(
+        "[NEARBY RESOLVE] "
+        f"origin_resolved={(result.get('origin') or {}).get('resolved_name')!r} "
+        f"resolution_method={(result.get('origin') or {}).get('resolution_method')}",
+        flush=True,
+    )
+    print(
+        "[NEARBY SEARCH] "
+        f"candidate_count={result.get('candidate_count', 0)} "
+        f"radius_m={result.get('radius_m')}", flush=True,
+    )
+    print(
+        "[NEARBY ROUTE] "
+        f"routed_count={result.get('routed_count', 0)} "
+        f"within_threshold={result.get('within_threshold', 0)}", flush=True,
+    )
+    print(
+        "[NEARBY TOOL] "
+        f"status={result.get('status')} result_count={len(result.get('places') or [])} "
+        f"duration_ms={result.get('provider_duration_ms')}", flush=True,
     )
     return json.dumps(result, ensure_ascii=False)
 
@@ -532,6 +573,22 @@ def _requires_location_comparison_tool(message):
         r"frequent destination)\b", text
     ))
     return recommendation_intent and destination_context
+
+
+def _requires_nearby_places_tool(message):
+    text = normalize_condo_name(message)
+    category = re.search(
+        r"\b(supermarkets?|grocer(?:y|ies)|grocery stores?|convenience stores?|"
+        r"pharmacies|pharmacy|cafes?|restaurants?|schools?|nurser(?:y|ies)|"
+        r"kindergartens?|gyms?|parks?|malls?|clinics?|hospitals?|"
+        r"public transport|petrol stations?|gas stations?|laundromats?|shops?)\b",
+        text,
+    )
+    proximity = re.search(
+        r"\b(nearby|near|around|walking distance|within .*?(?:walk|drive|minutes?))\b",
+        text,
+    )
+    return bool(category and proximity)
 
 
 def recommend_condos_for_search(search_state):
@@ -817,7 +874,7 @@ def build_response_args(
             {
                 "type": "function", "name": "get_travel_time",
                 "description": (
-                    "Get grounded driving distance and estimated time between two specific "
+                    "Get grounded driving or walking distance and estimated time between two specific "
                     "places. Required before claims about commute time, school-run time, "
                     "distance, proximity, accessibility, or relative convenience. If the "
                     "customer says this property/home, use the trusted current listing "
@@ -828,8 +885,32 @@ def build_response_args(
                         "origin": {"type": "string", "description":
                                    "Property/building, area, or trusted current listing place."},
                         "destination": {"type": "string", "description": "Specific destination place."},
-                        "mode": {"type": "string", "enum": ["driving"]},
+                        "mode": {"type": "string", "enum": ["driving", "walking"]},
                     }, "required": ["origin", "destination"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function", "name": "find_nearby_places",
+                "description": (
+                    "Find real nearby amenities around a resolved origin and route-filter them "
+                    "by walking or driving time. Use for nearby supermarkets, groceries, cafes, "
+                    "pharmacies, parks, schools, restaurants, shops, clinics, transport, and "
+                    "similar categories. Do not use get_travel_time unless both endpoints are "
+                    "already named. If walking distance has no stated threshold, use 10 minutes."
+                ),
+                "parameters": {
+                    "type": "object", "properties": {
+                        "origin": {"type": "string", "description":
+                                   "Starting property, building, landmark, or area."},
+                        "categories": {"type": "array", "items": {"type": "string"},
+                                       "minItems": 1},
+                        "travel_mode": {"type": "string", "enum": ["walking", "driving"]},
+                        "max_travel_minutes": {"type": ["integer", "null"],
+                                               "minimum": 1, "maximum": 60},
+                        "max_results": {"type": ["integer", "null"],
+                                        "minimum": 1, "maximum": 20},
+                    }, "required": ["origin", "categories", "travel_mode"],
                     "additionalProperties": False,
                 },
             },
@@ -862,10 +943,12 @@ def build_response_args(
         args["tool_choice"] = {"type": "function", "name": "advance_property_search"}
     elif _is_clear_condo_information_question(user_message, recognized_condos):
         args["tool_choice"] = {"type": "function", "name": "get_condo_info"}
-    if _requires_travel_time_tool(user_message):
-        args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
-    elif _requires_location_comparison_tool(user_message):
+    if _requires_location_comparison_tool(user_message):
         args["tool_choice"] = {"type": "function", "name": "compare_locations"}
+    elif _requires_nearby_places_tool(user_message):
+        args["tool_choice"] = {"type": "function", "name": "find_nearby_places"}
+    elif _requires_travel_time_tool(user_message):
+        args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
     return args
 
 
@@ -4594,6 +4677,20 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
             "traffic basis. Surface ambiguity and area-level approximation. Call another "
             "supported tool only when genuinely required. Never invent ranges or ask for a "
             "unit number, floor, or apartment details."
+        )
+    elif tool_call.name == "find_nearby_places":
+        output = find_nearby_places(
+            tool_args.get("origin"), tool_args.get("categories") or [],
+            tool_args.get("travel_mode", "walking"),
+            tool_args.get("max_travel_minutes"), tool_args.get("max_results"),
+        )
+        instructions = (
+            "Use only the supplied nearby-place results for business identity, address, "
+            "distance, and travel time. Summarize confirmed results naturally and do not "
+            "invent additional businesses. If the origin is area-level, explain that results "
+            "are approximate. For a strict time threshold, describe only places in `places`, "
+            "never unrouted candidates. If results are partial, state briefly that routing "
+            "could not verify the requested threshold."
         )
     elif tool_call.name == "compare_locations":
         output = compare_locations(
