@@ -1547,8 +1547,8 @@ def find_forwarded_lead_conversation(lead, phone, bubble_env="live"):
     return conversation
 
 
-def find_reply_to_conversation(message, bubble_env="live"):
-    """Resolve Meta reply context to the exact persisted Conversation."""
+def find_reply_context(message, bubble_env="live"):
+    """Resolve Meta reply context to its Conversation and optional exact Listing."""
     replied_to_id = str(((message or {}).get("context") or {}).get("id") or "").strip()
     if not replied_to_id:
         return None
@@ -1564,11 +1564,20 @@ def find_reply_to_conversation(message, bubble_env="live"):
     )
     if not conversation_id:
         return None
+    listing_id = conversation_store.relationship_id(
+        (previous or {}).get("listing")
+    )
     conversation = bubble(
         f"{get_bubble_base_url(bubble_env)}/obj/conversation/{conversation_id}"
     )
     conversation.setdefault("_id", conversation_id)
-    return conversation
+    return {"conversation": conversation, "listing_id": listing_id}
+
+
+def find_reply_to_conversation(message, bubble_env="live"):
+    """Backwards-compatible Conversation-only Meta reply resolver."""
+    context = find_reply_context(message, bubble_env)
+    return context["conversation"] if context else None
 
 
 def active_conversations_by_phone(phone, bubble_env="live"):
@@ -2052,7 +2061,7 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
 
 def persist_inbound_whatsapp_message(
     phone, whatsapp_message_id, message_content, lead_id=None,
-    conversation_id=None, bubble_env="live",
+    conversation_id=None, bubble_env="live", listing_id=None,
 ):
     """Create one durable Bubble Message for an inbound Meta message."""
     base_url = get_bubble_base_url(bubble_env)
@@ -2070,6 +2079,17 @@ def persist_inbound_whatsapp_message(
             existing.get("Conversation")
         ):
             patch["Conversation"] = conversation_id
+        existing_listing_id = conversation_store.relationship_id(
+            existing.get("listing")
+        )
+        if listing_id and not existing_listing_id:
+            patch["listing"] = listing_id
+        elif listing_id and existing_listing_id != str(listing_id):
+            print(
+                "[MESSAGE] direction=inbound action=listing_conflict "
+                f"existing_listing_id={existing_listing_id} "
+                f"reply_listing_id={listing_id}", flush=True,
+            )
         if patch:
             _bubble_patch(
                 f"{base_url}/obj/message/{message_id}", patch
@@ -2092,6 +2112,8 @@ def persist_inbound_whatsapp_message(
     if lead_id:
         payload["lead"] = lead_id
     payload["Conversation"] = conversation_id
+    if listing_id:
+        payload["listing"] = listing_id
     message_id = _bubble_create(base_url, "message", payload)
     conversation_store.update_conversation_last_inbound_at(
         conversation_id, bubble_env
@@ -2198,6 +2220,11 @@ def persist_recommendation_whatsapp_ids(
         }
         if lead_id:
             payload["lead"] = lead_id
+        listing_id = conversation_store.relationship_id(
+            delivery.get("listing_id")
+        )
+        if listing_id:
+            payload["listing"] = listing_id
         try:
             if index == 1:
                 _bubble_patch(
@@ -2216,7 +2243,8 @@ def persist_recommendation_whatsapp_ids(
             print(
                 "[WHATSAPP MESSAGE] direction=outbound "
                 f"recommendation_index={index} "
-                f"conversation_id={conversation_id} action=persisted",
+                f"conversation_id={conversation_id} "
+                f"listing_id={listing_id or 'none'} action=persisted",
                 flush=True,
             )
         except Exception as error:
@@ -4500,6 +4528,57 @@ def conversation_model_context(conversation, lead=None, bubble_env="live"):
     )
 
 
+def whatsapp_reply_listing_context(listing_id, bubble_env="live"):
+    """Build compact trusted model context for an exact WhatsApp listing reply."""
+    listing_id = conversation_store.relationship_id(listing_id)
+    if not listing_id:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    try:
+        listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+        condo_id = conversation_store.relationship_id(listing.get("condo"))
+        condo_names = (
+            get_relationship_names(base_url, "condo", [condo_id])
+            if condo_id else {}
+        )
+        facts = listing_facts(listing, condo_names=condo_names)
+    except Exception as error:
+        print(
+            "[WHATSAPP REPLY CONTEXT] action=listing_lookup_failed "
+            f"listing_id={listing_id} error={type(error).__name__}", flush=True,
+        )
+        return None
+    labels = (
+        ("Property", "property_name"), ("Bedrooms", "beds"),
+        ("Bathrooms", "baths"), ("Rent", "priceRent"),
+        ("Sale price", "priceSale"), ("Property type", "propertyType"),
+        ("Furnishing", "Furnishing"), ("Furnishing", "furnished"),
+        ("Availability", "availability"), ("Size", "Sq Ft"),
+        ("Land size", "Landed_sqft"), ("Key facts", "keyFacts"),
+        ("Description", "Description"), ("Notes", "Notes"),
+    )
+    rendered = []
+    used_labels = set()
+    for label, field in labels:
+        value = facts.get(field)
+        if value in (None, "", []) or label in used_labels:
+            continue
+        rendered.append(f"- {label}: {' '.join(str(value).split())[:500]}")
+        used_labels.add(label)
+    if not rendered:
+        rendered.append("- Property: exact previously recommended property")
+    return (
+        "WHATSAPP REPLY CONTEXT (trusted application context)\n"
+        "The customer used WhatsApp Reply on a message specifically referring "
+        "to this previously recommended property:\n"
+        + "\n".join(rendered)
+        + "\nInterpret references such as this, it, that, this one, that one, or "
+        "the property as this exact property unless the customer clearly changes "
+        "subject. This exact reply context takes priority over fuzzy property "
+        "reference resolution. Do not expose internal record IDs."
+    )
+
+
 def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=None,
                     bubble_env="live", conversation_context=None):
     """Run the existing customer turn lifecycle and collect its clean final text."""
@@ -4594,16 +4673,26 @@ def _process_whatsapp_message(message):
             inbound_message_id = None
             routed_conversation = None
             routed_conversation_id = None
+            reply_listing_id = None
             ambiguous_candidates = []
             try:
-                routed_conversation = find_reply_to_conversation(message, "live")
+                reply_context = find_reply_context(message, "live")
+                routed_conversation = (
+                    reply_context.get("conversation") if reply_context else None
+                )
+                reply_listing_id = (
+                    conversation_store.relationship_id(
+                        reply_context.get("listing_id")
+                    ) if reply_context else None
+                )
                 routed_conversation_id = conversation_store.relationship_id(
                     (routed_conversation or {}).get("_id")
                 )
                 if routed_conversation_id:
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
-                        f"resolution=reply_to conversation_id={routed_conversation_id}",
+                        f"resolution=reply_to conversation_id={routed_conversation_id} "
+                        f"listing_id={reply_listing_id or 'none'}",
                         flush=True,
                     )
                     inbound_message_id, _inbound_created = (
@@ -4611,6 +4700,7 @@ def _process_whatsapp_message(message):
                             phone, message_id, text,
                             conversation_id=routed_conversation_id,
                             bubble_env="live",
+                            listing_id=reply_listing_id,
                         )
                     )
             except Exception as error:
@@ -5064,12 +5154,18 @@ def _process_whatsapp_message(message):
                 f"[WHATSAPP CONVERSATION] current_message_id={current_message_id}",
                 flush=True,
             )
+            model_context = conversation_model_context(
+                lead_conversation, lead, "live"
+            )
+            exact_listing_context = whatsapp_reply_listing_context(
+                reply_listing_id, "live"
+            )
+            if exact_listing_context:
+                model_context += "\n\n" + exact_listing_context
             answer, response_id, recommendation_run = run_rentee_turn(
                 text, folio_id, previous_response_id=previous_response_id,
                 message_id=current_message_id, bubble_env="live",
-                conversation_context=conversation_model_context(
-                    lead_conversation, lead, "live"
-                ),
+                conversation_context=model_context,
             )
             if _requests_owner_check(answer):
                 owner_check = prepare_owner_check(lead, "live")

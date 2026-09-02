@@ -784,7 +784,7 @@ class OwnerCheckTests(unittest.TestCase):
     @patch("app.capture_linked_tenant_profile", return_value={"_id": "lead-linked"})
     @patch("app.find_existing_general_conversation_by_phone",
            return_value={"_id": "conversation-general"})
-    @patch("app.find_reply_to_conversation", return_value=None)
+    @patch("app.find_reply_context", return_value=None)
     @patch("app.send_whatsapp_typing_indicator")
     @patch("app.find_internal_user", return_value=None)
     def test_sufficient_profile_prepares_state_and_sends_only_customer_reply(
@@ -934,6 +934,8 @@ class WhatsAppTests(unittest.TestCase):
         direct_persistence_tests = {
             "test_inbound_message_persists_whatsapp_fields_once",
             "test_duplicate_inbound_meta_id_reuses_existing_message",
+            "test_inbound_reply_persists_exact_listing",
+            "test_duplicate_inbound_adds_missing_listing_without_overwrite",
             "test_inbound_message_stores_conversation_and_updates_activity",
             "test_new_message_creation_rejects_missing_conversation",
         }
@@ -955,7 +957,7 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.addCleanup(self.forwarded_conversation_patcher.stop)
         self.reply_conversation_patcher = patch(
-            "app.find_reply_to_conversation", return_value=None
+            "app.find_reply_context", return_value=None
         )
         self.reply_conversation_patcher.start()
         self.addCleanup(self.reply_conversation_patcher.stop)
@@ -1016,6 +1018,32 @@ class WhatsAppTests(unittest.TestCase):
             "key": "whatsappMessageId", "constraint_type": "equals",
             "value": "wamid.replied-to",
         }])
+
+    def test_reply_context_resolves_exact_message_listing(self):
+        self.reply_conversation_patcher.stop()
+        with patch("app._bubble_records", return_value=iter([{
+            "_id": "message-mesra",
+            "Conversation": {"_id": "conversation-search"},
+            "listing": {"_id": "listing-mesra"},
+        }])), patch("app.bubble", return_value={
+            "_id": "conversation-search", "Lead": "lead-1",
+        }):
+            result = app_module.find_reply_context({
+                "context": {"id": "wamid.mesra"},
+            })
+        self.assertEqual(result["conversation"]["_id"], "conversation-search")
+        self.assertEqual(result["listing_id"], "listing-mesra")
+
+    def test_reply_context_without_listing_preserves_legacy_routing(self):
+        self.reply_conversation_patcher.stop()
+        with patch("app._bubble_records", return_value=iter([{
+            "Conversation": "conversation-search",
+        }])), patch("app.bubble", return_value={"_id": "conversation-search"}):
+            result = app_module.find_reply_context({
+                "context": {"id": "wamid.footer"},
+            })
+        self.assertEqual(result["conversation"]["_id"], "conversation-search")
+        self.assertIsNone(result["listing_id"])
 
     def test_owner_check_reply_records_exact_text(self):
         conversation = {
@@ -1078,8 +1106,12 @@ class WhatsAppTests(unittest.TestCase):
         )["entry"][0]["changes"][0]["value"]["messages"][0]
         item["context"] = {"id": "wamid.owner-check"}
         with patch(
-            "app.find_reply_to_conversation", return_value=conversation,
-        ), patch("app.bubble", return_value={
+            "app.find_reply_context", return_value={
+                "conversation": conversation, "listing_id": "listing-1",
+            },
+        ), patch("app.find_active_conversation_by_phone") as phone_route, patch(
+            "app.route_conversation_by_message_clue"
+        ) as fuzzy_route, patch("app.bubble", return_value={
             "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
         }), patch("app._bubble_patch") as update, patch(
             "app.send_whatsapp_text", return_value=["wamid.ack"],
@@ -1100,6 +1132,9 @@ class WhatsAppTests(unittest.TestCase):
             if call.kwargs.get("conversation_id") == "conversation-owner"
         ]
         self.assertEqual(len(matching_inbound), 1)
+        self.assertEqual(matching_inbound[0].kwargs["listing_id"], "listing-1")
+        phone_route.assert_not_called()
+        fuzzy_route.assert_not_called()
         send.assert_called_once_with("60123456789", "Thanks — noted.")
         persist_sent.assert_called_once_with(
             "60123456789", "Thanks — noted.", ["wamid.ack"],
@@ -2754,6 +2789,48 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.conversation_store.update_conversation_last_inbound_at")
     @patch("app._bubble_create", return_value="inbound-current")
     @patch("app._bubble_records", return_value=iter([]))
+    def test_inbound_reply_persists_exact_listing(
+        self, _records, create, _activity,
+    ):
+        app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.reply", "What size is this?",
+            conversation_id="conversation-search", listing_id="listing-mesra",
+        )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["listing"], "listing-mesra")
+        self.assertNotIn("Listing", payload)
+
+    @patch("app.conversation_store.update_conversation_last_inbound_at")
+    @patch("app._bubble_patch")
+    @patch("app._bubble_records")
+    def test_duplicate_inbound_adds_missing_listing_without_overwrite(
+        self, records, update, _activity,
+    ):
+        records.return_value = iter([{
+            "_id": "message-existing", "Conversation": "conversation-search",
+        }])
+        app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.reply", "Retry",
+            conversation_id="conversation-search", listing_id="listing-mesra",
+        )
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/message/message-existing",
+            {"listing": "listing-mesra"},
+        )
+        update.reset_mock()
+        records.return_value = iter([{
+            "_id": "message-existing", "Conversation": "conversation-search",
+            "listing": "listing-other",
+        }])
+        app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.reply", "Retry",
+            conversation_id="conversation-search", listing_id="listing-mesra",
+        )
+        update.assert_not_called()
+
+    @patch("app.conversation_store.update_conversation_last_inbound_at")
+    @patch("app._bubble_create", return_value="inbound-current")
+    @patch("app._bubble_records", return_value=iter([]))
     def test_inbound_message_stores_conversation_and_updates_activity(
         self, _records, create, activity
     ):
@@ -2830,6 +2907,14 @@ class WhatsAppTests(unittest.TestCase):
             self.assertEqual(payload["Conversation"], "conversation-1")
             self.assertEqual(payload["lead"], "lead-1")
             self.assertEqual(payload["direction"], "Outbound")
+            self.assertNotIn("Listing", payload)
+        self.assertNotIn("listing", payloads[0])
+        self.assertEqual(
+            [payload.get("listing") for payload in payloads[1:7]],
+            ["listing-1", "listing-1", "listing-2", "listing-2",
+             "listing-3", "listing-3"],
+        )
+        self.assertNotIn("listing", payloads[7])
         for index in (1, 3, 5, 7, 8):
             payload = payloads[index - 1]
             self.assertEqual(payload["messageType"], "text")
@@ -2845,6 +2930,25 @@ class WhatsAppTests(unittest.TestCase):
             for payload in payloads
         ))
         activity.assert_called_once_with("conversation-1", "live")
+
+    def test_exact_reply_listing_context_contains_compact_facts_without_id(self):
+        with patch("app.bubble", return_value={
+            "_id": "listing-mesra", "name": "Mesra Terrace",
+            "priceRent": 9000, "beds": 5, "Description": "Near French school",
+        }):
+            context = app_module.whatsapp_reply_listing_context("listing-mesra")
+        self.assertIn("WHATSAPP REPLY CONTEXT", context)
+        self.assertIn("Property: Mesra Terrace", context)
+        self.assertIn("Bedrooms: 5", context)
+        self.assertIn("Rent: 9000", context)
+        self.assertNotIn("listing-mesra", context)
+        self.assertIn("takes priority over fuzzy", context)
+
+    def test_missing_exact_reply_listing_fails_safely(self):
+        with patch("app.bubble", side_effect=RuntimeError("not found")):
+            self.assertIsNone(
+                app_module.whatsapp_reply_listing_context("listing-missing")
+            )
 
     def test_each_recommendation_reply_id_resolves_the_same_conversation(self):
         self.reply_conversation_patcher.stop()

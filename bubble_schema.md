@@ -76,6 +76,7 @@ Known fields:
 | Field | Type | Notes |
 |---|---|---|
 | Conversation | Conversation | Logical Conversation containing this Message |
+| listing | Listing | Optional exact listing referred to by this message |
 | phone | text | Existing exact field name |
 | direction | text | Exact values Inbound / Outbound |
 | whatsappMessageId | text | Meta WhatsApp message ID |
@@ -92,6 +93,7 @@ Message semantics:
 - every Message newly persisted by Python must have exactly one Conversation
 - historical Message records without Conversation remain readable during migration
 - Meta reply context resolves through Message.whatsappMessageId to Message.Conversation
+- `listing` is an existing optional Bubble relationship to Listing; its exact field name is lowercase and it identifies the property referred to by that particular Message, not the Conversation as a whole
 
 ## Listing
 
