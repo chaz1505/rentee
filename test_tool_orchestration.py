@@ -36,6 +36,61 @@ def text_response(response_id):
 
 
 class ToolOrchestrationTests(unittest.TestCase):
+    def test_incomplete_completed_web_search_preserves_text_id_and_citations(self):
+        citation = SimpleNamespace(
+            type="url_citation",
+            url_citation=SimpleNamespace(
+                title="Groceries near 9 Beringin", url="https://example.com/groceries"
+            ),
+        )
+        message_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(annotations=[citation])],
+        )
+        incomplete_response = SimpleNamespace(
+            id="web-incomplete-response", output=[message_item],
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        )
+
+        class IncompleteWebStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([
+                    SimpleNamespace(type="response.created", response=SimpleNamespace(
+                        id="web-incomplete-response"
+                    )),
+                    SimpleNamespace(type="response.web_search_call.in_progress"),
+                    SimpleNamespace(type="response.web_search_call.searching"),
+                    SimpleNamespace(type="response.web_search_call.completed"),
+                    SimpleNamespace(type="response.output_text.delta", delta="Nearby groceries "),
+                    SimpleNamespace(type="response.output_text.delta", delta="include Village Grocer."),
+                    SimpleNamespace(type="response.output_text.done"),
+                    SimpleNamespace(type="response.output_item.done", item=message_item),
+                    SimpleNamespace(type="response.incomplete", response=incomplete_response),
+                ])
+            def get_final_response(self):
+                raise RuntimeError("Didn't receive a `response.completed` event.")
+
+        responses = MagicMock()
+        responses.stream.return_value = IncompleteWebStream()
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)), \
+                patch("builtins.print") as mocked_print:
+            body = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "Walking distance"}
+            ).get_data(as_text=True)
+        self.assertIn("Nearby groceries", body)
+        self.assertIn("Village Grocer", body)
+        self.assertIn('"response_id": "web-incomplete-response"', body)
+        self.assertIn("https://example.com/groceries", body)
+        logs = "\n".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn("application_function_call_started=False", logs)
+        self.assertIn("web_search_started=True", logs)
+        self.assertIn("web_search_completed=True", logs)
+        self.assertIn("output_text_done=True", logs)
+        self.assertIn("reason=max_output_tokens", logs)
+        self.assertIn("action=preserve_text", logs)
+
     def test_inventory_and_condo_information_routing_are_separate(self):
         inventory = app_module.build_response_args(
             "What have you got in Damansara Heights - landed ok"

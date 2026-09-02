@@ -4680,8 +4680,15 @@ def chat_stream():
                     initial_started = time.perf_counter()
                     buffered_text_deltas = []
                     event_types = []
-                    tool_call_started = False
+                    function_call_started = False
+                    web_search_started = False
+                    web_search_completed = False
+                    output_text_started = False
+                    output_text_done = False
+                    incomplete_reason = None
                     response_id_seen = None
+                    last_response_object = None
+                    completed_output_items = []
                     iterator_ended_naturally = False
                     stream_error = None
                     final_response = None
@@ -4692,19 +4699,29 @@ def chat_stream():
                                     event_type = str(getattr(event, "type", "unknown"))
                                     event_types.append(event_type)
                                     response_object = getattr(event, "response", None)
+                                    if response_object is not None:
+                                        last_response_object = response_object
                                     response_id_seen = (
                                         getattr(response_object, "id", None)
                                         or getattr(event, "response_id", None)
                                         or response_id_seen
                                     )
                                     item = getattr(event, "item", None)
-                                    if (
-                                        "function_call" in event_type
-                                        or "web_search_call" in event_type
-                                        or getattr(item, "type", None)
-                                        in {"function_call", "web_search_call"}
-                                    ):
-                                        tool_call_started = True
+                                    item_type = getattr(item, "type", None)
+                                    if "function_call" in event_type or item_type == "function_call":
+                                        function_call_started = True
+                                    if "web_search_call" in event_type or item_type == "web_search_call":
+                                        web_search_started = True
+                                    if event_type == "response.web_search_call.completed":
+                                        web_search_completed = True
+                                    if event_type == "response.output_item.done" and item is not None:
+                                        completed_output_items.append(item)
+                                    if event_type == "response.incomplete":
+                                        details = (
+                                            getattr(response_object, "incomplete_details", None)
+                                            or getattr(event, "incomplete_details", None)
+                                        )
+                                        incomplete_reason = getattr(details, "reason", None)
                                     if not initial_first_event_logged:
                                         log_timing("Initial OpenAI FIRST EVENT", initial_started)
                                         initial_first_event_logged = True
@@ -4715,11 +4732,14 @@ def chat_stream():
                                         print("Web search used", flush=True)
                                         web_search_status_sent = True
                                     if event_type == "response.output_text.delta":
+                                        output_text_started = True
                                         if not initial_first_delta_logged:
                                             log_timing("Initial OpenAI FIRST DELTA", initial_started)
                                             initial_first_delta_logged = True
                                         # Buffer until completion proves no function call follows.
                                         buffered_text_deltas.append(event.delta)
+                                    elif event_type == "response.output_text.done":
+                                        output_text_done = True
                                 iterator_ended_naturally = True
                             except Exception as error:
                                 stream_error = error
@@ -4739,24 +4759,59 @@ def chat_stream():
                             f"exception={type(stream_error).__name__}: {stream_error}; "
                             f"events={event_types}; text_chars="
                             f"{sum(len(delta) for delta in buffered_text_deltas)}; "
-                            f"tool_call_started={tool_call_started}; "
+                            f"application_function_call_started={function_call_started}; "
+                            f"web_search_started={web_search_started}; "
+                            f"web_search_completed={web_search_completed}; "
+                            f"output_text_started={output_text_started}; "
+                            f"output_text_done={output_text_done}; "
+                            f"incomplete_reason={incomplete_reason or 'unknown'}; "
                             f"response_id={response_id_seen}; elapsed={elapsed:.2f}s; "
                             f"iterator_ended_naturally={iterator_ended_naturally}"
                         )
                         print(f"[OPENAI STREAM WARNING] {diagnostic}", flush=True)
-                        if buffered_text_deltas and not tool_call_started:
+                        recoverable_text = bool(
+                            buffered_text_deltas
+                            and not function_call_started
+                            and (not web_search_started or web_search_completed)
+                            and (output_text_done or not web_search_started)
+                        )
+                        if recoverable_text:
                             text_chars = sum(len(delta) for delta in buffered_text_deltas)
                             print(
-                                "[STREAM WARNING] OpenAI stream ended without "
-                                "response.completed; preserving "
-                                f"{text_chars} chars of customer-facing text",
+                                "[OPENAI STREAM INCOMPLETE] "
+                                f"reason={incomplete_reason or 'unknown'} "
+                                "application_function_call_started=false "
+                                f"web_search_started={str(web_search_started).lower()} "
+                                f"web_search_completed={str(web_search_completed).lower()} "
+                                f"output_text_done={str(output_text_done).lower()} "
+                                f"buffered_text_chars={text_chars} action=preserve_text",
                                 flush=True,
                             )
+                            recovered_output = list(
+                                getattr(last_response_object, "output", None) or
+                                completed_output_items
+                            )
                             final_response = SimpleNamespace(
-                                id=response_id_seen, output=[], usage=None,
+                                id=response_id_seen, output=recovered_output, usage=None,
+                                status="incomplete",
+                                incomplete_details=getattr(
+                                    last_response_object, "incomplete_details", None
+                                ),
                             )
                         else:
-                            if tool_call_started:
+                            print(
+                                "[OPENAI STREAM INCOMPLETE] "
+                                f"reason={incomplete_reason or 'unknown'} "
+                                "application_function_call_started="
+                                f"{str(function_call_started).lower()} "
+                                f"web_search_started={str(web_search_started).lower()} "
+                                f"web_search_completed={str(web_search_completed).lower()} "
+                                f"output_text_done={str(output_text_done).lower()} "
+                                f"buffered_text_chars={sum(len(x) for x in buffered_text_deltas)} "
+                                "action=fail_safe",
+                                flush=True,
+                            )
+                            if function_call_started:
                                 print(
                                     "[OPENAI STREAM WARNING] Interrupted tool selection; "
                                     "partial tool call will not be executed",

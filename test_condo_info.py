@@ -376,8 +376,8 @@ class CondoInfoTests(unittest.TestCase):
         self.assertIn("[OPENAI STREAM] response.output_text.delta", logs)
         self.assertIn("RuntimeError", logs)
         self.assertIn("text_chars=16", logs)
-        self.assertIn("tool_call_started=False", logs)
-        self.assertIn("preserving 16 chars", logs)
+        self.assertIn("application_function_call_started=False", logs)
+        self.assertIn("buffered_text_chars=16 action=preserve_text", logs)
 
     @patch("app.advance_property_search")
     def test_interrupted_partial_tool_call_is_not_executed(self, mocked_advance):
@@ -412,7 +412,7 @@ class CondoInfoTests(unittest.TestCase):
         self.assertNotIn('"delta": "Let me check"', body)
         self.assertIn("Sorry, something went wrong", body)
         logs = "\n".join(str(call) for call in mocked_print.call_args_list)
-        self.assertIn("tool_call_started=True", logs)
+        self.assertIn("application_function_call_started=True", logs)
         self.assertIn("partial tool call will not be executed", logs)
 
     @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
