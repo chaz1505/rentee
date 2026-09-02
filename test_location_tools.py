@@ -26,10 +26,12 @@ class FakeProvider:
     def __init__(self, places, matrix=None):
         self.places = places
         self.matrix = matrix or {}
+        self.resolve_calls = []
         self.matrix_calls = []
         self.matrix_modes = []
 
     def resolve_place(self, query, known_location=None):
+        self.resolve_calls.append((query, known_location))
         if known_location and known_location.get("latitude") is not None:
             return resolved(known_location["resolved_name"],
                             known_location["latitude"], known_location["longitude"])
@@ -274,6 +276,27 @@ class LocationToolTests(unittest.TestCase):
         self.assertEqual(result["resolution_method"], "places_text_search")
         session.get.assert_not_called()
 
+    def test_google_rejects_area_result_for_specific_street_and_tries_full_geocode(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [{
+            "id": "area", "displayName": {"text": "Damansara Heights"},
+            "formattedAddress": "Kuala Lumpur",
+            "location": {"latitude": 3.15, "longitude": 101.66},
+            "types": ["neighborhood"],
+        }]}
+        session.get.return_value.json.return_value = {"status": "OK", "results": [{
+            "place_id": "street", "formatted_address": "Jalan Beringin, Kuala Lumpur",
+            "geometry": {"location": {"lat": 3.145, "lng": 101.658}},
+            "types": ["route"],
+        }]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "Jalan Beringin, Damansara Heights"
+        )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["resolution_level"], "street")
+        self.assertEqual(session.get.call_args.kwargs["params"]["address"],
+                         "Jalan Beringin, Damansara Heights")
+
     def test_google_failure_reasons_are_distinguishable(self):
         cases = {}
         denied = MagicMock()
@@ -368,6 +391,84 @@ class LocationToolTests(unittest.TestCase):
         self.assertTrue(result["origin"]["approximate"])
         self.assertEqual(result["origin"]["resolution_level"], "area")
 
+    def test_contextual_area_entity_does_not_replace_specific_street(self):
+        query = "Jalan Beringin, Damansara Heights"
+        provider = FakeProvider({
+            query: resolved("Jalan Beringin", 3.14, 101.66, "street"),
+            "School": resolved("School", 3.2, 101.7),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 12}})
+        known_area = {
+            "canonical_name": "Damansara Heights",
+            "resolved_name": "Damansara Heights",
+            "formatted_address": "Jalan Damanlela",
+            "resolution_level": "area",
+            "match_type": "contextual_component",
+        }
+        result = location_tools.get_travel_time(
+            query, "School", provider=provider,
+            coordinate_resolver=lambda value: known_area if value == query else None,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(provider.resolve_calls[0], (query, None))
+        self.assertEqual(result["origin"]["resolved_name"], "Jalan Beringin")
+
+    def test_exact_area_input_can_use_exact_known_entity(self):
+        provider = FakeProvider({
+            "Jalan Damanlela": resolved("Damansara Heights", 3.15, 101.66, "area"),
+            "School": resolved("School", 3.2, 101.7),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 12}})
+        known_area = {
+            "canonical_name": "Damansara Heights",
+            "resolved_name": "Damansara Heights",
+            "formatted_address": "Jalan Damanlela",
+            "resolution_level": "area", "match_type": "exact",
+        }
+        result = location_tools.get_travel_time(
+            "Damansara Heights", "School", provider=provider,
+            coordinate_resolver=lambda value: known_area if value == "Damansara Heights" else None,
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(provider.resolve_calls[0][1], known_area)
+
+    def test_contextual_building_coordinates_are_not_discarded(self):
+        provider = FakeProvider({
+            "School": resolved("School", 3.2, 101.7)
+        }, {(0, 0): {"status": "ok", "duration_minutes": 8}})
+        known_building = {
+            "canonical_name": "One Menerung", "resolved_name": "One Menerung",
+            "latitude": 3.13, "longitude": 101.67,
+            "resolution_level": "building", "match_type": "contextual_component",
+        }
+        result = location_tools.get_travel_time(
+            "One Menerung, Bangsar", "School", provider=provider,
+            coordinate_resolver=lambda value: (
+                known_building if value == "One Menerung, Bangsar" else None
+            ),
+        )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["origin"]["resolved_name"], "One Menerung")
+        self.assertEqual(provider.resolve_calls[0][1], known_building)
+
+    def test_exact_property_failure_uses_explicit_area_fallback(self):
+        query = "9 Beringin, Jalan Beringin, Damansara Heights"
+        provider = FakeProvider({
+            "Damansara Heights": resolved("Damansara Heights", 3.15, 101.66, "area"),
+            "School": resolved("School", 3.2, 101.7),
+        }, {(0, 0): {"status": "ok", "duration_minutes": 12}})
+        known_area = {
+            "canonical_name": "Damansara Heights", "resolved_name": "Damansara Heights",
+            "formatted_address": "Jalan Damanlela", "resolution_level": "area",
+            "match_type": "contextual_component",
+        }
+        result = location_tools.get_travel_time(
+            query, "School", provider=provider,
+            coordinate_resolver=lambda value: known_area if value == query else None,
+        )
+        self.assertEqual(provider.resolve_calls[0], (query, None))
+        self.assertEqual(result["origin"]["resolution_method"], "area_fallback")
+        self.assertEqual(result["origin"]["resolution_level"], "area")
+        self.assertTrue(result["origin"]["approximate"])
+
     def test_rentee_entity_matching_normalizes_case_spacing_and_punctuation(self):
         condo = {"Condo name": "Trinity Pentamont", "Address": "Mont Kiara, Kuala Lumpur"}
         with patch("app._get_condo_lookup", return_value={"trinity pentamont": condo}):
@@ -379,6 +480,23 @@ class LocationToolTests(unittest.TestCase):
         normalized = app_module._normalized_location_entity_name
         self.assertEqual(normalized("Mont' Kiara"), normalized("Mont’ Kiara"))
         self.assertEqual(normalized("Mont’ Kiara"), normalized("Mont Kiara"))
+
+    def test_rentee_substring_match_is_context_not_primary_entity(self):
+        rows = {
+            "area": {"Condo name": "Damansara Heights", "Address": "Jalan Damanlela"},
+            "condo": {"Condo name": "One Menerung", "Address": "Jalan Menerung"},
+        }
+        with patch("app._get_condo_lookup", return_value=rows):
+            street = app_module._known_location_coordinates(
+                "Jalan Beringin, Damansara Heights"
+            )
+            development = app_module._known_location_coordinates("One Menerung, Bangsar")
+            exact_area = app_module._known_location_coordinates("Damansara Heights")
+        self.assertEqual(street["match_type"], "contextual_component")
+        self.assertEqual(street["resolution_level"], "area")
+        self.assertEqual(development["match_type"], "contextual_component")
+        self.assertEqual(development["resolution_level"], "building")
+        self.assertEqual(exact_area["match_type"], "exact")
 
     def test_missing_api_key_fails_gracefully(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -459,6 +577,31 @@ class LocationToolTests(unittest.TestCase):
         self.assertIn("Trinity Pentamont", args["instructions"])
         self.assertIn("Address: Mont Kiara, Kuala Lumpur", args["instructions"])
         self.assertIn("apartment details", args["instructions"])
+
+    def test_reply_listing_context_preserves_coordinates_and_full_identity(self):
+        listing = {
+            "name": "9 Beringin", "Address": "Jalan Beringin, Damansara Heights",
+            "latitude": 3.145, "longitude": 101.658,
+        }
+        with patch("app.bubble", return_value=listing):
+            context = app_module.whatsapp_reply_listing_context("listing-9")
+        self.assertIn("Property: 9 Beringin", context)
+        self.assertIn("Address: Jalan Beringin, Damansara Heights", context)
+        self.assertIn("Latitude: 3.145", context)
+        self.assertIn("Longitude: 101.658", context)
+        self.assertIn("never drop a house number", context)
+
+    @patch("app.find_grounded_nearby_places")
+    def test_nearby_wrapper_uses_trusted_listing_coordinates_directly(self, grounded):
+        grounded.return_value = {"status": "ok", "origin": {}, "places": []}
+        app_module.find_nearby_places(
+            "9 Beringin, Jalan Beringin, Damansara Heights", ["shops"],
+            origin_latitude=3.145, origin_longitude=101.658,
+        )
+        resolver = grounded.call_args.kwargs["coordinate_resolver"]
+        known = resolver("9 Beringin, Jalan Beringin, Damansara Heights")
+        self.assertEqual((known["latitude"], known["longitude"]), (3.145, 101.658))
+        self.assertEqual(known["resolution_level"], "exact_property")
 
     def test_compare_locations_uses_the_same_web_resolution_pipeline(self):
         provider = FakeProvider({

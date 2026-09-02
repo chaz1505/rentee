@@ -130,7 +130,8 @@ relative geographic convenience. Call `get_travel_time` whenever a claim materia
 on them; call `compare_locations` before ranking where to live against school, work, hospital,
 family, or other destinations. Use the returned geographic facts with the customer's broader
 needs. Check resolved names, surface ambiguous branches/campuses, label area-level results as
-approximations, use only the returned traffic basis, and never invent commute ranges. Resolve
+approximations and say when the exact property could not be resolved, use only the
+returned traffic basis, and never invent commute ranges. Resolve
 obvious place identity and area context through the tools before asking for clarification.
 Never ask for a unit number, floor, or apartment details merely to calculate travel time.
 Use `find_nearby_places` for nearby amenities, not point-to-point tools or web search. When
@@ -382,7 +383,8 @@ def _known_location_coordinates(location_name):
         rows = list(_get_condo_lookup().values())
     except CondoDataError:
         return None
-    matches = []
+    exact_matches = []
+    component_matches = []
     padded_input = f" {normalized} "
     for row in rows:
         canonical = " ".join(str(row.get("Condo name") or "").split())
@@ -391,7 +393,12 @@ def _known_location_coordinates(location_name):
             normalized == normalized_canonical
             or f" {normalized_canonical} " in padded_input
         ):
-            matches.append((row, canonical))
+            match = (row, canonical)
+            if normalized == normalized_canonical:
+                exact_matches.append(match)
+            else:
+                component_matches.append(match)
+    matches = exact_matches or component_matches
     if len(matches) > 1:
         return {"status": "ambiguous", "candidates": [
             {"name": canonical,
@@ -415,9 +422,14 @@ def _known_location_coordinates(location_name):
     area = next((str(row.get(field)).strip() for field in
                  ("Area", "area", "Neighbourhood", "Neighborhood", "Geo")
                  if str(row.get(field) or "").strip()), None)
+    first_component = _normalized_location_entity_name(
+        str(location_name or "").split(",", 1)[0]
+    )
+    match_type = "exact" if exact_matches else "contextual_component"
+    candidate_level = "building" if normalized_canonical == first_component else "area"
     entity = {"canonical_name": canonical, "resolved_name": canonical,
               "formatted_address": address, "area": area,
-              "resolution_level": "building"}
+              "resolution_level": candidate_level, "match_type": match_type}
     try:
         entity.update(latitude=float(latitude), longitude=float(longitude))
     except (TypeError, ValueError):
@@ -497,17 +509,32 @@ def get_travel_time(origin, destination, mode="driving"):
 
 
 def find_nearby_places(origin, categories, travel_mode="walking",
-                       max_travel_minutes=None, max_results=None):
+                       max_travel_minutes=None, max_results=None,
+                       origin_latitude=None, origin_longitude=None):
     """Application wrapper for grounded amenity discovery and route filtering."""
     print(
         "[NEARBY TOOL] "
         f"origin={origin!r} categories={categories!r} mode={travel_mode} "
         f"max_minutes={max_travel_minutes}", flush=True,
     )
+    def resolve_origin(value):
+        if origin_latitude is not None and origin_longitude is not None:
+            try:
+                return {
+                    "canonical_name": " ".join(str(origin or "").split()),
+                    "resolved_name": " ".join(str(origin or "").split()),
+                    "latitude": float(origin_latitude),
+                    "longitude": float(origin_longitude),
+                    "resolution_level": "exact_property", "match_type": "exact",
+                }
+            except (TypeError, ValueError):
+                pass
+        return _known_location_coordinates(value)
+
     result = find_grounded_nearby_places(
         origin, categories, travel_mode=travel_mode,
         max_travel_minutes=max_travel_minutes, max_results=max_results,
-        coordinate_resolver=_known_location_coordinates,
+        coordinate_resolver=resolve_origin,
         web_resolver=_resolve_location_identity_with_web,
     )
     print(
@@ -897,7 +924,10 @@ def build_response_args(
                     "by walking or driving time. Use for nearby supermarkets, groceries, cafes, "
                     "pharmacies, parks, schools, restaurants, shops, clinics, transport, and "
                     "similar categories. Do not use get_travel_time unless both endpoints are "
-                    "already named. If walking distance has no stated threshold, use 10 minutes."
+                    "already named. If trusted current listing context includes coordinates, "
+                    "pass them in origin_latitude/origin_longitude so no geocoding is needed. "
+                    "Preserve the full property name and address in origin. If walking distance "
+                    "has no stated threshold, use 10 minutes."
                 ),
                 "parameters": {
                     "type": "object", "properties": {
@@ -910,6 +940,10 @@ def build_response_args(
                                                "minimum": 1, "maximum": 60},
                         "max_results": {"type": ["integer", "null"],
                                         "minimum": 1, "maximum": 20},
+                        "origin_latitude": {"type": ["number", "null"],
+                                            "description": "Trusted exact listing latitude, when present in current listing context."},
+                        "origin_longitude": {"type": ["number", "null"],
+                                             "description": "Trusted exact listing longitude, when present in current listing context."},
                     }, "required": ["origin", "categories", "travel_mode"],
                     "additionalProperties": False,
                 },
@@ -3481,6 +3515,8 @@ def listing_facts(listing, condo_names=None, geo_names=None):
     fields = (
         "_id", "name", "title", "beds", "baths", "priceRent", "priceSale",
         "propertyType", "condo", "Geo", "Address", "address", "Location",
+        "latitude", "Latitude", "lat", "Lat", "longitude", "Longitude",
+        "lng", "Lng", "lon", "Lon",
         "Furnishing", "furnished",
         "availability", "balcony", "family room", "maid room", "outdoor area",
         "Landed_sqft", "Sq Ft", "keyFacts", "Description", "Notes",
@@ -4679,11 +4715,19 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id):
             "unit number, floor, or apartment details."
         )
     elif tool_call.name == "find_nearby_places":
-        output = find_nearby_places(
+        nearby_args = (
             tool_args.get("origin"), tool_args.get("categories") or [],
             tool_args.get("travel_mode", "walking"),
             tool_args.get("max_travel_minutes"), tool_args.get("max_results"),
         )
+        if (tool_args.get("origin_latitude") is not None
+                and tool_args.get("origin_longitude") is not None):
+            output = find_nearby_places(
+                *nearby_args, origin_latitude=tool_args["origin_latitude"],
+                origin_longitude=tool_args["origin_longitude"],
+            )
+        else:
+            output = find_nearby_places(*nearby_args)
         instructions = (
             "Use only the supplied nearby-place results for business identity, address, "
             "distance, and travel time. Summarize confirmed results naturally and do not "
@@ -5145,6 +5189,10 @@ def whatsapp_reply_listing_context(listing_id, bubble_env="live"):
         ("Furnishing", "Furnishing"), ("Furnishing", "furnished"),
         ("Availability", "availability"), ("Size", "Sq Ft"),
         ("Address", "Address"), ("Address", "address"), ("Location", "Location"),
+        ("Latitude", "latitude"), ("Latitude", "Latitude"),
+        ("Latitude", "lat"), ("Latitude", "Lat"),
+        ("Longitude", "longitude"), ("Longitude", "Longitude"),
+        ("Longitude", "lng"), ("Longitude", "Lng"),
         ("Land size", "Landed_sqft"), ("Key facts", "keyFacts"),
         ("Description", "Description"), ("Notes", "Notes"),
     )
@@ -5165,7 +5213,10 @@ def whatsapp_reply_listing_context(listing_id, bubble_env="live"):
         + "\n".join(rendered)
         + "\nInterpret references such as this, it, that, this one, that one, or "
         "the property as this exact property unless the customer clearly changes "
-        "subject. This exact reply context takes priority over fuzzy property "
+        "subject. For location tools, preserve the most specific identity available: "
+        "stored coordinates first, then the full property name plus address; never "
+        "drop a house number or building name in favour of its broader area. "
+        "This exact reply context takes priority over fuzzy property "
         "reference resolution. Do not expose internal record IDs."
     )
 

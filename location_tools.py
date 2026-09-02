@@ -1,6 +1,7 @@
 """Provider-neutral grounded location resolution and driving-time tools."""
 
 import os
+import re
 import time
 
 import requests
@@ -11,6 +12,12 @@ GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchT
 GOOGLE_PLACES_NEARBY_SEARCH_URL = "https://places.googleapis.com/v1/places:searchNearby"
 GOOGLE_ROUTES_MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 LOCATION_TIMEOUT_SECONDS = 15
+
+LOCATION_SPECIFICITY = {
+    "city": 0, "area": 1, "poi": 2, "street": 3,
+    "street_address": 4, "building": 5, "exact_property": 6,
+    "exact": 4, "specific_place": 4, "property": 6,
+}
 
 NEARBY_CATEGORY_TYPES = {
     "supermarket": ("supermarket",),
@@ -47,6 +54,36 @@ def _normalize_place_text(value):
     return " ".join("".join(
         character if character.isalnum() else " " for character in value
     ).split())
+
+
+def infer_location_specificity(value, known_location=None):
+    """Conservatively infer precision without enabling fuzzy matching."""
+    known_level = (known_location or {}).get("resolution_level")
+    if (known_location or {}).get("match_type") == "exact" and known_level:
+        return known_level
+    text = " ".join(str(value or "").split())
+    normalized = _normalize_place_text(text)
+    if re.match(r"^\d+[\w/-]*\s+", normalized):
+        return "exact_property"
+    if re.match(r"^(jalan|jln|lorong|persiaran|lebuh|street|road|avenue)\b", normalized):
+        return "street"
+    if "," in text:
+        return "building"
+    return known_level or "poi"
+
+
+def _is_specificity_downgrade(input_level, result):
+    result_level = result.get("resolution_level") or result.get("location_level")
+    if result_level not in LOCATION_SPECIFICITY or input_level not in LOCATION_SPECIFICITY:
+        return False
+    if result_level in {"area", "city"}:
+        return input_level not in {"area", "city"}
+    if result_level == "street":
+        return input_level in {"building", "exact_property"}
+    # A provider may type a building, school or numbered property as a POI or
+    # street_address. Those are still exact coordinate-bearing results, not broad
+    # representative points, so they are safe to retain.
+    return False
 
 
 def nearby_place_types(categories):
@@ -111,8 +148,24 @@ class GoogleMapsProvider:
         display_name = display.get("text") if isinstance(display, dict) else display
         formatted = item.get("formattedAddress") or item.get("formatted_address")
         types = set(item.get("types") or [])
-        area_types = {"locality", "sublocality", "neighborhood", "administrative_area_level_3"}
-        level = "area" if types & area_types else "exact"
+        city_types = {"locality", "administrative_area_level_1", "administrative_area_level_2"}
+        area_types = {"sublocality", "sublocality_level_1", "neighborhood",
+                      "administrative_area_level_3"}
+        street_types = {"route", "intersection"}
+        address_types = {"street_address", "premise", "subpremise"}
+        building_types = {"apartment_complex", "housing_complex", "condominium_complex"}
+        if types & city_types:
+            level = "city"
+        elif types & area_types:
+            level = "area"
+        elif types & building_types:
+            level = "building"
+        elif types & address_types:
+            level = "street_address"
+        elif types & street_types:
+            level = "street"
+        else:
+            level = "poi"
         return {
             "status": "resolved", "input": clean_query,
             "resolved_name": display_name or formatted or clean_query,
@@ -121,7 +174,7 @@ class GoogleMapsProvider:
             "place_id": item.get("id") or item.get("place_id"),
             "resolution_level": level, "location_level": level,
             "resolution_method": method, "resolution_source": method,
-            "approximate": level == "area",
+            "approximate": level in {"area", "city"},
         }
 
     def search_places(self, query):
@@ -274,14 +327,51 @@ class GoogleMapsProvider:
                 "resolution_source": "stored_coordinates",
                 "resolution_method": "stored_coordinates", "approximate": False,
             }
-        search_query = ((known_location or {}).get("formatted_address")
-                        or (known_location or {}).get("canonical_name") or clean_query)
+        input_level = infer_location_specificity(clean_query, known_location)
+        known_level = (known_location or {}).get("resolution_level")
+        contextual_is_lower = (
+            (known_location or {}).get("match_type") == "contextual_component"
+            and known_level in LOCATION_SPECIFICITY
+            and LOCATION_SPECIFICITY[known_level] < LOCATION_SPECIFICITY[input_level]
+        )
+        primary_known = None if contextual_is_lower else known_location
+        search_query = ((primary_known or {}).get("formatted_address")
+                        or (primary_known or {}).get("canonical_name") or clean_query)
         places = self.search_places(search_query)
-        if places.get("status") in {"resolved", "ambiguous"}:
-            if known_location and places.get("status") == "resolved":
-                places["resolution_method"] = "stored_address" if known_location.get("formatted_address") else "rentee_entity_match"
+        if places.get("status") == "resolved" and not _is_specificity_downgrade(
+                input_level, places):
+            if primary_known:
+                places["resolution_method"] = "stored_address" if primary_known.get("formatted_address") else "rentee_entity_match"
             return places
-        return self.geocode(search_query)
+        if places.get("status") == "resolved":
+            print(
+                "[LOCATION MATCH] "
+                f"candidate={places.get('resolved_name')!r} "
+                f"candidate_specificity={places.get('resolution_level')} "
+                f"input_specificity={input_level} action=reject_as_primary "
+                "reason=lower_specificity_than_input",
+                flush=True,
+            )
+        if places.get("status") == "ambiguous":
+            return places
+        geocoded = self.geocode(search_query)
+        if geocoded.get("status") == "resolved" and _is_specificity_downgrade(
+                input_level, geocoded):
+            print(
+                "[LOCATION MATCH] "
+                f"candidate={geocoded.get('resolved_name')!r} "
+                f"candidate_specificity={geocoded.get('resolution_level')} "
+                f"input_specificity={input_level} action=reject_as_primary "
+                "reason=lower_specificity_than_input",
+                flush=True,
+            )
+            return {
+                "status": "error", "reason": "specificity_downgrade",
+                "input": clean_query,
+                "error": "Only a less-specific location could be resolved.",
+                "rejected_candidate": geocoded,
+            }
+        return geocoded
 
     def route_matrix(self, origins, destinations, mode="driving"):
         self._require_key()
@@ -369,12 +459,37 @@ def _safe_resolve(provider, query, coordinate_resolver=None, web_resolver=None):
     _log_resolution(query, "stored_coordinates", "matched" if has_coordinates else "miss")
     _log_resolution(query, "stored_address",
                     "matched" if known and known.get("formatted_address") else "miss")
+    input_level = infer_location_specificity(query, known)
+    _log_resolution(query, "specificity", "inferred", f"input_specificity={input_level}")
+    entity_detail = ""
+    if known:
+        entity_detail = (
+            f"canonical_name={known.get('canonical_name')!r} "
+            f"match_type={known.get('match_type', 'exact')} "
+            f"candidate_specificity={known.get('resolution_level')}"
+        )
     _log_resolution(query, "rentee_entity_match", "matched" if known else "miss",
-                    f"canonical_name={(known or {}).get('canonical_name')!r}" if known else "")
+                    entity_detail)
     if known and known.get("status") == "ambiguous":
         return {**known, "input": query, "attempts": attempts}
     try:
-        result = provider.resolve_place(query, known)
+        primary_known = known
+        candidate_level = (known or {}).get("resolution_level")
+        contextual_is_lower = (
+            known and known.get("match_type") == "contextual_component"
+            and candidate_level in LOCATION_SPECIFICITY
+            and LOCATION_SPECIFICITY[candidate_level] < LOCATION_SPECIFICITY[input_level]
+        )
+        if contextual_is_lower:
+            primary_known = None
+            print(
+                "[LOCATION MATCH] "
+                f"candidate={known.get('canonical_name')!r} "
+                f"candidate_specificity={known.get('resolution_level')} "
+                "action=reject_as_primary reason=contextual_component_of_more_specific_input",
+                flush=True,
+            )
+        result = provider.resolve_place(query, primary_known)
     except LocationProviderError as error:
         _log_resolution(query, "google", "failed", f"reason={error.reason}")
         return {"status": "error", "reason": error.reason,
@@ -427,6 +542,8 @@ def _safe_resolve(provider, query, coordinate_resolver=None, web_resolver=None):
             return {**web_identity, "input": query, "attempts": attempts}
 
     area = ((known or {}).get("area") or (web_identity or {}).get("area"))
+    if not area and (known or {}).get("resolution_level") == "area":
+        area = known.get("canonical_name")
     if not area:
         parts = [part.strip() for part in str(query or "").split(",") if part.strip()]
         if len(parts) >= 2:
