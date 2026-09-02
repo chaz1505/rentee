@@ -72,7 +72,23 @@ def infer_location_specificity(value, known_location=None):
     return known_level or "poi"
 
 
-def _is_specificity_downgrade(input_level, result):
+def _leading_location_number(value):
+    match = re.match(
+        r"^\s*(\d+[a-z]?(?:\s*[-/]\s*\d+[a-z]?)?)\b",
+        str(value or ""), flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", "", match.group(1)).casefold() if match else None
+
+
+def _is_specificity_downgrade(input_level, result, input_value=None):
+    input_number = _leading_location_number(input_value)
+    if input_level == "exact_property" and input_number:
+        result_numbers = {
+            _leading_location_number(result.get("resolved_name")),
+            _leading_location_number(result.get("formatted_address")),
+        }
+        if input_number not in result_numbers:
+            return True
     result_level = result.get("resolution_level") or result.get("location_level")
     if result_level not in LOCATION_SPECIFICITY or input_level not in LOCATION_SPECIFICITY:
         return False
@@ -339,7 +355,7 @@ class GoogleMapsProvider:
                         or (primary_known or {}).get("canonical_name") or clean_query)
         places = self.search_places(search_query)
         if places.get("status") == "resolved" and not _is_specificity_downgrade(
-                input_level, places):
+                input_level, places, clean_query):
             if primary_known:
                 places["resolution_method"] = "stored_address" if primary_known.get("formatted_address") else "rentee_entity_match"
             return places
@@ -356,7 +372,7 @@ class GoogleMapsProvider:
             return places
         geocoded = self.geocode(search_query)
         if geocoded.get("status") == "resolved" and _is_specificity_downgrade(
-                input_level, geocoded):
+                input_level, geocoded, clean_query):
             print(
                 "[LOCATION MATCH] "
                 f"candidate={geocoded.get('resolved_name')!r} "

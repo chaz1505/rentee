@@ -297,6 +297,80 @@ class LocationToolTests(unittest.TestCase):
         self.assertEqual(session.get.call_args.kwargs["params"]["address"],
                          "Jalan Beringin, Damansara Heights")
 
+    def test_numbered_property_accepts_google_result_retaining_house_number(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [{
+            "id": "numbered", "displayName": {"text": "9 Jalan Beringin"},
+            "formattedAddress": "9 Jalan Beringin, Bukit Damansara, Kuala Lumpur",
+            "location": {"latitude": 3.145, "longitude": 101.658},
+            "types": ["street_address"],
+        }]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "9 Jalan Beringin, Damansara Heights"
+        )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["place_id"], "numbered")
+        session.get.assert_not_called()
+
+    def test_numbered_property_rejects_google_result_that_loses_house_number(self):
+        session = MagicMock()
+        broad = {
+            "id": "street", "displayName": {"text": "Jalan Beringin"},
+            "formattedAddress": "Jalan Beringin, Bukit Damansara, Kuala Lumpur",
+            "location": {"latitude": 3.15, "longitude": 101.66},
+            "types": ["street_address"],
+        }
+        session.post.return_value.json.return_value = {"places": [broad]}
+        session.get.return_value.json.return_value = {
+            "status": "OK", "results": [{
+                "place_id": "street-geocode",
+                "formatted_address": broad["formattedAddress"],
+                "geometry": {"location": {"lat": 3.15, "lng": 101.66}},
+                "types": ["street_address"],
+            }],
+        }
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "9 Jalan Beringin, Damansara Heights"
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "specificity_downgrade")
+        session.get.assert_called_once()
+
+    def test_numbered_property_rejects_unrelated_numberless_street(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [{
+            "id": "damanlela", "displayName": {"text": "Jalan Damanlela"},
+            "formattedAddress": "Jalan Damanlela, Damansara Heights",
+            "location": {"latitude": 3.151, "longitude": 101.665},
+            "types": ["route"],
+        }]}
+        session.get.return_value.json.return_value = {"status": "OK", "results": [{
+            "place_id": "damanlela-geocode",
+            "formatted_address": "Jalan Damanlela, Damansara Heights",
+            "geometry": {"location": {"lat": 3.151, "lng": 101.665}},
+            "types": ["route"],
+        }]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "9 Jalan Beringin, Damansara Heights"
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "specificity_downgrade")
+
+    def test_non_numbered_poi_still_accepts_normal_places_result(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"places": [{
+            "id": "school", "displayName": {"text": "Alice Smith School"},
+            "formattedAddress": "Jalan Bellamy, Kuala Lumpur",
+            "location": {"latitude": 3.12, "longitude": 101.69},
+            "types": ["school"],
+        }]}
+        result = location_tools.GoogleMapsProvider("key", session=session).resolve_place(
+            "Alice Smith School"
+        )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["place_id"], "school")
+        session.get.assert_not_called()
+
     def test_google_failure_reasons_are_distinguishable(self):
         cases = {}
         denied = MagicMock()
@@ -497,6 +571,16 @@ class LocationToolTests(unittest.TestCase):
         self.assertEqual(development["match_type"], "contextual_component")
         self.assertEqual(development["resolution_level"], "building")
         self.assertEqual(exact_area["match_type"], "exact")
+
+    def test_known_location_level_uses_selected_match_not_last_loop_row(self):
+        rows = {
+            "selected": {"Condo name": "One Menerung", "Address": "Jalan Menerung"},
+            "later-nonmatch": {"Condo name": "Z Residence", "Address": "Jalan Z"},
+        }
+        with patch("app._get_condo_lookup", return_value=rows):
+            result = app_module._known_location_coordinates("One Menerung")
+        self.assertEqual(result["canonical_name"], "One Menerung")
+        self.assertEqual(result["resolution_level"], "building")
 
     def test_missing_api_key_fails_gracefully(self):
         with patch.dict(os.environ, {}, clear=False):

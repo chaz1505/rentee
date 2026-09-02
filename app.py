@@ -410,6 +410,7 @@ def _known_location_coordinates(location_name):
     if not matches:
         return None
     row, canonical = matches[0]
+    selected_normalized_canonical = _normalized_location_entity_name(canonical)
     latitude = next((row.get(field) for field in
                      ("latitude", "Latitude", "lat", "Lat")
                      if row.get(field) not in (None, "")), None)
@@ -426,7 +427,9 @@ def _known_location_coordinates(location_name):
         str(location_name or "").split(",", 1)[0]
     )
     match_type = "exact" if exact_matches else "contextual_component"
-    candidate_level = "building" if normalized_canonical == first_component else "area"
+    candidate_level = (
+        "building" if selected_normalized_canonical == first_component else "area"
+    )
     entity = {"canonical_name": canonical, "resolved_name": canonical,
               "formatted_address": address, "area": area,
               "resolution_level": candidate_level, "match_type": match_type}
