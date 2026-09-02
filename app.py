@@ -612,10 +612,15 @@ def _requires_nearby_places_tool(message):
         text,
     )
     proximity = re.search(
-        r"\b(nearby|near|around|walking distance|within .*?(?:walk|drive|minutes?))\b",
+        r"\b(nearby|near|close to|close by|around|walking distance|"
+        r"within .*?(?:walk|drive|minutes?))\b",
         text,
     )
-    return bool(category and proximity)
+    broad_around_request = re.search(
+        r"\bwhat(?:'s| is) (?:there )?(?:nearby|around (?:here|this|the))\b",
+        text,
+    )
+    return bool((category and proximity) or broad_around_request)
 
 
 def recommend_condos_for_search(search_state):
@@ -927,7 +932,9 @@ def build_response_args(
                     "already named. If trusted current listing context includes coordinates, "
                     "pass them in origin_latitude/origin_longitude so no geocoding is needed. "
                     "Preserve the full property name and address in origin. If walking distance "
-                    "has no stated threshold, use 10 minutes."
+                    "has no stated threshold, use 10 minutes. For broad shops, refresh without "
+                    "clarification using shopping_mall, supermarket, grocery_store, and "
+                    "convenience_store."
                 ),
                 "parameters": {
                     "type": "object", "properties": {

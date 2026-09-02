@@ -65,6 +65,81 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertIn("find_nearby_places", comparison_tools)
         self.assertIn("compare_locations", comparison_tools)
 
+    def test_obvious_nearby_phrases_force_nearby_tool_conservatively(self):
+        nearby_messages = (
+            "What shops are close to this one?",
+            "What supermarkets are nearby?",
+            "Any cafes around here?",
+            "What groceries are within walking distance?",
+            "Is there a pharmacy near this property?",
+            "What is around this condo?",
+        )
+        for message in nearby_messages:
+            with self.subTest(message=message):
+                self.assertTrue(app_module._requires_nearby_places_tool(message))
+                self.assertEqual(
+                    app_module.build_response_args(message)["tool_choice"],
+                    {"type": "function", "name": "find_nearby_places"},
+                )
+        for message in ("What is Bangsar like?", "Tell me about this condo.",
+                        "Tell me about this property"):
+            with self.subTest(message=message):
+                self.assertFalse(app_module._requires_nearby_places_tool(message))
+                self.assertNotEqual(
+                    app_module.build_response_args(message)["tool_choice"],
+                    {"type": "function", "name": "find_nearby_places"},
+                )
+
+    @patch("app.find_nearby_places", return_value=json.dumps({
+        "status": "ok", "origin": {
+            "resolved_name": "9 Beringin", "resolution_level": "exact_property",
+        }, "places": [{"name": "Village Grocer", "duration_minutes": 8}],
+    }))
+    def test_exact_reply_nearby_request_forces_one_grounded_call(self, nearby):
+        listing = {
+            "name": "9 Beringin",
+            "Address": "Jalan Beringin, Damansara Heights",
+            "latitude": 3.145, "longitude": 101.658,
+        }
+        with patch("app.bubble", return_value=listing):
+            context = app_module.whatsapp_reply_listing_context("listing-9")
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(function_response(
+                "nearby-call-response", "find_nearby_places", "nearby-call", {
+                    "origin": "9 Beringin, Jalan Beringin, Damansara Heights",
+                    "origin_latitude": 3.145, "origin_longitude": 101.658,
+                    "categories": ["shopping_mall", "supermarket", "grocery_store",
+                                   "convenience_store"],
+                    "travel_mode": "walking",
+                },
+            ), ["There are several shops around the earlier search origin."]),
+            FakeStream(text_response("nearby-final"), [
+                "Village Grocer is an 8-minute walk from 9 Beringin."
+            ]),
+        ]
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            body = app_module.app.test_client().post("/chat_stream", json={
+                "message": "What shops are close to this one",
+                "previous_response_id": "previous-nearby-results",
+                "conversation_context": context,
+            }).get_data(as_text=True)
+        nearby.assert_called_once_with(
+            "9 Beringin, Jalan Beringin, Damansara Heights",
+            ["shopping_mall", "supermarket", "grocery_store", "convenience_store"],
+            "walking", None, None,
+            origin_latitude=3.145, origin_longitude=101.658,
+        )
+        initial_request = responses.stream.call_args_list[0].kwargs
+        self.assertEqual(initial_request["tool_choice"], {
+            "type": "function", "name": "find_nearby_places",
+        })
+        self.assertEqual(initial_request["previous_response_id"],
+                         "previous-nearby-results")
+        self.assertIn("Property: 9 Beringin", initial_request["instructions"])
+        self.assertNotIn("earlier search origin", body)
+        self.assertIn("8-minute walk from 9 Beringin", body)
+
     @patch("app.find_nearby_places", return_value=json.dumps({
         "status": "ok", "places": [{"name": "Village Grocer", "duration_minutes": 8}]
     }))
