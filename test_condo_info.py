@@ -45,6 +45,65 @@ class CondoInfoTests(unittest.TestCase):
             timeout=app_module.CONDO_SHEET_TIMEOUT_SECONDS
         )
 
+    @patch("app.requests.get")
+    def test_all_case_and_whitespace_variants_resolve_canonical_name(
+        self, mocked_get,
+    ):
+        mocked_get.return_value = self.response()
+        variants = (
+            "One Menerung",
+            "one menerung",
+            "ONE MENERUNG",
+            "one   menerung",
+            " one menerung ",
+        )
+        results = [app_module.get_condo_info(value) for value in variants]
+        self.assertEqual(
+            [result["Condo name"] for result in results],
+            ["One Menerung"] * len(variants),
+        )
+
+    @patch("app.requests.get")
+    def test_condo_mentions_resolve_canonical_name_without_fuzzy_matching(
+        self, mocked_get,
+    ):
+        mocked_get.return_value = self.response()
+        for message in (
+            "What's One Menerung like?",
+            "What's one menerung like?",
+            "What's ONE MENERUNG like?",
+            "What's one   menerung like?",
+            "  one menerung  ",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(
+                    app_module.resolve_condo_mentions(message), ["One Menerung"]
+                )
+        self.assertEqual(app_module.resolve_condo_mentions("one menerun"), [])
+
+    @patch("app.requests.get")
+    def test_lowercase_named_condo_question_forces_same_information_tool_path(
+        self, mocked_get,
+    ):
+        mocked_get.return_value = self.response()
+        canonical = app_module.build_response_args("What's One Menerung like?")
+        lowercase = app_module.build_response_args("What's one menerung like?")
+        expected_choice = {"type": "function", "name": "get_condo_info"}
+        self.assertEqual(canonical["tool_choice"], expected_choice)
+        self.assertEqual(lowercase["tool_choice"], expected_choice)
+        self.assertIn('Canonical names: ["One Menerung"]', lowercase["instructions"])
+
+    @patch("app.requests.get")
+    def test_named_condo_listing_request_keeps_search_tool_selection_open(
+        self, mocked_get,
+    ):
+        mocked_get.return_value = self.response()
+        args = app_module.build_response_args(
+            "Find available units to rent in one menerung"
+        )
+        self.assertEqual(args["tool_choice"], "auto")
+        self.assertIn('Canonical names: ["One Menerung"]', args["instructions"])
+
     @patch("app.time.monotonic", side_effect=[0.0, 0.0, 301.0, 301.0])
     @patch("app.requests.get")
     def test_refreshes_after_ttl(self, mocked_get, _mocked_time):
@@ -192,6 +251,57 @@ class CondoInfoTests(unittest.TestCase):
         self.assertEqual(
             continuation["input"][0]["output"], mocked_condo_infos.return_value
         )
+
+    @patch("app.get_condo_infos")
+    def test_lowercase_chat_question_executes_condo_information_path(
+        self, mocked_condo_infos,
+    ):
+        app_module._condo_cache = {
+            "one menerung": {
+                "Condo name": "One Menerung", "Address": "Jalan Menerung",
+            },
+        }
+        app_module._condo_cache_checked_at = app_module.time.monotonic()
+        mocked_condo_infos.return_value = json.dumps({"condos": [{
+            "requested": "one menerung", "found": True,
+            "data": {"Condo name": "One Menerung"},
+        }]})
+        tool_call = SimpleNamespace(
+            type="function_call", name="get_condo_info", call_id="condo-lower",
+            arguments=json.dumps({"condo_names": ["one menerung"]}),
+        )
+        initial = SimpleNamespace(id="initial-lower", output=[tool_call], usage=None)
+        final = SimpleNamespace(id="final-lower", output=[], usage=None)
+
+        class FakeStream:
+            def __init__(self, response, events=()):
+                self.response, self.events = response, events
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self): return iter(self.events)
+            def get_final_response(self): return self.response
+
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(initial),
+            FakeStream(final, [SimpleNamespace(
+                type="response.output_text.delta", delta="One Menerung is...",
+            )]),
+        ]
+        with patch.object(
+            app_module, "client", SimpleNamespace(responses=responses)
+        ):
+            response = app_module.app.test_client().post(
+                "/chat_stream", json={"message": "What's one menerung like?"}
+            )
+            body = response.get_data(as_text=True)
+
+        mocked_condo_infos.assert_called_once_with(["one menerung"])
+        self.assertEqual(
+            responses.stream.call_args_list[0].kwargs["tool_choice"],
+            {"type": "function", "name": "get_condo_info"},
+        )
+        self.assertIn("One Menerung is...", body)
 
     def test_chat_stream_emits_each_initial_delta_when_no_tool_is_called(self):
         initial = SimpleNamespace(

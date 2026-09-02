@@ -18,6 +18,10 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import conversation as conversation_store
+from location_tools import (
+    compare_locations as compare_grounded_locations,
+    get_travel_time as get_grounded_travel_time,
+)
 
 from enquiry_workflow import (
     BUY_TRANSACTION,
@@ -115,6 +119,13 @@ needs to do instead. Never promise future or background actions that the system 
 execute. Do not say "I'll follow up", "I'll get back to you", "I'll let you know", "I'll keep
 checking", or "I'll contact them" unless that action is actually executed by an implemented
 workflow as part of the current request.
+
+Never guess travel times, distances, proximity, accessibility, school-run convenience, or
+relative geographic convenience. Call `get_travel_time` whenever a claim materially depends
+on them; call `compare_locations` before ranking where to live against school, work, hospital,
+family, or other destinations. Use the returned geographic facts with the customer's broader
+needs. Check resolved names, surface ambiguous branches/campuses, label area-level results as
+approximations, use only the returned traffic basis, and never invent commute ranges.
 """
 
 SKILLS_DIRECTORY = Path(__file__).with_name("skills")
@@ -153,7 +164,43 @@ class MatchingResult(str):
 
 
 def normalize_condo_name(value):
-    return " ".join(str(value or "").split()).lower()
+    return " ".join(str(value or "").split()).casefold()
+
+
+def resolve_condo_mentions(user_message):
+    """Return canonical database names for exact case/whitespace-insensitive mentions."""
+    normalized_message = re.sub(
+        r"[^\w]+", " ", normalize_condo_name(user_message), flags=re.UNICODE
+    ).strip()
+    if not normalized_message:
+        return []
+    padded_message = f" {normalized_message} "
+    try:
+        rows = _get_condo_lookup().values()
+    except CondoDataError:
+        return []
+    matches = []
+    for row in rows:
+        canonical = " ".join(str(row.get("Condo name") or "").split())
+        normalized_name = re.sub(
+            r"[^\w]+", " ", normalize_condo_name(canonical), flags=re.UNICODE
+        ).strip()
+        if normalized_name and f" {normalized_name} " in padded_message:
+            matches.append(canonical)
+    return list(dict.fromkeys(matches))
+
+
+def _is_clear_condo_information_question(user_message, canonical_names):
+    """Conservatively distinguish development facts from listing retrieval."""
+    if not canonical_names:
+        return False
+    text = normalize_condo_name(user_message)
+    listing_intent = re.search(
+        r"\b(find|show|search|listing|listings|unit|units|available|availability|"
+        r"rent|rental|buy|sale|option|options)\b",
+        text,
+    )
+    return not listing_intent
 
 
 def _download_condo_lookup():
@@ -192,6 +239,12 @@ def _get_condo_lookup():
     global _condo_cache, _condo_cache_checked_at
 
     now = time.monotonic()
+    if (
+        _condo_cache is None
+        and _condo_cache_checked_at
+        and now - _condo_cache_checked_at < CONDO_CACHE_TTL_SECONDS
+    ):
+        raise CondoDataError("Condo information is temporarily unavailable.")
     if (
         _condo_cache is not None
         and now - _condo_cache_checked_at < CONDO_CACHE_TTL_SECONDS
@@ -269,6 +322,91 @@ def get_condo_infos(condo_names):
                 "data": condo
             })
     return json.dumps({"condos": results}, ensure_ascii=False)
+
+
+def _known_location_coordinates(location_name):
+    """Use optional reliable coordinates already present in condo knowledge."""
+    normalized = normalize_condo_name(location_name)
+    if not normalized:
+        return None
+    try:
+        row = _get_condo_lookup().get(normalized)
+    except CondoDataError:
+        return None
+    if not row:
+        return None
+    latitude = next((row.get(field) for field in
+                     ("latitude", "Latitude", "lat", "Lat")
+                     if row.get(field) not in (None, "")), None)
+    longitude = next((row.get(field) for field in
+                      ("longitude", "Longitude", "lng", "Lng", "lon", "Lon")
+                      if row.get(field) not in (None, "")), None)
+    try:
+        latitude, longitude = float(latitude), float(longitude)
+    except (TypeError, ValueError):
+        return None
+    canonical = " ".join(str(row.get("Condo name") or location_name).split())
+    return {"resolved_name": canonical, "latitude": latitude,
+            "longitude": longitude, "location_level": "property"}
+
+
+def get_travel_time(origin, destination, mode="driving"):
+    """Application wrapper for provider-neutral grounded driving information."""
+    print(f"[LOCATION TOOL] name=get_travel_time origin={origin!r} destination={destination!r}",
+          flush=True)
+    result = get_grounded_travel_time(
+        origin, destination, mode=mode,
+        coordinate_resolver=_known_location_coordinates,
+    )
+    print(
+        "[LOCATION TOOL] name=get_travel_time "
+        f"status={result.get('status')} "
+        f"origin_resolved={(result.get('origin') or {}).get('resolved_name')} "
+        f"destination_resolved={(result.get('destination') or {}).get('resolved_name')} "
+        f"duration_minutes={result.get('duration_minutes')} source={result.get('source')}",
+        flush=True,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+def compare_locations(candidate_locations, destinations):
+    """Application wrapper for a batched residential-location comparison."""
+    print(
+        "[LOCATION TOOL] name=compare_locations "
+        f"candidate_count={len(candidate_locations or [])} "
+        f"destination_count={len(destinations or [])}", flush=True,
+    )
+    result = compare_grounded_locations(
+        candidate_locations, destinations,
+        coordinate_resolver=_known_location_coordinates,
+    )
+    print(
+        "[LOCATION TOOL] name=compare_locations "
+        f"status={result.get('status')} source={result.get('source')} "
+        f"duration_ms={result.get('provider_duration_ms')}", flush=True,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _requires_travel_time_tool(message):
+    text = normalize_condo_name(message)
+    return bool(
+        re.search(r"\b(how far|how long|travel time|drive time|commute time)\b", text)
+        or (" from " in f" {text} " and re.search(r"\b(minutes?|hours?|distance|far)\b", text))
+    )
+
+
+def _requires_location_comparison_tool(message):
+    text = normalize_condo_name(message)
+    recommendation_intent = bool(re.search(
+        r"\b(where should (?:i|we) live|which areas?|which locations?|"
+        r"suggest.*(?:live|area)|best area|easiest commute)\b", text
+    ))
+    destination_context = bool(re.search(
+        r"\b(school|work|office|hospital|commute|kids? go|family lives?|"
+        r"frequent destination)\b", text
+    ))
+    return recommendation_intent and destination_context
 
 
 def recommend_condos_for_search(search_state):
@@ -411,6 +549,7 @@ def build_response_args(
     user_message, previous_response_id=None, conversation_context=None,
 ):
     """Build the deliberately small customer-turn context and stable tool contracts."""
+    recognized_condos = resolve_condo_mentions(user_message)
     search_properties = {
         "regular_destinations": {"type": "array", "items": {"type": "string"}},
         "property_types": {"type": "array", "items": {"type": "string"}},
@@ -452,10 +591,21 @@ def build_response_args(
         "budget_rent": {"type": "number"},
         "budget_buy": {"type": "number"},
     }
+    condo_recognition_context = ""
+    if recognized_condos:
+        condo_recognition_context = (
+            "\n\n# Deterministic condo recognition\n"
+            "The application resolved exact condo-name mentions in the customer message "
+            "using case-insensitive database matching. Canonical names: "
+            + json.dumps(recognized_condos, ensure_ascii=False)
+            + ". Preserve these canonical spellings. For a condo-information question, "
+            "call `get_condo_info` with these names. For an explicit listing/search "
+            "request, use the appropriate property-search tool instead."
+        )
     args = {
         "model": "gpt-5-mini",
         "input": user_message,
-        "instructions": rentee_instructions() + (
+        "instructions": rentee_instructions() + condo_recognition_context + (
             f"\n\n{conversation_context}" if conversation_context else ""
         ),
         "reasoning": {"effort": "low"},
@@ -526,11 +676,53 @@ def build_response_args(
                 "parameters": {"type": "object", "properties": {}, "required": [],
                                "additionalProperties": False},
             },
+            {
+                "type": "function", "name": "get_travel_time",
+                "description": (
+                    "Get grounded driving distance and estimated time between two specific "
+                    "places. Required before claims about commute time, school-run time, "
+                    "distance, proximity, accessibility, or relative convenience."
+                ),
+                "parameters": {
+                    "type": "object", "properties": {
+                        "origin": {"type": "string", "description": "Specific origin place."},
+                        "destination": {"type": "string", "description": "Specific destination place."},
+                        "mode": {"type": "string", "enum": ["driving"]},
+                    }, "required": ["origin", "destination"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function", "name": "compare_locations",
+                "description": (
+                    "Compare candidate residential areas or properties against important "
+                    "destinations. Required before recommending where to live based on "
+                    "geography, commute, school run, distance, or proximity."
+                ),
+                "parameters": {
+                    "type": "object", "properties": {
+                        "candidate_locations": {"type": "array", "items": {"type": "string"},
+                                                "minItems": 1},
+                        "destinations": {"type": "array", "minItems": 1, "items": {
+                            "type": "object", "properties": {
+                                "name": {"type": "string"}, "label": {"type": "string"},
+                            }, "required": ["name"], "additionalProperties": False,
+                        }},
+                    }, "required": ["candidate_locations", "destinations"],
+                    "additionalProperties": False,
+                },
+            },
             {"type": "web_search"},
         ],
     }
     if previous_response_id:
         args["previous_response_id"] = previous_response_id
+    if _is_clear_condo_information_question(user_message, recognized_condos):
+        args["tool_choice"] = {"type": "function", "name": "get_condo_info"}
+    if _requires_travel_time_tool(user_message):
+        args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
+    elif _requires_location_comparison_tool(user_message):
+        args["tool_choice"] = {"type": "function", "name": "compare_locations"}
     return args
 
 
@@ -4396,6 +4588,36 @@ def chat_stream():
                         "requested information is unavailable. Do not invent missing details, "
                         "claim current listing availability, or expose tool/internal field names."
                     )
+                elif tool_call.name == "get_travel_time":
+                    has_match_results = False
+                    tool_result = get_travel_time(
+                        tool_args.get("origin"), tool_args.get("destination"),
+                        tool_args.get("mode", "driving"),
+                    )
+                    follow_up_instructions = (
+                        "Answer using only the supplied grounded geographic result for "
+                        "distance, driving time, place identity, and traffic basis. If either "
+                        "place is ambiguous or unresolved, state that briefly and do not pick "
+                        "an alternative silently. Do not invent ranges. If a resolved origin "
+                        "is area-level, explain that the estimate uses a representative point "
+                        "and exact building times vary. Apply higher-level property judgement "
+                        "yourself, but do not alter the geographic facts."
+                    )
+                elif tool_call.name == "compare_locations":
+                    has_match_results = False
+                    tool_result = compare_locations(
+                        tool_args.get("candidate_locations") or [],
+                        tool_args.get("destinations") or [],
+                    )
+                    follow_up_instructions = (
+                        "Use the supplied grounded location matrix for every geographic claim. "
+                        "First verify the resolved place names; surface ambiguous or unresolved "
+                        "campuses, branches, offices, and candidates rather than guessing. "
+                        "Use only returned point estimates and traffic metadata—never invent "
+                        "ranges. Explain that area-level results use representative points. "
+                        "Then make the personalised recommendation by combining these facts "
+                        "with the customer's stated lifestyle and property needs."
+                    )
                 else:
                     raise ValueError(f"Unsupported tool: {tool_call.name}")
 
@@ -4418,6 +4640,16 @@ def chat_stream():
                         "Submitting function_call_output for original "
                         f"get_condo_info call {original_call_id}",
                         flush=True
+                    )
+                elif tool_call.name == "get_travel_time":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"get_travel_time call {original_call_id}", flush=True
+                    )
+                elif tool_call.name == "compare_locations":
+                    print(
+                        "Submitting function_call_output for original "
+                        f"compare_locations call {original_call_id}", flush=True
                     )
                 elif tool_call.name == "get_current_recommendations":
                     print(
