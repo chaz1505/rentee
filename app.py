@@ -3780,11 +3780,16 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "known_tenant_profile is present, use it only as Gwen-supplied suitability "
         "context and for grounded trade-offs; do not turn it into hard retrieval "
         "criteria or let it override the structured search requirements. Use the "
-        "structured listing facts and "
-        "make sensible trade-offs, including fit with the customer's budget tier. "
-        "Return at most the 7 strongest genuine fits rather than exhaustively describing "
-        "every plausible listing. Keep each reco_summary concise and mention material "
-        "compromises. Never invent "
+        "structured listing facts and make sensible trade-offs, including fit with the "
+        "customer's budget tier. The supplied available_listings have already passed "
+        "structured retrieval and are plausible candidates. Your primary job is to rank "
+        "and select the strongest candidates, not to independently re-run retrieval. If "
+        "one or more candidates are reasonably suitable, you MUST return recommendations. "
+        "Return an empty recommendations array only when every candidate has a concrete, "
+        "material mismatch that makes it unsuitable. Do not reject every candidate merely "
+        "because none is perfect. Prefer the strongest 3 to 7 available options when there "
+        "are plausible candidates, make sensible trade-offs, and state compromises in each "
+        "reco_summary. Keep each reco_summary concise. Never invent "
         "facts. Copy each selected listing_id exactly from available_listings; do not alter, "
         "shorten, or invent it. Use property_name or condo_name in customer-facing prose and "
         "never expose listing_id or other internal IDs. Briefly explain why each option fits. Return JSON "
@@ -3880,7 +3885,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             validated_recommendations.append(recommendation)
             seen_recommended_listing_ids.add(listing_id)
 
-    if result["recommendations"] and not validated_recommendations:
+    fallback_reason = None
+    if grounded_listing_facts and not validated_recommendations:
+        fallback_reason = (
+            "invalid_model_listing_ids" if result["recommendations"]
+            else "empty_model_recommendations"
+        )
         fallback_facts = grounded_listing_facts[:3]
         validated_recommendations = [
             {
@@ -3890,13 +3900,15 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             for facts in fallback_facts
         ]
         print(
-            "[RANK DEBUG] all returned IDs were invalid; using structured-candidate "
-            f"fallback listing_ids={[item['listing_id'] for item in validated_recommendations]}",
+            f"[RANK FALLBACK] reason={fallback_reason} "
+            f"candidate_count={len(grounded_listing_facts)} "
+            f"fallback_count={len(validated_recommendations)} "
+            f"listing_ids={[item['listing_id'] for item in validated_recommendations]}",
             flush=True,
         )
         result["customer_response"] = (
-            "I found a few current listings that match your active search filters. "
-            "Here are the strongest available candidates to review."
+            "I found a few current listings that match your search. "
+            "Here are the strongest available options."
         )
 
     new_recommendations = [
@@ -3983,9 +3995,14 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             "photos": source_listing.get("photos"),
         })
         current_run_listings.append(item)
-    customer_response = build_whatsapp_recommendation_summary(
+    recommendation_summary = build_whatsapp_recommendation_summary(
         folio_id, bubble_env, listings=current_run_listings
-    ) or customer_response
+    )
+    if recommendation_summary:
+        customer_response = (
+            result["customer_response"] + "\n\n" + recommendation_summary
+            if fallback_reason else recommendation_summary
+        )
     current_listing_ids = [
         item["listing_id"] for item in current_run_listings
     ]

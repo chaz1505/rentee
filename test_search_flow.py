@@ -855,7 +855,9 @@ class SearchFlowStateTests(unittest.TestCase):
             output_text=json.dumps({"recommendations": [], "customer_response": "No fit."}),
             usage=None,
         )
-        with patch.object(app_module.client.responses, "create", return_value=model_response) as create:
+        with patch.object(
+            app_module.client.responses, "create", return_value=model_response
+        ) as create, patch("app.create_folio_items", return_value=[]):
             flow = app_module.match_lead("folio-1", "live", "message-1")
             while True:
                 try:
@@ -871,6 +873,9 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("British finance director", prompt)
         self.assertIn("use it only as Gwen-supplied suitability context", prompt)
         self.assertIn("do not turn it into hard retrieval criteria", prompt)
+        self.assertIn("already passed structured retrieval", prompt)
+        self.assertIn("MUST return recommendations", prompt)
+        self.assertIn("Do not reject every candidate merely because none is perfect", prompt)
         self.assertIn('"listing_id": "listing-1"', prompt)
         self.assertNotIn('"_id": "listing-1"', prompt)
         self.assertIn("A real structured description", prompt)
@@ -922,6 +927,54 @@ class SearchFlowStateTests(unittest.TestCase):
     @patch("app.create_folio_items", return_value=["folio-item-fallback"])
     @patch("app.get_plausible_listings")
     @patch("app.bubble")
+    def test_empty_model_recommendations_fall_back_to_structured_candidates(
+        self, mocked_bubble, mocked_listings, mocked_create, mocked_update
+    ):
+        mocked_bubble.side_effect = [
+            {"lead": "lead-1", "folioItems": []},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 3, "budgetRent": 15000},
+        ]
+        mocked_listings.return_value = ([
+            {"_id": f"listing-{index}", "beds": 3, "priceRent": 12000 + index}
+            for index in range(1, 15)
+        ], 625)
+        response = SimpleNamespace(
+            output_text=json.dumps({
+                "recommendations": [],
+                "customer_response": "No suitable matches.",
+            }),
+            usage=None,
+        )
+        with patch.object(
+            app_module.client.responses, "create", return_value=response
+        ), patch("builtins.print") as mocked_print:
+            flow = app_module.match_lead("folio-1", "live", "message-1")
+            while True:
+                try:
+                    next(flow)
+                except StopIteration as completed:
+                    answer = completed.value
+                    break
+
+        fallback = mocked_create.call_args.args[0]
+        self.assertEqual(
+            [item["listing_id"] for item in fallback],
+            ["listing-1", "listing-2", "listing-3"],
+        )
+        self.assertIn("strongest available options", answer)
+        self.assertNotIn("don't have a suitable current property match", answer)
+        self.assertTrue(answer.recommendations_available)
+        mocked_update.assert_called_once()
+        logs = " ".join(str(call) for call in mocked_print.call_args_list)
+        self.assertIn(
+            "reason=empty_model_recommendations candidate_count=14 fallback_count=3",
+            logs,
+        )
+
+    @patch("app.update_folio_items")
+    @patch("app.create_folio_items", return_value=["folio-item-fallback"])
+    @patch("app.get_plausible_listings")
+    @patch("app.bubble")
     def test_all_invalid_model_ids_fall_back_to_structured_candidates(
         self, mocked_bubble, mocked_listings, mocked_create, mocked_update
     ):
@@ -963,6 +1016,7 @@ class SearchFlowStateTests(unittest.TestCase):
         logs = " ".join(str(call) for call in mocked_print.call_args_list)
         self.assertIn("'invented-id'", logs)
         self.assertIn("valid_candidate_ids=['listing-1', 'listing-2']", logs)
+        self.assertIn("reason=invalid_model_listing_ids", logs)
 
     def test_geo_filter_accepts_listing_relationship_id(self):
         lead = {"Geo": ["geo-klcc"], "TransactionType": ["Rent/Let"]}
