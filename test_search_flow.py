@@ -119,6 +119,105 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(result["action"], "search_listings")
         self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
 
+    def test_current_condo_location_overrides_historical_model_locations(self):
+        condo_rows = {"one": {"Condo name": "One Menerung"}}
+        stale_args = {
+            "geo_names": ["Bangsar", "Mont Kiara", "KLCC"],
+            "area_update_mode": "add", "search_listings": True,
+        }
+        with patch("app._get_condo_lookup", return_value=condo_rows):
+            updated = app_module._apply_current_search_location(
+                "Ok find me something in one menerung then", "live", stale_args
+            )
+        self.assertEqual(updated["preferred_condo_names"], ["One Menerung"])
+        self.assertEqual(updated["condo_update_mode"], "replace")
+        self.assertEqual(updated["geo_names"], [])
+        self.assertEqual(updated["area_update_mode"], "reset")
+
+    def test_show_named_condo_resolves_as_condo_not_geo(self):
+        condo_rows = {"one": {"Condo name": "One Menerung"}}
+        with patch("app._get_condo_lookup", return_value=condo_rows):
+            updated = app_module._apply_current_search_location(
+                "show me One Menerung", "live", {"search_listings": True}
+            )
+        self.assertEqual(updated["preferred_condo_names"], ["One Menerung"])
+        self.assertEqual(updated["geo_names"], [])
+
+    def test_current_geo_location_replaces_previous_location_only(self):
+        updated = app_module._apply_current_search_location(
+            "show me KLCC instead", "live", {
+                "geo_names": ["Bangsar"], "bedrooms_min": 3,
+                "budget_rent": 10000, "search_listings": True,
+            },
+        )
+        self.assertEqual(updated["geo_names"], ["KLCC"])
+        self.assertEqual(updated["area_update_mode"], "replace")
+        self.assertEqual(updated["condo_update_mode"], "reset")
+        self.assertEqual(updated["bedrooms_min"], 3)
+        self.assertEqual(updated["budget_rent"], 10000)
+
+    @patch("app.save_search_state")
+    @patch("app.bubble")
+    def test_unresolved_current_location_does_not_fall_back_to_saved_area(
+        self, bubble, _save,
+    ):
+        stored = dump_search_state(apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Bangsar"],
+        }))
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "searchBriefJSON": stored, "searchActive": stored},
+        ]
+        update = app_module._apply_current_search_location(
+            "show me something in CompletelyFakeCondoName", "live",
+            {"search_listings": True},
+        )
+        result = app_module.advance_property_search("folio-1", "live", update)
+        self.assertEqual(result["action"], "ask")
+        self.assertEqual(result["active_state"]["areas"], [])
+        self.assertEqual(
+            result["geo_resolution"]["unresolved"],
+            ["CompletelyFakeCondoName"],
+        )
+
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids", return_value=["condo-one"])
+    @patch("app.bubble")
+    def test_condo_misclassified_as_geo_is_recovered_and_replaces_old_area(
+        self, bubble, _named_ids, _save,
+    ):
+        stored = dump_search_state(apply_search_update(empty_search_state(), {
+            "area_status": "known", "areas": ["Damansara Heights"],
+            "bedroom_requirement": "4", "budget_requirement": "15000",
+        }))
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "searchBriefJSON": stored, "searchActive": stored},
+        ]
+        condo_rows = {"one": {"Condo name": "One Menerung"}}
+        with patch("app._get_condo_lookup", return_value=condo_rows), patch(
+            "app.get_valid_geo_names",
+            return_value=["Bangsar", "KLCC", "Damansara Heights"],
+        ):
+            result = app_module.advance_property_search(
+                "folio-1", "live", {
+                    "geo_names": ["One Menerung"], "area_update_mode": "replace",
+                    "search_listings": True,
+                },
+            )
+        self.assertEqual(result["action"], "search_listings")
+        self.assertEqual(result["scope"], ["One Menerung"])
+        self.assertEqual(result["active_state"]["areas"], [])
+        self.assertEqual(result["active_state"]["selected_condos"], ["One Menerung"])
+        self.assertEqual(result["active_state"]["bedroom_requirement"], "4")
+        self.assertEqual(result["active_state"]["budget_requirement"], "15000")
+        retrieval_lead = app_module.lead_with_active_search_filters({
+            "Geo": ["geo-damansara"],
+            "searchActive": dump_search_state(result["active_state"]),
+        }, "https://www.rentee.asia/api/1.1")
+        self.assertEqual(retrieval_lead["Geo"], [])
+        self.assertEqual(retrieval_lead["preferredCondos"], ["condo-one"])
+
     @patch("app.save_search_state")
     @patch("app.bubble")
     def test_existing_valid_persisted_area_remains_canonical(

@@ -200,6 +200,24 @@ def resolve_condo_mentions(user_message):
     return list(dict.fromkeys(matches))
 
 
+def resolve_condo_names(candidates):
+    """Resolve exact condo candidates to canonical database names."""
+    try:
+        rows = _get_condo_lookup().values()
+    except CondoDataError:
+        return {"resolved": [], "unresolved": _unique_search_values(candidates)}
+    canonical_by_key = {}
+    for row in rows:
+        canonical = " ".join(str(row.get("Condo name") or "").split())
+        if canonical:
+            canonical_by_key[normalize_condo_name(canonical)] = canonical
+    resolved, unresolved = [], []
+    for candidate in _unique_search_values(candidates):
+        canonical = canonical_by_key.get(normalize_condo_name(candidate))
+        (resolved if canonical else unresolved).append(canonical or candidate)
+    return {"resolved": _unique_search_values(resolved), "unresolved": unresolved}
+
+
 def _is_clear_condo_information_question(user_message, canonical_names):
     """Conservatively distinguish development facts from listing retrieval."""
     if not canonical_names:
@@ -806,11 +824,15 @@ def build_response_args(
         "geo_names": {
             "type": "array", "items": {"type": "string"},
             "description": (
-                "Candidate locations stated by the customer. The application "
-                "canonicalizes them and may ask for clarification."
+                "Candidate neighbourhood/area locations stated by the customer. Never "
+                "put a known condo or building name here; use preferred_condo_names. "
+                "The application canonicalizes areas and may ask for clarification."
             ),
         },
-        "preferred_condo_names": {"type": "array", "items": {"type": "string"}},
+        "preferred_condo_names": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Exact condo/building names constraining listing retrieval.",
+        },
         "area_update_mode": {
             "type": "string",
             "enum": ["unchanged", "replace", "add", "remove", "reset"],
@@ -837,7 +859,9 @@ def build_response_args(
             + json.dumps(recognized_condos, ensure_ascii=False)
             + ". Preserve these canonical spellings. For a condo-information question, "
             "call `get_condo_info` with these names. For an explicit listing/search "
-            "request, use the appropriate property-search tool instead."
+            "request, call `advance_property_search`, put them in "
+            "`preferred_condo_names`, set `condo_update_mode` to `replace`, and reset "
+            "the prior area constraint."
         )
     args = {
         "model": "gpt-5-mini",
@@ -4385,7 +4409,7 @@ def apply_active_search_update(active_state, update):
     previous_areas = list(state["areas"])
     geo_names = update.get("geo_names") or []
     area_mode = update.get("area_update_mode")
-    if geo_names or area_mode == "reset":
+    if geo_names or area_mode in {"replace", "reset"}:
         state["areas"] = _modify_active_values(
             state["areas"], geo_names, area_mode, "replace"
         )
@@ -4506,6 +4530,7 @@ def lead_with_active_search_filters(lead, base_url):
         active["preferredCondos"] = get_named_object_ids(
             base_url, "condo", state["selected_condos"]
         )
+        active["Geo"] = []
     if state["bedroom_requirement"]:
         active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
     transaction = " ".join(state["property_types"]).casefold()
@@ -4535,6 +4560,24 @@ def advance_property_search(folio_id, bubble_env, update):
     lead_id = folio["lead"]
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     valid_geo_names = get_valid_geo_names(bubble_env)
+    update = dict(update)
+    condo_candidates = resolve_condo_names(update.get("geo_names") or [])
+    if condo_candidates["resolved"]:
+        update["geo_names"] = condo_candidates["unresolved"]
+        update["preferred_condo_names"] = _unique_search_values(
+            (update.get("preferred_condo_names") or [])
+            + condo_candidates["resolved"]
+        )
+        update["area_update_mode"] = "reset"
+        update["condo_update_mode"] = "replace"
+        for canonical in condo_candidates["resolved"]:
+            print(
+                f"[PROPERTY RESOLUTION] candidate={canonical!r} "
+                f"type=condo resolved={canonical!r}", flush=True,
+            )
+    if (update.get("preferred_condo_names")
+            and update.get("condo_update_mode") in (None, "replace")):
+        update["area_update_mode"] = "reset"
     geo_resolution = resolve_geo_names(
         update.get("geo_names") or [], valid_geo_names
     )
@@ -4569,6 +4612,12 @@ def advance_property_search(folio_id, bubble_env, update):
         cumulative_state = set_recommended_condos(cumulative_state, _unique_search_values(
             cumulative_state["recommended_condos"] + preferred_names
         ))
+    print(
+        f"[SEARCH ACTIVE] condos={active_state['selected_condos']!r} "
+        f"areas={active_state['areas']!r} "
+        f"beds={active_state['bedroom_requirement'] or None} "
+        f"budget={active_state['budget_requirement'] or None}", flush=True,
+    )
     lead_fields = structured_lead_update(safe_update, base_url)
     for field in ("Geo", "preferredCondos"):
         if field in lead_fields:
@@ -4681,6 +4730,68 @@ def _explicit_nearby_place(message):
     return None
 
 
+def _explicit_property_search_location(message):
+    """Extract only a location explicitly scoped by the current search request."""
+    text = " ".join(str(message or "").split())
+    patterns = (
+        r"\b(?:find|show) me\b.*?\bin\s+(.+?)(?:\s+(?:then|instead))?[?.!]*$",
+        r"\bwhat (?:have|do) you got\b.*?\bin\s+(.+?)[?.!]*$",
+        r"\bshow me\s+(.+?)\s+instead[?.!]*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return " ".join(match.group(1).strip(" ,.!?").split())
+    return None
+
+
+def _apply_current_search_location(user_message, bubble_env, tool_args):
+    """Make this turn's explicit location authoritative over model history."""
+    candidate = _explicit_property_search_location(user_message)
+    condos = resolve_condo_mentions(candidate or user_message)
+    if condos:
+        updated = dict(tool_args)
+        updated.update({
+            "preferred_condo_names": condos,
+            "condo_update_mode": "replace",
+            "geo_names": [],
+            "area_update_mode": "reset",
+        })
+        print(
+            f"[PROPERTY RESOLUTION] candidate={candidate or condos[0]!r} "
+            f"type=condo resolved={condos[0]!r}", flush=True,
+        )
+        print(
+            "[SEARCH OVERRIDE] source=current_message field=location "
+            f"condos={condos!r} areas=[]", flush=True,
+        )
+        return updated
+    if not candidate:
+        return tool_args
+    normalized_message = normalize_condo_name(user_message)
+    for model_geo in _unique_search_values(tool_args.get("geo_names") or []):
+        normalized_geo = normalize_condo_name(model_geo)
+        if normalized_geo and re.search(
+            rf"(?<!\w){re.escape(normalized_geo)}(?!\w)", normalized_message
+        ):
+            candidate = model_geo
+            break
+    updated = dict(tool_args)
+    updated["preferred_condo_names"] = []
+    updated["condo_update_mode"] = "reset"
+    updated["geo_names"] = [candidate]
+    updated["area_update_mode"] = "replace"
+    print(
+        f"[PROPERTY RESOLUTION] candidate={candidate!r} "
+        "type=area_candidate resolution=pending", flush=True,
+    )
+    print(
+        "[SEARCH OVERRIDE] source=current_message field=location "
+        f"condos=[] areas={updated['geo_names']!r}", flush=True,
+    )
+    return updated
+
+
 def _exact_property_name_for_location(message, conversation_context=None):
     """Return only a high-confidence exact name from this turn or trusted context."""
     explicit = _explicit_nearby_place(message)
@@ -4790,6 +4901,9 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
     has_match_results = False
     recommendations = []
     if tool_call.name == "advance_property_search":
+        tool_args = _apply_current_search_location(
+            user_message, bubble_env, tool_args
+        )
         search_result = advance_property_search(folio_id, bubble_env, tool_args)
         if search_result["action"] == "search_listings":
             matching_result = execute_match_lead_silently(
