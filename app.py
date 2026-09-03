@@ -3013,35 +3013,155 @@ def _stop_whatsapp_typing(keepalive):
         keepalive.stop()
 
 
+def build_listing_bubble_constraints(requirements, condo_ids=None):
+    """Build safe Bubble query variants from the existing structured requirements."""
+    base_constraints = []
+    python_only_filters = []
+    bedrooms_min = requirements.get("bedrooms_min")
+    if bedrooms_min is not None:
+        # Bubble exposes strict numeric comparison; subtracting a tiny epsilon preserves
+        # the existing inclusive bedrooms_min semantic.
+        base_constraints.append({
+            "key": "beds", "constraint_type": "greater than",
+            "value": bedrooms_min - 0.000001,
+        })
+
+    modes = _transaction_modes(requirements.get("transaction_type"))
+    budget_rent = requirements.get("budget_rent")
+    budget_buy = requirements.get("budget_buy")
+    if modes == {"rent"}:
+        base_constraints.append({
+            "key": "priceRent", "constraint_type": "is_not_empty",
+        })
+        if budget_rent:
+            python_only_filters.append("budget")
+    elif modes == {"buy"}:
+        base_constraints.append({
+            "key": "priceSale", "constraint_type": "is_not_empty",
+        })
+        if budget_buy:
+            python_only_filters.append("budget")
+    elif modes:
+        python_only_filters.append("mixed_transaction_mode")
+    if requirements.get("furnishing_preference"):
+        python_only_filters.append("furnishing")
+
+    resolved_condo_ids = _unique_search_values(
+        condo_ids or requirements.get("preferred_condo_ids") or []
+    )
+    geo_ids = _unique_search_values(requirements.get("geo_ids") or [])
+    scope_field = None
+    scope_ids = []
+    if resolved_condo_ids:
+        scope_field, scope_ids = "condo", resolved_condo_ids
+    elif geo_ids:
+        scope_field, scope_ids = "Geo", geo_ids
+    queries = []
+    if scope_ids:
+        queries = [
+            base_constraints + [{
+                "key": scope_field,
+                "constraint_type": "contains" if scope_field == "Geo" else "equals",
+                "value": scope_id,
+            }]
+            for scope_id in scope_ids
+        ]
+    else:
+        queries = [base_constraints]
+    return {
+        "queries": queries,
+        "scope_field": scope_field,
+        "scope_ids": scope_ids,
+        "python_only_filters": python_only_filters,
+    }
+
+
 def get_plausible_listings(
     base_url, lead, condo_scope=None, target=RETRIEVAL_CANDIDATE_TARGET
 ):
-    """Filter each Bubble page and stop once ranking has a healthy candidate pool."""
+    """Query Bubble narrowly, then retain Python filtering as validation."""
     started = time.perf_counter()
     plausible = []
-    cursor = 0
     pages = 0
     fetched = 0
+    seen_listing_ids = set()
     condo_cache = {}
-    seen_cursors = set()
-    while cursor not in seen_cursors and len(plausible) < target:
-        seen_cursors.add(cursor)
-        page = bubble(f"{base_url}/obj/listing", params={"cursor": cursor})
-        raw_results = page.get("results", []) or []
-        results = raw_results
-        pages += 1
-        fetched += len(results)
-        if condo_scope:
-            results = [
-                listing for listing in results
-                if _listing_is_in_condo_scope(
-                    listing, condo_scope, base_url, condo_cache
-                )
-            ]
-        plausible.extend(shortlist_structured_listings(lead, results))
-        if not raw_results or not page.get("remaining"):
-            break
-        cursor += len(raw_results)
+    requirements = structured_lead_requirements(lead)
+    resolved_condo_ids = []
+    condo_resolution_failed = False
+    if condo_scope:
+        resolved_condo_ids = get_named_object_ids(base_url, "condo", condo_scope)
+        condo_resolution_failed = len(resolved_condo_ids) != len(
+            _unique_search_values(condo_scope)
+        )
+        if condo_resolution_failed:
+            print(
+                "[LISTING QUERY] fallback=full_scan reason=condo_resolution_failed",
+                flush=True,
+            )
+            resolved_condo_ids = []
+            requirements = dict(requirements)
+            requirements["preferred_condo_ids"] = []
+    plan = build_listing_bubble_constraints(requirements, resolved_condo_ids)
+    validation_lead = dict(lead)
+    if resolved_condo_ids:
+        validation_lead["preferredCondos"] = resolved_condo_ids
+        validation_lead["Geo"] = []
+
+    print(
+        "[LISTING QUERY] transaction="
+        f"{sorted(_transaction_modes(requirements['transaction_type']))}",
+        flush=True,
+    )
+    print(f"[LISTING QUERY] condo_scope={list(condo_scope or [])!r}", flush=True)
+    print(f"[LISTING QUERY] geo_scope={requirements['geo_ids']!r}", flush=True)
+    print(f"[LISTING QUERY] resolved_condo_ids={resolved_condo_ids!r}", flush=True)
+    print(
+        f"[LISTING QUERY] resolved_geo_ids="
+        f"{plan['scope_ids'] if plan['scope_field'] == 'Geo' else []!r}",
+        flush=True,
+    )
+    print(f"[LISTING QUERY] bedrooms_min={requirements['bedrooms_min']!r}", flush=True)
+    print(
+        f"[LISTING QUERY] budget_rent={requirements['budget_rent']!r} "
+        f"budget_buy={requirements['budget_buy']!r}", flush=True,
+    )
+    print(f"[LISTING QUERY] bubble_constraints={plan['queries']!r}", flush=True)
+    print(f"[LISTING QUERY] python_only_filters={plan['python_only_filters']!r}", flush=True)
+    print("[LISTING QUERY] mode=structured_bubble_query", flush=True)
+
+    for constraints in plan["queries"]:
+        cursor = 0
+        seen_cursors = set()
+        while cursor not in seen_cursors and (cursor == 0 or len(plausible) < target):
+            seen_cursors.add(cursor)
+            params = {"cursor": cursor}
+            if constraints:
+                params["constraints"] = json.dumps(constraints, separators=(",", ":"))
+            page = bubble(f"{base_url}/obj/listing", params=params)
+            raw_results = page.get("results", []) or []
+            pages += 1
+            fetched += len(raw_results)
+            results = []
+            for listing in raw_results:
+                listing_id = str(listing.get("_id") or "")
+                if listing_id and listing_id in seen_listing_ids:
+                    continue
+                if listing_id:
+                    seen_listing_ids.add(listing_id)
+                results.append(listing)
+            if condo_scope and condo_resolution_failed:
+                results = [
+                    listing for listing in results
+                    if _listing_is_in_condo_scope(
+                        listing, condo_scope, base_url, condo_cache
+                    )
+                ]
+            plausible.extend(shortlist_structured_listings(validation_lead, results))
+            if not raw_results or not page.get("remaining"):
+                break
+            cursor += len(raw_results)
+    print(f"[LISTING QUERY] pages={pages} fetched={fetched}", flush=True)
     log_timing(
         "Load plausible listings", started,
         f" (pages={pages} fetched={fetched} plausible={len(plausible)})",

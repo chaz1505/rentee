@@ -806,6 +806,121 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(len(listings), 120)
         self.assertEqual(mocked_bubble.call_count, 2)
 
+    @patch("app.get_named_object_ids", return_value=["condo-one"])
+    @patch("app.bubble")
+    def test_listing_query_pushes_condo_and_bedrooms_then_validates_in_python(
+        self, mocked_bubble, mocked_ids,
+    ):
+        mocked_bubble.return_value = {"results": [
+            {"_id": "fit", "condo": "condo-one", "beds": 3, "priceRent": 14000},
+            {"_id": "too-small", "condo": "condo-one", "beds": 2, "priceRent": 14000},
+        ], "remaining": 0}
+        lead = {
+            "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
+            "budgetRent": 15000, "preferredCondos": ["stale-condo"],
+            "Geo": ["geo-damansara"],
+        }
+        listings, fetched = app_module.get_plausible_listings(
+            "https://bubble.test", lead, ["One Menerung"]
+        )
+        self.assertEqual([item["_id"] for item in listings], ["fit"])
+        self.assertEqual(fetched, 2)
+        mocked_ids.assert_called_once_with(
+            "https://bubble.test", "condo", ["One Menerung"]
+        )
+        constraints = json.loads(mocked_bubble.call_args.kwargs["params"]["constraints"])
+        self.assertIn(
+            {"key": "condo", "constraint_type": "equals", "value": "condo-one"},
+            constraints,
+        )
+        self.assertTrue(any(
+            item["key"] == "beds" and item["constraint_type"] == "greater than"
+            for item in constraints
+        ))
+        self.assertFalse(any(item.get("value") == "geo-damansara" for item in constraints))
+
+    @patch("app.bubble")
+    def test_listing_query_pushes_each_area_and_deduplicates(self, mocked_bubble):
+        mocked_bubble.side_effect = [
+            {"results": [{"_id": "shared", "Geo": ["geo-bangsar"], "beds": 3}],
+             "remaining": 0},
+            {"results": [
+                {"_id": "shared", "Geo": ["geo-bangsar"], "beds": 3},
+                {"_id": "klcc", "Geo": ["geo-klcc"], "beds": 3},
+            ], "remaining": 0},
+        ]
+        lead = {"Geo": ["geo-bangsar", "geo-klcc"], "bedroomsMin": 3}
+        listings, fetched = app_module.get_plausible_listings(
+            "https://bubble.test", lead
+        )
+        self.assertEqual([item["_id"] for item in listings], ["shared", "klcc"])
+        self.assertEqual(fetched, 3)
+        self.assertEqual(mocked_bubble.call_count, 2)
+        query_constraints = [
+            json.loads(call.kwargs["params"]["constraints"])
+            for call in mocked_bubble.call_args_list
+        ]
+        geo_constraints = [
+            next(item for item in constraints if item["key"] == "Geo")
+            for constraints in query_constraints
+        ]
+        self.assertEqual(
+            {item["value"] for item in geo_constraints},
+            {"geo-bangsar", "geo-klcc"},
+        )
+        self.assertTrue(all(item["constraint_type"] == "contains" for item in geo_constraints))
+
+    @patch("app.get_named_object_ids", return_value=["condo-one", "condo-two"])
+    @patch("app.bubble")
+    def test_listing_query_uses_one_query_per_condo_and_deduplicates(
+        self, mocked_bubble, _mocked_ids,
+    ):
+        mocked_bubble.side_effect = [
+            {"results": [{"_id": "shared", "condo": "condo-one"}], "remaining": 0},
+            {"results": [
+                {"_id": "shared", "condo": "condo-one"},
+                {"_id": "two", "condo": "condo-two"},
+            ], "remaining": 0},
+        ]
+        listings, _fetched = app_module.get_plausible_listings(
+            "https://bubble.test", {}, ["One Menerung", "Condo Two"]
+        )
+        self.assertEqual([item["_id"] for item in listings], ["shared", "two"])
+        self.assertEqual(mocked_bubble.call_count, 2)
+        condo_values = {
+            next(
+                item for item in json.loads(call.kwargs["params"]["constraints"])
+                if item["key"] == "condo"
+            )["value"]
+            for call in mocked_bubble.call_args_list
+        }
+        self.assertEqual(condo_values, {"condo-one", "condo-two"})
+
+    def test_listing_query_keeps_budget_python_side_to_preserve_tolerance(self):
+        plan = app_module.build_listing_bubble_constraints({
+            "transaction_type": ["Rent/Let"], "bedrooms_min": 3,
+            "geo_ids": [], "preferred_condo_ids": [],
+            "budget_rent": 15000, "budget_buy": None,
+            "furnishing_preference": None,
+        })
+        self.assertEqual(plan["queries"][0], [
+            {"key": "beds", "constraint_type": "greater than", "value": 2.999999},
+            {"key": "priceRent", "constraint_type": "is_not_empty"},
+        ])
+        self.assertIn("budget", plan["python_only_filters"])
+
+    def test_listing_query_without_budget_pushes_transaction_price_presence(self):
+        plan = app_module.build_listing_bubble_constraints({
+            "transaction_type": ["Sale/Purchase"], "bedrooms_min": None,
+            "geo_ids": [], "preferred_condo_ids": [],
+            "budget_rent": None, "budget_buy": None,
+            "furnishing_preference": None,
+        })
+        self.assertEqual(plan["queries"], [[{
+            "key": "priceSale", "constraint_type": "is_not_empty",
+        }]])
+        self.assertNotIn("transaction_price_presence", plan["python_only_filters"])
+
     def test_preferred_condo_relationship_constrains_structured_shortlist(self):
         lead = {"preferredCondos": ["condo-one", "condo-loft"]}
         listings = [
