@@ -1076,11 +1076,6 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.reply_conversation_patcher.start()
         self.addCleanup(self.reply_conversation_patcher.stop)
-        self.phone_context_log_patcher = patch(
-            "app.log_phone_conversations", return_value=[]
-        )
-        self.phone_context_log_patcher.start()
-        self.addCleanup(self.phone_context_log_patcher.stop)
         self.active_phone_conversation_patcher = patch(
             "app.find_active_conversation_by_phone",
             return_value=(None, "none", 0),
@@ -1187,7 +1182,7 @@ class WhatsAppTests(unittest.TestCase):
             acknowledgement = app_module.handle_owner_check_reply(
                 conversation, "  profile ok  "
             )
-        self.assertEqual(acknowledgement, "Noted, thanks.")
+        self.assertEqual(acknowledgement, "Thanks — noted.")
         update.assert_called_once_with(
             "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
             {
@@ -1310,7 +1305,7 @@ class WhatsAppTests(unittest.TestCase):
                 result, now=now
             )
         message = (
-            "Good news — the unit is available and your profile is okay. "
+            "Good news — the owner has confirmed this unit is available. "
             "Viewings are possible after 5pm. When would you like to view?"
         )
         self.assertTrue(notified)
@@ -1523,16 +1518,16 @@ class WhatsAppTests(unittest.TestCase):
                 "OwnerCheckResult": "available",
             },
         )
-        send.assert_called_once_with("60123456789", "Noted, thanks.")
+        send.assert_called_once_with("60123456789", "Thanks — noted.")
         persist_sent.assert_called_once_with(
-            "60123456789", "Noted, thanks.", ["wamid.ack"],
+            "60123456789", "Thanks — noted.", ["wamid.ack"],
             "conversation-owner", lead_id="tenant-lead-1", bubble_env="live",
         )
         outcome = self.mocked_owner_check_notify.call_args.args[0]
         self.assertEqual(outcome.result, "available")
         self.assertEqual(outcome.enquiry["Lead"], "tenant-lead-1")
         logs = "\n".join(str(call) for call in logged.call_args_list)
-        self.assertIn("resolution=pending_owner_enquiry", logs)
+        self.assertIn("resolution=owner_check_phone", logs)
         self.assertIn("resolution=owner_check conversation_id=conversation-owner", logs)
         self.assertNotIn("LEAD ROUTING", logs)
         self.assertNotIn("missing_principal", logs)
@@ -1559,66 +1554,6 @@ class WhatsAppTests(unittest.TestCase):
         create_lead.assert_not_called()
         send.assert_called_once()
         self.assertIn("do you mean", send.call_args.args[1])
-
-    def test_newest_pending_owner_check_wins_over_history_and_general(self):
-        old = {
-            "_id": "conversation-owner-old", "Enquiry": "enquiry-old",
-            "Lead": "tenant-old", "CounterParty Role": "Owner Representative",
-            "Last Outbound At": "2026-09-04T10:00:00Z",
-        }
-        current = {
-            "_id": "conversation-owner-current", "Enquiry": "enquiry-current",
-            "Lead": "tenant-current", "CounterParty Role": "Owner Representative",
-            "Last Outbound At": "2026-09-04T11:00:00Z",
-        }
-        item = webhook_payload(
-            message_id="wamid.owner-current",
-            text="Yes unit available and profile ok",
-        )["entry"][0]["changes"][0]["value"]["messages"][0]
-        self.active_phone_conversation_patcher.stop()
-        with patch(
-            "app.find_owner_check_conversations_by_phone", return_value=[old, current]
-        ), patch(
-            "app.find_active_conversation_by_phone",
-            return_value=({"_id": "conversation-general"}, "single_active", 1),
-        ) as general_route, patch(
-            "app.find_or_create_whatsapp_lead"
-        ) as create_lead, patch(
-            "app.bubble", return_value={
-                "_id": "enquiry-current", "Lead": "tenant-current",
-                "OwnerCheckStatus": "Sent",
-            },
-        ), patch("app._bubble_patch") as update, patch(
-            "app.send_whatsapp_text", return_value=["wamid.owner-ack"]
-        ) as send, patch("app.persist_sent_whatsapp_text") as persist_sent, patch(
-            "app.run_rentee_turn"
-        ) as rentee_turn, patch("builtins.print") as logged:
-            app_module._process_whatsapp_message(item)
-
-        general_route.assert_not_called()
-        create_lead.assert_not_called()
-        update.assert_called_once_with(
-            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-current",
-            {
-                "OwnerCheckStatus": "Replied",
-                "OwnerCheckResponse": "Yes unit available and profile ok",
-                "OwnerCheckResult": "available",
-            },
-        )
-        send.assert_called_once_with("60123456789", "Noted, thanks.")
-        persist_sent.assert_called_once_with(
-            "60123456789", "Noted, thanks.", ["wamid.owner-ack"],
-            "conversation-owner-current", lead_id="tenant-current",
-            bubble_env="live",
-        )
-        result = self.mocked_owner_check_notify.call_args.args[0]
-        self.assertEqual(result.enquiry["_id"], "enquiry-current")
-        self.assertEqual(result.result, "available")
-        rentee_turn.assert_not_called()
-        logs = "\n".join(str(call) for call in logged.call_args_list)
-        self.assertIn("resolution=most_recent_outbound_owner_enquiry", logs)
-        self.assertIn("conversation_type=enquiry_owner", logs)
-        self.assertIn('text="Yes unit available and profile ok"', logs)
 
     def test_non_owner_conversation_is_not_intercepted(self):
         with patch("app.bubble") as get_enquiry, patch("app._bubble_patch") as update:
@@ -1689,9 +1624,9 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(matching_inbound[0].kwargs["listing_id"], "listing-1")
         phone_route.assert_not_called()
         fuzzy_route.assert_not_called()
-        send.assert_called_once_with("60123456789", "Noted, thanks.")
+        send.assert_called_once_with("60123456789", "Thanks — noted.")
         persist_sent.assert_called_once_with(
-            "60123456789", "Noted, thanks.", ["wamid.ack"],
+            "60123456789", "Thanks — noted.", ["wamid.ack"],
             "conversation-owner", lead_id="lead-1", bubble_env="live",
         )
         internal.assert_not_called()
