@@ -3423,7 +3423,30 @@ def build_folio_url(folio_id):
     return f"https://www.rentee.asia/folio3/{folio_id}"
 
 
-def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
+def _format_listing_price(listing, transaction_type=None):
+    """Select and format a listing price without mixing sale and rent units."""
+    active_modes = _transaction_modes(transaction_type or [])
+    listing_modes = _transaction_modes(listing.get("TransactionType") or [])
+    modes = active_modes or listing_modes
+    rent = _as_number(listing.get("priceRent"))
+    sale = _as_number(listing.get("priceSale"))
+
+    if modes == {"buy"}:
+        choices = ((sale, ""), (rent, "/month"))
+    elif modes == {"rent"}:
+        choices = ((rent, "/month"), (sale, ""))
+    else:
+        choices = ((rent, "/month"), (sale, ""))
+
+    for price, suffix in choices:
+        if price is not None:
+            return f"RM{price:,.0f}{suffix}"
+    return None
+
+
+def _whatsapp_recommendation_sections(
+    listings, folio_id, top_count=3, transaction_type=None
+):
     shown = listings[:max(1, min(top_count, MAX_WHATSAPP_RECOMMENDATION_IMAGES))]
     total = len(listings)
     property_word = "property" if total == 1 else "properties"
@@ -3435,11 +3458,7 @@ def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
     cards = []
     for index, listing in enumerate(shown, start=1):
         name = listing.get("property_name") or listing.get("condo_name") or f"Property {index}"
-        rent = _as_number(listing.get("priceRent"))
-        sale = _as_number(listing.get("priceSale"))
-        price_label = f"RM{rent:,.0f}/month" if rent is not None else None
-        if price_label is None and sale is not None:
-            price_label = f"RM{sale:,.0f}"
+        price_label = _format_listing_price(listing, transaction_type)
         beds = _as_number(listing.get("beds"))
         bed_label = f"{beds:g} bed" if beds is not None else None
         details = ", ".join(value for value in (price_label, bed_label) if value)
@@ -3459,7 +3478,8 @@ def _whatsapp_recommendation_sections(listings, folio_id, top_count=3):
 
 
 def build_whatsapp_recommendation_summary(
-    folio_id, bubble_env="live", top_count=3, listings=None
+    folio_id, bubble_env="live", top_count=3, listings=None,
+    transaction_type=None,
 ):
     """Render a compact, grounded subset while leaving the Folio as the full UI."""
     if listings is None:
@@ -3468,15 +3488,17 @@ def build_whatsapp_recommendation_summary(
     if not listings:
         return None
     intro, cards, footer, _shown = _whatsapp_recommendation_sections(
-        listings, folio_id, top_count
+        listings, folio_id, top_count, transaction_type
     )
     return "\n\n".join([intro, *cards, footer])
 
 
-def send_whatsapp_recommendation_batch(to_phone, folio_id, listings, top_count=3):
+def send_whatsapp_recommendation_batch(
+    to_phone, folio_id, listings, top_count=3, transaction_type=None
+):
     """Interleave each ranked Listing's own image and grounded recommendation text."""
     intro, cards, footer, shown = _whatsapp_recommendation_sections(
-        listings, folio_id, top_count
+        listings, folio_id, top_count, transaction_type
     )
     deliveries = []
 
@@ -4201,7 +4223,8 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         })
         current_run_listings.append(item)
     recommendation_summary = build_whatsapp_recommendation_summary(
-        folio_id, bubble_env, listings=current_run_listings
+        folio_id, bubble_env, listings=current_run_listings,
+        transaction_type=lead.get("TransactionType"),
     )
     if recommendation_summary:
         customer_response = (
@@ -6459,7 +6482,8 @@ def _process_whatsapp_message(message):
             if isinstance(recommendation_run, list):
                 recommendation_listings = recommendation_run
                 recommendation_summary = build_whatsapp_recommendation_summary(
-                    folio_id, "live", listings=recommendation_listings
+                    folio_id, "live", listings=recommendation_listings,
+                    transaction_type=lead.get("TransactionType"),
                 )
                 if recommendation_summary:
                     answer = recommendation_summary
@@ -6495,7 +6519,8 @@ def _process_whatsapp_message(message):
             _stop_whatsapp_typing(typing_keepalive)
             if recommendation_listings:
                 outbound_deliveries = send_whatsapp_recommendation_batch(
-                    phone, folio_id, recommendation_listings
+                    phone, folio_id, recommendation_listings,
+                    transaction_type=lead.get("TransactionType"),
                 )
                 if isinstance(outbound_deliveries, list) and outbound_deliveries:
                     persist_recommendation_whatsapp_ids(

@@ -3561,6 +3561,32 @@ class WhatsAppTests(unittest.TestCase):
             self.assertNotIn(f"listing-internal-{index}", result)
             self.assertNotIn(f"condo-internal-{index}", result)
 
+    def test_recommendation_price_formats_rental_listing_per_month(self):
+        listing = {"priceRent": 15000, "TransactionType": ["Rent/Let"]}
+        self.assertEqual(
+            app_module._format_listing_price(listing), "RM15,000/month"
+        )
+
+    def test_recommendation_price_formats_sale_listing_without_month(self):
+        listing = {"priceSale": 4600000, "TransactionType": ["Buy/Sell"]}
+        self.assertEqual(
+            app_module._format_listing_price(listing), "RM4,600,000"
+        )
+
+    def test_buy_search_prefers_sale_price_when_both_prices_exist(self):
+        listing = {"priceRent": 15000, "priceSale": 4600000}
+        self.assertEqual(
+            app_module._format_listing_price(listing, ["Buy/Sell"]),
+            "RM4,600,000",
+        )
+
+    def test_rent_search_prefers_rent_price_when_both_prices_exist(self):
+        listing = {"priceRent": 15000, "priceSale": 4600000}
+        self.assertEqual(
+            app_module._format_listing_price(listing, ["Rent/Let"]),
+            "RM15,000/month",
+        )
+
     @patch("app.get_current_recommendations", return_value=json.dumps({
         "current_recommendations": []
     }))
@@ -3610,9 +3636,13 @@ class WhatsAppTests(unittest.TestCase):
         mocked_folio.assert_called_once_with("lead-1", "live")
         mocked_current.assert_not_called()
         mocked_summary.assert_called_once_with(
-            "folio-active", "live", listings=listings
+            "folio-active", "live", listings=listings,
+            transaction_type=lead.get("TransactionType"),
         )
-        mocked_batch.assert_called_once_with("60123456789", "folio-active", listings)
+        mocked_batch.assert_called_once_with(
+            "60123456789", "folio-active", listings,
+            transaction_type=lead.get("TransactionType"),
+        )
         mocked_send.assert_not_called()
         mocked_save.assert_called_once_with(
             "bubble-message-current", mocked_summary.return_value, "resp-1", "live"
@@ -3662,7 +3692,10 @@ class WhatsAppTests(unittest.TestCase):
         self.assertIn(
             "https://www.rentee.asia/folio3/folio-current", saved_text
         )
-        batch.assert_called_once_with("60123456789", "folio-current", current)
+        batch.assert_called_once_with(
+            "60123456789", "folio-current", current,
+            transaction_type=None,
+        )
         send.assert_not_called()
 
 
