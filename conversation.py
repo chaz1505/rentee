@@ -77,8 +77,6 @@ def validate_conversation_context(
             conversation.get("CounterParty Role") or ""
         ).strip() or None,
         "lead_id": conversation_lead_id,
-        "conversation_lead_id": conversation_lead_id,
-        "expected_lead_id": expected_lead_id,
         "enquiry_id": enquiry_id,
         "enquiry_lead_id": None,
         "listing_id": relationship_id(conversation.get("Listing")),
