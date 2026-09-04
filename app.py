@@ -1527,36 +1527,14 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
     return lead
 
 
-def prepare_owner_check(
-    lead, bubble_env="live", authoritative_enquiry_id=None,
-    authoritative_listing_id=None, source_conversation_id=None,
-):
+def prepare_owner_check(lead, bubble_env="live"):
     """Best-effort durable pending state; this function sends no messages."""
     lead_id = str((lead or {}).get("_id") or "").strip()
-    fallback_enquiry_id = str(
+    enquiry_id = str(
         (lead or {}).get("ActiveForwardedEnquiry") or ""
     ).strip()
-    authoritative_enquiry_id = str(authoritative_enquiry_id or "").strip()
-    authoritative_listing_id = str(authoritative_listing_id or "").strip()
-    source_conversation_id = str(source_conversation_id or "").strip()
-    enquiry_id = authoritative_enquiry_id or fallback_enquiry_id
-    resolution = (
-        "current_conversation" if authoritative_enquiry_id
-        else "lead_active_forwarded_enquiry"
-    )
     if not lead_id:
         return None
-    if (
-        authoritative_enquiry_id and fallback_enquiry_id
-        and authoritative_enquiry_id != fallback_enquiry_id
-    ):
-        print(
-            "[OWNER CHECK] action=failed "
-            "reason=enquiry_context_mismatch "
-            f"current_enquiry_id={authoritative_enquiry_id} "
-            f"resolved_enquiry_id={fallback_enquiry_id} "
-            "resolution=current_conversation_override", flush=True,
-        )
     if not enquiry_id:
         print(
             f"[OWNER CHECK] lead_id={lead_id} unresolved "
@@ -1573,14 +1551,6 @@ def prepare_owner_check(
             )
             return None
         listing_id = str(enquiry.get("Listing") or "").strip()
-        if authoritative_listing_id and listing_id != authoritative_listing_id:
-            print(
-                f"[OWNER CHECK] enquiry_id={enquiry_id} action=failed "
-                "reason=listing_context_mismatch "
-                f"current_listing_id={authoritative_listing_id} "
-                f"resolved_listing_id={listing_id or 'none'}", flush=True,
-            )
-            return None
         if not listing_id:
             print(
                 f"[OWNER CHECK] enquiry_id={enquiry_id} "
@@ -1647,9 +1617,7 @@ def prepare_owner_check(
         enquiry.update(payload)
         print(
             f"[OWNER CHECK] enquiry_id={enquiry_id} "
-            f"resolved_via={resolution} "
-            f"conversation_id={source_conversation_id or 'none'} "
-            "action=pending_created",
+            "resolved_via=lead_active_forwarded_enquiry action=pending_created",
             flush=True,
         )
         return enquiry
@@ -6923,20 +6891,7 @@ def _process_whatsapp_message(message):
                    if location_listing_id else {}),
             )
             if _requests_owner_check(answer):
-                current_enquiry_id = conversation_store.relationship_id(
-                    (lead_conversation or {}).get("Enquiry")
-                )
-                current_listing_id = conversation_store.relationship_id(
-                    (lead_conversation or {}).get("Listing")
-                ) or reply_listing_id
-                owner_check = prepare_owner_check(
-                    lead, "live",
-                    authoritative_enquiry_id=current_enquiry_id,
-                    authoritative_listing_id=current_listing_id,
-                    source_conversation_id=conversation_store.relationship_id(
-                        (lead_conversation or {}).get("_id")
-                    ),
-                )
+                owner_check = prepare_owner_check(lead, "live")
                 if owner_check:
                     send_pending_owner_check(lead, owner_check, "live")
             recommendation_listings = []

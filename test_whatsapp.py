@@ -368,53 +368,6 @@ class OwnerCheckTests(unittest.TestCase):
             "listing_id=listing-1 raw_owner_contact_present=true", logs
         )
         self.assertNotIn("+60 11-555 1234", logs)
-        self.assertIn("resolved_via=lead_active_forwarded_enquiry", logs)
-
-    def test_current_conversation_enquiry_wins_over_stale_lead_enquiry(self):
-        enquiry = self.enquiry(_id="enquiry-current")
-        lead = {
-            "_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-stale",
-        }
-        with patch("app.bubble", side_effect=[
-                 enquiry, {"ownerContact": "+60 11-555 1234"},
-             ]) as get, patch("app._bubble_patch") as update, \
-             patch("builtins.print") as logged:
-            result = app_module.prepare_owner_check(
-                lead,
-                authoritative_enquiry_id="enquiry-current",
-                authoritative_listing_id="listing-1",
-            )
-
-        self.assertEqual(result["_id"], "enquiry-current")
-        self.assertTrue(get.call_args_list[0].args[0].endswith(
-            "/enquiry/enquiry-current"
-        ))
-        update.assert_called_once_with(
-            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-current",
-            {"OwnerCheckStatus": "Pending", "OwnerCheckPhone": "60115551234"},
-        )
-        logs = " ".join(str(call) for call in logged.call_args_list)
-        self.assertIn("action=failed", logs)
-        self.assertIn("reason=enquiry_context_mismatch", logs)
-        self.assertIn("resolved_via=current_conversation", logs)
-
-    def test_current_listing_mismatch_is_rejected(self):
-        lead = {
-            "_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-stale",
-        }
-        with patch("app.bubble", return_value=self.enquiry()), \
-             patch("app._bubble_patch") as update, \
-             patch("builtins.print") as logged:
-            result = app_module.prepare_owner_check(
-                lead,
-                authoritative_enquiry_id="enquiry-1",
-                authoritative_listing_id="listing-other",
-            )
-
-        self.assertIsNone(result)
-        update.assert_not_called()
-        logs = " ".join(str(call) for call in logged.call_args_list)
-        self.assertIn("reason=listing_context_mismatch", logs)
 
     def test_owner_contact_is_read_from_enquiry_listing_not_enquiry_id(self):
         enquiry = self.enquiry(_id="enquiry-A", Listing="listing-B")
@@ -832,10 +785,7 @@ class OwnerCheckTests(unittest.TestCase):
     @patch("app.find_or_create_lead_folio", return_value=("folio-1", False))
     @patch("app.capture_linked_tenant_profile", return_value={"_id": "lead-linked"})
     @patch("app.find_existing_general_conversation_by_phone",
-           return_value={
-               "_id": "conversation-general", "Enquiry": "enquiry-current",
-               "Listing": "listing-current",
-           })
+           return_value={"_id": "conversation-general"})
     @patch("app.find_reply_context", return_value=None)
     @patch("app.send_whatsapp_typing_indicator")
     @patch("app.find_internal_user", return_value=None)
@@ -847,12 +797,7 @@ class OwnerCheckTests(unittest.TestCase):
         prepare.return_value = prepared
         item = webhook_payload(text="Complete profile")["entry"][0]["changes"][0]["value"]["messages"][0]
         app_module._process_whatsapp_message(item)
-        prepare.assert_called_once_with(
-            {"_id": "lead-linked"}, "live",
-            authoritative_enquiry_id="enquiry-current",
-            authoritative_listing_id="listing-current",
-            source_conversation_id="conversation-general",
-        )
+        prepare.assert_called_once_with({"_id": "lead-linked"}, "live")
         owner_send.assert_called_once_with(
             {"_id": "lead-linked"}, prepared, "live"
         )
