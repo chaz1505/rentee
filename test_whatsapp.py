@@ -370,7 +370,7 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertNotIn("+60 11-555 1234", logs)
         self.assertIn("resolved_via=lead_active_forwarded_enquiry", logs)
 
-    def test_current_conversation_enquiry_wins_over_stale_lead_enquiry(self):
+    def test_validated_current_conversation_enquiry_is_used_without_override(self):
         enquiry = self.enquiry(_id="enquiry-current")
         lead = {
             "_id": "lead-1", "ActiveForwardedEnquiry": "enquiry-stale",
@@ -394,9 +394,8 @@ class OwnerCheckTests(unittest.TestCase):
             {"OwnerCheckStatus": "Pending", "OwnerCheckPhone": "60115551234"},
         )
         logs = " ".join(str(call) for call in logged.call_args_list)
-        self.assertIn("action=failed", logs)
-        self.assertIn("reason=enquiry_context_mismatch", logs)
         self.assertIn("resolved_via=current_conversation", logs)
+        self.assertNotIn("current_conversation_override", logs)
 
     def test_current_listing_mismatch_is_rejected(self):
         lead = {
@@ -1581,7 +1580,8 @@ class WhatsAppTests(unittest.TestCase):
             "CounterParty Phone": "60123456789", "Status": "Active",
             "Enquiry": "enquiry-1", "Lead": "lead-1", "Listing": "listing-1",
         }
-        with patch("app._bubble_records", return_value=iter([conversation])) as records:
+        with patch("app._bubble_records", return_value=iter([conversation])) as records, \
+             patch("app.bubble", return_value={"Lead": "lead-1"}):
             result, resolution, count = app_module.find_active_conversation_by_phone(
                 "+60 12-345 6789", "It is available"
             )
@@ -1604,12 +1604,35 @@ class WhatsAppTests(unittest.TestCase):
              "CounterParty Phone": "60123456789", "Status": "Active",
              "Enquiry": "enquiry-2", "Subject": "The Loft"},
         ]
-        with patch("app._bubble_records", return_value=iter(candidates)):
+        with patch("app._bubble_records", return_value=iter(candidates)), \
+             patch("app.bubble", side_effect=lambda url: {
+                 "Lead": "lead-1", "_id": url.rsplit("/", 1)[-1],
+             }):
             result, resolution, count = app_module.find_active_conversation_by_phone(
                 "60123456789", "Yes, it is available"
             )
         self.assertIsNone(result)
         self.assertEqual((resolution, count), ("ambiguous", 2))
+
+    def test_phone_routing_excludes_internally_inconsistent_enquiry(self):
+        self.active_phone_conversation_patcher.stop()
+        stale = {
+            "_id": "conversation-stale", "CounterParty Phone": "60123456789",
+            "Status": "Active", "Enquiry": "enquiry-1", "Lead": "lead-1",
+            "CounterParty Role": "Lead",
+        }
+        with patch("app._bubble_records", return_value=iter([stale])), \
+             patch("app.bubble", return_value={"Lead": "lead-2"}), \
+             patch("builtins.print") as logged:
+            result, resolution, count = app_module.find_active_conversation_by_phone(
+                "60123456789"
+            )
+        self.assertIsNone(result)
+        self.assertEqual((resolution, count), ("none", 0))
+        self.assertIn(
+            "reason=enquiry_lead_mismatch",
+            " ".join(str(call) for call in logged.call_args_list),
+        )
 
     def test_three_active_phone_conversations_are_ambiguous(self):
         self.active_phone_conversation_patcher.stop()
@@ -1618,7 +1641,10 @@ class WhatsAppTests(unittest.TestCase):
              "Status": "Active", "Enquiry": f"enquiry-{number}"}
             for number in (1, 2, 3)
         ]
-        with patch("app._bubble_records", return_value=iter(candidates)):
+        with patch("app._bubble_records", return_value=iter(candidates)), \
+             patch("app.bubble", side_effect=lambda url: {
+                 "Lead": "lead-1", "_id": url.rsplit("/", 1)[-1],
+             }):
             result, resolution, count = app_module.find_active_conversation_by_phone(
                 "60123456789"
             )
@@ -1640,7 +1666,10 @@ class WhatsAppTests(unittest.TestCase):
              "CounterParty Phone": "60123456789", "Status": "Active",
              "Enquiry": "enquiry-2", "Created Date": "2026-01-01T10:00:00Z"},
         ]
-        with patch("app._bubble_records", return_value=iter(candidates)):
+        with patch("app._bubble_records", return_value=iter(candidates)), \
+             patch("app.bubble", side_effect=lambda url: {
+                 "Lead": "lead-1", "_id": url.rsplit("/", 1)[-1],
+             }):
             result, resolution, count = app_module.find_active_conversation_by_phone(
                 "60123456789", "okay"
             )

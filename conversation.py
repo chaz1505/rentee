@@ -1,4 +1,12 @@
-"""Durable Bubble Conversation primitives for incremental WhatsApp migration."""
+"""Durable Bubble Conversation primitives.
+
+User is neutral person identity; Lead is the tenant/customer business role;
+Conversation is one logical communication thread; Enquiry is one property
+business interaction; Listing is the property.  A User may have multiple
+Conversations, a Lead multiple Enquiries, and an Enquiry separate Lead-side and
+owner-side Conversations.  Enquiry-specific Conversations never jump Enquiries
+and must remain consistent with their Enquiry's Lead.
+"""
 
 import datetime
 import json
@@ -25,6 +33,126 @@ def get_bubble_base_url(bubble_env="live"):
     if bubble_env == "development":
         return "https://www.rentee.asia/version-test/api/1.1"
     return "https://www.rentee.asia/api/1.1"
+
+
+def classify_conversation(conversation):
+    """Classify one logical thread without inferring a person's business role."""
+    conversation = conversation or {}
+    enquiry_id = relationship_id(conversation.get("Enquiry"))
+    role = str(conversation.get("CounterParty Role") or "").strip()
+    if not enquiry_id:
+        return "principal" if role == "Principal" else "general"
+    if role == "Owner Representative":
+        return "enquiry_owner"
+    if role == "Lead Representative":
+        return "enquiry_lead_representative"
+    if role in {"", "Lead"}:
+        return "enquiry_lead"
+    return "unknown"
+
+
+def validate_conversation_context(
+    conversation, expected_lead_id=None, expected_user_id=None,
+    expected_phone=None, bubble_env="live", enquiry=None,
+):
+    """Return a read-only integrity result for one Conversation candidate."""
+    conversation = conversation or {}
+    conversation_id = relationship_id(conversation.get("_id"))
+    conversation_type = classify_conversation(conversation)
+    status = str(conversation.get("Status") or "").strip()
+    conversation_lead_id = relationship_id(conversation.get("Lead"))
+    enquiry_id = relationship_id(conversation.get("Enquiry"))
+    visible_user_id = relationship_id(conversation.get("Counterparty User"))
+    visible_phone = normalize_phone(conversation.get("CounterParty Phone"))
+    expected_lead_id = relationship_id(expected_lead_id)
+    expected_user_id = relationship_id(expected_user_id)
+    expected_phone = normalize_phone(expected_phone)
+    result = {
+        "valid": False,
+        "reason": None,
+        "type": conversation_type,
+        "conversation_id": conversation_id,
+        "status": status,
+        "counterparty_role": str(
+            conversation.get("CounterParty Role") or ""
+        ).strip() or None,
+        "lead_id": conversation_lead_id,
+        "enquiry_id": enquiry_id,
+        "enquiry_lead_id": None,
+        "listing_id": relationship_id(conversation.get("Listing")),
+    }
+
+    reason = None
+    if not conversation_id:
+        reason = "missing_conversation_id"
+    elif status and status != "Active":
+        reason = "inactive"
+    elif expected_phone and visible_phone and expected_phone != visible_phone:
+        reason = "phone_mismatch"
+    elif expected_user_id and visible_user_id and expected_user_id != visible_user_id:
+        reason = "user_mismatch"
+    elif expected_lead_id and conversation_type != "enquiry_owner" \
+            and conversation_lead_id and expected_lead_id != conversation_lead_id:
+        reason = "expected_lead_mismatch"
+
+    if not reason and enquiry_id:
+        try:
+            if enquiry is None:
+                enquiry = _get(
+                    get_bubble_base_url(bubble_env), "enquiry", enquiry_id
+                )
+        except Exception:
+            reason = "enquiry_lookup_failed"
+        if not reason:
+            enquiry_lead_id = relationship_id((enquiry or {}).get("Lead"))
+            enquiry_listing_id = relationship_id((enquiry or {}).get("Listing"))
+            result["enquiry_lead_id"] = enquiry_lead_id
+            result["listing_id"] = (
+                enquiry_listing_id or result["listing_id"]
+            )
+            if (
+                conversation_lead_id and enquiry_lead_id
+                and conversation_lead_id != enquiry_lead_id
+            ):
+                reason = "enquiry_lead_mismatch"
+            elif (
+                expected_lead_id and conversation_type != "enquiry_owner"
+                and enquiry_lead_id and expected_lead_id != enquiry_lead_id
+            ):
+                reason = "expected_lead_mismatch"
+            elif (
+                relationship_id(conversation.get("Listing"))
+                and enquiry_listing_id
+                and relationship_id(conversation.get("Listing"))
+                != enquiry_listing_id
+            ):
+                reason = "enquiry_listing_mismatch"
+
+    result["reason"] = reason
+    result["valid"] = reason is None
+    if result["valid"]:
+        print(
+            "[CONVERSATION VALIDATION] "
+            f"conversation_id={conversation_id} type={conversation_type} "
+            f"result=valid enquiry_id={enquiry_id or 'none'} "
+            f"lead_id={conversation_lead_id or result['enquiry_lead_id'] or 'none'}",
+            flush=True,
+        )
+    else:
+        print(
+            "[CONVERSATION VALIDATION] "
+            f"conversation_id={conversation_id or 'none'} result=rejected "
+            f"reason={reason} conversation_lead_id={conversation_lead_id or 'none'} "
+            f"enquiry_lead_id={result['enquiry_lead_id'] or 'none'} "
+            f"expected_lead_id={expected_lead_id or 'none'}",
+            flush=True,
+        )
+    return result
+
+
+def inspect_conversation_context(conversation, bubble_env="live"):
+    """Read-only diagnostic view of Conversation/Enquiry relationships."""
+    return validate_conversation_context(conversation, bubble_env=bubble_env)
 
 
 def _headers():
@@ -364,6 +492,13 @@ def find_or_create_conversation(
         )
     else:
         existing = None
+    if existing:
+        integrity = validate_conversation_context(
+            existing, expected_lead_id=lead_id, bubble_env=bubble_env,
+            enquiry=enquiry if enquiry_id else None,
+        )
+        if not integrity["valid"]:
+            existing = None
     if existing:
         missing = {}
         if lead_id and not relationship_id(existing.get("Lead")):

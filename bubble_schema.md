@@ -9,6 +9,18 @@ Do not silently normalize or invent Bubble field keys.
 
 When future Bubble schema changes are confirmed, update this file in the same code change where practical.
 
+## Relationship model
+
+- User = person / neutral identity. A User does not imply a Lead.
+- Lead = tenant/customer business role.
+- Conversation = one logical communication thread.
+- Enquiry = one specific property business interaction.
+- Listing = property.
+- A User may have multiple Conversations, a Lead may have multiple Enquiries,
+  and an Enquiry may have separate Lead-side and owner-side Conversations.
+- Every enquiry-specific Conversation must remain consistent with its Enquiry
+  and must not be reassigned to a different Enquiry.
+
 ## Conversation
 
 Purpose:
