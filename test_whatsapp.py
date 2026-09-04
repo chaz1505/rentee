@@ -2412,6 +2412,48 @@ class WhatsAppTests(unittest.TestCase):
         mocked_turn.assert_called_once()
         mocked_send.assert_called_once_with("60123456789", "Normal reply")
 
+    def test_new_unowned_lead_bootstraps_general_conversation_for_any_message(self):
+        self.general_conversation_patcher.stop()
+        self.existing_general_patcher.stop()
+        for index, text in enumerate(("hi", "4 bed in Bangsar"), start=1):
+            with self.subTest(text=text), \
+                 patch("app.find_existing_general_conversation_by_phone", return_value=None), \
+                 patch("app.find_or_create_whatsapp_lead", return_value=(
+                     {"_id": f"lead-{index}", "searchBriefJSON": ""}, True,
+                 )) as lead, patch(
+                     "app.conversation_store.find_or_create_conversation",
+                     return_value=({
+                         "_id": f"conversation-{index}", "Lead": f"lead-{index}",
+                         "Counterparty User": "user-whatsapp",
+                     }, True),
+                 ) as conversation, patch(
+                     "app.find_or_create_lead_folio", return_value=(f"folio-{index}", True)
+                 ), patch("app.find_latest_ai_message", return_value=None), \
+                 patch("app.create_whatsapp_ai_message", return_value=f"outbound-{index}"), \
+                 patch("app.run_rentee_turn", return_value=("Welcome", f"resp-{index}", False)), \
+                 patch("app.save_whatsapp_ai_message"), \
+                 patch("app.send_whatsapp_text", return_value=[f"wamid.out-{index}"]), \
+                 patch("builtins.print") as logged:
+                item = webhook_payload(
+                    message_id=f"wamid.new-{index}", text=text
+                )["entry"][0]["changes"][0]["value"]["messages"][0]
+                app_module._process_whatsapp_message(item)
+
+            lead.assert_called_once()
+            conversation.assert_called_once_with(
+                None, "60123456789", counterparty_user_id="user-whatsapp",
+                counterparty_role="Lead", rentee_role="Lead Advisor",
+                bubble_env="live", side="general", lead_id=f"lead-{index}",
+            )
+            matching = [
+                call for call in self.mocked_inbound.call_args_list
+                if call.kwargs.get("conversation_id") == f"conversation-{index}"
+            ]
+            self.assertEqual(len(matching), 1)
+            logs = "\n".join(str(call) for call in logged.call_args_list)
+            self.assertIn("resolution=general_created", logs)
+            self.assertNotIn("missing_principal", logs)
+
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-profile")
     @patch("app.find_latest_ai_message", return_value=None)

@@ -11,6 +11,46 @@ import conversation
 
 
 class ConversationTests(unittest.TestCase):
+    def test_creates_general_conversation_without_principal(self):
+        with patch("conversation._create", return_value="conversation-general") as create:
+            result = conversation.create_conversation(
+                None, "+60 12-345 6789", counterparty_user_id="user-1",
+                lead_id="lead-1", counterparty_role="Lead",
+                rentee_role="Lead Advisor", side="general",
+            )
+        self.assertEqual(result["_id"], "conversation-general")
+        self.assertEqual(create.call_args.args[2], {
+            "CounterParty Phone": "60123456789",
+            "Status": "Active",
+            "Counterparty User": "user-1",
+            "Lead": "lead-1",
+            "CounterParty Role": "Lead",
+            "Rentee Role": "Lead Advisor",
+        })
+        self.assertNotIn("Principal", create.call_args.args[2])
+
+    def test_unassigned_general_conversation_is_reused(self):
+        existing = {
+            "_id": "conversation-general", "CounterParty Phone": "60123456789",
+            "Status": "Active", "Counterparty User": "user-1", "Lead": "lead-1",
+        }
+        with patch(
+            "conversation.find_active_general_conversation", return_value=existing
+        ), patch("conversation.create_conversation") as create:
+            result, created = conversation.find_or_create_conversation(
+                None, "60123456789", counterparty_user_id="user-1",
+                lead_id="lead-1", side="general",
+            )
+        self.assertEqual((result, created), (existing, False))
+        create.assert_not_called()
+
+    def test_enquiry_conversation_still_requires_principal(self):
+        with self.assertRaisesRegex(ValueError, "requires Principal"):
+            conversation.create_conversation(
+                None, "60123456789", enquiry_id="enquiry-1",
+                counterparty_user_id="user-1", lead_id="lead-1",
+            )
+
     def test_finds_active_enquiry_conversation_by_counterparty_phone(self):
         matching = {
             "_id": "conversation-owner", "Enquiry": "enquiry-1",

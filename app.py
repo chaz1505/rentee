@@ -2449,19 +2449,18 @@ def build_prefilled_search_confirmation(lead, bubble_env="live"):
 def find_general_conversation(
     principal_id, phone, lead_id=None, counterparty_user_id=None,
     counterparty_role=None, rentee_role=None, bubble_env="live",
+    return_created=False,
 ):
     """Find/create the safe non-enquiry Conversation for one counterparty."""
     principal_id = conversation_store.relationship_id(principal_id)
-    if not principal_id:
-        return None
-    conversation, _created = conversation_store.find_or_create_conversation(
+    conversation, created = conversation_store.find_or_create_conversation(
         principal_id, phone,
         counterparty_user_id=counterparty_user_id,
         counterparty_role=counterparty_role,
         rentee_role=rentee_role,
         bubble_env=bubble_env, side="general", lead_id=lead_id,
     )
-    return conversation
+    return (conversation, created) if return_created else conversation
 
 
 def find_existing_general_conversation_by_phone(phone, bubble_env="live"):
@@ -2476,7 +2475,6 @@ def find_existing_general_conversation_by_phone(phone, bubble_env="live"):
             get_bubble_base_url(bubble_env), "conversation", constraints
         )
         if not conversation_store.relationship_id(item.get("Enquiry"))
-        and conversation_store.relationship_id(item.get("Principal"))
         and item.get("_id")
     ]
     return candidates[0] if len(candidates) == 1 else None
@@ -6450,6 +6448,7 @@ def _process_whatsapp_message(message):
             lead_id = lead["_id"]
             lead_conversation = routed_conversation
             lead_conversation_id = routed_conversation_id
+            general_conversation_created = False
             try:
                 if not lead_conversation_id:
                     lead_conversation = find_forwarded_lead_conversation(
@@ -6460,15 +6459,24 @@ def _process_whatsapp_message(message):
                         lead.get("owner")
                     )
                     if principal_id:
-                        lead_conversation = find_general_conversation(
+                        lead_conversation, general_conversation_created = find_general_conversation(
                             principal_id, phone, lead_id=lead_id,
+                            counterparty_user_id=bubble_user_id,
                             counterparty_role="Lead", rentee_role="Lead Advisor",
-                            bubble_env="live",
+                            bubble_env="live", return_created=True,
                         )
                     else:
                         lead_conversation = find_existing_general_conversation_by_phone(
                             phone, "live"
                         )
+                        if not lead_conversation:
+                            lead_conversation, general_conversation_created = find_general_conversation(
+                                None, phone, lead_id=lead_id,
+                                counterparty_user_id=bubble_user_id,
+                                counterparty_role="Lead",
+                                rentee_role="Lead Advisor", bubble_env="live",
+                                return_created=True,
+                            )
                 lead_conversation_id = conversation_store.relationship_id(
                     (lead_conversation or {}).get("_id")
                 )
@@ -6483,7 +6491,7 @@ def _process_whatsapp_message(message):
                     )
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
-                        f"resolution={'enquiry' if enquiry_id else 'general'} "
+                        f"resolution={'enquiry' if enquiry_id else ('general_created' if general_conversation_created else 'general')} "
                         f"conversation_id={lead_conversation_id}"
                         + (f" enquiry_id={enquiry_id}" if enquiry_id else ""),
                         flush=True,

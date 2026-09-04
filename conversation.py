@@ -175,6 +175,51 @@ def find_active_conversation(
     return selected
 
 
+def find_active_general_conversation(
+    counterparty_phone, lead_id=None, counterparty_user_id=None,
+    bubble_env="live", side=None,
+):
+    """Find an active non-enquiry Conversation for an unassigned Lead."""
+    phone = normalize_phone(counterparty_phone)
+    lead_id = relationship_id(lead_id)
+    counterparty_user_id = relationship_id(counterparty_user_id)
+    if not phone or (not lead_id and not counterparty_user_id):
+        return None
+    constraints = [
+        {"key": "CounterParty Phone", "constraint_type": "equals", "value": phone},
+        {"key": "Status", "constraint_type": "equals", "value": "Active"},
+    ]
+    matches = []
+    for item in _records(
+        get_bubble_base_url(bubble_env), "conversation", constraints
+    ):
+        if not item.get("_id") or relationship_id(item.get("Enquiry")):
+            continue
+        visible_phone = normalize_phone(item.get("CounterParty Phone"))
+        visible_status = str(item.get("Status") or "").strip()
+        visible_lead = relationship_id(item.get("Lead"))
+        visible_user = relationship_id(item.get("Counterparty User"))
+        if visible_phone and visible_phone != phone:
+            continue
+        if visible_status and visible_status != "Active":
+            continue
+        if lead_id and visible_lead and visible_lead != lead_id:
+            continue
+        if counterparty_user_id and visible_user and visible_user != counterparty_user_id:
+            continue
+        matches.append(item)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: str(item.get("_id")))
+    selected = matches[0]
+    print(
+        f"[CONVERSATION] side={side or 'unspecified'} action=found "
+        f"type=general conversation_id={selected['_id']} "
+        f"lead_id={lead_id or 'none'}", flush=True,
+    )
+    return selected
+
+
 def find_active_conversations_by_enquiry_phone(
     enquiry_id, counterparty_phone, bubble_env="live",
 ):
@@ -219,18 +264,27 @@ def create_conversation(
     principal_id = relationship_id(principal_id)
     phone = normalize_phone(counterparty_phone)
     enquiry_id = relationship_id(enquiry_id)
-    if not principal_id or not phone:
-        raise ValueError("Conversation requires Principal and CounterParty Phone.")
+    lead_id = relationship_id(lead_id)
+    counterparty_user_id = relationship_id(counterparty_user_id)
+    if not phone:
+        raise ValueError("Conversation requires CounterParty Phone.")
+    if enquiry_id and not principal_id:
+        raise ValueError("Enquiry Conversation requires Principal.")
+    if not principal_id and not lead_id and not counterparty_user_id:
+        raise ValueError(
+            "General Conversation requires Principal, Lead, or Counterparty User."
+        )
     payload = {
-        "Principal": principal_id,
         "CounterParty Phone": phone,
         "Status": "Active",
     }
+    if principal_id:
+        payload["Principal"] = principal_id
     optional = {
-        "Counterparty User": relationship_id(counterparty_user_id),
+        "Counterparty User": counterparty_user_id,
         "Counterparty Name": str(counterparty_name or "").strip() or None,
         "Enquiry": enquiry_id,
-        "Lead": relationship_id(lead_id),
+        "Lead": lead_id,
         "Listing": relationship_id(listing_id),
         "CounterParty Role": str(counterparty_role or "").strip() or None,
         "Rentee Role": str(rentee_role or "").strip() or None,
@@ -248,8 +302,10 @@ def create_conversation(
     conversation = {"_id": conversation_id, **payload}
     print(
         f"[CONVERSATION] side={side or 'unspecified'} action=created "
+        f"type={'enquiry' if enquiry_id else 'general'} "
         f"conversation_id={conversation_id} "
-        f"principal_id={principal_id} enquiry_id={enquiry_id or 'none'}",
+        f"principal_id={principal_id or 'none'} "
+        f"lead_id={lead_id or 'none'} enquiry_id={enquiry_id or 'none'}",
         flush=True,
     )
     return conversation
@@ -271,9 +327,16 @@ def find_or_create_conversation(
         if enquiry_lead_id:
             lead_id = enquiry_lead_id
         listing_id = relationship_id(enquiry.get("Listing"))
-    existing = find_active_conversation(
-        principal_id, counterparty_phone, enquiry_id, bubble_env, side
-    )
+    if principal_id:
+        existing = find_active_conversation(
+            principal_id, counterparty_phone, enquiry_id, bubble_env, side
+        )
+    elif not enquiry_id:
+        existing = find_active_general_conversation(
+            counterparty_phone, lead_id, counterparty_user_id, bubble_env, side
+        )
+    else:
+        existing = None
     if existing:
         missing = {}
         if lead_id and not relationship_id(existing.get("Lead")):
