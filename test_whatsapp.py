@@ -1078,6 +1078,61 @@ class WhatsAppTests(unittest.TestCase):
             },
         )
 
+    def test_owner_check_detection_uses_enquiry_phone_when_routed_role_is_hidden(self):
+        conversation = {
+            "_id": "conversation-owner", "Enquiry": "enquiry-1",
+        }
+        with patch("app.bubble", return_value={
+            "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
+            "OwnerCheckPhone": "60123456789",
+        }):
+            detected = app_module.is_owner_check_conversation(
+                conversation, counterparty_phone="+60 12-345 6789"
+            )
+        self.assertTrue(detected)
+        self.assertEqual(
+            conversation["CounterParty Role"], "Owner Representative"
+        )
+
+    def test_normal_general_conversation_is_not_owner_check_context(self):
+        conversation = {
+            "_id": "conversation-general", "CounterParty Role": "Lead",
+            "Lead": "lead-1",
+        }
+        with patch("app.bubble") as get:
+            self.assertFalse(app_module.is_owner_check_conversation(conversation))
+        get.assert_not_called()
+
+    def test_reply_to_owner_conversation_dispatches_when_role_is_hidden(self):
+        conversation = {
+            "_id": "conversation-owner", "Enquiry": "enquiry-1",
+            "Lead": "tenant-lead-1", "Listing": "listing-1",
+        }
+        item = webhook_payload(
+            message_id="wamid.owner-hidden-role", text="Yes, available"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        item["context"] = {"id": "wamid.owner-outbound"}
+        enquiry = {
+            "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
+            "OwnerCheckPhone": "60123456789", "Lead": "tenant-lead-1",
+            "Listing": "listing-1",
+        }
+        with patch("app.find_reply_context", return_value={
+            "conversation": conversation, "listing_id": "listing-1",
+        }), patch("app.bubble", return_value=enquiry), \
+             patch("app._bubble_patch"), \
+             patch("app.send_whatsapp_text", return_value=["wamid.ack"]), \
+             patch("app.persist_sent_whatsapp_text"), \
+             patch("app.find_or_create_whatsapp_lead") as lead:
+            app_module._process_whatsapp_message(item)
+        lead.assert_not_called()
+        self.assertEqual(
+            conversation["CounterParty Role"], "Owner Representative"
+        )
+        outcome = self.mocked_owner_check_notify.call_args.args[0]
+        self.assertEqual(outcome.result, "available")
+        self.assertEqual(outcome.enquiry["_id"], "enquiry-1")
+
     def test_owner_check_interpretation_covers_positive_negative_and_unclear(self):
         available = app_module._interpret_owner_check_response(
             "Yes, available. Viewings after 5pm."
