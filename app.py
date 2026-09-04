@@ -3029,20 +3029,23 @@ def build_listing_bubble_constraints(requirements, condo_ids=None):
     modes = _transaction_modes(requirements.get("transaction_type"))
     budget_rent = requirements.get("budget_rent")
     budget_buy = requirements.get("budget_buy")
-    if modes == {"rent"}:
-        base_constraints.append({
-            "key": "priceRent", "constraint_type": "is_not_empty",
-        })
-        if budget_rent:
-            python_only_filters.append("budget")
-    elif modes == {"buy"}:
-        base_constraints.append({
-            "key": "priceSale", "constraint_type": "is_not_empty",
-        })
-        if budget_buy:
-            python_only_filters.append("budget")
-    elif modes:
-        python_only_filters.append("mixed_transaction_mode")
+    transaction_groups = [[]]
+    if modes:
+        transaction_groups = []
+        if "rent" in modes:
+            transaction_groups.append([
+                {"key": "TransactionType", "constraint_type": "contains",
+                 "value": RENT_TRANSACTION},
+                {"key": "priceRent", "constraint_type": "is_not_empty"},
+            ])
+        if "buy" in modes:
+            transaction_groups.append([
+                {"key": "TransactionType", "constraint_type": "contains",
+                 "value": BUY_TRANSACTION},
+                {"key": "priceSale", "constraint_type": "is_not_empty"},
+            ])
+    if (budget_rent and "rent" in modes) or (budget_buy and "buy" in modes):
+        python_only_filters.append("budget")
     if requirements.get("furnishing_preference"):
         python_only_filters.append("furnishing")
 
@@ -3057,17 +3060,21 @@ def build_listing_bubble_constraints(requirements, condo_ids=None):
     elif geo_ids:
         scope_field, scope_ids = "Geo", geo_ids
     queries = []
+    location_groups = [[]]
     if scope_ids:
-        queries = [
-            base_constraints + [{
+        location_groups = [
+            [{
                 "key": scope_field,
                 "constraint_type": "contains" if scope_field == "Geo" else "equals",
                 "value": scope_id,
             }]
             for scope_id in scope_ids
         ]
-    else:
-        queries = [base_constraints]
+    queries = [
+        base_constraints + transaction_group + location_group
+        for transaction_group in transaction_groups
+        for location_group in location_groups
+    ]
     return {
         "queries": queries,
         "scope_field": scope_field,
@@ -3113,6 +3120,17 @@ def get_plausible_listings(
         f"{sorted(_transaction_modes(requirements['transaction_type']))}",
         flush=True,
     )
+    print(
+        "[LISTING QUERY] transaction_values="
+        f"{bubble_transaction_values(requirements['transaction_type'])!r}",
+        flush=True,
+    )
+    modes = _transaction_modes(requirements["transaction_type"])
+    price_field = (
+        "priceSale" if modes == {"buy"} else
+        "priceRent" if modes == {"rent"} else None
+    )
+    print(f"[LISTING QUERY] price_field={price_field}", flush=True)
     print(f"[LISTING QUERY] condo_scope={list(condo_scope or [])!r}", flush=True)
     print(f"[LISTING QUERY] geo_scope={requirements['geo_ids']!r}", flush=True)
     print(f"[LISTING QUERY] resolved_condo_ids={resolved_condo_ids!r}", flush=True)
@@ -3676,7 +3694,7 @@ def listing_facts(listing, condo_names=None, geo_names=None):
     """Compact grounded listing context; excludes generated listing-search prose."""
     fields = (
         "_id", "name", "title", "beds", "baths", "priceRent", "priceSale",
-        "propertyType", "condo", "Geo", "Address", "address", "Location",
+        "propertyType", "TransactionType", "condo", "Geo", "Address", "address", "Location",
         "latitude", "Latitude", "lat", "Lat", "longitude", "Longitude",
         "lng", "Lng", "lon", "Lon",
         "Furnishing", "furnished",
@@ -3721,11 +3739,24 @@ def _transaction_modes(value):
     values = value if isinstance(value, list) else [value]
     rendered = " ".join(str(item).casefold() for item in values)
     modes = set()
+    if "both" in rendered:
+        modes.update(("rent", "buy"))
     if "rent" in rendered or "let" in rendered:
         modes.add("rent")
-    if "buy" in rendered or "sale" in rendered or "purchase" in rendered:
+    if "buy" in rendered or "sale" in rendered or "purchas" in rendered:
         modes.add("buy")
     return modes
+
+
+def bubble_transaction_values(value):
+    """Serialize normalized transaction intent to valid Bubble option values."""
+    modes = _transaction_modes(value)
+    return [
+        option for mode, option in (
+            ("rent", RENT_TRANSACTION), ("buy", BUY_TRANSACTION)
+        )
+        if mode in modes
+    ]
 
 
 def shortlist_structured_listings(lead, listings):
@@ -3753,6 +3784,9 @@ def shortlist_structured_listings(lead, listings):
 
         rent = _as_number(listing.get("priceRent"))
         sale = _as_number(listing.get("priceSale"))
+        listing_modes = _transaction_modes(listing.get("TransactionType") or [])
+        if modes and not modes.intersection(listing_modes):
+            continue
         if modes == {"rent"} and rent is None:
             continue
         if modes == {"buy"} and sale is None:
@@ -4312,18 +4346,24 @@ def unresolved_geo_response(resolution):
     return f"I couldn't match {rendered} to an area I search. Which area did you mean?"
 
 
-def structured_lead_update(update, base_url):
+def structured_lead_update(
+    update, base_url, existing_transaction_values=None,
+):
     """Translate model-extracted values into Bubble's real structured Lead fields."""
     payload = {}
     transaction = update.get("transaction_type")
     if transaction and transaction != "unchanged":
-        # Rent/Let is the existing Bubble option-set value used by this application.
-        values = []
-        if transaction in ("rent", "both"):
-            values.append("Rent/Let")
-        if transaction in ("buy", "both"):
-            values.append("Sale/Purchase")
+        values = bubble_transaction_values(transaction)
+        if update.get("_transaction_interest_mode") == "add":
+            values = list(dict.fromkeys(
+                bubble_transaction_values(existing_transaction_values) + values
+            ))
         payload["TransactionType"] = values
+        print(
+            f"[TRANSACTION] raw={transaction!r} "
+            f"internal_mode={sorted(_transaction_modes(transaction))!r}", flush=True,
+        )
+        print(f"[TRANSACTION] lead_persist_values={values!r}", flush=True)
     if update.get("bedrooms_min") is not None:
         payload["bedroomsMin"] = update["bedrooms_min"]
     if update.get("budget_rent") is not None:
@@ -4341,6 +4381,19 @@ def structured_lead_update(update, base_url):
         if condo_ids:
             payload["preferredCondos"] = condo_ids
     return payload
+
+
+def save_property_search_state(*args):
+    """Persist non-critical search memory without aborting executable retrieval."""
+    try:
+        save_search_state(*args)
+        return True
+    except Exception as error:
+        print(
+            "[SEARCH PERSISTENCE] status=failed continuing_current_search "
+            f"error={type(error).__name__}", flush=True,
+        )
+        return False
 
 
 def save_search_state(
@@ -4563,10 +4616,19 @@ def apply_active_search_update(active_state, update):
     scalar_update["area_status"] = "unchanged"
     if scalar_update.get("bedrooms_min") is not None:
         scalar_update["bedroom_requirement"] = str(scalar_update["bedrooms_min"])
-    relevant_budget = scalar_update.get("budget_rent") or scalar_update.get("budget_buy")
+    relevant_budget = (
+        scalar_update.get("budget_rent")
+        if scalar_update.get("budget_rent") is not None
+        else scalar_update.get("budget_buy")
+    )
     if relevant_budget is not None:
         scalar_update["budget_requirement"] = str(relevant_budget)
     transaction = scalar_update.get("transaction_type")
+    prior_modes = _transaction_modes(state["property_types"])
+    incoming_modes = _transaction_modes(transaction)
+    if (incoming_modes and prior_modes and incoming_modes != prior_modes
+            and relevant_budget is None):
+        state["budget_requirement"] = ""
     incoming_property_types = _unique_search_values(
         scalar_update.get("property_types") or []
     )
@@ -4620,7 +4682,11 @@ def apply_cumulative_search_update(cumulative_state, update):
         )
     if cumulative_update.get("bedrooms_min") is not None:
         cumulative_update["bedroom_requirement"] = str(cumulative_update["bedrooms_min"])
-    relevant_budget = cumulative_update.get("budget_rent") or cumulative_update.get("budget_buy")
+    relevant_budget = (
+        cumulative_update.get("budget_rent")
+        if cumulative_update.get("budget_rent") is not None
+        else cumulative_update.get("budget_buy")
+    )
     if relevant_budget is not None:
         cumulative_update["budget_requirement"] = str(relevant_budget)
     transaction = cumulative_update.get("transaction_type")
@@ -4670,21 +4736,21 @@ def lead_with_active_search_filters(lead, base_url):
         active["Geo"] = []
     if state["bedroom_requirement"]:
         active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
-    transaction = " ".join(state["property_types"]).casefold()
-    if transaction:
-        active["TransactionType"] = (
-            ["Rent/Let"] if "rent" in transaction else
-            ["Sale/Purchase"] if "buy" in transaction else
-            active.get("TransactionType") or []
-        )
+    transaction_modes = _transaction_modes(state["property_types"])
+    if transaction_modes:
+        active["TransactionType"] = bubble_transaction_values(transaction_modes)
     budget = _as_number(state["budget_requirement"])
-    effective_transaction = (
-        transaction or " ".join(active.get("TransactionType") or []).casefold()
+    effective_modes = transaction_modes or _transaction_modes(
+        active.get("TransactionType") or []
     )
+    if effective_modes == {"buy"}:
+        active.pop("budgetRent", None)
+    elif effective_modes == {"rent"}:
+        active.pop("budgetBuy", None)
     if budget is not None:
-        if "rent" in effective_transaction:
+        if effective_modes == {"rent"}:
             active["budgetRent"] = budget
-        elif "buy" in effective_transaction or "sale" in effective_transaction:
+        elif effective_modes == {"buy"}:
             active["budgetBuy"] = budget
     print("[SEARCH ACTIVE] using active filters for recommendation", flush=True)
     return active
@@ -4735,8 +4801,16 @@ def advance_property_search(folio_id, bubble_env, update):
     )["resolved"]
     if not active_source["areas"] and active_source["area_status"] == "known":
         active_source["area_status"] = "unknown"
+    cumulative_update = dict(safe_update)
+    if safe_update.get("_transaction_interest_mode") == "add":
+        cumulative_modes = _transaction_modes(lead.get("TransactionType") or [])
+        cumulative_modes.update(_transaction_modes(safe_update.get("transaction_type")))
+        cumulative_update["transaction_type"] = (
+            "both" if cumulative_modes == {"rent", "buy"}
+            else next(iter(cumulative_modes), safe_update.get("transaction_type"))
+        )
     cumulative_state = apply_cumulative_search_update(
-        cumulative_source, safe_update
+        cumulative_source, cumulative_update
     )
     active_state = apply_active_search_update(
         active_source, safe_update
@@ -4755,7 +4829,9 @@ def advance_property_search(folio_id, bubble_env, update):
         f"beds={active_state['bedroom_requirement'] or None} "
         f"budget={active_state['budget_requirement'] or None}", flush=True,
     )
-    lead_fields = structured_lead_update(safe_update, base_url)
+    lead_fields = structured_lead_update(
+        safe_update, base_url, lead.get("TransactionType") or []
+    )
     for field in ("Geo", "preferredCondos"):
         if field in lead_fields:
             lead_fields[field] = list(dict.fromkeys(
@@ -4763,7 +4839,7 @@ def advance_property_search(folio_id, bubble_env, update):
             ))
 
     if geo_resolution["unresolved"]:
-        save_search_state(
+        save_property_search_state(
             lead_id, cumulative_state, base_url, lead_fields, active_state
         )
         return {
@@ -4782,7 +4858,7 @@ def advance_property_search(folio_id, bubble_env, update):
     )
     if update.get("search_listings") and (scope or not active_state["recommended_condos"]):
         active_state["selected_condos"] = list(scope or [])
-        save_search_state(
+        save_property_search_state(
             lead_id, cumulative_state, base_url, lead_fields, active_state
         )
         return {
@@ -4795,7 +4871,7 @@ def advance_property_search(folio_id, bubble_env, update):
         if not active_state["area_recommendations"]:
             recommendations = recommend_areas_for_search(active_state)
             active_state = set_area_recommendations(active_state, recommendations)
-        save_search_state(
+        save_property_search_state(
             lead_id, cumulative_state, base_url, lead_fields, active_state
         )
         return {
@@ -4811,7 +4887,7 @@ def advance_property_search(folio_id, bubble_env, update):
         active_state = set_recommended_condos(
             active_state, [item["condo_name"] for item in recommendations]
         )
-        save_search_state(
+        save_property_search_state(
             lead_id, cumulative_state, base_url, lead_fields, active_state
         )
         return {
@@ -4822,7 +4898,7 @@ def advance_property_search(folio_id, bubble_env, update):
             "recommendations": recommendations,
         }
 
-    save_search_state(
+    save_property_search_state(
         lead_id, cumulative_state, base_url, lead_fields, active_state
     )
     question = str(update.get("question") or "").strip()
@@ -4925,6 +5001,25 @@ def _apply_current_search_location(user_message, bubble_env, tool_args):
     print(
         "[SEARCH OVERRIDE] source=current_message field=location "
         f"condos=[] areas={updated['geo_names']!r}", flush=True,
+    )
+    return updated
+
+
+def _apply_current_transaction_intent(user_message, tool_args):
+    """Normalize explicit current-turn intent before Bubble persistence."""
+    text = normalize_condo_name(user_message)
+    buy_intent = bool(re.search(r"\b(buy|buying|purchase|purchasing|for sale)\b", text))
+    rent_intent = bool(re.search(r"\b(rent|renting|rental|to let)\b", text))
+    if not buy_intent and not rent_intent:
+        return tool_args
+    updated = dict(tool_args)
+    active_mode = "both" if buy_intent and rent_intent else "buy" if buy_intent else "rent"
+    updated["transaction_type"] = active_mode
+    if re.search(r"\b(as well|also|too)\b", text):
+        updated["_transaction_interest_mode"] = "add"
+    print(
+        f"[TRANSACTION] raw={user_message!r} internal_mode={active_mode}",
+        flush=True,
     )
     return updated
 
@@ -5038,6 +5133,7 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
     has_match_results = False
     recommendations = []
     if tool_call.name == "advance_property_search":
+        tool_args = _apply_current_transaction_intent(user_message, tool_args)
         tool_args = _apply_current_search_location(
             user_message, bubble_env, tool_args
         )
@@ -5046,7 +5142,7 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
             matching_result = execute_match_lead_silently(
                 folio_id, bubble_env, message_id, search_result["scope"]
             )
-            save_search_state(
+            save_property_search_state(
                 search_result["lead_id"], search_result["state"],
                 get_bubble_base_url(bubble_env),
             )

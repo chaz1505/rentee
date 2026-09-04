@@ -641,10 +641,10 @@ class SearchFlowStateTests(unittest.TestCase):
             "AIsearchtext": "This generated prose must not drive matching",
         }
         listings = [
-            {"_id": "strong", "beds": 4, "priceRent": 14500, "Geo": "geo-bangsar"},
-            {"_id": "too-small", "beds": 3, "priceRent": 14000, "Geo": "geo-bangsar"},
-            {"_id": "wrong-tier", "beds": 4, "priceRent": 5000, "Geo": "geo-bangsar"},
-            {"_id": "too-far-over", "beds": 4, "priceRent": 19000, "Geo": "geo-bangsar"},
+            {"_id": "strong", "beds": 4, "priceRent": 14500, "Geo": "geo-bangsar", "TransactionType": ["Rent/Let"]},
+            {"_id": "too-small", "beds": 3, "priceRent": 14000, "Geo": "geo-bangsar", "TransactionType": ["Rent/Let"]},
+            {"_id": "wrong-tier", "beds": 4, "priceRent": 5000, "Geo": "geo-bangsar", "TransactionType": ["Rent/Let"]},
+            {"_id": "too-far-over", "beds": 4, "priceRent": 19000, "Geo": "geo-bangsar", "TransactionType": ["Rent/Let"]},
         ]
         shortlisted = app_module.shortlist_structured_listings(lead, listings)
         self.assertEqual([item["_id"] for item in shortlisted], ["strong"])
@@ -812,8 +812,8 @@ class SearchFlowStateTests(unittest.TestCase):
         self, mocked_bubble, mocked_ids,
     ):
         mocked_bubble.return_value = {"results": [
-            {"_id": "fit", "condo": "condo-one", "beds": 3, "priceRent": 14000},
-            {"_id": "too-small", "condo": "condo-one", "beds": 2, "priceRent": 14000},
+            {"_id": "fit", "condo": "condo-one", "beds": 3, "priceRent": 14000, "TransactionType": ["Rent/Let"]},
+            {"_id": "too-small", "condo": "condo-one", "beds": 2, "priceRent": 14000, "TransactionType": ["Rent/Let"]},
         ], "remaining": 0}
         lead = {
             "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
@@ -905,21 +905,155 @@ class SearchFlowStateTests(unittest.TestCase):
         })
         self.assertEqual(plan["queries"][0], [
             {"key": "beds", "constraint_type": "greater than", "value": 2.999999},
+            {"key": "TransactionType", "constraint_type": "contains", "value": "Rent/Let"},
             {"key": "priceRent", "constraint_type": "is_not_empty"},
         ])
         self.assertIn("budget", plan["python_only_filters"])
 
     def test_listing_query_without_budget_pushes_transaction_price_presence(self):
         plan = app_module.build_listing_bubble_constraints({
-            "transaction_type": ["Sale/Purchase"], "bedrooms_min": None,
+            "transaction_type": ["Buy/Sell"], "bedrooms_min": None,
             "geo_ids": [], "preferred_condo_ids": [],
             "budget_rent": None, "budget_buy": None,
             "furnishing_preference": None,
         })
-        self.assertEqual(plan["queries"], [[{
-            "key": "priceSale", "constraint_type": "is_not_empty",
-        }]])
+        self.assertEqual(plan["queries"], [[
+            {"key": "TransactionType", "constraint_type": "contains", "value": "Buy/Sell"},
+            {"key": "priceSale", "constraint_type": "is_not_empty"},
+        ]])
         self.assertNotIn("transaction_price_presence", plan["python_only_filters"])
+
+    def test_buy_transaction_normalization_and_bubble_serialization(self):
+        self.assertEqual(app_module._transaction_modes(["Buy/Sell"]), {"buy"})
+        for raw in ("buy", "buying", "purchase", "purchasing", "sale", "for sale"):
+            self.assertEqual(app_module._transaction_modes(raw), {"buy"})
+            payload = app_module.structured_lead_update(
+                {"transaction_type": raw}, "https://bubble.test"
+            )
+            self.assertEqual(payload["TransactionType"], ["Buy/Sell"])
+            self.assertFalse(
+                {"buy", "sale", "purchase"}.intersection(payload["TransactionType"])
+            )
+
+    def test_buy_as_well_preserves_rent_interest_but_active_mode_is_buy(self):
+        update = app_module._apply_current_transaction_intent(
+            "If I wanted to buy as well - what have you got",
+            {"search_listings": True},
+        )
+        self.assertEqual(update["transaction_type"], "buy")
+        self.assertEqual(update["_transaction_interest_mode"], "add")
+        payload = app_module.structured_lead_update(
+            update, "https://bubble.test", ["Rent/Let"]
+        )
+        self.assertEqual(payload["TransactionType"], ["Rent/Let", "Buy/Sell"])
+
+        prior = apply_search_update(empty_search_state(), {
+            "property_types": ["rent"], "budget_requirement": "15000",
+        })
+        active = app_module.apply_active_search_update(prior, update)
+        self.assertEqual(app_module._transaction_modes(active["property_types"]), {"buy"})
+        self.assertEqual(active["budget_requirement"], "")
+
+    def test_sale_message_sets_buy_mode_and_preserves_named_condo(self):
+        condo_rows = {"one": {"Condo name": "One Menerung"}}
+        update = app_module._apply_current_transaction_intent(
+            "Show me properties for sale in One Menerung",
+            {"transaction_type": "rent", "search_listings": True},
+        )
+        with patch("app._get_condo_lookup", return_value=condo_rows):
+            update = app_module._apply_current_search_location(
+                "Show me properties for sale in One Menerung", "live", update
+            )
+        self.assertEqual(update["transaction_type"], "buy")
+        self.assertEqual(update["preferred_condo_names"], ["One Menerung"])
+        self.assertEqual(update["area_update_mode"], "reset")
+
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids", return_value=["condo-one"])
+    @patch("app.bubble")
+    def test_existing_rental_search_switches_to_one_menerung_sale_without_rent_budget(
+        self, bubble, _named_ids, save,
+    ):
+        prior = apply_search_update(empty_search_state(), {
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000",
+        })
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "TransactionType": ["Rent/Let"],
+             "budgetRent": 15000, "searchBriefJSON": dump_search_state(prior),
+             "searchActive": dump_search_state(prior)},
+        ]
+        message = "Do you have anything for sale in One Menerung"
+        update = app_module._apply_current_transaction_intent(
+            message, {"search_listings": True}
+        )
+        condo_rows = {"one": {"Condo name": "One Menerung"}}
+        with patch("app._get_condo_lookup", return_value=condo_rows):
+            update = app_module._apply_current_search_location(
+                message, "live", update
+            )
+            result = app_module.advance_property_search("folio-1", "live", update)
+
+        self.assertEqual(result["action"], "search_listings")
+        self.assertEqual(result["scope"], ["One Menerung"])
+        self.assertEqual(result["active_state"]["property_types"], ["buy"])
+        self.assertEqual(result["active_state"]["budget_requirement"], "")
+        lead_fields = save.call_args.args[3]
+        self.assertEqual(lead_fields["TransactionType"], ["Buy/Sell"])
+        self.assertNotIn("budgetBuy", lead_fields)
+
+    def test_buy_listing_query_and_python_filter_use_transaction_type_and_sale_price(self):
+        requirements = {
+            "transaction_type": ["Buy/Sell"], "bedrooms_min": 3,
+            "geo_ids": [], "preferred_condo_ids": ["condo-one"],
+            "budget_rent": 15000, "budget_buy": 2000000,
+            "furnishing_preference": None,
+        }
+        plan = app_module.build_listing_bubble_constraints(requirements)
+        constraints = plan["queries"][0]
+        self.assertIn({
+            "key": "TransactionType", "constraint_type": "contains",
+            "value": "Buy/Sell",
+        }, constraints)
+        self.assertIn({
+            "key": "priceSale", "constraint_type": "is_not_empty",
+        }, constraints)
+        self.assertFalse(any(item["key"] == "priceRent" for item in constraints))
+
+        lead = {
+            "TransactionType": ["Buy/Sell"], "bedroomsMin": 3,
+            "budgetRent": 15000, "budgetBuy": 2000000,
+        }
+        listings = [
+            {"_id": "buy-fit", "TransactionType": ["Buy/Sell"],
+             "beds": 3, "priceSale": 1900000, "priceRent": 14000},
+            {"_id": "rent-only", "TransactionType": ["Rent/Let"],
+             "beds": 3, "priceSale": 1900000, "priceRent": 14000},
+            {"_id": "buy-too-expensive", "TransactionType": ["Buy/Sell"],
+             "beds": 3, "priceSale": 2600000, "priceRent": 14000},
+        ]
+        self.assertEqual(
+            [item["_id"] for item in app_module.shortlist_structured_listings(lead, listings)],
+            ["buy-fit"],
+        )
+
+    @patch("app.get_valid_geo_names", return_value=[])
+    @patch("app.save_search_state", side_effect=app_module.requests.HTTPError("bad save"))
+    @patch("app.bubble")
+    def test_search_continues_when_noncritical_state_persistence_fails(
+        self, bubble, _save, _valid_geos,
+    ):
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "TransactionType": ["Rent/Let"],
+             "searchBriefJSON": "", "searchActive": ""},
+        ]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "transaction_type": "buy", "search_listings": True,
+        })
+        self.assertEqual(result["action"], "search_listings")
+        self.assertEqual(result["active_state"]["property_types"], ["buy"])
 
     def test_preferred_condo_relationship_constrains_structured_shortlist(self):
         lead = {"preferredCondos": ["condo-one", "condo-loft"]}
@@ -1136,8 +1270,8 @@ class SearchFlowStateTests(unittest.TestCase):
     def test_geo_filter_accepts_listing_relationship_id(self):
         lead = {"Geo": ["geo-klcc"], "TransactionType": ["Rent/Let"]}
         listings = [
-            {"_id": "klcc", "Geo": ["geo-klcc"], "priceRent": 12000},
-            {"_id": "bangsar", "Geo": ["geo-bangsar"], "priceRent": 12000},
+            {"_id": "klcc", "Geo": ["geo-klcc"], "priceRent": 12000, "TransactionType": ["Rent/Let"]},
+            {"_id": "bangsar", "Geo": ["geo-bangsar"], "priceRent": 12000, "TransactionType": ["Rent/Let"]},
         ]
         self.assertEqual(
             [item["_id"] for item in app_module.shortlist_structured_listings(lead, listings)],
