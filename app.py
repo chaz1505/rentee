@@ -2000,6 +2000,69 @@ def _requests_owner_check(answer):
     return " ".join(str(answer or "").split()).endswith(OWNER_CHECK_RESPONSE)
 
 
+class OwnerCheckReplyResult(str):
+    """Landlord acknowledgement carrying the one structured interpretation."""
+
+    def __new__(cls, acknowledgement, *, enquiry=None, result="unclear",
+                reason=None, viewing_note=None):
+        value = super().__new__(cls, acknowledgement)
+        value.enquiry = enquiry or {}
+        value.result = result
+        value.reason = reason
+        value.viewing_note = viewing_note
+        return value
+
+
+def _interpret_owner_check_response(message_text):
+    """Classify one owner response deterministically for this Enquiry."""
+    text = " ".join(str(message_text or "").split())
+    normalized = text.casefold()
+    if re.fullmatch(r"(?:sorry[, ]*)?(?:no|cannot proceed|can't proceed)", normalized):
+        return {"result": "unavailable", "reason": "other_decline",
+                "viewing_note": None}
+    negative_groups = (
+        ("property_unavailable", (
+            "rented", "already taken", "not available", "unavailable",
+            "withdrawn", "no longer available",
+        )),
+        ("profile_declined", (
+            "profile is not suitable", "profile isn't suitable", "unsuitable",
+            "tenant profile", "nationality", "race", "ethnicity",
+        )),
+        ("timing_mismatch", (
+            "move-in date", "move in date", "timing doesn't work",
+            "timing does not work",
+        )),
+        ("terms_mismatch", (
+            "lease duration", "terms", "pets not", "no pets",
+        )),
+    )
+    for reason, phrases in negative_groups:
+        if any(phrase in normalized for phrase in phrases):
+            if reason == "profile_declined" and not any(
+                marker in normalized for marker in
+                ("no", "not", "isn't", "don't", "doesn't", "declin", "reject", "sorry")
+            ):
+                continue
+            return {"result": "unavailable", "reason": reason, "viewing_note": None}
+    positive = bool(re.search(
+        r"\b(yes|available|can proceed|okay to proceed|ok to proceed)\b", normalized
+    )) and not bool(re.search(r"\b(not|isn't|no longer)\s+available\b", normalized))
+    if positive:
+        viewing_note = None
+        note_match = re.search(
+            r"\bviewings?\s+(?:are\s+)?(?:possible\s+)?"
+            r"((?:after|before|on|from)\s+[^.!?]{1,60})",
+            text, flags=re.IGNORECASE,
+        )
+        if note_match:
+            detail = note_match.group(1).strip(" ,.;")
+            viewing_note = f"Viewings are possible {detail}."
+        return {"result": "available", "reason": None,
+                "viewing_note": viewing_note}
+    return {"result": "unclear", "reason": None, "viewing_note": None}
+
+
 def handle_owner_check_reply(conversation, message_text, bubble_env="live"):
     """Record one reply for an owner-check Conversation awaiting a response."""
     conversation = conversation or {}
@@ -2012,17 +2075,174 @@ def handle_owner_check_reply(conversation, message_text, bubble_env="live"):
         return None
     base_url = get_bubble_base_url(bubble_env)
     enquiry = bubble(f"{base_url}/obj/enquiry/{enquiry_id}")
-    if str(enquiry.get("OwnerCheckStatus") or "").strip() != "Sent":
+    for field in ("Lead", "Listing"):
+        relationship = conversation_store.relationship_id(conversation.get(field))
+        if relationship:
+            enquiry.setdefault(field, relationship)
+    status = str(enquiry.get("OwnerCheckStatus") or "").strip()
+    if status not in {"Sent", "Replied"}:
         return None
-    _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", {
-        "OwnerCheckStatus": "Replied",
-        "OwnerCheckResponse": str(message_text),
-    })
+    interpretation = _interpret_owner_check_response(message_text)
+    if status == "Replied":
+        stored_result = str(enquiry.get("OwnerCheckResult") or "").strip()
+        if stored_result in {"available", "unavailable"}:
+            interpretation = {
+                "result": stored_result,
+                "reason": str(enquiry.get("OwnerCheckReason") or "").strip() or None,
+                "viewing_note": str(enquiry.get("OwnerCheckViewingNote") or "").strip() or None,
+            }
+        else:
+            return None
+    else:
+        payload = {
+            "OwnerCheckResponse": str(message_text),
+            "OwnerCheckResult": interpretation["result"],
+        }
+        if interpretation["result"] != "unclear":
+            payload["OwnerCheckStatus"] = "Replied"
+        if interpretation["reason"]:
+            payload["OwnerCheckReason"] = interpretation["reason"]
+        if interpretation["viewing_note"]:
+            payload["OwnerCheckViewingNote"] = interpretation["viewing_note"]
+        _bubble_patch(f"{base_url}/obj/enquiry/{enquiry_id}", payload)
+        enquiry.update(payload)
     print(
-        f"[OWNER CHECK REPLY] enquiry_id={enquiry_id} action=recorded",
+        f"[OWNER CHECK REPLY] enquiry_id={enquiry_id} action=recorded "
+        f"result={interpretation['result']}",
         flush=True,
     )
-    return "Thanks — noted."
+    reason_log = (
+        f" reason={interpretation['reason']}" if interpretation["reason"] else ""
+    )
+    print(
+        f"[OWNER CHECK RESULT] enquiry_id={enquiry_id} "
+        f"result={interpretation['result']}{reason_log}", flush=True,
+    )
+    return OwnerCheckReplyResult(
+        "Thanks — noted.", enquiry=enquiry, **interpretation
+    )
+
+
+def _owner_check_enquirer_message(result):
+    if result.result == "available":
+        parts = ["Good news — the owner has confirmed this unit is available."]
+        if result.viewing_note:
+            parts.append(result.viewing_note)
+        parts.append("When would you like to view?")
+        return " ".join(parts)
+    if result.result == "unavailable":
+        return "Unfortunately, this unit is unavailable."
+    return None
+
+
+def notify_enquirer_of_owner_check(result, bubble_env="live", now=None):
+    """Send one definitive owner-check result on the enquirer Conversation."""
+    message_text = _owner_check_enquirer_message(result)
+    enquiry = result.enquiry or {}
+    enquiry_id = conversation_store.relationship_id(enquiry.get("_id"))
+    if not message_text or not enquiry_id:
+        return False
+    if enquiry.get("OwnerCheckNotifiedAt"):
+        print(
+            f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} "
+            "action=skipped reason=already_notified", flush=True,
+        )
+        return False
+    conversations = conversation_store.find_active_conversations_by_enquiry(
+        enquiry_id, bubble_env
+    )
+    lead_id = conversation_store.relationship_id(enquiry.get("Lead"))
+    candidates = [
+        conversation for conversation in conversations
+        if str(conversation.get("CounterParty Role") or "").strip()
+        != "Owner Representative"
+        and (
+            not lead_id
+            or not conversation_store.relationship_id(conversation.get("Lead"))
+            or conversation_store.relationship_id(conversation.get("Lead")) == lead_id
+        )
+    ]
+    if len(candidates) != 1:
+        reason = (
+            "missing_enquirer_conversation" if not candidates
+            else "ambiguous_enquirer_conversation"
+        )
+        print(
+            f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} "
+            f"action=failed reason={reason}", flush=True,
+        )
+        return False
+    conversation = candidates[0]
+    conversation_id = conversation_store.relationship_id(conversation.get("_id"))
+    phone = normalize_phone(conversation.get("CounterParty Phone"))
+    if not conversation_id or not phone:
+        print(
+            f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} "
+            "action=failed reason=missing_enquirer_conversation", flush=True,
+        )
+        return False
+    print(
+        f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} action=send_attempt "
+        f"conversation_id={conversation_id} phone={_masked_whatsapp_phone(phone)}",
+        flush=True,
+    )
+    try:
+        window = owner_check_whatsapp_window(phone, bubble_env, now)
+        if window == "open":
+            sent_ids = send_whatsapp_text(phone, message_text)
+        else:
+            suffix = "AVAILABLE" if result.result == "available" else "UNAVAILABLE"
+            template_name = str(os.getenv(
+                f"WHATSAPP_OWNER_CHECK_{suffix}_TEMPLATE_NAME"
+            ) or "").strip()
+            if not template_name:
+                print(
+                    f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} "
+                    "action=failed reason=missing_template_configuration",
+                    flush=True,
+                )
+                return False
+            language = str(
+                os.getenv("WHATSAPP_OWNER_CHECK_RESULT_TEMPLATE_LANGUAGE")
+                or "en_US"
+            ).strip()
+            sent_ids = send_whatsapp_template(phone, template_name, language)
+        persist_sent_whatsapp_text(
+            phone, message_text, sent_ids, conversation_id,
+            lead_id=lead_id, bubble_env=bubble_env,
+        )
+        if result.result == "available":
+            try:
+                conversation_store.set_conversation_awaiting_viewing_response(
+                    conversation_id, True, bubble_env
+                )
+            except Exception as error:
+                print(
+                    f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} "
+                    "action=context_mark_failed "
+                    f"error={type(error).__name__}", flush=True,
+                )
+        notified_at = now or datetime.datetime.now(datetime.timezone.utc)
+        notified_at = notified_at.isoformat().replace("+00:00", "Z")
+        _bubble_patch(f"{get_bubble_base_url(bubble_env)}/obj/enquiry/{enquiry_id}", {
+            "OwnerCheckNotifiedAt": notified_at,
+            "OwnerCheckNotificationConversation": conversation_id,
+        })
+        enquiry.update({
+            "OwnerCheckNotifiedAt": notified_at,
+            "OwnerCheckNotificationConversation": conversation_id,
+        })
+        print(
+            f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} action=sent "
+            f"conversation_id={conversation_id}", flush=True,
+        )
+        return True
+    except Exception as error:
+        print(
+            f"[OWNER CHECK NOTIFY] enquiry_id={enquiry_id} action=failed "
+            f"reason={type(error).__name__}", flush=True,
+        )
+        return False
 
 
 def find_forwarded_lead_conversation(lead, phone, bubble_env="live"):
@@ -2210,6 +2430,20 @@ def route_conversation_by_message_clue(
 ):
     """Filter ambiguous candidates only for high-confidence workflow clues."""
     candidates = [item for item in candidates or [] if item.get("_id")]
+    viewing_candidates = [
+        item for item in candidates
+        if str(item.get("Awaiting Viewing Response") or "").strip() == "Yes"
+        and conversation_store.relationship_id(item.get("Enquiry"))
+        and str(item.get("CounterParty Role") or "").strip()
+        != "Owner Representative"
+    ]
+    if len(viewing_candidates) == 1 and re.search(
+        r"\b(today|tomorrow|tonight|morning|afternoon|evening|weekend|"
+        r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"\d{1,2}(?::\d{2})?\s*(?:am|pm))\b",
+        str(message_text or ""), flags=re.IGNORECASE,
+    ):
+        return viewing_candidates[0], "viewing_response", viewing_candidates
     if not _has_strong_property_search_clue(message_text, bubble_env):
         return None, None, candidates
     compatible = [item for item in candidates if _property_search_conversation(item)]
@@ -6246,6 +6480,9 @@ def _process_whatsapp_message(message):
                         routed_conversation.get("Lead")
                     ),
                     bubble_env="live",
+                )
+                notify_enquirer_of_owner_check(
+                    owner_check_acknowledgement, "live"
                 )
                 reply_sent = True
                 return

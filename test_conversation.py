@@ -244,6 +244,17 @@ class ConversationTests(unittest.TestCase):
         )
         self.assertEqual(update.call_count, 3)
 
+    def test_marks_conversation_as_awaiting_viewing_response(self):
+        with patch("conversation._patch") as update:
+            payload = conversation.set_conversation_awaiting_viewing_response(
+                "conversation-1"
+            )
+        self.assertEqual(payload, {"Awaiting Viewing Response": "Yes"})
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "conversation", "conversation-1",
+            {"Awaiting Viewing Response": "Yes"},
+        )
+
     def test_conversation_http_error_log_is_safe_and_actionable(self):
         response = requests.Response()
         response.status_code = 400

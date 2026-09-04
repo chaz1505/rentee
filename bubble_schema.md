@@ -31,6 +31,7 @@ Fields:
 | Rentee Role | text | Role/skills Rentee performs in this Conversation |
 | Status | text | Current expected values: Active / Closed |
 | Subject | text | Optional human-readable label |
+| Awaiting Viewing Response | text | Yes while the enquirer is answering a viewing-time prompt |
 
 Conversation semantics:
 - logical identity is approximately Principal + CounterParty Phone + Enquiry
@@ -65,6 +66,16 @@ Known fields:
 | OwnerCheckPhone | text | Existing |
 | OwnerCheckSentAt | date | Existing |
 | OwnerCheckResponse | text | Existing |
+| OwnerCheckResult | text | Values available / unavailable / unclear |
+| OwnerCheckReason | text | Optional internal decline reason; never customer-facing |
+| OwnerCheckViewingNote | text | Optional safe, grounded viewing restriction |
+| OwnerCheckNotifiedAt | date | Durable enquirer-notification idempotency marker |
+| OwnerCheckNotificationConversation | Conversation | Enquirer Conversation notified of the result |
+| OwnerCheckResult | text | Values available / unavailable / unclear |
+| OwnerCheckReason | text | Optional internal decline reason; never customer-facing |
+| OwnerCheckViewingNote | text | Optional safe, grounded viewing restriction |
+| OwnerCheckNotifiedAt | date | Durable enquirer-notification idempotency marker |
+| OwnerCheckNotificationConversation | Conversation | Enquirer Conversation notified of the result |
 
 ## Message
 
