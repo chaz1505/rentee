@@ -1527,6 +1527,19 @@ def capture_linked_tenant_profile(phone, message_text, bubble_env="live"):
     return lead
 
 
+def find_expected_inbound_lead(phone, bubble_env="live"):
+    """Read-only Lead resolution used to validate tenant routing candidates."""
+    try:
+        lead = find_lead_by_phone(phone, bubble_env)
+        return lead or find_handoff_lead_by_phone(phone, bubble_env)
+    except Exception as error:
+        print(
+            "[LEAD ROUTING] resolution=validation_lookup_failed "
+            f"error={type(error).__name__}", flush=True,
+        )
+        return None
+
+
 def prepare_owner_check(
     lead, bubble_env="live", authoritative_enquiry_id=None,
     authoritative_listing_id=None, source_conversation_id=None,
@@ -2424,14 +2437,25 @@ def validate_routing_conversation(
                 f"error={type(error).__name__}", flush=True,
             )
             return {"valid": False, "reason": "enquiry_lookup_failed"}
+    owner_side = (
+        str((conversation or {}).get("CounterParty Role") or "").strip()
+        == "Owner Representative"
+        or (
+            enquiry_id
+            and normalize_phone((enquiry or {}).get("OwnerCheckPhone"))
+            == normalize_phone(expected_phone)
+            and str((enquiry or {}).get("OwnerCheckStatus") or "").strip()
+            == "Sent"
+        )
+    )
     return conversation_store.validate_conversation_context(
-        conversation, expected_lead_id=expected_lead_id,
+        conversation, expected_lead_id=(None if owner_side else expected_lead_id),
         expected_user_id=expected_user_id, expected_phone=expected_phone,
         bubble_env=bubble_env, enquiry=enquiry,
     )
 def find_active_conversation_by_phone(
     phone, message_text="", bubble_env="live", include_candidates=False,
-    expected_user_id=None,
+    expected_user_id=None, expected_lead_id=None,
 ):
     """Conservatively resolve a phone-only enquiry Conversation.
 
@@ -2443,7 +2467,8 @@ def find_active_conversation_by_phone(
         candidate for candidate in active_conversations_by_phone(phone, bubble_env)
         if (
             (integrity := validate_routing_conversation(
-                candidate, expected_user_id=expected_user_id,
+                candidate, expected_lead_id=expected_lead_id,
+                expected_user_id=expected_user_id,
                 expected_phone=phone, bubble_env=bubble_env,
             ))["valid"]
             and integrity["type"] != "enquiry_owner"
@@ -6353,6 +6378,10 @@ def _process_whatsapp_message(message):
                     "processing_transcript_as_text", flush=True,
                 )
             base_url = get_bubble_base_url("live")
+            expected_lead = find_expected_inbound_lead(phone, "live")
+            expected_lead_id = conversation_store.relationship_id(
+                (expected_lead or {}).get("_id")
+            )
             inbound_message_id = None
             routed_conversation = None
             routed_conversation_id = None
@@ -6374,6 +6403,7 @@ def _process_whatsapp_message(message):
                 if routed_conversation_id:
                     integrity = validate_routing_conversation(
                         routed_conversation,
+                        expected_lead_id=expected_lead_id,
                         expected_user_id=bubble_user_id,
                         expected_phone=phone,
                         bubble_env="live",
@@ -6408,6 +6438,7 @@ def _process_whatsapp_message(message):
                     phone_resolution = find_active_conversation_by_phone(
                         phone, text, "live", include_candidates=True,
                         expected_user_id=bubble_user_id,
+                        expected_lead_id=expected_lead_id,
                     )
                     routed_conversation, resolution, candidate_count = (
                         phone_resolution[:3]
@@ -6789,7 +6820,14 @@ def _process_whatsapp_message(message):
             routed_lead_id = conversation_store.relationship_id(
                 (routed_conversation or {}).get("Lead")
             )
-            if routed_lead_id:
+            if expected_lead_id:
+                lead = expected_lead
+                lead_created = False
+                print(
+                    "[LEAD ROUTING] resolution=phone_validation "
+                    f"lead_id={expected_lead_id}", flush=True,
+                )
+            elif routed_lead_id:
                 lead = bubble(f"{base_url}/obj/lead/{routed_lead_id}")
                 lead.setdefault("_id", routed_lead_id)
                 lead_created = False
