@@ -2063,62 +2063,6 @@ def _interpret_owner_check_response(message_text):
     return {"result": "unclear", "reason": None, "viewing_note": None}
 
 
-def is_owner_check_conversation(
-    conversation, bubble_env="live", counterparty_phone=None,
-):
-    """Identify owner-check context from durable Conversation/Enquiry state."""
-    conversation = conversation or {}
-    conversation_id = conversation_store.relationship_id(conversation.get("_id"))
-    initial_role = str(conversation.get("CounterParty Role") or "").strip()
-    initial_enquiry_id = conversation_store.relationship_id(
-        conversation.get("Enquiry")
-    )
-    if conversation_id and (
-        initial_role == "Owner Representative" or initial_enquiry_id
-    ) and (
-        not initial_role or not initial_enquiry_id
-    ):
-        try:
-            hydrated = bubble(
-                f"{get_bubble_base_url(bubble_env)}/obj/conversation/{conversation_id}"
-            )
-            for field, value in hydrated.items():
-                if value not in (None, "", []):
-                    conversation.setdefault(field, value)
-        except Exception as error:
-            print(
-                "[OWNER CHECK DISPATCH] action=hydrate_failed "
-                f"conversation_id={conversation_id} error={type(error).__name__}",
-                flush=True,
-            )
-    enquiry_id = conversation_store.relationship_id(conversation.get("Enquiry"))
-    role = str(conversation.get("CounterParty Role") or "").strip()
-    if not enquiry_id:
-        return False
-    try:
-        enquiry = bubble(
-            f"{get_bubble_base_url(bubble_env)}/obj/enquiry/{enquiry_id}"
-        )
-    except Exception as error:
-        print(
-            "[OWNER CHECK DISPATCH] action=enquiry_lookup_failed "
-            f"conversation_id={conversation_id or 'none'} enquiry_id={enquiry_id} "
-            f"error={type(error).__name__}", flush=True,
-        )
-        return False
-    status = str(enquiry.get("OwnerCheckStatus") or "").strip()
-    if status not in {"Sent", "Replied"}:
-        return False
-    if role == "Owner Representative":
-        return True
-    expected_phone = normalize_phone(enquiry.get("OwnerCheckPhone"))
-    actual_phone = normalize_phone(counterparty_phone)
-    if expected_phone and actual_phone and expected_phone == actual_phone:
-        conversation["CounterParty Role"] = "Owner Representative"
-        return True
-    return False
-
-
 def handle_owner_check_reply(conversation, message_text, bubble_env="live"):
     """Record one reply for an owner-check Conversation awaiting a response."""
     conversation = conversation or {}
@@ -6501,13 +6445,9 @@ def _process_whatsapp_message(message):
                 reply_sent = True
                 return
             owner_check_response = raw_text if message_type == "text" else text
-            owner_check_acknowledgement = None
-            if is_owner_check_conversation(
-                routed_conversation, "live", counterparty_phone=phone
-            ):
-                owner_check_acknowledgement = handle_owner_check_reply(
-                    routed_conversation, owner_check_response, "live"
-                )
+            owner_check_acknowledgement = handle_owner_check_reply(
+                routed_conversation, owner_check_response, "live"
+            )
             if owner_check_acknowledgement:
                 if not routed_conversation_id:
                     raise RuntimeError(
