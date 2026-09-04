@@ -2000,6 +2000,15 @@ def send_pending_owner_check(lead, enquiry, bubble_env="live", now=None):
                 or "en_US"
             ).strip()
             sent_ids = send_whatsapp_template(phone, template_name, language)
+        print(
+            "[WHATSAPP SEND] destination_role=owner "
+            f"phone={_masked_whatsapp_phone(phone)} "
+            f"conversation_id={conversation_id} "
+            "conversation_type=enquiry_owner "
+            f"enquiry_id={enquiry_id} "
+            f"lead_id={conversation_store.relationship_id((lead or {}).get('_id')) or 'none'} "
+            f"text={json.dumps(message, ensure_ascii=False)}", flush=True,
+        )
         meta_message_id = _first_whatsapp_message_id(sent_ids)
         if meta_message_id:
             try:
@@ -2219,13 +2228,13 @@ def handle_owner_check_reply(conversation, message_text, bubble_env="live"):
         f"result={interpretation['result']}{reason_log}", flush=True,
     )
     return OwnerCheckReplyResult(
-        "Thanks — noted.", enquiry=enquiry, **interpretation
+        "Noted, thanks.", enquiry=enquiry, **interpretation
     )
 
 
 def _owner_check_enquirer_message(result):
     if result.result == "available":
-        parts = ["Good news — the owner has confirmed this unit is available."]
+        parts = ["Good news — the unit is available and your profile is okay."]
         if result.viewing_note:
             parts.append(result.viewing_note)
         parts.append("When would you like to view?")
@@ -2310,6 +2319,13 @@ def notify_enquirer_of_owner_check(result, bubble_env="live", now=None):
         persist_sent_whatsapp_text(
             phone, message_text, sent_ids, conversation_id,
             lead_id=lead_id, bubble_env=bubble_env,
+        )
+        print(
+            "[WHATSAPP SEND] destination_role=enquirer "
+            f"phone={_masked_whatsapp_phone(phone)} "
+            f"conversation_id={conversation_id} conversation_type=enquiry "
+            f"enquiry_id={enquiry_id} lead_id={lead_id or 'none'} "
+            f"text={json.dumps(message_text, ensure_ascii=False)}", flush=True,
         )
         if result.result == "available":
             try:
@@ -2449,6 +2465,10 @@ def find_reply_context(message, bubble_env="live"):
     replied_to_id = str(((message or {}).get("context") or {}).get("id") or "").strip()
     if not replied_to_id:
         return None
+    print(
+        "[CONVERSATION REPLY-TO] "
+        f"whatsapp_message_id={replied_to_id} action=lookup", flush=True,
+    )
     constraints = [{
         "key": "whatsappMessageId", "constraint_type": "equals",
         "value": replied_to_id,
@@ -2460,6 +2480,10 @@ def find_reply_context(message, bubble_env="live"):
         (previous or {}).get("Conversation")
     )
     if not conversation_id:
+        print(
+            "[CONVERSATION REPLY-TO] "
+            f"whatsapp_message_id={replied_to_id} resolution=not_found", flush=True,
+        )
         return None
     listing_id = conversation_store.relationship_id(
         (previous or {}).get("listing")
@@ -2468,6 +2492,11 @@ def find_reply_context(message, bubble_env="live"):
         f"{get_bubble_base_url(bubble_env)}/obj/conversation/{conversation_id}"
     )
     conversation.setdefault("_id", conversation_id)
+    print(
+        "[CONVERSATION REPLY-TO] "
+        f"whatsapp_message_id={replied_to_id} resolution=conversation "
+        f"conversation_id={conversation_id}", flush=True,
+    )
     return {"conversation": conversation, "listing_id": listing_id}
 
 
@@ -2493,6 +2522,27 @@ def active_conversations_by_phone(phone, bubble_env="live"):
         and normalize_phone(item.get("CounterParty Phone")) == canonical_phone
         and str(item.get("Status") or "").strip() == "Active"
     ]
+
+
+def log_phone_conversations(phone, bubble_env="live"):
+    """Log the complete active phone context before candidate narrowing."""
+    conversations = active_conversations_by_phone(phone, bubble_env)
+    for conversation in conversations:
+        print(
+            "[CONVERSATION PHONE CONTEXT] "
+            f"conversation_id={conversation.get('_id') or 'none'} "
+            f"conversation_type={conversation_store.classify_conversation(conversation)} "
+            f"enquiry_id={conversation_store.relationship_id(conversation.get('Enquiry')) or 'none'} "
+            f"last_outbound_at={conversation.get('Last Outbound At') or 'none'} "
+            "result=valid_phone_candidate",
+            flush=True,
+        )
+    print(
+        "[CONVERSATION PHONE CONTEXT] "
+        f"phone={_masked_whatsapp_phone(phone)} candidate_count={len(conversations)}",
+        flush=True,
+    )
+    return conversations
 
 
 def validate_routing_conversation(
@@ -2545,17 +2595,27 @@ def find_active_conversation_by_phone(
     enquiry fallback for legacy inbound traffic only when it cannot conflict
     with a general Conversation; never guess between multiple enquiries.
     """
-    all_candidates = [
-        candidate for candidate in active_conversations_by_phone(phone, bubble_env)
-        if (
-            (integrity := validate_routing_conversation(
-                candidate, expected_lead_id=expected_lead_id,
-                expected_user_id=expected_user_id,
-                expected_phone=phone, bubble_env=bubble_env,
-            ))["valid"]
-            and integrity["type"] != "enquiry_owner"
+    all_candidates = []
+    for candidate in active_conversations_by_phone(phone, bubble_env):
+        integrity = validate_routing_conversation(
+            candidate, expected_lead_id=expected_lead_id,
+            expected_user_id=expected_user_id,
+            expected_phone=phone, bubble_env=bubble_env,
         )
-    ]
+        included = integrity["valid"] and integrity["type"] != "enquiry_owner"
+        reason = (
+            "eligible" if included else
+            "pending_owner_workflow" if integrity["valid"] else integrity["reason"]
+        )
+        print(
+            "[CONVERSATION CANDIDATE] source=active_phone "
+            f"conversation_id={candidate.get('_id') or 'none'} "
+            f"conversation_type={integrity.get('type') or 'unknown'} "
+            f"action={'included' if included else 'excluded'} reason={reason}",
+            flush=True,
+        )
+        if included:
+            all_candidates.append(candidate)
     result = None
     resolution = "none"
     if len(all_candidates) == 1:
@@ -2603,9 +2663,41 @@ def find_owner_check_conversations_by_phone(phone, bubble_env="live"):
                 bubble_env=bubble_env, enquiry=enquiry,
             )
             if not integrity["valid"] or integrity["type"] != "enquiry_owner":
+                print(
+                    "[CONVERSATION CANDIDATE] source=owner_check_phone "
+                    f"conversation_id={conversation.get('_id') or 'none'} "
+                    "action=excluded "
+                    f"reason={integrity.get('reason') or 'not_owner_conversation'}",
+                    flush=True,
+                )
                 continue
             matches[str(conversation["_id"])] = conversation
     return list(matches.values())
+
+
+def select_owner_check_conversation(candidates):
+    """Resolve pending owner threads by their durable outbound activity."""
+    candidates = list(candidates or [])
+    if len(candidates) == 1:
+        return candidates[0], "pending_owner_enquiry"
+    dated = []
+    for candidate in candidates:
+        outbound_at = _bubble_created_at(candidate.get("Last Outbound At"))
+        print(
+            "[CONVERSATION OUTBOUND SIGNAL] "
+            f"conversation_id={candidate.get('_id') or 'none'} "
+            f"last_outbound_at={candidate.get('Last Outbound At') or 'none'}",
+            flush=True,
+        )
+        if outbound_at:
+            dated.append((outbound_at, candidate))
+    if not dated:
+        return None, "ambiguous_no_outbound_signal"
+    latest = max(value for value, _candidate in dated)
+    newest = [candidate for value, candidate in dated if value == latest]
+    if len(newest) != 1:
+        return None, "ambiguous_outbound_tie"
+    return newest[0], "most_recent_outbound_owner_enquiry"
 
 
 def _has_strong_property_search_clue(message_text, bubble_env="live"):
@@ -6471,6 +6563,7 @@ def _process_whatsapp_message(message):
             provisional_tenant_conversation = None
             reply_listing_id = None
             ambiguous_candidates = []
+            routing_reason = None
             try:
                 reply_context = find_reply_context(message, "live")
                 routed_conversation = (
@@ -6504,6 +6597,7 @@ def _process_whatsapp_message(message):
                         routed_conversation = None
                         routed_conversation_id = None
                 if routed_conversation_id:
+                    routing_reason = "reply_to"
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
                         f"resolution=reply_to conversation_id={routed_conversation_id} "
@@ -6526,6 +6620,71 @@ def _process_whatsapp_message(message):
                     flush=True,
                 )
             if not routed_conversation_id and not provisional_tenant_conversation:
+                try:
+                    log_phone_conversations(phone, "live")
+                except Exception as error:
+                    print(
+                        "[CONVERSATION PHONE CONTEXT] action=lookup_failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+                try:
+                    owner_check_candidates = find_owner_check_conversations_by_phone(
+                        phone, "live"
+                    )
+                    for candidate in owner_check_candidates:
+                        print(
+                            "[CONVERSATION CANDIDATE] source=owner_check_phone "
+                            f"conversation_id={candidate.get('_id') or 'none'} "
+                            f"enquiry_id={candidate.get('Enquiry') or 'none'} "
+                            "action=included reason=pending_owner_enquiry",
+                            flush=True,
+                        )
+                    routed_conversation, owner_resolution = (
+                        select_owner_check_conversation(owner_check_candidates)
+                    )
+                    if routed_conversation:
+                        routing_reason = owner_resolution
+                        routed_conversation_id = conversation_store.relationship_id(
+                            routed_conversation.get("_id")
+                        )
+                        enquiry_id = conversation_store.relationship_id(
+                            routed_conversation.get("Enquiry")
+                        )
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution={owner_resolution} "
+                            f"conversation_id={routed_conversation_id} "
+                            f"enquiry_id={enquiry_id}", flush=True,
+                        )
+                        inbound_message_id, _inbound_created = (
+                            persist_inbound_whatsapp_message(
+                                phone, message_id, text,
+                                lead_id=conversation_store.relationship_id(
+                                    routed_conversation.get("Lead")
+                                ),
+                                conversation_id=routed_conversation_id,
+                                bubble_env="live",
+                            )
+                        )
+                    elif len(owner_check_candidates) > 1:
+                        ambiguous_candidates = owner_check_candidates
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            f"resolution={owner_resolution} "
+                            f"candidate_count={len(owner_check_candidates)} "
+                            "action=clarify", flush=True,
+                        )
+                except Exception as error:
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        "resolution=owner_check_phone_lookup_failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+            if (
+                not routed_conversation_id
+                and not provisional_tenant_conversation
+                and not ambiguous_candidates
+            ):
                 try:
                     phone_resolution = find_active_conversation_by_phone(
                         phone, text, "live", include_candidates=True,
@@ -6618,78 +6777,6 @@ def _process_whatsapp_message(message):
                         "resolution=active_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
-            if not routed_conversation_id and not provisional_tenant_conversation:
-                try:
-                    owner_check_candidates = find_owner_check_conversations_by_phone(
-                        phone, "live"
-                    )
-                    if len(owner_check_candidates) == 1:
-                        routed_conversation = owner_check_candidates[0]
-                        routed_conversation_id = conversation_store.relationship_id(
-                            routed_conversation.get("_id")
-                        )
-                        ambiguous_candidates = []
-                        enquiry_id = conversation_store.relationship_id(
-                            routed_conversation.get("Enquiry")
-                        )
-                        print(
-                            "[CONVERSATION ROUTING] direction=inbound "
-                            "resolution=owner_check_phone "
-                            f"conversation_id={routed_conversation_id} "
-                            f"enquiry_id={enquiry_id}", flush=True,
-                        )
-                        inbound_message_id, _inbound_created = (
-                            persist_inbound_whatsapp_message(
-                                phone, message_id, text,
-                                lead_id=conversation_store.relationship_id(
-                                    routed_conversation.get("Lead")
-                                ),
-                                conversation_id=routed_conversation_id,
-                                bubble_env="live",
-                            )
-                        )
-                    elif len(owner_check_candidates) > 1:
-                        routed_conversation, clue, ambiguous_candidates = (
-                            route_conversation_by_message_clue(
-                                text, owner_check_candidates, "live"
-                            )
-                        )
-                        routed_conversation_id = conversation_store.relationship_id(
-                            (routed_conversation or {}).get("_id")
-                        )
-                        if routed_conversation_id:
-                            enquiry_id = conversation_store.relationship_id(
-                                routed_conversation.get("Enquiry")
-                            )
-                            print(
-                                "[CONVERSATION ROUTING] direction=inbound "
-                                "resolution=owner_check_phone "
-                                f"clue={clue} conversation_id={routed_conversation_id} "
-                                f"enquiry_id={enquiry_id}", flush=True,
-                            )
-                            inbound_message_id, _inbound_created = (
-                                persist_inbound_whatsapp_message(
-                                    phone, message_id, text,
-                                    lead_id=conversation_store.relationship_id(
-                                        routed_conversation.get("Lead")
-                                    ),
-                                    conversation_id=routed_conversation_id,
-                                    bubble_env="live",
-                                )
-                            )
-                        else:
-                            print(
-                                "[CONVERSATION ROUTING] direction=inbound "
-                                "resolution=owner_check_phone_ambiguous "
-                                f"candidate_count={len(ambiguous_candidates)} "
-                                "action=clarify", flush=True,
-                            )
-                except Exception as error:
-                    print(
-                        "[CONVERSATION ROUTING] direction=inbound "
-                        "resolution=owner_check_phone_lookup_failed "
-                        f"error={type(error).__name__}", flush=True,
-                    )
             if len(ambiguous_candidates) > 1:
                 clarification, ambiguity_labels = (
                     build_conversation_ambiguity_message(
@@ -6715,6 +6802,17 @@ def _process_whatsapp_message(message):
             if is_owner_check_conversation(
                 routed_conversation, "live", counterparty_phone=phone
             ):
+                print(
+                    "[WHATSAPP INBOUND] "
+                    f"phone={_masked_whatsapp_phone(phone)} "
+                    f"text={json.dumps(owner_check_response, ensure_ascii=False)} "
+                    f"conversation_id={routed_conversation_id or 'none'} "
+                    "conversation_type=enquiry_owner "
+                    f"enquiry_id={conversation_store.relationship_id((routed_conversation or {}).get('Enquiry')) or 'none'} "
+                    f"lead_id={conversation_store.relationship_id((routed_conversation or {}).get('Lead')) or 'none'} "
+                    f"routing_reason={routing_reason or 'conversation_context'}",
+                    flush=True,
+                )
                 owner_check_acknowledgement = handle_owner_check_reply(
                     routed_conversation, owner_check_response, "live"
                 )
@@ -6750,6 +6848,16 @@ def _process_whatsapp_message(message):
                         routed_conversation.get("Lead")
                     ),
                     bubble_env="live",
+                )
+                print(
+                    "[WHATSAPP SEND] destination_role=owner "
+                    f"phone={_masked_whatsapp_phone(phone)} "
+                    f"conversation_id={routed_conversation_id} "
+                    "conversation_type=enquiry_owner "
+                    f"enquiry_id={conversation_store.relationship_id(routed_conversation.get('Enquiry')) or 'none'} "
+                    f"lead_id={conversation_store.relationship_id(routed_conversation.get('Lead')) or 'none'} "
+                    f"text={json.dumps(str(owner_check_acknowledgement), ensure_ascii=False)}",
+                    flush=True,
                 )
                 notify_enquirer_of_owner_check(
                     owner_check_acknowledgement, "live"
