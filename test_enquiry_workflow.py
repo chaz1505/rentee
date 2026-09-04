@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 import requests
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import enquiry_workflow as workflow
 
@@ -30,6 +30,7 @@ class EnquiryWorkflowTests(unittest.TestCase):
     def complete_handoff_with_lead(
         self, enquiry, lead, created=False, sender_phone="+60 12-345 6789",
         finder=None, patcher=None, folio_finder=None,
+        conversation_ensurer=None, sender_user_id=None,
     ):
         records = MagicMock(return_value=iter([{"_id": "enquiry-1"}]))
         bubble_get = MagicMock(side_effect=[enquiry, {"_id": "listing-1"}])
@@ -40,6 +41,8 @@ class EnquiryWorkflowTests(unittest.TestCase):
             records, bubble_get, patch_bubble, normalize_phone,
             find_or_create_lead=finder,
             find_or_create_folio=folio_finder,
+            ensure_enquirer_conversation=conversation_ensurer,
+            sender_user_id=sender_user_id,
         )
         return result, finder, patch_bubble
 
@@ -73,6 +76,41 @@ class EnquiryWorkflowTests(unittest.TestCase):
         self.assertIn(
             "lead_id=lead-existing folio_id=folio-existing folio=existing", logs
         )
+
+    def test_handoff_immediately_ensures_exact_tenant_conversation(self):
+        conversation = {
+            "_id": "conversation-tenant", "Enquiry": "enquiry-1",
+            "Lead": "lead-1", "CounterParty Role": "Lead",
+        }
+        ensure = MagicMock(return_value=conversation)
+        result, _finder, patch_bubble = self.complete_handoff_with_lead(
+            {
+                "Listing": "listing-1", "Enquirer Phone": "60123456789",
+                "Principal": "principal-1",
+            },
+            {"_id": "lead-1"}, conversation_ensurer=ensure,
+            sender_user_id="user-tenant",
+        )
+        ensure.assert_called_once_with(
+            "enquiry-1", "lead-1", "60123456789", "user-tenant"
+        )
+        self.assertEqual(result.conversation, conversation)
+        self.assertIn(
+            {"Lead": "lead-1"},
+            [call.args[1] for call in patch_bubble.call_args_list],
+        )
+
+    def test_handoff_fails_explicitly_when_tenant_conversation_is_missing(self):
+        ensure = MagicMock(return_value=None)
+        result, _finder, _patch = self.complete_handoff_with_lead(
+            {
+                "Listing": "listing-1", "Enquirer Phone": "60123456789",
+                "Principal": "principal-1",
+            },
+            {"_id": "lead-1"}, conversation_ensurer=ensure,
+        )
+        self.assertIn("fresh one", result.response_text)
+        self.assertIsNone(result.conversation)
 
     def test_repeated_handoff_callback_reuses_folio_without_duplicate(self):
         folios = {}

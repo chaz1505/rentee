@@ -501,6 +501,11 @@ def find_or_create_conversation(
     else:
         existing = None
     if existing:
+        existing_role = str(existing.get("CounterParty Role") or "").strip()
+        requested_role = str(counterparty_role or "").strip()
+        if existing_role and requested_role and existing_role != requested_role:
+            existing = None
+    if existing:
         integrity = validate_conversation_context(
             existing, expected_lead_id=lead_id, bubble_env=bubble_env,
             enquiry=enquiry if enquiry_id else None,
@@ -513,6 +518,10 @@ def find_or_create_conversation(
             missing["Lead"] = lead_id
         if listing_id and not relationship_id(existing.get("Listing")):
             missing["Listing"] = listing_id
+        if counterparty_role and not str(
+            existing.get("CounterParty Role") or ""
+        ).strip():
+            missing["CounterParty Role"] = counterparty_role
         if missing:
             _patch(
                 get_bubble_base_url(bubble_env), "conversation", existing["_id"],

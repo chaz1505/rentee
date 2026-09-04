@@ -315,6 +315,55 @@ class TenantProfileCaptureTests(unittest.TestCase):
         self.assertNotIn("British", log)
 
 
+class EnquirerConversationTests(unittest.TestCase):
+    def test_exact_tenant_conversation_is_created_or_reused(self):
+        enquiry = {
+            "_id": "enquiry-1", "Lead": "lead-1", "Listing": "listing-1",
+            "Principal": "principal-1", "Agent?": "No",
+        }
+        for created in (True, False):
+            with self.subTest(created=created):
+                conversation = {
+                    "_id": "conversation-1", "Enquiry": "enquiry-1",
+                    "Lead": "lead-1", "Listing": "listing-1",
+                    "Counterparty User": "user-tenant",
+                    "CounterParty Phone": "60123456789",
+                    "CounterParty Role": "Lead", "Status": "Active",
+                }
+                with patch("app.bubble", return_value=enquiry), patch(
+                    "app.conversation_store.find_or_create_conversation",
+                    return_value=(conversation, created),
+                ) as find, patch("builtins.print") as logged:
+                    result = app_module.ensure_enquirer_conversation(
+                        "enquiry-1", "lead-1", "+60 12-345 6789",
+                        counterparty_user_id="user-tenant",
+                    )
+                self.assertEqual(result, conversation)
+                find.assert_called_once_with(
+                    "principal-1", "+60 12-345 6789",
+                    enquiry_id="enquiry-1",
+                    counterparty_user_id="user-tenant",
+                    counterparty_role="Lead", rentee_role="Lead Advisor",
+                    bubble_env="live", side="lead", lead_id="lead-1",
+                )
+                logs = " ".join(str(call) for call in logged.call_args_list)
+                self.assertIn(
+                    f"action={'created' if created else 'reused'}", logs
+                )
+
+    def test_legacy_blank_enquiry_lead_is_not_modified_or_reused(self):
+        with patch("app.bubble", return_value={
+                 "_id": "enquiry-old", "Principal": "principal-1",
+             }), patch(
+                 "app.conversation_store.find_or_create_conversation"
+             ) as find:
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                app_module.ensure_enquirer_conversation(
+                    "enquiry-old", "lead-new", "60123456789"
+                )
+        find.assert_not_called()
+
+
 class OwnerCheckTests(unittest.TestCase):
     def setUp(self):
         self.expected_lead_patcher = patch(
