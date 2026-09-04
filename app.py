@@ -45,18 +45,8 @@ from search_flow import (
     set_recommended_condos,
 )
 
-
-def get_build_sha():
-    """Return Render's deployed Git revision without requiring Git at runtime."""
-    sha = os.getenv("RENDER_GIT_COMMIT")
-    if sha:
-        return sha[:8]
-    return "unknown"
-
-
 # Connection-test marker: confirms updates can be applied to this app.
 app = Flask(__name__)
-print(f"[BUILD] commit={get_build_sha()}", flush=True)
 
 CORS(
     app,
@@ -6352,7 +6342,6 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
 
 
 def _process_whatsapp_message(message):
-    print(f"[WHATSAPP BUILD] commit={get_build_sha()}", flush=True)
     message_id = str(message["id"])
     typing_keepalive = whatsapp_typing_keepalive(message_id)
     phone = normalize_phone(message["from"])
