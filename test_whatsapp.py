@@ -4305,5 +4305,22 @@ class WhatsAppTests(unittest.TestCase):
         send.assert_not_called()
 
 
+class BuildShaTests(unittest.TestCase):
+    def test_render_git_commit_is_shortened_consistently(self):
+        with patch.dict(os.environ, {
+            "RENDER_GIT_COMMIT": "3ec8f96e1234567890abcdef",
+        }):
+            self.assertEqual(app_module.get_build_sha(), "3ec8f96e")
+
+    def test_missing_render_git_commit_returns_unknown(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(app_module.get_build_sha(), "unknown")
+
+    def test_missing_render_git_commit_does_not_raise(self):
+        with patch.dict(os.environ, {}, clear=True):
+            result = app_module.get_build_sha()
+        self.assertEqual(result, "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
