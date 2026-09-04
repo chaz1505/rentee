@@ -1003,6 +1003,97 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(lead_fields["TransactionType"], ["Buy/Sell"])
         self.assertNotIn("budgetBuy", lead_fields)
 
+    @patch("app.save_search_state")
+    @patch("app.get_named_object_ids", return_value=["condo-one"])
+    @patch("app.bubble")
+    def test_rental_search_switch_to_buy_uses_current_purchase_budget(
+        self, bubble, _named_ids, save,
+    ):
+        prior = apply_search_update(empty_search_state(), {
+            "property_types": ["rent"], "bedroom_requirement": "3",
+            "budget_requirement": "15000", "budget_rent": "15000",
+        })
+        bubble.side_effect = [
+            {"lead": "lead-1"},
+            {"_id": "lead-1", "TransactionType": ["Rent/Let"],
+             "budgetRent": 15000, "searchBriefJSON": dump_search_state(prior),
+             "searchActive": dump_search_state(prior)},
+        ]
+        result = app_module.advance_property_search("folio-1", "live", {
+            "transaction_type": "buy", "_transaction_interest_mode": "add",
+            "bedrooms_min": 3, "budget_buy": 5000000,
+            "preferred_condo_names": ["One Menerung"],
+            "condo_update_mode": "replace", "search_listings": True,
+        })
+
+        active = result["active_state"]
+        self.assertEqual(active["property_types"], ["buy"])
+        self.assertEqual(active["bedroom_requirement"], "3")
+        self.assertEqual(active["budget_buy"], "5000000")
+        self.assertEqual(active["budget_rent"], "")
+        self.assertEqual(active["selected_condos"], ["One Menerung"])
+        lead_fields = save.call_args.args[3]
+        self.assertEqual(lead_fields["TransactionType"], ["Rent/Let", "Buy/Sell"])
+        self.assertEqual(lead_fields["budgetBuy"], 5000000)
+
+        persisted_lead = {
+            "TransactionType": ["Rent/Let", "Buy/Sell"],
+            "budgetRent": 15000, "budgetBuy": 5000000,
+            "searchActive": dump_search_state(active),
+        }
+        effective = app_module.lead_with_active_search_filters(
+            persisted_lead, "https://bubble.test"
+        )
+        requirements = app_module.structured_lead_requirements(effective)
+        self.assertEqual(requirements["transaction_type"], ["Buy/Sell"])
+        self.assertEqual(requirements["budget_buy"], 5000000)
+        self.assertIsNone(requirements["budget_rent"])
+
+    def test_transaction_specific_active_budgets_never_cross_contaminate(self):
+        rental = apply_search_update(empty_search_state(), {
+            "property_types": ["rent"], "budget_rent": "15000",
+            "budget_requirement": "15000",
+        })
+        buy = app_module.apply_active_search_update(
+            rental, {"transaction_type": "buy"}
+        )
+        self.assertEqual(buy["budget_buy"], "")
+        self.assertEqual(buy["budget_rent"], "")
+        purchase = app_module.apply_active_search_update(
+            buy, {"budget_buy": 5000000}
+        )
+        self.assertEqual(purchase["budget_buy"], "5000000")
+        rent_again = app_module.apply_active_search_update(
+            purchase, {"transaction_type": "rent"}
+        )
+        self.assertEqual(rent_again["budget_rent"], "")
+        self.assertEqual(rent_again["budget_buy"], "")
+
+        cumulative = app_module.apply_cumulative_search_update(rental, {
+            "transaction_type": "both", "budget_buy": 5000000,
+        })
+        self.assertEqual(cumulative["budget_rent"], "15000")
+        self.assertEqual(cumulative["budget_buy"], "5000000")
+
+    def test_purchase_budget_is_maximum_without_a_lower_price_floor(self):
+        lead = {"TransactionType": ["Buy/Sell"], "budgetBuy": 5000000}
+        listings = [
+            {"_id": "cheap", "TransactionType": ["Buy/Sell"], "priceSale": 15000},
+            {"_id": "fit", "TransactionType": ["Buy/Sell"], "priceSale": 4500000},
+            {"_id": "over", "TransactionType": ["Buy/Sell"], "priceSale": 6000000},
+        ]
+        shortlisted = app_module.shortlist_structured_listings(lead, listings)
+        self.assertEqual([item["_id"] for item in shortlisted], ["cheap", "fit"])
+
+    def test_budget_tool_schema_explains_transaction_specific_amounts(self):
+        search_tool = next(
+            item for item in app_module.build_response_args("5 million to buy")["tools"]
+            if item.get("name") == "advance_property_search"
+        )
+        properties = search_tool["parameters"]["properties"]
+        self.assertIn("15k rent", properties["budget_rent"]["description"])
+        self.assertIn("5000000", properties["budget_buy"]["description"])
+
     def test_buy_listing_query_and_python_filter_use_transaction_type_and_sale_price(self):
         requirements = {
             "transaction_type": ["Buy/Sell"], "bedrooms_min": 3,

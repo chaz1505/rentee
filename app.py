@@ -847,8 +847,22 @@ def build_response_args(
             "type": "boolean",
             "description": "True only when the customer explicitly starts over.",
         },
-        "budget_rent": {"type": "number"},
-        "budget_buy": {"type": "number"},
+        "budget_rent": {
+            "type": "number",
+            "description": (
+                "Customer's rental budget in RM; use only for rent searches. "
+                "For example, '15k rent' means 15000 in budget_rent. Never put a "
+                "purchase or sale budget here."
+            ),
+        },
+        "budget_buy": {
+            "type": "number",
+            "description": (
+                "Customer's purchase budget in RM; use only for buy, purchase, or "
+                "sale searches. For example, '5 million to buy' or 'RM5m purchase "
+                "budget' means 5000000 in budget_buy. Never put a rental budget here."
+            ),
+        },
     }
     condo_recognition_context = ""
     if recognized_condos:
@@ -3089,6 +3103,12 @@ def get_plausible_listings(
     """Query Bubble narrowly, then retain Python filtering as validation."""
     started = time.perf_counter()
     plausible = []
+    filter_counts = {
+        key: 0 for key in (
+            "fetched", "after_transaction", "after_condo", "after_bedrooms",
+            "after_budget", "after_geo", "plausible", "rejected_budget",
+        )
+    }
     pages = 0
     fetched = 0
     seen_listing_ids = set()
@@ -3175,11 +3195,30 @@ def get_plausible_listings(
                         listing, condo_scope, base_url, condo_cache
                     )
                 ]
-            plausible.extend(shortlist_structured_listings(validation_lead, results))
+            page_plausible, page_counts = shortlist_structured_listings(
+                validation_lead, results, return_counts=True
+            )
+            plausible.extend(page_plausible)
+            for key in filter_counts:
+                filter_counts[key] += page_counts[key]
             if not raw_results or not page.get("remaining"):
                 break
             cursor += len(raw_results)
     print(f"[LISTING QUERY] pages={pages} fetched={fetched}", flush=True)
+    print(
+        "[LISTING FILTER] "
+        f"fetched={filter_counts['fetched']} "
+        f"after_transaction={filter_counts['after_transaction']} "
+        f"after_condo={filter_counts['after_condo']} "
+        f"after_bedrooms={filter_counts['after_bedrooms']} "
+        f"after_budget={filter_counts['after_budget']} "
+        f"rejected_budget={filter_counts['rejected_budget']} "
+        f"after_geo={filter_counts['after_geo']} "
+        f"plausible={filter_counts['plausible']} "
+        f"budget_rent={requirements['budget_rent']!r} "
+        f"budget_buy={requirements['budget_buy']!r}",
+        flush=True,
+    )
     log_timing(
         "Load plausible listings", started,
         f" (pages={pages} fetched={fetched} plausible={len(plausible)})",
@@ -3759,7 +3798,7 @@ def bubble_transaction_values(value):
     ]
 
 
-def shortlist_structured_listings(lead, listings):
+def shortlist_structured_listings(lead, listings, return_counts=False):
     """Remove obvious mismatches while leaving trade-off judgement to the model."""
     requirements = structured_lead_requirements(lead)
     modes = _transaction_modes(requirements["transaction_type"])
@@ -3769,19 +3808,12 @@ def shortlist_structured_listings(lead, listings):
     budget_rent = requirements["budget_rent"]
     budget_buy = requirements["budget_buy"]
     shortlisted = []
+    counts = {
+        "fetched": len(listings), "after_transaction": 0, "after_condo": 0,
+        "after_bedrooms": 0, "after_budget": 0, "after_geo": 0,
+    }
 
     for listing in listings:
-        beds = _as_number(listing.get("beds"))
-        if bedrooms_min is not None and beds is not None and beds < bedrooms_min:
-            continue
-        if condo_ids and str(listing.get("condo")) not in condo_ids:
-            continue
-        listing_geos = listing.get("Geo") or []
-        if not isinstance(listing_geos, list):
-            listing_geos = [listing_geos]
-        if geo_ids and not condo_ids and not geo_ids.intersection(str(item) for item in listing_geos):
-            continue
-
         rent = _as_number(listing.get("priceRent"))
         sale = _as_number(listing.get("priceSale"))
         listing_modes = _transaction_modes(listing.get("TransactionType") or [])
@@ -3791,13 +3823,34 @@ def shortlist_structured_listings(lead, listings):
             continue
         if modes == {"buy"} and sale is None:
             continue
+        counts["after_transaction"] += 1
+        if condo_ids and str(listing.get("condo")) not in condo_ids:
+            continue
+        counts["after_condo"] += 1
+        beds = _as_number(listing.get("beds"))
+        if bedrooms_min is not None and beds is not None and beds < bedrooms_min:
+            continue
+        counts["after_bedrooms"] += 1
         if budget_rent and "buy" not in modes and rent:
             if rent > budget_rent * 1.2 or rent < budget_rent * 0.45:
                 continue
         if budget_buy and "rent" not in modes and sale:
-            if sale > budget_buy * 1.2 or sale < budget_buy * 0.45:
+            # Purchase budget is a hard maximum. Cheaper eligible homes remain in
+            # the pool; closeness to the spending tier is handled by ranking.
+            if sale > budget_buy:
                 continue
+        counts["after_budget"] += 1
+        listing_geos = listing.get("Geo") or []
+        if not isinstance(listing_geos, list):
+            listing_geos = [listing_geos]
+        if geo_ids and not condo_ids and not geo_ids.intersection(str(item) for item in listing_geos):
+            continue
+        counts["after_geo"] += 1
         shortlisted.append(listing)
+    if return_counts:
+        counts["plausible"] = len(shortlisted)
+        counts["rejected_budget"] = counts["after_bedrooms"] - counts["after_budget"]
+        return shortlisted, counts
     return shortlisted
 
 
@@ -3883,14 +3936,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             + ", ".join(condo_scope),
             flush=True,
         )
-    scoped_listing_count = len(listings)
-    structured_listing_count = len(listings)
+    plausible_listing_count = len(listings)
     listings = reduce_listing_candidates(search_lead, listings)
     print(
         "Listing candidates: "
         f"fetched={fetched_listing_count} "
-        f"after_condo_scope={scoped_listing_count} "
-        f"after_structured_filters={structured_listing_count} "
+        f"plausible={plausible_listing_count} "
         f"sent_to_ranking={len(listings)}",
         flush=True,
     )
@@ -4621,11 +4672,19 @@ def apply_active_search_update(active_state, update):
         if scalar_update.get("budget_rent") is not None
         else scalar_update.get("budget_buy")
     )
+    if scalar_update.get("budget_rent") is not None:
+        scalar_update["budget_rent"] = str(scalar_update["budget_rent"])
+    if scalar_update.get("budget_buy") is not None:
+        scalar_update["budget_buy"] = str(scalar_update["budget_buy"])
     if relevant_budget is not None:
         scalar_update["budget_requirement"] = str(relevant_budget)
     transaction = scalar_update.get("transaction_type")
     prior_modes = _transaction_modes(state["property_types"])
     incoming_modes = _transaction_modes(transaction)
+    if incoming_modes == {"buy"}:
+        state["budget_rent"] = ""
+    elif incoming_modes == {"rent"}:
+        state["budget_buy"] = ""
     if (incoming_modes and prior_modes and incoming_modes != prior_modes
             and relevant_budget is None):
         state["budget_requirement"] = ""
@@ -4689,6 +4748,10 @@ def apply_cumulative_search_update(cumulative_state, update):
     )
     if relevant_budget is not None:
         cumulative_update["budget_requirement"] = str(relevant_budget)
+    if cumulative_update.get("budget_rent") is not None:
+        cumulative_update["budget_rent"] = str(cumulative_update["budget_rent"])
+    if cumulative_update.get("budget_buy") is not None:
+        cumulative_update["budget_buy"] = str(cumulative_update["budget_buy"])
     transaction = cumulative_update.get("transaction_type")
     if transaction and transaction != "unchanged":
         home_types = [
@@ -4718,6 +4781,7 @@ def lead_with_active_search_filters(lead, base_url):
     has_state_filters = bool(
         state["areas"] or state["selected_condos"]
         or state["bedroom_requirement"] or state["budget_requirement"]
+        or state["budget_rent"] or state["budget_buy"]
         or state["property_types"]
     )
     if not has_state_filters:
@@ -4739,14 +4803,25 @@ def lead_with_active_search_filters(lead, base_url):
     transaction_modes = _transaction_modes(state["property_types"])
     if transaction_modes:
         active["TransactionType"] = bubble_transaction_values(transaction_modes)
-    budget = _as_number(state["budget_requirement"])
     effective_modes = transaction_modes or _transaction_modes(
         active.get("TransactionType") or []
     )
     if effective_modes == {"buy"}:
         active.pop("budgetRent", None)
+        budget = _as_number(
+            state["budget_buy"] or (
+                state["budget_requirement"] if not transaction_modes else None
+            )
+        )
     elif effective_modes == {"rent"}:
         active.pop("budgetBuy", None)
+        budget = _as_number(
+            state["budget_rent"] or (
+                state["budget_requirement"] if not transaction_modes else None
+            )
+        )
+    else:
+        budget = None
     if budget is not None:
         if effective_modes == {"rent"}:
             active["budgetRent"] = budget
@@ -4758,6 +4833,16 @@ def lead_with_active_search_filters(lead, base_url):
 
 def advance_property_search(folio_id, bubble_env, update):
     """Persist search facts and execute the useful action chosen for this turn."""
+    print(
+        "[SEARCH UPDATE] "
+        f"transaction_type={update.get('transaction_type')!r} "
+        f"bedrooms_min={update.get('bedrooms_min')!r} "
+        f"budget_rent={update.get('budget_rent')!r} "
+        f"budget_buy={update.get('budget_buy')!r} "
+        f"preferred_condo_names={update.get('preferred_condo_names')!r} "
+        f"search_listings={update.get('search_listings')!r}",
+        flush=True,
+    )
     base_url = get_bubble_base_url(bubble_env)
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
@@ -4827,7 +4912,8 @@ def advance_property_search(folio_id, bubble_env, update):
         f"[SEARCH ACTIVE] condos={active_state['selected_condos']!r} "
         f"areas={active_state['areas']!r} "
         f"beds={active_state['bedroom_requirement'] or None} "
-        f"budget={active_state['budget_requirement'] or None}", flush=True,
+        f"budget_rent={active_state['budget_rent'] or None} "
+        f"budget_buy={active_state['budget_buy'] or None}", flush=True,
     )
     lead_fields = structured_lead_update(
         safe_update, base_url, lead.get("TransactionType") or []

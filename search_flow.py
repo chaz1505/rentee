@@ -5,6 +5,7 @@ import json
 
 SEARCH_BRIEF_FIELDS = (
     "areas", "property_types", "bedroom_requirement", "budget_requirement",
+    "budget_rent", "budget_buy",
     "other_requirements", "priorities",
 )
 
@@ -18,6 +19,8 @@ def empty_search_state():
         "property_types": [],
         "bedroom_requirement": "",
         "budget_requirement": "",
+        "budget_rent": "",
+        "budget_buy": "",
         "other_requirements": [],
         "other_requirements_answered": False,
         "priorities": [],
@@ -48,6 +51,20 @@ def load_search_state(value):
             state["area_status"] = "unknown"
         elif state["areas"]:
             state["area_status"] = "known"
+        # Migrate the old generic budget only when its transaction is unambiguous.
+        # This preserves existing searches without ever turning a rental budget into
+        # a purchase budget (or vice versa) after the active mode changes.
+        if (source.get("budget_requirement")
+                and "budget_rent" not in source and "budget_buy" not in source):
+            rendered_types = " ".join(
+                str(item).casefold() for item in source.get("property_types", [])
+            )
+            is_rent = "rent" in rendered_types or "let" in rendered_types
+            is_buy = any(word in rendered_types for word in ("buy", "sale", "purchas"))
+            if is_rent and not is_buy:
+                state["budget_rent"] = str(source["budget_requirement"])
+            elif is_buy and not is_rent:
+                state["budget_buy"] = str(source["budget_requirement"])
     if state["area_status"] not in ("unchanged", "known", "unknown"):
         state["area_status"] = "known" if state["areas"] else "unchanged"
     return state
@@ -82,11 +99,25 @@ def apply_search_update(state, update):
             elif value != state[key]:
                 state["area_recommendations"] = []
             state[key] = value
-    for key in ("bedroom_requirement", "budget_requirement"):
+    for key in (
+        "bedroom_requirement", "budget_requirement", "budget_rent", "budget_buy",
+    ):
         if str(update.get(key) or "").strip():
             value = str(update[key]).strip()
             material_change |= value != state[key]
             state[key] = value
+    if update.get("budget_requirement") and not (
+        update.get("budget_rent") is not None or update.get("budget_buy") is not None
+    ):
+        rendered_types = " ".join(item.casefold() for item in state["property_types"])
+        if ("rent" in rendered_types or "let" in rendered_types) and not any(
+            word in rendered_types for word in ("buy", "sale", "purchas")
+        ):
+            state["budget_rent"] = str(update["budget_requirement"]).strip()
+        elif any(word in rendered_types for word in ("buy", "sale", "purchas")) and not (
+            "rent" in rendered_types or "let" in rendered_types
+        ):
+            state["budget_buy"] = str(update["budget_requirement"]).strip()
 
     if update.get("other_requirements_answered"):
         state["other_requirements_answered"] = True
