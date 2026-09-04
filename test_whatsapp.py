@@ -1988,11 +1988,12 @@ class WhatsAppTests(unittest.TestCase):
             "_id": "conversation-b", "Principal": "principal-1",
             "CounterParty Phone": "60123456789", "Status": "Active",
             "Enquiry": "enquiry-b", "Lead": "lead-1", "Listing": "listing-b",
-            "CounterParty Role": "Owner Representative",
+            "CounterParty Role": "Lead",
             "Rentee Role": "Enquiry Coordinator",
             "_routing_enquiry_created_at": "2026-08-31T10:00:00Z",
         }
         active.return_value = (selected, "single_active", 1, [selected])
+        self.mocked_expected_lead.return_value = {"_id": "lead-1"}
         item = webhook_payload(
             message_id="wamid.profile-ok", text="profile Ok"
         )["entry"][0]["changes"][0]["value"]["messages"][0]
@@ -2046,7 +2047,9 @@ class WhatsAppTests(unittest.TestCase):
             "app.find_active_conversation_by_phone",
             return_value=(conversation, "single_active", 1),
         ), patch("app.find_or_create_whatsapp_lead") as create_lead, \
-             patch("app.send_whatsapp_text"):
+             patch("app.send_whatsapp_text"), patch(
+                 "app.bubble", return_value={"Lead": "lead-1"}
+             ):
             item = webhook_payload(
                 message_id="wamid.identity-collision", text="Hello"
             )["entry"][0]["changes"][0]["value"]["messages"][0]
@@ -3768,15 +3771,14 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app.capture_linked_tenant_profile")
     @patch("app.find_active_conversation_by_phone")
     @patch("app.send_whatsapp_typing_indicator")
-    def test_owner_inbound_reuses_single_active_conversation_without_lead_owner(
+    def test_general_inbound_reuses_single_active_conversation_without_lead_owner(
         self, _typing, active, capture, find_lead, _folio, turn, _send,
         _latest, create_ai, _save_ai, save_meta, save_previous,
     ):
         owner_conversation = {
             "_id": "conversation-owner", "Principal": "principal-1",
             "CounterParty Phone": "60123456789", "Status": "Active",
-            "Enquiry": "enquiry-1", "Lead": "lead-1", "Listing": "listing-1",
-            "CounterParty Role": "Owner Representative",
+            "Lead": "lead-1", "CounterParty Role": "Lead",
         }
         active.return_value = (owner_conversation, "single_active", 1)
         with patch("app.bubble", return_value={"_id": "lead-1"}), \
@@ -3809,7 +3811,7 @@ class WhatsAppTests(unittest.TestCase):
             "conversation-owner", "response-new", "live"
         )
         logs = "\n".join(str(call) for call in logged.call_args_list)
-        self.assertIn("resolution=single_active conversation_id=conversation-owner", logs)
+        self.assertNotIn("resolution=enquiry conversation_id=conversation-owner", logs)
 
     @patch("app.save_whatsapp_ai_message")
     @patch("app.create_whatsapp_ai_message", return_value="message-current")
@@ -3898,6 +3900,55 @@ class WhatsAppTests(unittest.TestCase):
             "[LEAD ROUTING] resolution=phone_fallback lead_id=lead-fallback",
             logs,
         )
+
+    @patch("app.save_whatsapp_ai_message")
+    @patch("app.create_whatsapp_ai_message", return_value="message-current")
+    @patch("app.send_whatsapp_text", return_value=["wamid.outbound"])
+    @patch("app.run_rentee_turn", return_value=("Reply", "response-new", False))
+    @patch("app.find_or_create_lead_folio", return_value=("folio-new", False))
+    @patch("app.capture_linked_tenant_profile",
+           return_value={"_id": "lead-new"})
+    @patch("app.find_active_conversation_by_phone")
+    @patch("app.send_whatsapp_typing_indicator")
+    def test_stale_phone_enquiry_is_rejected_after_final_lead_resolution(
+        self, _typing, active, _capture, folio, turn, _send,
+        create_ai, _save_ai,
+    ):
+        stale = {
+            "_id": "conversation-old", "Lead": "lead-old",
+            "Enquiry": "enquiry-old", "Status": "Active",
+            "CounterParty Phone": "60123456789", "CounterParty Role": "Lead",
+        }
+        active.return_value = (stale, "single_active", 1, [stale])
+        with patch("app.bubble", return_value={
+                 "_id": "enquiry-old", "Lead": "lead-old",
+             }), patch("builtins.print") as logged:
+            item = webhook_payload(text="Please check availability")[
+                "entry"
+            ][0]["changes"][0]["value"]["messages"][0]
+            app_module._process_whatsapp_message(item)
+
+        folio.assert_called_once_with("lead-new", "live")
+        create_ai.assert_called_once_with(
+            "lead-new", "60123456789", "live", "conversation-general"
+        )
+        self.assertEqual(turn.call_args.args[1], "folio-new")
+        stale_persistence = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-old"
+        ]
+        self.assertEqual(stale_persistence, [])
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "conversation_id=conversation-old result=rejected "
+            "reason=enquiry_lead_mismatch",
+            logs,
+        )
+        self.assertIn("expected_lead_id=lead-new", logs)
+        self.assertNotIn(
+            "resolution=enquiry conversation_id=conversation-old", logs
+        )
+        self.assertNotIn("active_enquiry_lead_mismatch", logs)
 
     def test_prefilled_search_confirmation_is_concise_and_customer_facing(self):
         lead = {

@@ -93,7 +93,7 @@ def validate_conversation_context(
         reason = "phone_mismatch"
     elif expected_user_id and visible_user_id and expected_user_id != visible_user_id:
         reason = "user_mismatch"
-    elif expected_lead_id and conversation_type != "enquiry_owner" \
+    elif not enquiry_id and expected_lead_id \
             and conversation_lead_id and expected_lead_id != conversation_lead_id:
         reason = "expected_lead_mismatch"
 
@@ -119,9 +119,15 @@ def validate_conversation_context(
                 reason = "enquiry_lead_mismatch"
             elif (
                 expected_lead_id and conversation_type != "enquiry_owner"
-                and enquiry_lead_id and expected_lead_id != enquiry_lead_id
+                and (
+                    (enquiry_lead_id and expected_lead_id != enquiry_lead_id)
+                    or (
+                        conversation_lead_id
+                        and expected_lead_id != conversation_lead_id
+                    )
+                )
             ):
-                reason = "expected_lead_mismatch"
+                reason = "enquiry_lead_mismatch"
             elif (
                 relationship_id(conversation.get("Listing"))
                 and enquiry_listing_id
