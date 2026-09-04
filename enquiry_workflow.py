@@ -51,7 +51,6 @@ class EnquiryWorkflowResult:
     followup_text: Optional[str] = None
     enquiry_id: Optional[str] = None
     lead_id: Optional[str] = None
-    conversation: object = None
 
     def complete(self):
         """Commit state changes that must happen only after WhatsApp sends."""
@@ -252,7 +251,7 @@ def handle_external_handoff_message(
     sender_phone, message_text, base_url, bubble_records, bubble_get,
     bubble_patch, normalize_phone, sender_user_id=None,
     find_or_create_lead=None, find_or_create_folio=None,
-    whatsapp_profile_name=None, ensure_enquirer_conversation=None,
+    whatsapp_profile_name=None,
 ):
     """Resolve and bind one external WhatsApp sender to an existing Enquiry."""
     code = extract_handoff_code(message_text)
@@ -339,7 +338,6 @@ def handle_external_handoff_message(
             f"enquirer_phone_set phone={safe_incoming}",
             flush=True,
         )
-    tenant_conversation = None
     if find_or_create_lead:
         enquiry_classification = (
             "Yes" if str(enquiry.get("Agent?") or "").strip() == "Yes" else "No"
@@ -496,16 +494,6 @@ def handle_external_handoff_message(
                 f"lead_id={lead_id} lead linked",
                 flush=True,
             )
-            print(
-                f"[ENQUIRY] action=resolved enquiry_id={enquiry_id} "
-                f"lead_id={lead_id} listing_id={listing_id}", flush=True,
-            )
-            if ensure_enquirer_conversation:
-                tenant_conversation = ensure_enquirer_conversation(
-                    enquiry_id, lead_id, incoming_phone, sender_user_id
-                )
-                if not tenant_conversation or not tenant_conversation.get("_id"):
-                    raise RuntimeError("Tenant Enquiry Conversation was not created.")
             if find_or_create_folio:
                 folio_id, folio_created = find_or_create_folio(lead_id)
                 if not folio_id:
@@ -537,7 +525,6 @@ def handle_external_handoff_message(
         followup_text=followup_text,
         enquiry_id=enquiry_id,
         lead_id=lead_id if find_or_create_lead else None,
-        conversation=tenant_conversation,
     )
 
 

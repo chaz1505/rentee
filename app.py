@@ -2375,75 +2375,6 @@ def find_forwarded_lead_conversation(lead, phone, bubble_env="live"):
     return conversation
 
 
-def ensure_enquirer_conversation(
-    enquiry_id, lead_id, phone, counterparty_user_id=None, bubble_env="live",
-):
-    """Ensure one active tenant-side Conversation for an exact Enquiry."""
-    enquiry_id = conversation_store.relationship_id(enquiry_id)
-    lead_id = conversation_store.relationship_id(lead_id)
-    print(
-        "[ENQUIRY CONVERSATION] side=lead action=find_started "
-        f"enquiry_id={enquiry_id or 'none'} lead_id={lead_id or 'none'}",
-        flush=True,
-    )
-    if not enquiry_id or not lead_id:
-        print(
-            "[ENQUIRY CONVERSATION] action=failed "
-            "reason=missing_tenant_conversation "
-            f"enquiry_id={enquiry_id or 'none'}", flush=True,
-        )
-        raise ValueError("Tenant Enquiry Conversation requires Enquiry and Lead.")
-    enquiry = bubble(
-        f"{get_bubble_base_url(bubble_env)}/obj/enquiry/{enquiry_id}"
-    )
-    enquiry_lead_id = conversation_store.relationship_id(enquiry.get("Lead"))
-    if enquiry_lead_id != lead_id:
-        print(
-            "[ENQUIRY CONVERSATION] action=failed "
-            "reason=enquiry_lead_mismatch "
-            f"enquiry_id={enquiry_id} lead_id={lead_id} "
-            f"enquiry_lead_id={enquiry_lead_id or 'none'}", flush=True,
-        )
-        raise ValueError("Enquiry Lead does not match tenant Lead.")
-    principal_id = conversation_store.relationship_id(enquiry.get("Principal"))
-    if not principal_id:
-        print(
-            "[ENQUIRY CONVERSATION] action=failed "
-            "reason=missing_tenant_conversation "
-            f"enquiry_id={enquiry_id}", flush=True,
-        )
-        raise ValueError("Tenant Enquiry Conversation requires Principal.")
-    representative = str(enquiry.get("Agent?") or "").strip() == "Yes"
-    conversation, created = conversation_store.find_or_create_conversation(
-        principal_id, phone, enquiry_id=enquiry_id,
-        counterparty_user_id=counterparty_user_id,
-        counterparty_role=("Lead Representative" if representative else "Lead"),
-        rentee_role=(
-            "Lead Representative Coordinator" if representative else "Lead Advisor"
-        ),
-        bubble_env=bubble_env, side="lead", lead_id=lead_id,
-    )
-    integrity = validate_routing_conversation(
-        conversation, expected_lead_id=lead_id,
-        expected_user_id=counterparty_user_id, expected_phone=phone,
-        bubble_env=bubble_env, enquiry=enquiry,
-    )
-    if not integrity["valid"] or integrity.get("type") == "enquiry_owner":
-        print(
-            "[ENQUIRY CONVERSATION] action=failed "
-            "reason=missing_tenant_conversation "
-            f"enquiry_id={enquiry_id}", flush=True,
-        )
-        raise RuntimeError("Could not ensure a valid tenant Enquiry Conversation.")
-    print(
-        "[ENQUIRY CONVERSATION] side=lead "
-        f"action={'created' if created else 'reused'} "
-        f"conversation_id={conversation['_id']} enquiry_id={enquiry_id}",
-        flush=True,
-    )
-    return conversation
-
-
 def find_reply_context(message, bubble_env="live"):
     """Resolve Meta reply context to its Conversation and optional exact Listing."""
     replied_to_id = str(((message or {}).get("context") or {}).get("id") or "").strip()
@@ -6789,12 +6720,6 @@ def _process_whatsapp_message(message):
                         find_or_create_lead_folio(lead_id, "live")
                     ),
                     whatsapp_profile_name=message.get("customer_name"),
-                    ensure_enquirer_conversation=lambda enquiry_id, lead_id,
-                    enquirer_phone, enquirer_user_id: ensure_enquirer_conversation(
-                        enquiry_id, lead_id, enquirer_phone,
-                        counterparty_user_id=enquirer_user_id,
-                        bubble_env="live",
-                    ),
                 )
                 linked_handoff_lead_id = getattr(handoff_result, "lead_id", None)
                 if linked_handoff_lead_id:
@@ -6809,9 +6734,7 @@ def _process_whatsapp_message(message):
                             flush=True,
                         )
                     try:
-                        lead_conversation = getattr(
-                            handoff_result, "conversation", None
-                        )
+                        lead_conversation = routed_conversation
                         if not lead_conversation:
                             handoff_lead = {
                                 "_id": linked_handoff_lead_id,
