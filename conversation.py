@@ -175,6 +175,41 @@ def find_active_conversation(
     return selected
 
 
+def find_active_conversations_by_enquiry_phone(
+    enquiry_id, counterparty_phone, bubble_env="live",
+):
+    """Find active enquiry Conversations without requiring a Principal lookup."""
+    enquiry_id = relationship_id(enquiry_id)
+    phone = normalize_phone(counterparty_phone)
+    if not enquiry_id or not phone:
+        return []
+    constraints = [
+        {"key": "Enquiry", "constraint_type": "equals", "value": enquiry_id},
+        {"key": "CounterParty Phone", "constraint_type": "equals", "value": phone},
+        {"key": "Status", "constraint_type": "equals", "value": "Active"},
+    ]
+    matches = []
+    for item in _records(
+        get_bubble_base_url(bubble_env), "conversation", constraints
+    ):
+        visible_enquiry = relationship_id(item.get("Enquiry"))
+        visible_phone = normalize_phone(item.get("CounterParty Phone"))
+        visible_status = str(item.get("Status") or "").strip()
+        if not item.get("_id"):
+            continue
+        if visible_enquiry and visible_enquiry != enquiry_id:
+            continue
+        if visible_phone and visible_phone != phone:
+            continue
+        if visible_status and visible_status != "Active":
+            continue
+        item.setdefault("Enquiry", enquiry_id)
+        item.setdefault("CounterParty Phone", phone)
+        item.setdefault("Status", "Active")
+        matches.append(item)
+    return matches
+
+
 def create_conversation(
     principal_id, counterparty_phone, enquiry_id=None,
     counterparty_user_id=None, counterparty_name=None, counterparty_role=None,

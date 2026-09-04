@@ -969,6 +969,11 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.active_phone_conversation_patcher.start()
         self.addCleanup(self.active_phone_conversation_patcher.stop)
+        self.owner_check_phone_patcher = patch(
+            "app.find_owner_check_conversations_by_phone", return_value=[]
+        )
+        self.mocked_owner_check_phone = self.owner_check_phone_patcher.start()
+        self.addCleanup(self.owner_check_phone_patcher.stop)
         self.general_conversation_patcher = patch(
             "app.find_general_conversation",
             return_value={"_id": "conversation-general"},
@@ -1067,6 +1072,108 @@ class WhatsAppTests(unittest.TestCase):
                 "OwnerCheckResponse": "  profile ok  ",
             },
         )
+
+    def test_owner_check_phone_resolver_uses_sent_enquiry_and_active_conversation(self):
+        self.owner_check_phone_patcher.stop()
+        enquiries = [{
+            "_id": "enquiry-1", "OwnerCheckPhone": "60115551234",
+            "OwnerCheckStatus": "Sent",
+        }]
+        owner_conversation = {
+            "_id": "conversation-owner", "Enquiry": "enquiry-1",
+            "CounterParty Role": "Owner Representative",
+        }
+        with patch("app._bubble_records", return_value=iter(enquiries)) as records, \
+             patch(
+                 "app.conversation_store.find_active_conversations_by_enquiry_phone",
+                 return_value=[owner_conversation],
+             ) as conversations:
+            result = app_module.find_owner_check_conversations_by_phone(
+                "+60 11-555 1234"
+            )
+        self.assertEqual(result, [owner_conversation])
+        self.assertEqual(records.call_args.args[1], "enquiry")
+        self.assertIn({
+            "key": "OwnerCheckStatus", "constraint_type": "equals",
+            "value": "Sent",
+        }, records.call_args.args[2])
+        conversations.assert_called_once_with(
+            "enquiry-1", "60115551234", "live"
+        )
+
+    def test_landlord_owner_check_phone_reply_bypasses_tenant_lead_creation(self):
+        conversation = {
+            "_id": "conversation-owner", "Principal": "principal-1",
+            "CounterParty Phone": "60123456789", "Status": "Active",
+            "CounterParty Role": "Owner Representative",
+            "Enquiry": "enquiry-1", "Lead": "tenant-lead-1",
+            "Listing": "listing-1",
+        }
+        item = webhook_payload(
+            message_id="wamid.owner-phone", text="Yes, it is available"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {
+            "_id": "user-landlord", "phone": "60123456789"
+        }
+        with patch(
+            "app.find_owner_check_conversations_by_phone",
+            return_value=[conversation],
+        ), patch("app.find_or_create_whatsapp_lead") as create_lead, \
+             patch("app.bubble", return_value={
+                 "_id": "enquiry-1", "OwnerCheckStatus": "Sent",
+             }), patch("app._bubble_patch") as update, \
+             patch("app.send_whatsapp_text", return_value=["wamid.ack"]) as send, \
+             patch("app.persist_sent_whatsapp_text") as persist_sent, \
+             patch("builtins.print") as logged:
+            app_module._process_whatsapp_message(item)
+
+        create_lead.assert_not_called()
+        matching_inbound = [
+            call for call in self.mocked_inbound.call_args_list
+            if call.kwargs.get("conversation_id") == "conversation-owner"
+        ]
+        self.assertEqual(len(matching_inbound), 1)
+        self.assertEqual(matching_inbound[0].kwargs["lead_id"], "tenant-lead-1")
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
+            {
+                "OwnerCheckStatus": "Replied",
+                "OwnerCheckResponse": "Yes, it is available",
+            },
+        )
+        send.assert_called_once_with("60123456789", "Thanks — noted.")
+        persist_sent.assert_called_once_with(
+            "60123456789", "Thanks — noted.", ["wamid.ack"],
+            "conversation-owner", lead_id="tenant-lead-1", bubble_env="live",
+        )
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("resolution=owner_check_phone", logs)
+        self.assertIn("resolution=owner_check conversation_id=conversation-owner", logs)
+        self.assertNotIn("LEAD ROUTING", logs)
+        self.assertNotIn("missing_principal", logs)
+
+    def test_multiple_owner_check_phone_matches_do_not_create_tenant_lead(self):
+        candidates = [
+            {
+                "_id": "conversation-one", "Enquiry": "enquiry-1",
+                "CounterParty Role": "Owner Representative", "Subject": "One",
+            },
+            {
+                "_id": "conversation-two", "Enquiry": "enquiry-2",
+                "CounterParty Role": "Owner Representative", "Subject": "Two",
+            },
+        ]
+        item = webhook_payload(
+            message_id="wamid.owner-ambiguous", text="Yes"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        with patch(
+            "app.find_owner_check_conversations_by_phone", return_value=candidates
+        ), patch("app.find_or_create_whatsapp_lead") as create_lead, \
+             patch("app.send_whatsapp_text") as send:
+            app_module._process_whatsapp_message(item)
+        create_lead.assert_not_called()
+        send.assert_called_once()
+        self.assertIn("do you mean", send.call_args.args[1])
 
     def test_non_owner_conversation_is_not_intercepted(self):
         with patch("app.bubble") as get_enquiry, patch("app._bubble_patch") as update:

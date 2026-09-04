@@ -2126,6 +2126,46 @@ def find_active_conversation_by_phone(
     return response + (all_candidates,) if include_candidates else response
 
 
+def find_owner_check_conversations_by_phone(phone, bubble_env="live"):
+    """Resolve active Conversations for owner checks awaiting a landlord reply."""
+    canonical_phone = normalize_phone(phone)
+    if not canonical_phone:
+        return []
+    constraints = [
+        {"key": "OwnerCheckPhone", "constraint_type": "equals",
+         "value": canonical_phone},
+        {"key": "OwnerCheckStatus", "constraint_type": "equals", "value": "Sent"},
+    ]
+    enquiries = [
+        enquiry for enquiry in _bubble_records(
+            get_bubble_base_url(bubble_env), "enquiry", constraints
+        )
+        if enquiry.get("_id")
+        and (
+            not normalize_phone(enquiry.get("OwnerCheckPhone"))
+            or normalize_phone(enquiry.get("OwnerCheckPhone")) == canonical_phone
+        )
+        and (
+            not str(enquiry.get("OwnerCheckStatus") or "").strip()
+            or str(enquiry.get("OwnerCheckStatus") or "").strip() == "Sent"
+        )
+    ]
+    matches = {}
+    for enquiry in enquiries:
+        enquiry_id = conversation_store.relationship_id(enquiry.get("_id"))
+        for conversation in (
+            conversation_store.find_active_conversations_by_enquiry_phone(
+                enquiry_id, canonical_phone, bubble_env
+            )
+        ):
+            if str(conversation.get("CounterParty Role") or "").strip() != (
+                "Owner Representative"
+            ):
+                continue
+            matches[str(conversation["_id"])] = conversation
+    return list(matches.values())
+
+
 def _has_strong_property_search_clue(message_text, bubble_env="live"):
     """Recognize only explicit property-search criteria, without an LLM guess."""
     text = " ".join(str(message_text or "").casefold().split())
@@ -6078,6 +6118,78 @@ def _process_whatsapp_message(message):
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
                         "resolution=active_phone_lookup_failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+            if not routed_conversation_id:
+                try:
+                    owner_check_candidates = find_owner_check_conversations_by_phone(
+                        phone, "live"
+                    )
+                    if len(owner_check_candidates) == 1:
+                        routed_conversation = owner_check_candidates[0]
+                        routed_conversation_id = conversation_store.relationship_id(
+                            routed_conversation.get("_id")
+                        )
+                        ambiguous_candidates = []
+                        enquiry_id = conversation_store.relationship_id(
+                            routed_conversation.get("Enquiry")
+                        )
+                        print(
+                            "[CONVERSATION ROUTING] direction=inbound "
+                            "resolution=owner_check_phone "
+                            f"conversation_id={routed_conversation_id} "
+                            f"enquiry_id={enquiry_id}", flush=True,
+                        )
+                        inbound_message_id, _inbound_created = (
+                            persist_inbound_whatsapp_message(
+                                phone, message_id, text,
+                                lead_id=conversation_store.relationship_id(
+                                    routed_conversation.get("Lead")
+                                ),
+                                conversation_id=routed_conversation_id,
+                                bubble_env="live",
+                            )
+                        )
+                    elif len(owner_check_candidates) > 1:
+                        routed_conversation, clue, ambiguous_candidates = (
+                            route_conversation_by_message_clue(
+                                text, owner_check_candidates, "live"
+                            )
+                        )
+                        routed_conversation_id = conversation_store.relationship_id(
+                            (routed_conversation or {}).get("_id")
+                        )
+                        if routed_conversation_id:
+                            enquiry_id = conversation_store.relationship_id(
+                                routed_conversation.get("Enquiry")
+                            )
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                "resolution=owner_check_phone "
+                                f"clue={clue} conversation_id={routed_conversation_id} "
+                                f"enquiry_id={enquiry_id}", flush=True,
+                            )
+                            inbound_message_id, _inbound_created = (
+                                persist_inbound_whatsapp_message(
+                                    phone, message_id, text,
+                                    lead_id=conversation_store.relationship_id(
+                                        routed_conversation.get("Lead")
+                                    ),
+                                    conversation_id=routed_conversation_id,
+                                    bubble_env="live",
+                                )
+                            )
+                        else:
+                            print(
+                                "[CONVERSATION ROUTING] direction=inbound "
+                                "resolution=owner_check_phone_ambiguous "
+                                f"candidate_count={len(ambiguous_candidates)} "
+                                "action=clarify", flush=True,
+                            )
+                except Exception as error:
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        "resolution=owner_check_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
             if len(ambiguous_candidates) > 1:

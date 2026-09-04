@@ -11,6 +11,27 @@ import conversation
 
 
 class ConversationTests(unittest.TestCase):
+    def test_finds_active_enquiry_conversation_by_counterparty_phone(self):
+        matching = {
+            "_id": "conversation-owner", "Enquiry": "enquiry-1",
+            "CounterParty Phone": "60115551234", "Status": "Active",
+        }
+        wrong = {
+            "_id": "conversation-wrong", "Enquiry": "enquiry-other",
+            "CounterParty Phone": "60115551234", "Status": "Active",
+        }
+        with patch("conversation._records", return_value=iter([matching, wrong])) as records:
+            result = conversation.find_active_conversations_by_enquiry_phone(
+                "enquiry-1", "+60 11-555 1234"
+            )
+        self.assertEqual(result, [matching])
+        self.assertEqual(records.call_args.args[2], [
+            {"key": "Enquiry", "constraint_type": "equals", "value": "enquiry-1"},
+            {"key": "CounterParty Phone", "constraint_type": "equals",
+             "value": "60115551234"},
+            {"key": "Status", "constraint_type": "equals", "value": "Active"},
+        ])
+
     def test_enquiry_specific_creation_copies_lead_and_listing(self):
         with patch("conversation._get", return_value={
                  "Lead": "lead-1", "Listing": "listing-1",
