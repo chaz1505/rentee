@@ -974,11 +974,6 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.mocked_owner_check_phone = self.owner_check_phone_patcher.start()
         self.addCleanup(self.owner_check_phone_patcher.stop)
-        self.owner_check_notify_patcher = patch(
-            "app.notify_enquirer_of_owner_check", return_value=False
-        )
-        self.mocked_owner_check_notify = self.owner_check_notify_patcher.start()
-        self.addCleanup(self.owner_check_notify_patcher.stop)
         self.general_conversation_patcher = patch(
             "app.find_general_conversation",
             return_value={"_id": "conversation-general"},
@@ -1073,213 +1068,10 @@ class WhatsAppTests(unittest.TestCase):
         update.assert_called_once_with(
             "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
             {
+                "OwnerCheckStatus": "Replied",
                 "OwnerCheckResponse": "  profile ok  ",
-                "OwnerCheckResult": "unclear",
             },
         )
-
-    def test_owner_check_interpretation_covers_positive_negative_and_unclear(self):
-        available = app_module._interpret_owner_check_response(
-            "Yes, available. Viewings after 5pm."
-        )
-        self.assertEqual(available["result"], "available")
-        self.assertEqual(available["viewing_note"], "Viewings are possible after 5pm.")
-        for text, reason in (
-            ("Sorry, rented already.", "property_unavailable"),
-            ("Sorry, this tenant profile is not suitable.", "profile_declined"),
-            ("The move-in date does not work.", "timing_mismatch"),
-            ("No, those lease terms do not work.", "terms_mismatch"),
-            ("We do not accept that nationality.", "profile_declined"),
-        ):
-            with self.subTest(text=text):
-                outcome = app_module._interpret_owner_check_response(text)
-                self.assertEqual(outcome["result"], "unavailable")
-                self.assertEqual(outcome["reason"], reason)
-        for text in ("Let me check.", "Who is the tenant?", "Maybe."):
-            with self.subTest(text=text):
-                self.assertEqual(
-                    app_module._interpret_owner_check_response(text)["result"],
-                    "unclear",
-                )
-
-    def test_positive_owner_check_notifies_enquirer_and_progresses_to_viewing(self):
-        self.owner_check_notify_patcher.stop()
-        enquiry = {
-            "_id": "enquiry-1", "Lead": "lead-tenant",
-            "Listing": "listing-1",
-        }
-        result = app_module.OwnerCheckReplyResult(
-            "Thanks — noted.", enquiry=enquiry, result="available",
-            viewing_note="Viewings are possible after 5pm.",
-        )
-        conversations = [
-            {
-                "_id": "conversation-owner", "Enquiry": "enquiry-1",
-                "CounterParty Role": "Owner Representative",
-                "CounterParty Phone": "60111111111", "Lead": "lead-tenant",
-            },
-            {
-                "_id": "conversation-enquirer", "Enquiry": "enquiry-1",
-                "CounterParty Role": "Lead", "CounterParty Phone": "60122222222",
-                "Lead": "lead-tenant", "Listing": "listing-1",
-            },
-        ]
-        now = datetime(2026, 9, 4, 8, 0, tzinfo=timezone.utc)
-        with patch(
-            "app.conversation_store.find_active_conversations_by_enquiry",
-            return_value=conversations,
-        ), patch("app.owner_check_whatsapp_window", return_value="open"), \
-             patch("app.send_whatsapp_text", return_value=["wamid.tenant"]) as send, \
-             patch("app.persist_sent_whatsapp_text") as persist, \
-             patch("app.conversation_store.set_conversation_awaiting_viewing_response") as awaiting, \
-             patch("app._bubble_patch") as update:
-            notified = app_module.notify_enquirer_of_owner_check(
-                result, now=now
-            )
-        message = (
-            "Good news — the owner has confirmed this unit is available. "
-            "Viewings are possible after 5pm. When would you like to view?"
-        )
-        self.assertTrue(notified)
-        send.assert_called_once_with("60122222222", message)
-        persist.assert_called_once_with(
-            "60122222222", message, ["wamid.tenant"],
-            "conversation-enquirer", lead_id="lead-tenant", bubble_env="live",
-        )
-        awaiting.assert_called_once_with(
-            "conversation-enquirer", True, "live"
-        )
-        self.assertEqual(
-            update.call_args.args[1]["OwnerCheckNotificationConversation"],
-            "conversation-enquirer",
-        )
-        self.assertTrue(result.enquiry["OwnerCheckNotifiedAt"])
-
-    def test_negative_owner_check_notification_is_generic_and_not_a_viewing_prompt(self):
-        for reason in (
-            "property_unavailable", "profile_declined", "timing_mismatch",
-            "terms_mismatch", "other_decline",
-        ):
-            result = app_module.OwnerCheckReplyResult(
-                "Thanks — noted.", enquiry={"_id": "enquiry-1"},
-                result="unavailable", reason=reason,
-            )
-            message = app_module._owner_check_enquirer_message(result)
-            self.assertEqual(message, "Unfortunately, this unit is unavailable.")
-            self.assertNotIn("view", message.casefold())
-            self.assertNotIn("profile", message.casefold())
-
-    def test_owner_check_notification_is_durably_idempotent(self):
-        self.owner_check_notify_patcher.stop()
-        result = app_module.OwnerCheckReplyResult(
-            "Thanks — noted.", enquiry={
-                "_id": "enquiry-1", "OwnerCheckNotifiedAt": "2026-09-04T08:00:00Z",
-            }, result="available",
-        )
-        with patch(
-            "app.conversation_store.find_active_conversations_by_enquiry"
-        ) as find, patch("app.send_whatsapp_text") as send:
-            self.assertFalse(app_module.notify_enquirer_of_owner_check(result))
-        find.assert_not_called()
-        send.assert_not_called()
-
-    def test_missing_enquirer_conversation_does_not_break_recorded_result(self):
-        self.owner_check_notify_patcher.stop()
-        result = app_module.OwnerCheckReplyResult(
-            "Thanks — noted.", enquiry={"_id": "enquiry-1"},
-            result="available",
-        )
-        with patch(
-            "app.conversation_store.find_active_conversations_by_enquiry",
-            return_value=[],
-        ), patch("app.send_whatsapp_text") as send, \
-             patch("builtins.print") as logged:
-            self.assertFalse(app_module.notify_enquirer_of_owner_check(result))
-        send.assert_not_called()
-        logs = "\n".join(str(call) for call in logged.call_args_list)
-        self.assertIn("reason=missing_enquirer_conversation", logs)
-
-    def test_closed_window_without_template_keeps_notification_retryable(self):
-        self.owner_check_notify_patcher.stop()
-        result = app_module.OwnerCheckReplyResult(
-            "Thanks — noted.", enquiry={"_id": "enquiry-1"},
-            result="available",
-        )
-        conversation = {
-            "_id": "conversation-enquirer", "Enquiry": "enquiry-1",
-            "CounterParty Role": "Lead", "CounterParty Phone": "60122222222",
-        }
-        with patch(
-            "app.conversation_store.find_active_conversations_by_enquiry",
-            return_value=[conversation],
-        ), patch("app.owner_check_whatsapp_window", return_value="closed"), \
-             patch.dict(os.environ, {
-                 "WHATSAPP_OWNER_CHECK_AVAILABLE_TEMPLATE_NAME": ""
-             }), patch("app.send_whatsapp_template") as template, \
-             patch("app._bubble_patch") as update, \
-             patch("builtins.print") as logged:
-            self.assertFalse(app_module.notify_enquirer_of_owner_check(result))
-        template.assert_not_called()
-        update.assert_not_called()
-        self.assertNotIn("OwnerCheckNotifiedAt", result.enquiry)
-        self.assertIn(
-            "missing_template_configuration",
-            "\n".join(str(call) for call in logged.call_args_list),
-        )
-
-    def test_closed_window_uses_configured_result_template(self):
-        self.owner_check_notify_patcher.stop()
-        result = app_module.OwnerCheckReplyResult(
-            "Thanks — noted.", enquiry={"_id": "enquiry-1"},
-            result="unavailable", reason="profile_declined",
-        )
-        conversation = {
-            "_id": "conversation-enquirer", "Enquiry": "enquiry-1",
-            "CounterParty Role": "Lead", "CounterParty Phone": "60122222222",
-        }
-        with patch(
-            "app.conversation_store.find_active_conversations_by_enquiry",
-            return_value=[conversation],
-        ), patch("app.owner_check_whatsapp_window", return_value="closed"), \
-             patch.dict(os.environ, {
-                 "WHATSAPP_OWNER_CHECK_UNAVAILABLE_TEMPLATE_NAME": "owner_unavailable",
-                 "WHATSAPP_OWNER_CHECK_RESULT_TEMPLATE_LANGUAGE": "en_US",
-             }), patch(
-                 "app.send_whatsapp_template", return_value=["wamid.template"]
-             ) as template, patch("app.persist_sent_whatsapp_text") as persist, \
-             patch("app._bubble_patch"):
-            self.assertTrue(app_module.notify_enquirer_of_owner_check(result))
-        template.assert_called_once_with(
-            "60122222222", "owner_unavailable", "en_US"
-        )
-        persist.assert_called_once_with(
-            "60122222222", "Unfortunately, this unit is unavailable.",
-            ["wamid.template"], "conversation-enquirer",
-            lead_id=None, bubble_env="live",
-        )
-
-    def test_viewing_time_replies_select_the_notified_enquiry_conversation(self):
-        viewing = {
-            "_id": "conversation-enquiry", "Enquiry": "enquiry-1",
-            "Listing": "listing-1", "Lead": "lead-1",
-            "CounterParty Role": "Lead", "Awaiting Viewing Response": "Yes",
-        }
-        general = {
-            "_id": "conversation-general", "Lead": "lead-1",
-            "CounterParty Role": "Lead",
-        }
-        for text in (
-            "Saturday afternoon", "Tomorrow at 3", "Any time this weekend"
-        ):
-            with self.subTest(text=text):
-                selected, clue, compatible = (
-                    app_module.route_conversation_by_message_clue(
-                        text, [general, viewing]
-                    )
-                )
-                self.assertIs(selected, viewing)
-                self.assertEqual(clue, "viewing_response")
-                self.assertEqual(compatible, [viewing])
 
     def test_owner_check_phone_resolver_uses_sent_enquiry_and_active_conversation(self):
         self.owner_check_phone_patcher.stop()
@@ -1347,7 +1139,6 @@ class WhatsAppTests(unittest.TestCase):
             {
                 "OwnerCheckStatus": "Replied",
                 "OwnerCheckResponse": "Yes, it is available",
-                "OwnerCheckResult": "available",
             },
         )
         send.assert_called_once_with("60123456789", "Thanks — noted.")
@@ -1355,9 +1146,6 @@ class WhatsAppTests(unittest.TestCase):
             "60123456789", "Thanks — noted.", ["wamid.ack"],
             "conversation-owner", lead_id="tenant-lead-1", bubble_env="live",
         )
-        outcome = self.mocked_owner_check_notify.call_args.args[0]
-        self.assertEqual(outcome.result, "available")
-        self.assertEqual(outcome.enquiry["Lead"], "tenant-lead-1")
         logs = "\n".join(str(call) for call in logged.call_args_list)
         self.assertIn("resolution=owner_check_phone", logs)
         self.assertIn("resolution=owner_check conversation_id=conversation-owner", logs)
@@ -1444,8 +1232,8 @@ class WhatsAppTests(unittest.TestCase):
         update.assert_called_once_with(
             "https://www.rentee.asia/api/1.1/obj/enquiry/enquiry-1",
             {
+                "OwnerCheckStatus": "Replied",
                 "OwnerCheckResponse": "profile ok",
-                "OwnerCheckResult": "unclear",
             },
         )
         matching_inbound = [

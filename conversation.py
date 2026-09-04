@@ -255,33 +255,6 @@ def find_active_conversations_by_enquiry_phone(
     return matches
 
 
-def find_active_conversations_by_enquiry(enquiry_id, bubble_env="live"):
-    """Return active Conversations tied to one exact Enquiry."""
-    enquiry_id = relationship_id(enquiry_id)
-    if not enquiry_id:
-        return []
-    constraints = [
-        {"key": "Enquiry", "constraint_type": "equals", "value": enquiry_id},
-        {"key": "Status", "constraint_type": "equals", "value": "Active"},
-    ]
-    matches = []
-    for item in _records(
-        get_bubble_base_url(bubble_env), "conversation", constraints
-    ):
-        visible_enquiry = relationship_id(item.get("Enquiry"))
-        visible_status = str(item.get("Status") or "").strip()
-        if not item.get("_id"):
-            continue
-        if visible_enquiry and visible_enquiry != enquiry_id:
-            continue
-        if visible_status and visible_status != "Active":
-            continue
-        item.setdefault("Enquiry", enquiry_id)
-        item.setdefault("Status", "Active")
-        matches.append(item)
-    return matches
-
-
 def create_conversation(
     principal_id, counterparty_phone, enquiry_id=None,
     counterparty_user_id=None, counterparty_name=None, counterparty_role=None,
@@ -410,17 +383,6 @@ def update_conversation_last_outbound_at(conversation_id, bubble_env="live", now
     )
     _patch(get_bubble_base_url(bubble_env), "conversation", conversation_id, payload)
     print(f"[CONVERSATION] message=outbound conversation_id={conversation_id}", flush=True)
-    return payload
-
-
-def set_conversation_awaiting_viewing_response(
-    conversation_id, awaiting=True, bubble_env="live",
-):
-    payload = {"Awaiting Viewing Response": "Yes" if awaiting else "No"}
-    _patch(
-        get_bubble_base_url(bubble_env), "conversation",
-        relationship_id(conversation_id), payload,
-    )
     return payload
 
 
