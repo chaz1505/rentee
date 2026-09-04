@@ -1000,8 +1000,76 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(result["active_state"]["property_types"], ["buy"])
         self.assertEqual(result["active_state"]["budget_requirement"], "")
         lead_fields = save.call_args.args[3]
-        self.assertEqual(lead_fields["TransactionType"], ["Buy/Sell"])
+        self.assertEqual(
+            lead_fields["TransactionType"], ["Rent/Let", "Buy/Sell"]
+        )
         self.assertNotIn("budgetBuy", lead_fields)
+
+    def test_lead_transaction_type_preserves_valid_cumulative_interests(self):
+        cases = (
+            (["Rent/Let"], "buy", ["Rent/Let", "Buy/Sell"]),
+            (["Buy/Sell"], "rent", ["Buy/Sell", "Rent/Let"]),
+            (["Rent/Let", "Buy/Sell"], "buy", ["Rent/Let", "Buy/Sell"]),
+            (["Rent/Let", "Buy/Sell"], "rent", ["Rent/Let", "Buy/Sell"]),
+            ([], "buy", ["Buy/Sell"]),
+            ([], "rent", ["Rent/Let"]),
+        )
+        for existing, active_transaction, expected in cases:
+            with self.subTest(existing=existing, active=active_transaction):
+                payload = app_module.structured_lead_update(
+                    {"transaction_type": active_transaction},
+                    "https://bubble.test",
+                    existing,
+                )
+                self.assertEqual(payload["TransactionType"], expected)
+
+    def test_active_buy_search_stays_buy_only_when_lead_has_both_interests(self):
+        active = apply_search_update(empty_search_state(), {
+            "property_types": ["buy"],
+        })
+        lead = {
+            "TransactionType": ["Rent/Let", "Buy/Sell"],
+            "searchActive": dump_search_state(active),
+        }
+        with patch("app.get_valid_geo_names", return_value=[]):
+            effective = app_module.lead_with_active_search_filters(
+                lead, "https://bubble.test"
+            )
+        requirements = app_module.structured_lead_requirements(effective)
+        plan = app_module.build_listing_bubble_constraints(requirements)
+        self.assertEqual(requirements["transaction_type"], ["Buy/Sell"])
+        self.assertEqual(len(plan["queries"]), 1)
+        self.assertIn({
+            "key": "TransactionType", "constraint_type": "contains",
+            "value": "Buy/Sell",
+        }, plan["queries"][0])
+        self.assertFalse(any(
+            item.get("value") == "Rent/Let" for item in plan["queries"][0]
+        ))
+
+    def test_active_rent_search_stays_rent_only_when_lead_has_both_interests(self):
+        active = apply_search_update(empty_search_state(), {
+            "property_types": ["rent"],
+        })
+        lead = {
+            "TransactionType": ["Rent/Let", "Buy/Sell"],
+            "searchActive": dump_search_state(active),
+        }
+        with patch("app.get_valid_geo_names", return_value=[]):
+            effective = app_module.lead_with_active_search_filters(
+                lead, "https://bubble.test"
+            )
+        requirements = app_module.structured_lead_requirements(effective)
+        plan = app_module.build_listing_bubble_constraints(requirements)
+        self.assertEqual(requirements["transaction_type"], ["Rent/Let"])
+        self.assertEqual(len(plan["queries"]), 1)
+        self.assertIn({
+            "key": "TransactionType", "constraint_type": "contains",
+            "value": "Rent/Let",
+        }, plan["queries"][0])
+        self.assertFalse(any(
+            item.get("value") == "Buy/Sell" for item in plan["queries"][0]
+        ))
 
     @patch("app.save_search_state")
     @patch("app.get_named_object_ids", return_value=["condo-one"])

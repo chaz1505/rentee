@@ -4427,11 +4427,10 @@ def structured_lead_update(
     payload = {}
     transaction = update.get("transaction_type")
     if transaction and transaction != "unchanged":
-        values = bubble_transaction_values(transaction)
-        if update.get("_transaction_interest_mode") == "add":
-            values = list(dict.fromkeys(
-                bubble_transaction_values(existing_transaction_values) + values
-            ))
+        values = list(dict.fromkeys(
+            bubble_transaction_values(existing_transaction_values)
+            + bubble_transaction_values(transaction)
+        ))
         payload["TransactionType"] = values
         print(
             f"[TRANSACTION] raw={transaction!r} "
