@@ -71,7 +71,7 @@ class ConversationTests(unittest.TestCase):
             candidate, expected_lead_id="lead-1", enquiry={"Lead": "lead-2"},
         )
         self.assertFalse(result["valid"])
-        self.assertEqual(result["reason"], "enquiry_lead_mismatch")
+        self.assertEqual(result["reason"], "expected_lead_mismatch")
 
     def test_owner_conversation_keeps_tenant_lead_as_business_context(self):
         candidate = {
