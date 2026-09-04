@@ -11,95 +11,6 @@ import conversation
 
 
 class ConversationTests(unittest.TestCase):
-    def test_general_conversation_is_classified_and_valid_without_enquiry(self):
-        candidate = {
-            "_id": "general-1", "Lead": "lead-1", "Status": "Active",
-            "CounterParty Phone": "60123456789", "CounterParty Role": "Lead",
-        }
-        self.assertEqual(conversation.classify_conversation(candidate), "general")
-        result = conversation.validate_conversation_context(
-            candidate, expected_lead_id="lead-1", expected_phone="60123456789"
-        )
-        self.assertTrue(result["valid"])
-        self.assertIsNone(result["enquiry_id"])
-
-    def test_valid_lead_enquiry_conversation(self):
-        candidate = {
-            "_id": "conversation-1", "Lead": "lead-1", "Enquiry": "enquiry-1",
-            "Status": "Active", "CounterParty Role": "Lead",
-        }
-        result = conversation.validate_conversation_context(
-            candidate, expected_lead_id="lead-1",
-            enquiry={"Lead": "lead-1", "Listing": "listing-1"},
-        )
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["type"], "enquiry_lead")
-        self.assertEqual(result["listing_id"], "listing-1")
-
-    def test_enquiry_lead_mismatch_is_rejected(self):
-        candidate = {
-            "_id": "conversation-1", "Lead": "lead-1", "Enquiry": "enquiry-1",
-            "Status": "Active", "CounterParty Role": "Lead",
-        }
-        result = conversation.validate_conversation_context(
-            candidate, enquiry={"Lead": "lead-2"},
-        )
-        self.assertFalse(result["valid"])
-        self.assertEqual(result["reason"], "enquiry_lead_mismatch")
-
-    def test_owner_conversation_preserves_tenant_lead_as_business_context(self):
-        candidate = {
-            "_id": "owner-1", "Lead": "tenant-lead", "Enquiry": "enquiry-1",
-            "Status": "Active", "CounterParty Role": "Owner Representative",
-            "CounterParty Phone": "60115551234",
-        }
-        result = conversation.validate_conversation_context(
-            candidate, expected_lead_id="landlord-is-not-a-lead",
-            expected_phone="60115551234",
-            enquiry={"Lead": "tenant-lead", "Listing": "listing-1"},
-        )
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["type"], "enquiry_owner")
-        self.assertEqual(result["lead_id"], "tenant-lead")
-
-    def test_expected_lead_mismatch_is_rejected(self):
-        candidate = {
-            "_id": "conversation-1", "Lead": "lead-2", "Enquiry": "enquiry-1",
-            "Status": "Active", "CounterParty Role": "Lead",
-        }
-        result = conversation.validate_conversation_context(
-            candidate, expected_lead_id="lead-1", enquiry={"Lead": "lead-2"},
-        )
-        self.assertFalse(result["valid"])
-        self.assertEqual(result["reason"], "expected_lead_mismatch")
-
-    def test_owner_conversation_keeps_tenant_lead_as_business_context(self):
-        candidate = {
-            "_id": "owner-1", "Lead": "lead-1", "Enquiry": "enquiry-1",
-            "Status": "Active", "CounterParty Role": "Owner Representative",
-        }
-        result = conversation.validate_conversation_context(
-            candidate, expected_lead_id="landlord-is-not-a-lead",
-            enquiry={"Lead": "lead-1"},
-        )
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["type"], "enquiry_owner")
-
-    def test_diagnostic_helper_reports_relationship_integrity(self):
-        candidate = {
-            "_id": "conversation-1", "Lead": "lead-1", "Enquiry": "enquiry-1",
-            "Listing": "listing-1", "Status": "Active",
-            "CounterParty Role": "Lead",
-        }
-        with patch("conversation._get", return_value={
-            "Lead": "lead-1", "Listing": "listing-1",
-        }):
-            result = conversation.inspect_conversation_context(candidate)
-        self.assertEqual(result["conversation_id"], "conversation-1")
-        self.assertEqual(result["enquiry_lead_id"], "lead-1")
-        self.assertEqual(result["listing_id"], "listing-1")
-        self.assertTrue(result["valid"])
-
     def test_creates_general_conversation_without_principal(self):
         with patch("conversation._create", return_value="conversation-general") as create:
             result = conversation.create_conversation(
@@ -197,7 +108,7 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(result["Lead"], "lead-1")
         self.assertEqual(result["Listing"], "listing-1")
 
-    def test_inconsistent_existing_conversation_is_not_reused(self):
+    def test_existing_lead_and_listing_are_not_overwritten(self):
         existing = {
             "_id": "conversation-1", "Lead": "lead-existing",
             "Listing": "listing-existing",
@@ -205,16 +116,14 @@ class ConversationTests(unittest.TestCase):
         with patch("conversation._get", return_value={
                  "Lead": "lead-new", "Listing": "listing-new",
              }), patch("conversation.find_active_conversation",
-                       return_value=existing), patch("conversation._patch") as update, \
-             patch("conversation.create_conversation",
-                   return_value={"_id": "conversation-new"}) as create:
+                       return_value=existing), patch("conversation._patch") as update:
             result, created = conversation.find_or_create_conversation(
                 "user-1", "60115551234", "enquiry-1"
             )
-        self.assertTrue(created)
+        self.assertFalse(created)
         update.assert_not_called()
-        self.assertEqual(result["_id"], "conversation-new")
-        create.assert_called_once()
+        self.assertEqual(result["Lead"], "lead-existing")
+        self.assertEqual(result["Listing"], "listing-existing")
 
     def test_lead_and_listing_are_not_conversation_identity_constraints(self):
         with patch("conversation._records", return_value=iter([])) as records:

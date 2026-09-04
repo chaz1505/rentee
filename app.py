@@ -1546,6 +1546,17 @@ def prepare_owner_check(
     )
     if not lead_id:
         return None
+    if (
+        authoritative_enquiry_id and fallback_enquiry_id
+        and authoritative_enquiry_id != fallback_enquiry_id
+    ):
+        print(
+            "[OWNER CHECK] action=failed "
+            "reason=enquiry_context_mismatch "
+            f"current_enquiry_id={authoritative_enquiry_id} "
+            f"resolved_enquiry_id={fallback_enquiry_id} "
+            "resolution=current_conversation_override", flush=True,
+        )
     if not enquiry_id:
         print(
             f"[OWNER CHECK] lead_id={lead_id} unresolved "
@@ -2403,35 +2414,8 @@ def active_conversations_by_phone(phone, bubble_env="live"):
     ]
 
 
-def validate_routing_conversation(
-    conversation, expected_lead_id=None, expected_user_id=None,
-    expected_phone=None, bubble_env="live", enquiry=None,
-):
-    """Validate a routing candidate before it can become the active thread."""
-    enquiry_id = conversation_store.relationship_id(
-        (conversation or {}).get("Enquiry")
-    )
-    if enquiry_id and enquiry is None:
-        try:
-            enquiry = bubble(
-                f"{get_bubble_base_url(bubble_env)}/obj/enquiry/{enquiry_id}"
-            )
-        except Exception as error:
-            print(
-                "[CONVERSATION VALIDATION] "
-                f"conversation_id={conversation_store.relationship_id((conversation or {}).get('_id')) or 'none'} "
-                "result=rejected reason=enquiry_lookup_failed "
-                f"error={type(error).__name__}", flush=True,
-            )
-            return {"valid": False, "reason": "enquiry_lookup_failed"}
-    return conversation_store.validate_conversation_context(
-        conversation, expected_lead_id=expected_lead_id,
-        expected_user_id=expected_user_id, expected_phone=expected_phone,
-        bubble_env=bubble_env, enquiry=enquiry,
-    )
 def find_active_conversation_by_phone(
     phone, message_text="", bubble_env="live", include_candidates=False,
-    expected_user_id=None,
 ):
     """Conservatively resolve a phone-only enquiry Conversation.
 
@@ -2439,16 +2423,7 @@ def find_active_conversation_by_phone(
     enquiry fallback for legacy inbound traffic only when it cannot conflict
     with a general Conversation; never guess between multiple enquiries.
     """
-    all_candidates = [
-        candidate for candidate in active_conversations_by_phone(phone, bubble_env)
-        if (
-            (integrity := validate_routing_conversation(
-                candidate, expected_user_id=expected_user_id,
-                expected_phone=phone, bubble_env=bubble_env,
-            ))["valid"]
-            and integrity["type"] != "enquiry_owner"
-        )
-    ]
+    all_candidates = active_conversations_by_phone(phone, bubble_env)
     result = None
     resolution = "none"
     if len(all_candidates) == 1:
@@ -2491,11 +2466,9 @@ def find_owner_check_conversations_by_phone(phone, bubble_env="live"):
                 enquiry_id, canonical_phone, bubble_env
             )
         ):
-            integrity = validate_routing_conversation(
-                conversation, expected_phone=canonical_phone,
-                bubble_env=bubble_env, enquiry=enquiry,
-            )
-            if not integrity["valid"] or integrity["type"] != "enquiry_owner":
+            if str(conversation.get("CounterParty Role") or "").strip() != (
+                "Owner Representative"
+            ):
                 continue
             matches[str(conversation["_id"])] = conversation
     return list(matches.values())
@@ -6372,16 +6345,6 @@ def _process_whatsapp_message(message):
                     (routed_conversation or {}).get("_id")
                 )
                 if routed_conversation_id:
-                    integrity = validate_routing_conversation(
-                        routed_conversation,
-                        expected_user_id=bubble_user_id,
-                        expected_phone=phone,
-                        bubble_env="live",
-                    )
-                    if not integrity["valid"]:
-                        routed_conversation = None
-                        routed_conversation_id = None
-                if routed_conversation_id:
                     print(
                         "[CONVERSATION ROUTING] direction=inbound "
                         f"resolution=reply_to conversation_id={routed_conversation_id} "
@@ -6406,8 +6369,7 @@ def _process_whatsapp_message(message):
             if not routed_conversation_id:
                 try:
                     phone_resolution = find_active_conversation_by_phone(
-                        phone, text, "live", include_candidates=True,
-                        expected_user_id=bubble_user_id,
+                        phone, text, "live", include_candidates=True
                     )
                     routed_conversation, resolution, candidate_count = (
                         phone_resolution[:3]
