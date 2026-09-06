@@ -1261,7 +1261,7 @@ def find_lead_by_phone(phone, bubble_env="live"):
 
 def find_or_create_whatsapp_lead(
     phone, customer_name=None, bubble_env="live", agent_classification=None,
-    owner_user_id=None,
+    owner_user_id=None, principal_user_id=None,
 ):
     canonical = normalize_phone(phone)
     if not canonical:
@@ -1271,6 +1271,8 @@ def find_or_create_whatsapp_lead(
         return lead, False
     base_url = get_bubble_base_url(bubble_env)
     payload = {WHATSAPP_LEAD_PHONE_FIELD: canonical}
+    if str(principal_user_id or "").strip():
+        payload["PrincipalUser"] = str(principal_user_id).strip()
     if agent_classification in {"Yes", "No"}:
         payload["Agent?"] = agent_classification
         if str(customer_name or "").strip():
@@ -1288,6 +1290,8 @@ def find_or_create_whatsapp_lead(
         )
     lead.setdefault("_id", lead_id)
     lead[WHATSAPP_LEAD_PHONE_FIELD] = canonical
+    if str(principal_user_id or "").strip():
+        lead.setdefault("PrincipalUser", str(principal_user_id).strip())
     if agent_classification in {"Yes", "No"}:
         lead.setdefault("Agent?", agent_classification)
         if str(customer_name or "").strip():
@@ -6438,7 +6442,8 @@ def _process_whatsapp_message(message):
                     lead, lead_created = linked_lead, False
                 else:
                     lead, lead_created = find_or_create_whatsapp_lead(
-                        phone, message.get("customer_name"), "live"
+                        phone, message.get("customer_name"), "live",
+                        principal_user_id=bubble_user_id,
                     )
                 print(
                     "[LEAD ROUTING] resolution=phone_fallback "

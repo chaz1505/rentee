@@ -1719,6 +1719,23 @@ class WhatsAppTests(unittest.TestCase):
     @patch("app._bubble_create", return_value="lead-new")
     @patch("app.find_lead_by_phone", return_value=None)
     @patch("app.bubble", return_value={"_id": "lead-new"})
+    def test_new_whatsapp_lead_stores_resolved_user_as_principal_user(
+        self, _bubble, _find, mocked_create
+    ):
+        lead, created = app_module.find_or_create_whatsapp_lead(
+            "+60 12-345-6789", principal_user_id="user-whatsapp"
+        )
+
+        self.assertTrue(created)
+        self.assertEqual(lead["PrincipalUser"], "user-whatsapp")
+        mocked_create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "lead",
+            {"phone": "60123456789", "PrincipalUser": "user-whatsapp"},
+        )
+
+    @patch("app._bubble_create", return_value="lead-new")
+    @patch("app.find_lead_by_phone", return_value=None)
+    @patch("app.bubble", return_value={"_id": "lead-new"})
     def test_new_handoff_lead_stores_text_agent_classification(
         self, _bubble, _find, mocked_create
     ):
@@ -2541,7 +2558,9 @@ class WhatsAppTests(unittest.TestCase):
         events = []
         lead = {"_id": "lead-1", "phone": "60123456789", "searchBriefJSON": ""}
         mocked_typing.side_effect = lambda _message_id: events.append("typing")
-        mocked_lead.side_effect = lambda *_args: (events.append("lead") or (lead, False))
+        mocked_lead.side_effect = lambda *_args, **_kwargs: (
+            events.append("lead") or (lead, False)
+        )
         mocked_latest.return_value = {
             "_id": "bubble-message-1", "lead": "lead-1",
             "own_Sent?": "No", "response_ID": "response-1",
@@ -3485,7 +3504,9 @@ class WhatsAppTests(unittest.TestCase):
         capture.assert_called_once_with(
             "60123456789", "Find a property", "live"
         )
-        phone_lead.assert_called_once_with("60123456789", None, "live")
+        phone_lead.assert_called_once_with(
+            "60123456789", None, "live", principal_user_id="user-whatsapp"
+        )
         folio.assert_called_once_with("lead-fallback", "live")
         create_ai.assert_called_once_with(
             "lead-fallback", "60123456789", "live", "conversation-general"
