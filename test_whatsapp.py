@@ -3299,6 +3299,10 @@ class WhatsAppTests(unittest.TestCase):
             "phone=...456789",
             logs,
         )
+        self.assertIn(
+            "[WHATSAPP AI REPLY] phone=...456789 text=Reply",
+            logs,
+        )
         self.assertNotIn("60123456789", logs)
 
     @patch("app.conversation_store.set_conversation_previous_response_id")

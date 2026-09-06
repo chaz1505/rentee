@@ -6647,6 +6647,11 @@ def _process_whatsapp_message(message):
                         lead_conversation_id, lead_id, "live",
                     )
             else:
+                print(
+                    "[WHATSAPP AI REPLY] "
+                    f"phone={_masked_whatsapp_phone(phone)} text={answer}",
+                    flush=True,
+                )
                 outbound_ids = send_whatsapp_text(phone, answer)
                 if isinstance(outbound_ids, list) and outbound_ids:
                     try:
