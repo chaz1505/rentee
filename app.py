@@ -3073,6 +3073,12 @@ def build_listing_bubble_constraints(requirements, condo_ids=None):
     """Build safe Bubble query variants from the existing structured requirements."""
     base_constraints = []
     python_only_filters = []
+    home_types = _home_property_types(requirements.get("property_types"))
+    if len(home_types) == 1:
+        base_constraints.append({
+            "key": "propertyType", "constraint_type": "equals",
+            "value": next(iter(home_types)),
+        })
     bedrooms_min = requirements.get("bedrooms_min")
     if bedrooms_min is not None:
         # Bubble exposes strict numeric comparison; subtracting a tiny epsilon preserves
@@ -3147,7 +3153,7 @@ def get_plausible_listings(
     plausible = []
     filter_counts = {
         key: 0 for key in (
-            "fetched", "after_transaction", "after_condo", "after_bedrooms",
+            "fetched", "after_transaction", "after_property_type", "after_condo", "after_bedrooms",
             "after_budget", "after_geo", "plausible", "rejected_budget",
         )
     }
@@ -3186,6 +3192,10 @@ def get_plausible_listings(
         "[LISTING QUERY] transaction_values="
         f"{bubble_transaction_values(requirements['transaction_type'])!r}",
         flush=True,
+    )
+    print(
+        "[LISTING QUERY] property_types="
+        f"{requirements['property_types']!r}", flush=True,
     )
     modes = _transaction_modes(requirements["transaction_type"])
     price_field = (
@@ -3251,6 +3261,7 @@ def get_plausible_listings(
         "[LISTING FILTER] "
         f"fetched={filter_counts['fetched']} "
         f"after_transaction={filter_counts['after_transaction']} "
+        f"after_property_type={filter_counts['after_property_type']} "
         f"after_condo={filter_counts['after_condo']} "
         f"after_bedrooms={filter_counts['after_bedrooms']} "
         f"after_budget={filter_counts['after_budget']} "
@@ -3739,6 +3750,9 @@ def structured_lead_requirements(lead):
     """Return only factual Bubble Lead fields used for listing retrieval and ranking."""
     return {
         "transaction_type": lead.get("TransactionType") or [],
+        "property_types": _normalized_home_property_types(
+            lead.get("_active_property_types") or []
+        ),
         "bedrooms_min": _as_number(lead.get("bedroomsMin")),
         "geo_ids": list(lead.get("Geo") or []),
         "preferred_condo_ids": list(lead.get("preferredCondos") or []),
@@ -3851,6 +3865,45 @@ def _transaction_modes(value):
     return modes
 
 
+def _normalized_search_property_types(values):
+    """Canonicalize transaction and home types without conflating them."""
+    values = values if isinstance(values, list) else [values]
+    normalized = []
+    for value in values:
+        clean = " ".join(str(value or "").casefold().split())
+        if not clean:
+            continue
+        if clean in {"landed", "house", "houses", "landed house", "landed homes"}:
+            canonical = "Landed"
+        elif clean in {"condo", "condominium", "apartment"}:
+            canonical = "Condo"
+        elif clean in {"rent", "let", "rent/let"}:
+            canonical = "rent"
+        elif clean in {"buy", "sale", "buy/sell", "purchase"}:
+            canonical = "buy"
+        elif clean == "both":
+            canonical = "both"
+        else:
+            canonical = " ".join(str(value or "").split())
+        if canonical and canonical.casefold() not in {
+            item.casefold() for item in normalized
+        }:
+            normalized.append(canonical)
+    return normalized
+
+
+def _normalized_home_property_types(values):
+    return [
+        value for value in _normalized_search_property_types(values)
+        if value in {"Landed", "Condo"}
+    ]
+
+
+def _home_property_types(values):
+    home_types = set(_normalized_home_property_types(values))
+    return set() if home_types == {"Landed", "Condo"} else home_types
+
+
 def bubble_transaction_values(value):
     """Serialize normalized transaction intent to valid Bubble option values."""
     modes = _transaction_modes(value)
@@ -3866,6 +3919,7 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
     """Remove obvious mismatches while leaving trade-off judgement to the model."""
     requirements = structured_lead_requirements(lead)
     modes = _transaction_modes(requirements["transaction_type"])
+    home_types = _home_property_types(requirements["property_types"])
     bedrooms_min = requirements["bedrooms_min"]
     geo_ids = {str(item) for item in requirements["geo_ids"]}
     condo_ids = {str(item) for item in requirements["preferred_condo_ids"]}
@@ -3873,7 +3927,8 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
     budget_buy = requirements["budget_buy"]
     shortlisted = []
     counts = {
-        "fetched": len(listings), "after_transaction": 0, "after_condo": 0,
+        "fetched": len(listings), "after_transaction": 0,
+        "after_property_type": 0, "after_condo": 0,
         "after_bedrooms": 0, "after_budget": 0, "after_geo": 0,
     }
 
@@ -3888,6 +3943,9 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
         if modes == {"buy"} and sale is None:
             continue
         counts["after_transaction"] += 1
+        if home_types and str(listing.get("propertyType") or "") not in home_types:
+            continue
+        counts["after_property_type"] += 1
         if condo_ids and str(listing.get("condo")) not in condo_ids:
             continue
         counts["after_condo"] += 1
@@ -4711,6 +4769,9 @@ def apply_active_search_update(active_state, update):
     state = load_search_state(
         empty_search_state() if update.get("new_search") else active_state
     )
+    state["property_types"] = _normalized_search_property_types(
+        state["property_types"]
+    )
     previous_areas = list(state["areas"])
     geo_names = update.get("geo_names") or []
     area_mode = update.get("area_update_mode")
@@ -4753,7 +4814,9 @@ def apply_active_search_update(active_state, update):
             and relevant_budget is None):
         state["budget_requirement"] = ""
     incoming_property_types = _unique_search_values(
-        scalar_update.get("property_types") or []
+        _normalized_search_property_types(
+            scalar_update.get("property_types") or []
+        )
     )
     existing_transaction_types = [
         value for value in state["property_types"]
@@ -4796,7 +4859,14 @@ def apply_active_search_update(active_state, update):
 def apply_cumulative_search_update(cumulative_state, update):
     """Retain historical search knowledge while accepting this turn's new facts."""
     prior_state = load_search_state(cumulative_state)
+    prior_state["property_types"] = _normalized_search_property_types(
+        prior_state["property_types"]
+    )
     cumulative_update = dict(update)
+    if cumulative_update.get("property_types"):
+        cumulative_update["property_types"] = _normalized_search_property_types(
+            cumulative_update["property_types"]
+        )
     new_areas = _unique_search_values(update.get("geo_names") or [])
     if new_areas:
         cumulative_update["area_status"] = "known"
@@ -4865,6 +4935,9 @@ def lead_with_active_search_filters(lead, base_url):
     if state["bedroom_requirement"]:
         active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
     transaction_modes = _transaction_modes(state["property_types"])
+    active_home_types = _normalized_home_property_types(state["property_types"])
+    if active_home_types:
+        active["_active_property_types"] = active_home_types
     if transaction_modes:
         active["TransactionType"] = bubble_transaction_values(transaction_modes)
     effective_modes = transaction_modes or _transaction_modes(
@@ -5110,6 +5183,23 @@ def _explicit_property_search_location(message):
 
 def _apply_current_search_location(user_message, bubble_env, tool_args):
     """Make this turn's explicit location authoritative over model history."""
+    normalized = " ".join(str(user_message or "").casefold().split())
+    unrestricted_patterns = (
+        r"\ball areas\b", r"\bany area\b", r"\banywhere(?: in kl)?\b",
+        r"\bi (?:do not|don't) care about (?:the )?area\b",
+        r"\blocation (?:does not|doesn't) matter\b", r"\bsearch everywhere\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in unrestricted_patterns):
+        updated = dict(tool_args)
+        updated.update({
+            "geo_names": [], "area_update_mode": "reset",
+            "preferred_condo_names": [], "condo_update_mode": "reset",
+        })
+        print(
+            "[SEARCH OVERRIDE] source=current_message field=location "
+            "scope=unrestricted condos=[] areas=[]", flush=True,
+        )
+        return updated
     candidate = _explicit_property_search_location(user_message)
     condos = resolve_condo_mentions(candidate or user_message)
     if condos:
@@ -5151,6 +5241,33 @@ def _apply_current_search_location(user_message, bubble_env, tool_args):
     print(
         "[SEARCH OVERRIDE] source=current_message field=location "
         f"condos=[] areas={updated['geo_names']!r}", flush=True,
+    )
+    return updated
+
+
+def _apply_current_home_type_intent(user_message, tool_args):
+    """Make explicit current-turn Landed/Condo wording canonical."""
+    text = " ".join(str(user_message or "").casefold().split())
+    landed = bool(re.search(
+        r"\b(landed(?: house| homes?)?|houses?)\b", text
+    ))
+    condo = bool(re.search(r"\b(condos?|condominiums?|apartments?)\b", text))
+    if not landed and not condo:
+        return tool_args
+    updated = dict(tool_args)
+    requested = [
+        value for value, present in (("Landed", landed), ("Condo", condo))
+        if present
+    ]
+    transaction_values = [
+        value for value in _normalized_search_property_types(
+            updated.get("property_types") or []
+        ) if value.casefold() in {"rent", "buy", "both"}
+    ]
+    updated["property_types"] = requested + transaction_values
+    print(
+        "[SEARCH OVERRIDE] source=current_message field=property_type "
+        f"property_types={requested!r}", flush=True,
     )
     return updated
 
@@ -5284,6 +5401,7 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
     recommendations = []
     if tool_call.name == "advance_property_search":
         tool_args = _apply_current_transaction_intent(user_message, tool_args)
+        tool_args = _apply_current_home_type_intent(user_message, tool_args)
         tool_args = _apply_current_search_location(
             user_message, bubble_env, tool_args
         )

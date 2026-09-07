@@ -508,7 +508,7 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertEqual(updated["bedroom_requirement"], "4")
         self.assertEqual(updated["budget_requirement"], "15000")
         self.assertIn("rent", updated["property_types"])
-        self.assertIn("landed", updated["property_types"])
+        self.assertIn("Landed", updated["property_types"])
 
 
 if __name__ == "__main__":

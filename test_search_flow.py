@@ -923,6 +923,143 @@ class SearchFlowStateTests(unittest.TestCase):
         ]])
         self.assertNotIn("transaction_price_presence", plan["python_only_filters"])
 
+    def test_landed_property_type_reaches_bubble_and_python_filters(self):
+        active = app_module.apply_active_search_update(empty_search_state(), {
+            "property_types": ["landed"], "transaction_type": "rent",
+            "bedrooms_min": 4, "budget_rent": 15000,
+        })
+        effective = app_module.lead_with_active_search_filters({
+            "TransactionType": ["Rent/Let"],
+            "searchActive": dump_search_state(active),
+        }, "https://www.rentee.asia/api/1.1")
+        requirements = app_module.structured_lead_requirements(effective)
+        self.assertEqual(active["property_types"], ["Landed", "rent"])
+        self.assertEqual(requirements["property_types"], ["Landed"])
+        self.assertIn({
+            "key": "propertyType", "constraint_type": "equals", "value": "Landed",
+        }, app_module.build_listing_bubble_constraints(requirements)["queries"][0])
+        listings = [
+            {"_id": "landed", "propertyType": "Landed",
+             "TransactionType": ["Rent/Let"], "priceRent": 14000, "beds": 4},
+            {"_id": "condo", "propertyType": "Condo",
+             "TransactionType": ["Rent/Let"], "priceRent": 14000, "beds": 4},
+            {"_id": "missing", "TransactionType": ["Rent/Let"],
+             "priceRent": 14000, "beds": 4},
+        ]
+        self.assertEqual(
+            [item["_id"] for item in app_module.shortlist_structured_listings(
+                effective, listings
+            )], ["landed"],
+        )
+
+    def test_condo_property_type_rejects_landed_listing(self):
+        lead = {
+            "_active_property_types": ["Condo"],
+            "TransactionType": ["Rent/Let"],
+        }
+        listings = [
+            {"_id": "condo", "propertyType": "Condo",
+             "TransactionType": ["Rent/Let"], "priceRent": 10000},
+            {"_id": "landed", "propertyType": "Landed",
+             "TransactionType": ["Rent/Let"], "priceRent": 10000},
+        ]
+        self.assertEqual(
+            [item["_id"] for item in app_module.shortlist_structured_listings(
+                lead, listings
+            )], ["condo"],
+        )
+
+    def test_home_type_refinement_preserves_then_replaces_active_type(self):
+        landed = app_module.apply_active_search_update(empty_search_state(), {
+            "property_types": ["landed"], "bedrooms_min": 4,
+        })
+        five_beds = app_module.apply_active_search_update(
+            landed, {"bedrooms_min": 5}
+        )
+        condo = app_module.apply_active_search_update(
+            five_beds, {"property_types": ["condominium"]}
+        )
+        self.assertEqual(five_beds["property_types"], ["Landed"])
+        self.assertEqual(five_beds["bedroom_requirement"], "5")
+        self.assertEqual(condo["property_types"], ["Condo"])
+
+    def test_all_areas_clears_location_but_keeps_landed(self):
+        active = app_module.apply_active_search_update(empty_search_state(), {
+            "property_types": ["landed"], "geo_names": ["Bangsar"],
+            "area_update_mode": "replace",
+            "preferred_condo_names": ["One Menerung"],
+            "condo_update_mode": "replace",
+        })
+        update = app_module._apply_current_search_location(
+            "actually search all areas", "live", {"search_listings": True}
+        )
+        unrestricted = app_module.apply_active_search_update(active, update)
+        self.assertEqual(unrestricted["property_types"], ["Landed"])
+        self.assertEqual(unrestricted["areas"], [])
+        self.assertEqual(unrestricted["selected_condos"], [])
+        effective = app_module.lead_with_active_search_filters({
+            "searchActive": dump_search_state(unrestricted),
+        }, "https://www.rentee.asia/api/1.1")
+        constraints = app_module.build_listing_bubble_constraints(
+            app_module.structured_lead_requirements(effective)
+        )["queries"][0]
+        self.assertIn({
+            "key": "propertyType", "constraint_type": "equals", "value": "Landed",
+        }, constraints)
+        self.assertFalse(any(item["key"] in {"Geo", "condo"} for item in constraints))
+
+    def test_no_property_type_keeps_listing_query_unconstrained(self):
+        plan = app_module.build_listing_bubble_constraints({
+            "transaction_type": [], "property_types": [], "geo_ids": [],
+            "preferred_condo_ids": [], "bedrooms_min": None,
+            "budget_rent": None, "budget_buy": None,
+            "furnishing_preference": None,
+        })
+        self.assertFalse(any(
+            item["key"] == "propertyType" for item in plan["queries"][0]
+        ))
+
+    def test_property_type_aliases_are_canonical_without_losing_transaction(self):
+        for alias in ("landed", "house", "houses", "landed house", "landed homes"):
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    app_module._normalized_search_property_types([alias, "rent"]),
+                    ["Landed", "rent"],
+                )
+        for alias in ("condo", "condominium", "apartment"):
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    app_module._normalized_search_property_types([alias, "buy"]),
+                    ["Condo", "buy"],
+                )
+        plan = app_module.build_listing_bubble_constraints({
+            "property_types": ["Landed", "Condo"], "transaction_type": [],
+            "geo_ids": [], "preferred_condo_ids": [], "bedrooms_min": None,
+            "budget_rent": None, "budget_buy": None,
+            "furnishing_preference": None,
+        })
+        self.assertFalse(any(
+            item["key"] == "propertyType" for item in plan["queries"][0]
+        ))
+
+    def test_location_unrestricted_phrases_reset_geo_and_condo_scope(self):
+        for phrase in (
+            "all areas", "any area", "anywhere", "anywhere in KL",
+            "I don't care about area", "location doesn't matter",
+            "search everywhere",
+        ):
+            with self.subTest(phrase=phrase):
+                update = app_module._apply_current_search_location(
+                    phrase, "live", {
+                        "geo_names": ["Bangsar"],
+                        "preferred_condo_names": ["One Menerung"],
+                    },
+                )
+                self.assertEqual(update["geo_names"], [])
+                self.assertEqual(update["preferred_condo_names"], [])
+                self.assertEqual(update["area_update_mode"], "reset")
+                self.assertEqual(update["condo_update_mode"], "reset")
+
     def test_buy_transaction_normalization_and_bubble_serialization(self):
         self.assertEqual(app_module._transaction_modes(["Buy/Sell"]), {"buy"})
         for raw in ("buy", "buying", "purchase", "purchasing", "sale", "for sale"):
