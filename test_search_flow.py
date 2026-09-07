@@ -868,7 +868,10 @@ class SearchFlowStateTests(unittest.TestCase):
             {item["value"] for item in geo_constraints},
             {"geo-bangsar", "geo-klcc"},
         )
-        self.assertTrue(all(item["constraint_type"] == "contains" for item in geo_constraints))
+        self.assertTrue(all(item["constraint_type"] == "equals" for item in geo_constraints))
+        self.assertFalse(any(
+            item["constraint_type"] == "contains" for item in geo_constraints
+        ))
 
     @patch("app.get_named_object_ids", return_value=["condo-one", "condo-two"])
     @patch("app.bubble")
@@ -922,6 +925,23 @@ class SearchFlowStateTests(unittest.TestCase):
             {"key": "priceSale", "constraint_type": "is_not_empty"},
         ]])
         self.assertNotIn("transaction_price_presence", plan["python_only_filters"])
+
+    def test_combined_landed_rent_geo_query_uses_field_specific_operators(self):
+        plan = app_module.build_listing_bubble_constraints({
+            "property_types": ["Landed"],
+            "transaction_type": ["Rent/Let"], "bedrooms_min": 4,
+            "geo_ids": ["geo-bangsar"], "preferred_condo_ids": [],
+            "budget_rent": 15000, "budget_buy": None,
+            "furnishing_preference": None,
+        })
+
+        self.assertEqual(plan["queries"], [[
+            {"key": "propertyType", "constraint_type": "equals", "value": "Landed"},
+            {"key": "beds", "constraint_type": "greater than", "value": 3.999999},
+            {"key": "TransactionType", "constraint_type": "contains", "value": "Rent/Let"},
+            {"key": "priceRent", "constraint_type": "is_not_empty"},
+            {"key": "Geo", "constraint_type": "equals", "value": "geo-bangsar"},
+        ]])
 
     def test_landed_property_type_reaches_bubble_and_python_filters(self):
         active = app_module.apply_active_search_update(empty_search_state(), {

@@ -3127,7 +3127,7 @@ def build_listing_bubble_constraints(requirements, condo_ids=None):
         location_groups = [
             [{
                 "key": scope_field,
-                "constraint_type": "contains" if scope_field == "Geo" else "equals",
+                "constraint_type": "equals",
                 "value": scope_id,
             }]
             for scope_id in scope_ids
