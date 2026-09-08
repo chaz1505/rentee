@@ -117,6 +117,7 @@ Message semantics:
 | availability_date | Existing |
 | photos | list of images |
 | coverPhoto | image |
+| photoUploadBuffer | image (temporary WhatsApp upload buffer; cleared after attachment) |
 | Description | text |
 | Notes | text |
 

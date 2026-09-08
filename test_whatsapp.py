@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import threading
@@ -936,6 +937,7 @@ class WhatsAppTests(unittest.TestCase):
         app_module._whatsapp_processed_ids.clear()
         app_module._whatsapp_processed_order.clear()
         app_module._whatsapp_phone_locks.clear()
+        app_module._listing_photo_locks.clear()
         self.internal_user_patcher = patch("app.find_internal_user", return_value=None)
         self.mocked_internal_user = self.internal_user_patcher.start()
         self.addCleanup(self.internal_user_patcher.stop)
@@ -2107,7 +2109,11 @@ class WhatsAppTests(unittest.TestCase):
         with patch(
             "app.find_active_conversation_by_phone",
             return_value=(conversation, "single_active", 1),
-        ), patch("app.persist_whatsapp_image", return_value="https://bubble/photo"), \
+        ), patch(
+            "app.download_whatsapp_image", return_value=(b"image", "image/jpeg")
+        ), patch(
+            "app.store_whatsapp_listing_photo", return_value="https://bubble/photo"
+        ), \
              patch("app.handle_listing_creation", return_value=result), \
              patch("app.schedule_listing_photo_finalization") as schedule, \
              patch("app.send_whatsapp_text") as send, \
@@ -2147,27 +2153,34 @@ class WhatsAppTests(unittest.TestCase):
 
     def test_whatsapp_image_is_uploaded_to_bubble_and_permanent_url_returned(self):
         before = {"photos": [], "coverPhoto": ""}
-        after = {"photos": ["//s3.amazonaws.com/appforest_uf/photo.jpg"]}
-        with patch(
-            "app.download_whatsapp_image",
-            return_value=(b"jpeg-bytes", "image/jpeg"),
-        ), patch("app.bubble", side_effect=[before, after]), patch(
+        buffered = {
+            "photos": [], "coverPhoto": "",
+            "photoUploadBuffer": "//s3.amazonaws.com/appforest_uf/photo.jpg",
+        }
+        with patch("app.bubble", side_effect=[before, buffered]), patch(
             "app._bubble_patch"
         ) as bubble_patch:
-            stored_url = app_module.persist_whatsapp_image(
-                "media-1", "wamid.image", "listing-1"
+            stored_url = app_module.store_whatsapp_listing_photo(
+                "listing-1", b"jpeg-bytes", "image/jpeg", "wamid.image"
             )
 
         self.assertEqual(
             stored_url, "//s3.amazonaws.com/appforest_uf/photo.jpg"
         )
-        photo_payload = bubble_patch.call_args_list[0].args[1]["photos"][-1]
-        self.assertEqual(photo_payload["filename"], "whatsapp-wamid.image.jpg")
-        self.assertEqual(photo_payload["private"], False)
-        self.assertNotIn("lookaside.facebook", str(photo_payload))
+        buffer_payload = bubble_patch.call_args_list[0].args[1]
+        self.assertEqual(set(buffer_payload), {"photoUploadBuffer"})
+        upload = buffer_payload["photoUploadBuffer"]
+        self.assertEqual(upload["filename"], "whatsapp-wamid.image.jpg")
+        self.assertEqual(upload["private"], False)
+        final_payload = bubble_patch.call_args_list[1].args[1]
+        self.assertEqual(final_payload, {
+            "photos": ["//s3.amazonaws.com/appforest_uf/photo.jpg"],
+            "coverPhoto": "//s3.amazonaws.com/appforest_uf/photo.jpg",
+            "photoUploadBuffer": "",
+        })
         bubble_patch.assert_any_call(
             "https://www.rentee.asia/api/1.1/obj/listing/listing-1",
-            {"coverPhoto": "//s3.amazonaws.com/appforest_uf/photo.jpg"},
+            final_payload,
         )
 
     def test_later_stored_photo_does_not_replace_cover(self):
@@ -2175,30 +2188,122 @@ class WhatsAppTests(unittest.TestCase):
             "photos": ["https://bubble/first.jpg"],
             "coverPhoto": "https://bubble/first.jpg",
         }
-        after = {"photos": [
-            "https://bubble/first.jpg", "https://bubble/second.jpg",
-        ]}
-        with patch(
-            "app.download_whatsapp_image",
-            return_value=(b"png-bytes", "image/png"),
-        ), patch("app.bubble", side_effect=[before, after]), patch(
+        buffered = {
+            **before, "photoUploadBuffer": "https://bubble/second.jpg",
+        }
+        with patch("app.bubble", side_effect=[before, buffered]), patch(
             "app._bubble_patch"
         ) as bubble_patch:
-            result = app_module.persist_whatsapp_image(
-                "media-2", "wamid.second", "listing-1"
+            result = app_module.store_whatsapp_listing_photo(
+                "listing-1", b"png-bytes", "image/png", "wamid.second"
             )
         self.assertEqual(result, "https://bubble/second.jpg")
-        self.assertEqual(bubble_patch.call_count, 1)
+        self.assertEqual(bubble_patch.call_count, 2)
+        final_payload = bubble_patch.call_args_list[1].args[1]
+        self.assertEqual(final_payload["photos"], [
+            "https://bubble/first.jpg", "https://bubble/second.jpg",
+        ])
+        self.assertNotIn("coverPhoto", final_payload)
+        self.assertEqual(final_payload["photoUploadBuffer"], "")
 
-    def test_failed_permanent_storage_never_patches_listing(self):
-        with patch(
-            "app.download_whatsapp_image", side_effect=RuntimeError("download failed")
-        ), patch("app._bubble_patch") as bubble_patch:
-            with self.assertRaises(RuntimeError):
-                app_module.persist_whatsapp_image(
-                    "media-1", "wamid.failed", "listing-1"
+    def test_missing_buffer_url_does_not_mutate_photos_and_cleans_buffer(self):
+        before = {"photos": ["https://bubble/existing.jpg"]}
+        without_url = {**before, "photoUploadBuffer": ""}
+        with patch("app.bubble", side_effect=[before, without_url]), patch(
+            "app._bubble_patch"
+        ) as bubble_patch:
+            with self.assertRaises(ValueError):
+                app_module.store_whatsapp_listing_photo(
+                    "listing-1", b"image", "image/jpeg", "wamid.failed"
                 )
+        self.assertEqual(
+            set(bubble_patch.call_args_list[0].args[1]), {"photoUploadBuffer"}
+        )
+        self.assertEqual(
+            bubble_patch.call_args_list[-1].args[1], {"photoUploadBuffer": ""}
+        )
+        self.assertFalse(any(
+            "photos" in call.args[1] for call in bubble_patch.call_args_list
+        ))
+
+    def test_duplicate_photo_message_id_does_not_attach_again(self):
+        existing_url = "https://bubble/whatsapp-wamid.same.jpg"
+        with patch("app.bubble", return_value={
+            "photos": [existing_url], "coverPhoto": existing_url,
+        }), patch("app._bubble_patch") as bubble_patch:
+            result = app_module.store_whatsapp_listing_photo(
+                "listing-1", b"same-image", "image/jpeg", "wamid.same"
+            )
+        self.assertEqual(result, existing_url)
         bubble_patch.assert_not_called()
+
+    def test_photo_storage_uses_distinct_locks_for_distinct_listings(self):
+        first = app_module._listing_photo_lock("listing-1")
+        self.assertIs(first, app_module._listing_photo_lock("listing-1"))
+        self.assertIsNot(first, app_module._listing_photo_lock("listing-2"))
+
+    def test_rapid_same_listing_storage_preserves_every_photo(self):
+        state = {"photos": [], "coverPhoto": "", "photoUploadBuffer": ""}
+        state_guard = threading.Lock()
+
+        def get_listing(_url):
+            with state_guard:
+                return dict(state)
+
+        def patch_listing(_url, payload):
+            with state_guard:
+                value = payload.get("photoUploadBuffer")
+                if isinstance(value, dict):
+                    state["photoUploadBuffer"] = (
+                        "https://bubble/" + value["filename"]
+                    )
+                else:
+                    state.update(payload)
+
+        errors = []
+        def store(index):
+            try:
+                app_module.store_whatsapp_listing_photo(
+                    "listing-1", f"image-{index}".encode(), "image/jpeg",
+                    f"wamid.{index}",
+                )
+            except Exception as error:
+                errors.append(error)
+
+        with patch("app.bubble", side_effect=get_listing), patch(
+            "app._bubble_patch", side_effect=patch_listing
+        ):
+            workers = [threading.Thread(target=store, args=(index,)) for index in range(4)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(state["photos"]), 4)
+        self.assertEqual(len(set(state["photos"])), 4)
+        self.assertEqual(state["coverPhoto"], state["photos"][0])
+        self.assertEqual(state["photoUploadBuffer"], "")
+
+    def test_bubble_upload_error_logs_body_without_base64_contents(self):
+        response = MagicMock(status_code=400, text='{"error":"INVALID_DATA"}')
+        error = requests.HTTPError("400", response=response)
+        with patch("app.bubble", return_value={"photos": []}), patch(
+            "app._bubble_patch", side_effect=error
+        ), patch("builtins.print") as logged:
+            with self.assertRaises(requests.HTTPError):
+                app_module.store_whatsapp_listing_photo(
+                    "listing-1", b"secret-image-bytes", "image/jpeg",
+                    "wamid.failed",
+                )
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn("operation=upload_buffer", logs)
+        self.assertIn("status=400", logs)
+        self.assertIn("INVALID_DATA", logs)
+        self.assertIn("<base64 omitted>", logs)
+        self.assertNotIn(
+            base64.b64encode(b"secret-image-bytes").decode("ascii"), logs
+        )
 
     def test_inactive_listing_image_is_ignored_after_publish(self):
         general = {
@@ -2235,7 +2340,10 @@ class WhatsAppTests(unittest.TestCase):
             "app.find_active_conversation_by_phone",
             return_value=(conversation, "single_active", 1),
         ), patch(
-            "app.persist_whatsapp_image", side_effect=RuntimeError("upload failed")
+            "app.download_whatsapp_image", return_value=(b"image", "image/jpeg")
+        ), patch(
+            "app.store_whatsapp_listing_photo",
+            side_effect=RuntimeError("upload failed")
         ), patch(
             "app.schedule_listing_photo_finalization"
         ) as schedule, patch(
@@ -2243,10 +2351,37 @@ class WhatsAppTests(unittest.TestCase):
         ) as send, patch("app.persist_sent_whatsapp_text") as persist:
             app_module._process_whatsapp_message(item)
 
-        retry = "I couldn't save that photo — could you send it again?"
+        retry = (
+            "I received the photo, but couldn't attach it to the listing. "
+            "You don't need to resend it."
+        )
         send.assert_called_once_with("60123456789", retry)
         persist.assert_called_once()
         schedule.assert_not_called()
+
+    def test_failed_photo_download_asks_user_to_resend(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        item = image_webhook_payload(message_id="wamid.download-failed")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch(
+            "app.download_whatsapp_image", side_effect=RuntimeError("Meta failed")
+        ), patch("app.store_whatsapp_listing_photo") as store, patch(
+            "app.send_whatsapp_text", return_value=["wamid.retry"]
+        ) as send, patch("app.persist_sent_whatsapp_text"):
+            app_module._process_whatsapp_message(item)
+        send.assert_called_once_with(
+            "60123456789",
+            "I couldn't download that photo — could you send it again?",
+        )
+        store.assert_not_called()
 
     def test_active_listing_skill_wins_ambiguous_conversation_routing(self):
         active = {

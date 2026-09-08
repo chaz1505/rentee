@@ -13,7 +13,7 @@ import threading
 import time
 import re
 from PIL import Image, ImageOps
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from collections import deque
 from types import SimpleNamespace
 from pathlib import Path
@@ -108,6 +108,8 @@ _whatsapp_processed_ids = set()
 _whatsapp_processed_order = deque(maxlen=1000)
 _whatsapp_processing_lock = threading.Lock()
 _whatsapp_phone_locks = {}
+_listing_photo_locks = {}
+_listing_photo_locks_guard = threading.Lock()
 _geo_name_cache = {}
 _geo_name_cache_lock = threading.Lock()
 _location_web_identity_cache = {}
@@ -1873,50 +1875,159 @@ def download_whatsapp_image(media_id, message_id=None):
     return image_bytes, mime_type
 
 
-def persist_whatsapp_image(media_id, message_id, listing_id, bubble_env="live"):
-    """Upload WhatsApp image bytes through Bubble and return its hosted URL."""
-    image_bytes, mime_type = download_whatsapp_image(media_id, message_id)
+def _listing_photo_lock(listing_id):
+    with _listing_photo_locks_guard:
+        return _listing_photo_locks.setdefault(str(listing_id), threading.Lock())
+
+
+def _photo_payload_structure(payload):
+    structure = {}
+    for key, value in (payload or {}).items():
+        if isinstance(value, dict):
+            structure[key] = {
+                child_key: ("<base64 omitted>" if child_key == "contents" else child_value)
+                for child_key, child_value in value.items()
+            }
+        elif isinstance(value, list):
+            structure[key] = f"<list length={len(value)}>"
+        else:
+            structure[key] = value
+    return structure
+
+
+def _log_photo_bubble_error(
+    error, operation, listing_id, message_id, method, payload=None,
+):
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    body = str(getattr(response, "text", "") or "")[:1000]
+    for value in (payload or {}).values():
+        if isinstance(value, dict) and value.get("contents"):
+            body = body.replace(str(value["contents"]), "<base64 omitted>")
+    body = re.sub(
+        r'("contents"\s*:\s*")[^"]*', r'\1<base64 omitted>', body,
+        flags=re.IGNORECASE,
+    )
+    print(
+        "[LISTING PHOTO BUBBLE ERROR] "
+        f"operation={operation} listing_id={listing_id} message_id={message_id} "
+        f"method={method} status={status or 'unknown'} body={body!r} "
+        f"payload={_photo_payload_structure(payload)!r}", flush=True,
+    )
+
+
+def _photo_bubble_patch(
+    listing_url, payload, operation, listing_id, message_id,
+):
+    try:
+        return _bubble_patch(listing_url, payload)
+    except Exception as error:
+        _log_photo_bubble_error(
+            error, operation, listing_id, message_id, "PATCH", payload
+        )
+        raise
+
+
+def _photo_bubble_get(listing_url, operation, listing_id, message_id):
+    try:
+        return bubble(listing_url)
+    except Exception as error:
+        _log_photo_bubble_error(
+            error, operation, listing_id, message_id, "GET"
+        )
+        raise
+
+
+def _usable_bubble_image_url(value):
+    rendered = str(value or "").strip()
+    return rendered if (
+        isinstance(value, str)
+        and re.match(r"^(?:https?:)?//", rendered)
+        and "lookaside.fbsbx.com" not in rendered.casefold()
+        and "facebook.com" not in rendered.casefold()
+    ) else None
+
+
+def store_whatsapp_listing_photo(
+    listing_id, image_bytes, mime_type, message_id, bubble_env="live",
+):
+    """Attach bytes through Bubble's single-image buffer, serialized per Listing."""
+    listing_id = str(listing_id or "").strip()
+    if not listing_id:
+        raise ValueError("Listing photo storage requires a Listing ID.")
     extension = {
         "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
         "image/gif": "gif",
     }[mime_type]
     base_url = get_bubble_base_url(bubble_env)
     listing_url = f"{base_url}/obj/listing/{listing_id}"
-    listing = bubble(listing_url)
-    existing_photos = list(listing.get("photos") or [])
+    safe_message_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(message_id))
+    filename = f"whatsapp-{safe_message_id}.{extension}"
     upload_value = {
-        "filename": f"whatsapp-{message_id}.{extension}",
+        "filename": filename,
         "contents": base64.b64encode(image_bytes).decode("ascii"),
         "private": False,
     }
-    print(
-        f"[WHATSAPP IMAGE] message_id={message_id} action=upload_started",
-        flush=True,
-    )
-    _bubble_patch(listing_url, {"photos": existing_photos + [upload_value]})
-    stored_listing = bubble(listing_url)
-    stored_photos = list(stored_listing.get("photos") or [])
-    if len(stored_photos) <= len(existing_photos):
-        raise ValueError("Bubble did not return the uploaded Listing photo.")
-    stored_value = stored_photos[-1]
-    stored_url = str(stored_value or "").strip()
-    if (
-        not isinstance(stored_value, str)
-        or not re.match(r"^(?:https?:)?//", stored_url)
-        or "lookaside.fbsbx.com" in stored_url.casefold()
-        or "facebook.com" in stored_url.casefold()
-    ):
-        raise ValueError("Bubble did not return a permanent image URL.")
-    cover_added = not bool(listing.get("coverPhoto"))
-    if cover_added:
-        _bubble_patch(listing_url, {"coverPhoto": stored_url})
+    with _listing_photo_lock(listing_id):
+        listing = _photo_bubble_get(
+            listing_url, "read_before_upload", listing_id, message_id
+        )
+        existing_photos = list(listing.get("photos") or [])
+        duplicate = next((
+            _usable_bubble_image_url(value) for value in existing_photos
+            if filename in unquote(str(value or ""))
+        ), None)
+        if duplicate:
+            return duplicate
+        print(
+            f"[WHATSAPP IMAGE] message_id={message_id} action=upload_started",
+            flush=True,
+        )
+        _photo_bubble_patch(
+            listing_url, {"photoUploadBuffer": upload_value},
+            "upload_buffer", listing_id, message_id,
+        )
+        try:
+            uploaded_listing = _photo_bubble_get(
+                listing_url, "read_upload_buffer", listing_id, message_id
+            )
+            stored_url = _usable_bubble_image_url(
+                uploaded_listing.get("photoUploadBuffer")
+            )
+            if not stored_url:
+                raise ValueError(
+                    "Bubble did not return a usable photoUploadBuffer URL."
+                )
+            latest_photos = list(uploaded_listing.get("photos") or [])
+            if stored_url not in latest_photos:
+                latest_photos.append(stored_url)
+            final_payload = {
+                "photos": latest_photos,
+                "photoUploadBuffer": "",
+            }
+            cover_added = not bool(uploaded_listing.get("coverPhoto"))
+            if cover_added:
+                final_payload["coverPhoto"] = stored_url
+            _photo_bubble_patch(
+                listing_url, final_payload, "attach_and_clear_buffer",
+                listing_id, message_id,
+            )
+        except Exception:
+            try:
+                _photo_bubble_patch(
+                    listing_url, {"photoUploadBuffer": ""},
+                    "cleanup_buffer", listing_id, message_id,
+                )
+            except Exception:
+                pass
+            raise
     masked_url = stored_url if len(stored_url) <= 80 else stored_url[:77] + "..."
     print(
         f"[WHATSAPP IMAGE] message_id={message_id} "
         f"stored_url={masked_url!r} action=uploaded", flush=True,
     )
     print(
-        f"[LISTING PHOTO] listing_id={listing_id} photos={len(stored_photos)} "
+        f"[LISTING PHOTO] listing_id={listing_id} photos={len(latest_photos)} "
         f"cover_photo={cover_added}", flush=True,
     )
     return stored_url
@@ -6664,11 +6775,31 @@ def _process_whatsapp_message(message):
                 if message_type == "image":
                     media_id = (message.get("image") or {}).get("id")
                     try:
-                        persist_whatsapp_image(
-                            media_id, message_id,
+                        image_bytes, image_mime_type = download_whatsapp_image(
+                            media_id, message_id
+                        )
+                    except Exception as error:
+                        print(
+                            f"[WHATSAPP IMAGE] message_id={message_id} "
+                            "action=download_failed "
+                            f"error={type(error).__name__}: {error}", flush=True,
+                        )
+                        retry_text = (
+                            "I couldn't download that photo — could you send it again?"
+                        )
+                        _stop_whatsapp_typing(typing_keepalive)
+                        sent_ids = send_whatsapp_text(phone, retry_text)
+                        persist_sent_whatsapp_text(
+                            phone, retry_text, sent_ids,
+                            skill_conversation_id, bubble_env="live",
+                        )
+                        reply_sent = True
+                        return
+                    try:
+                        store_whatsapp_listing_photo(
                             conversation_store.relationship_id(
                                 skill_conversation.get("Listing")
-                            ), "live",
+                            ), image_bytes, image_mime_type, message_id, "live",
                         )
                         photo_stored = True
                     except Exception as error:
@@ -6678,7 +6809,8 @@ def _process_whatsapp_message(message):
                             f"error={type(error).__name__}: {error}", flush=True,
                         )
                         retry_text = (
-                            "I couldn't save that photo — could you send it again?"
+                            "I received the photo, but couldn't attach it to the "
+                            "listing. You don't need to resend it."
                         )
                         _stop_whatsapp_typing(typing_keepalive)
                         sent_ids = send_whatsapp_text(phone, retry_text)
