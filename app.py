@@ -84,6 +84,8 @@ WHATSAPP_GRAPH_API_VERSION = "v23.0"
 WHATSAPP_TEXT_LIMIT = 4096
 WHATSAPP_TYPING_REFRESH_SECONDS = 20
 WHATSAPP_TYPING_THREAD_FACTORY = threading.Thread
+WHATSAPP_PHOTO_DEBOUNCE_SECONDS = 2.5
+WHATSAPP_PHOTO_TIMER_FACTORY = threading.Timer
 WHATSAPP_LEAD_PHONE_FIELD = "phone"
 WHATSAPP_LEAD_NAME_FIELD = "name"
 WHATSAPP_LEAD_OWNER_FIELD = "owner"
@@ -2644,6 +2646,7 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
 def persist_inbound_whatsapp_message(
     phone, whatsapp_message_id, message_content, lead_id=None,
     conversation_id=None, bubble_env="live", listing_id=None,
+    message_type=None,
 ):
     """Create one durable Bubble Message for an inbound Meta message."""
     base_url = get_bubble_base_url(bubble_env)
@@ -2672,6 +2675,13 @@ def persist_inbound_whatsapp_message(
                 f"existing_listing_id={existing_listing_id} "
                 f"reply_listing_id={listing_id}", flush=True,
             )
+        normalized_message_type = str(message_type or "").casefold()
+        if (
+            normalized_message_type in {"text", "audio", "image"}
+            and str(existing.get("messageType") or "").casefold()
+            != normalized_message_type
+        ):
+            patch["messageType"] = normalized_message_type
         if patch:
             _bubble_patch(
                 f"{base_url}/obj/message/{message_id}", patch
@@ -2691,6 +2701,8 @@ def persist_inbound_whatsapp_message(
         "whatsappMessageId": meta_id,
         "messageContent": str(message_content or ""),
     }
+    if message_type:
+        payload["messageType"] = str(message_type).casefold()
     if lead_id:
         payload["lead"] = lead_id
     payload["Conversation"] = conversation_id
@@ -2862,6 +2874,12 @@ def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
 
 
 def send_whatsapp_text(to_phone, text):
+    rendered_text = " ".join(str(text or "").split())
+    print(
+        "[WHATSAPP OUTBOUND TEXT] "
+        f"phone={_masked_whatsapp_phone(to_phone)} text={rendered_text!r}",
+        flush=True,
+    )
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
     access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
     url = (
@@ -6118,6 +6136,82 @@ def run_rentee_turn(message, folio_id, previous_response_id=None, message_id=Non
     )
 
 
+def _latest_inbound_image_message(conversation_id, bubble_env="live"):
+    constraints = [
+        {"key": "Conversation", "constraint_type": "equals",
+         "value": conversation_id},
+        {"key": "direction", "constraint_type": "equals", "value": "Inbound"},
+        {"key": "messageType", "constraint_type": "equals", "value": "image"},
+    ]
+    messages = list(_bubble_records(
+        get_bubble_base_url(bubble_env), "message", constraints
+    ))
+    messages.sort(key=lambda item: (
+        str(item.get("Created Date") or item.get("created_date") or ""),
+        str(item.get("_id") or ""),
+    ), reverse=True)
+    return messages[0] if messages else None
+
+
+def finalize_listing_photo_batch(
+    phone, conversation_id, listing_id, whatsapp_message_id, bubble_env="live",
+):
+    """Send one prompt only for the latest image in an active listing burst."""
+    base_url = get_bubble_base_url(bubble_env)
+    conversation = bubble(f"{base_url}/obj/conversation/{conversation_id}")
+    conversation.setdefault("_id", conversation_id)
+    if str(conversation.get("ActiveSkill") or "").strip() != LISTING_CREATION_SKILL:
+        return False
+    if conversation_store.relationship_id(conversation.get("Listing")) != listing_id:
+        return False
+    latest = _latest_inbound_image_message(conversation_id, bubble_env)
+    if str((latest or {}).get("whatsappMessageId") or "") != whatsapp_message_id:
+        return False
+    listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+    result = handle_listing_creation(
+        "", conversation, listing.get("owner"), base_url,
+        bubble_create=_bubble_create, bubble_patch=_bubble_patch,
+        bubble_get=bubble, bubble_records=_bubble_records,
+    )
+    if not result.handled or not result.response_text:
+        return False
+    sent_ids = send_whatsapp_text(phone, result.response_text)
+    persist_sent_whatsapp_text(
+        phone, result.response_text, sent_ids, conversation_id,
+        bubble_env=bubble_env,
+    )
+    print(
+        "[LISTING CREATION] action=photo_batch_finalized "
+        f"conversation_id={conversation_id} listing_id={listing_id}",
+        flush=True,
+    )
+    return True
+
+
+def schedule_listing_photo_finalization(
+    phone, conversation_id, listing_id, whatsapp_message_id, bubble_env="live",
+):
+    timer = WHATSAPP_PHOTO_TIMER_FACTORY(
+        WHATSAPP_PHOTO_DEBOUNCE_SECONDS,
+        finalize_listing_photo_batch,
+        args=(phone, conversation_id, listing_id, whatsapp_message_id, bubble_env),
+    )
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+def _principal_general_candidate(candidates):
+    general = [
+        item for item in candidates or []
+        if item.get("_id")
+        and not conversation_store.relationship_id(item.get("Enquiry"))
+        and str(item.get("CounterParty Role") or "").strip() == "Principal"
+        and str(item.get("Rentee Role") or "").strip() == "Principal Assistant"
+    ]
+    return general[0] if len(general) == 1 else None
+
+
 def _process_whatsapp_message(message):
     message_id = str(message["id"])
     typing_keepalive = whatsapp_typing_keepalive(message_id)
@@ -6159,10 +6253,12 @@ def _process_whatsapp_message(message):
                 )
             base_url = get_bubble_base_url("live")
             inbound_message_id = None
+            inbound_message_created = False
             routed_conversation = None
             routed_conversation_id = None
             reply_listing_id = None
             ambiguous_candidates = []
+            internal_user = None
             try:
                 reply_context = find_reply_context(message, "live")
                 routed_conversation = (
@@ -6183,11 +6279,11 @@ def _process_whatsapp_message(message):
                         f"listing_id={reply_listing_id or 'none'}",
                         flush=True,
                     )
-                    inbound_message_id, _inbound_created = (
+                    inbound_message_id, inbound_message_created = (
                         persist_inbound_whatsapp_message(
                             phone, message_id, text,
                             conversation_id=routed_conversation_id,
-                            bubble_env="live",
+                            bubble_env="live", message_type=message_type,
                             listing_id=reply_listing_id,
                         )
                     )
@@ -6239,7 +6335,7 @@ def _process_whatsapp_message(message):
                                 "[CONVERSATION ROUTING] direction=inbound "
                                 "resolution=ambiguous "
                                 f"candidate_count={len(ambiguous_candidates)} "
-                                "action=clarify",
+                                "action=pending_context_checks",
                                 flush=True,
                             )
                     routed_conversation_id = conversation_store.relationship_id(
@@ -6256,14 +6352,14 @@ def _process_whatsapp_message(message):
                             + (f" enquiry_id={enquiry_id}" if enquiry_id else ""),
                             flush=True,
                         )
-                        inbound_message_id, _inbound_created = (
+                        inbound_message_id, inbound_message_created = (
                             persist_inbound_whatsapp_message(
                                 phone, message_id, text,
                                 lead_id=conversation_store.relationship_id(
                                     routed_conversation.get("Lead")
                                 ),
                                 conversation_id=routed_conversation_id,
-                                bubble_env="live",
+                                bubble_env="live", message_type=message_type,
                             )
                         )
                 except Exception as error:
@@ -6292,14 +6388,14 @@ def _process_whatsapp_message(message):
                             f"conversation_id={routed_conversation_id} "
                             f"enquiry_id={enquiry_id}", flush=True,
                         )
-                        inbound_message_id, _inbound_created = (
+                        inbound_message_id, inbound_message_created = (
                             persist_inbound_whatsapp_message(
                                 phone, message_id, text,
                                 lead_id=conversation_store.relationship_id(
                                     routed_conversation.get("Lead")
                                 ),
                                 conversation_id=routed_conversation_id,
-                                bubble_env="live",
+                                bubble_env="live", message_type=message_type,
                             )
                         )
                     elif len(owner_check_candidates) > 1:
@@ -6321,14 +6417,14 @@ def _process_whatsapp_message(message):
                                 f"clue={clue} conversation_id={routed_conversation_id} "
                                 f"enquiry_id={enquiry_id}", flush=True,
                             )
-                            inbound_message_id, _inbound_created = (
+                            inbound_message_id, inbound_message_created = (
                                 persist_inbound_whatsapp_message(
                                     phone, message_id, text,
                                     lead_id=conversation_store.relationship_id(
                                         routed_conversation.get("Lead")
                                     ),
                                     conversation_id=routed_conversation_id,
-                                    bubble_env="live",
+                                    bubble_env="live", message_type=message_type,
                                 )
                             )
                         else:
@@ -6336,7 +6432,7 @@ def _process_whatsapp_message(message):
                                 "[CONVERSATION ROUTING] direction=inbound "
                                 "resolution=owner_check_phone_ambiguous "
                                 f"candidate_count={len(ambiguous_candidates)} "
-                                "action=clarify", flush=True,
+                                "action=pending_context_checks", flush=True,
                             )
                 except Exception as error:
                     print(
@@ -6344,6 +6440,33 @@ def _process_whatsapp_message(message):
                         "resolution=owner_check_phone_lookup_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
+            if len(ambiguous_candidates) > 1:
+                internal_user = find_internal_user(
+                    phone, base_url, _bubble_records, bubble, normalize_phone
+                )
+            if len(ambiguous_candidates) > 1 and internal_user:
+                principal_general = _principal_general_candidate(
+                    ambiguous_candidates
+                )
+                if principal_general:
+                    routed_conversation = principal_general
+                    routed_conversation_id = conversation_store.relationship_id(
+                        principal_general.get("_id")
+                    )
+                    ambiguous_candidates = []
+                    print(
+                        "[CONVERSATION ROUTING] direction=inbound "
+                        "resolution=principal_general "
+                        f"conversation_id={routed_conversation_id}", flush=True,
+                    )
+                    if not inbound_message_id:
+                        inbound_message_id, inbound_message_created = (
+                            persist_inbound_whatsapp_message(
+                                phone, message_id, text,
+                                conversation_id=routed_conversation_id,
+                                bubble_env="live", message_type=message_type,
+                            )
+                        )
             if len(ambiguous_candidates) > 1:
                 clarification, ambiguity_labels = (
                     build_conversation_ambiguity_message(
@@ -6418,14 +6541,29 @@ def _process_whatsapp_message(message):
                             bubble_env="live",
                         )
                 raise identity_error
-            internal_user = find_internal_user(
-                phone, base_url, _bubble_records, bubble, normalize_phone
-            )
+            if internal_user is None:
+                internal_user = find_internal_user(
+                    phone, base_url, _bubble_records, bubble, normalize_phone
+                )
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
             listing_skill_active = (
                 str((routed_conversation or {}).get("ActiveSkill") or "").strip()
                 == LISTING_CREATION_SKILL
             )
+            if (
+                internal_user and message_type == "image"
+                and not listing_skill_active
+                and conversation_store.relationship_id(
+                    (routed_conversation or {}).get("Listing")
+                )
+            ):
+                print(
+                    "[LISTING CREATION] action=stale_image_ignored "
+                    f"conversation_id={routed_conversation_id or 'none'}",
+                    flush=True,
+                )
+                reply_sent = True
+                return
             if internal_user and (
                 listing_skill_active or is_listing_creation_intent(text)
             ):
@@ -6445,9 +6583,10 @@ def _process_whatsapp_message(message):
                         "Listing creation requires a durable Conversation."
                     )
                 if not inbound_message_id:
-                    inbound_message_id, _created = persist_inbound_whatsapp_message(
+                    inbound_message_id, inbound_message_created = persist_inbound_whatsapp_message(
                         phone, message_id, text,
                         conversation_id=skill_conversation_id, bubble_env="live",
+                        message_type=message_type,
                     )
                 image_url = None
                 if message_type == "image":
@@ -6462,11 +6601,22 @@ def _process_whatsapp_message(message):
                 )
                 if skill_result.handled:
                     _stop_whatsapp_typing(typing_keepalive)
-                    sent_ids = send_whatsapp_text(phone, skill_result.response_text)
-                    persist_sent_whatsapp_text(
-                        phone, skill_result.response_text, sent_ids,
-                        skill_conversation_id, bubble_env="live",
-                    )
+                    if skill_result.response_text:
+                        sent_ids = send_whatsapp_text(
+                            phone, skill_result.response_text
+                        )
+                        persist_sent_whatsapp_text(
+                            phone, skill_result.response_text, sent_ids,
+                            skill_conversation_id, bubble_env="live",
+                        )
+                    elif (
+                        message_type == "image" and inbound_message_created
+                        and skill_result.listing_id
+                    ):
+                        schedule_listing_photo_finalization(
+                            phone, skill_conversation_id,
+                            skill_result.listing_id, message_id, "live",
+                        )
                     print(
                         "[LISTING CREATION] "
                         f"conversation_id={skill_conversation_id} "
@@ -6856,11 +7006,6 @@ def _process_whatsapp_message(message):
                         lead_conversation_id, lead_id, "live",
                     )
             else:
-                print(
-                    "[WHATSAPP AI REPLY] "
-                    f"phone={_masked_whatsapp_phone(phone)} text={answer}",
-                    flush=True,
-                )
                 outbound_ids = send_whatsapp_text(phone, answer)
                 if isinstance(outbound_ids, list) and outbound_ids:
                     try:

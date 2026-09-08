@@ -95,7 +95,40 @@ class ListingCreationTests(unittest.TestCase):
             "photos": ["https://meta.test/photo-1"],
             "coverPhoto": "https://meta.test/photo-1",
         })
-        self.assertIn("1 photos. Publish?", result.response_text)
+        self.assertTrue(result.handled)
+        self.assertIsNone(result.response_text)
+
+    def test_exact_live_phrase_persists_beds_and_renders_summary(self):
+        result = self.handle(
+            "New listing one menerung, 16.3k rent per month, 3 beds"
+        )
+        payload = self.create.call_args.args[2]
+        self.assertEqual(payload["beds"], 3)
+        self.assertEqual(payload["priceRent"], 16300)
+        self.assertIn("3 bed", result.response_text)
+
+    def test_four_rapid_photos_are_all_saved_without_immediate_prompts(self):
+        self.listing = {
+            "_id": "listing-1", "condo": "condo-1", "propertyType": "Condo",
+            "unitNumber": "A-25-2", "beds": 3,
+            "TransactionType": ["Rent/Let"], "priceRent": 16300,
+            "photos": [],
+        }
+        conversation = {"_id": "conversation-1", "ActiveSkill": "create_listing",
+                        "Listing": "listing-1"}
+
+        def apply_patch(url, updates):
+            if url.endswith("/listing/listing-1"):
+                self.listing.update(updates)
+
+        self.patch.side_effect = apply_patch
+        results = [
+            self.handle("", conversation, f"https://meta.test/photo-{index}")
+            for index in range(1, 5)
+        ]
+        self.assertEqual(len(self.listing["photos"]), 4)
+        self.assertEqual(self.listing["coverPhoto"], "https://meta.test/photo-1")
+        self.assertTrue(all(result.response_text is None for result in results))
 
     def test_no_photos_publish_and_cancel_clear_active_skill(self):
         self.listing = {

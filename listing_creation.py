@@ -14,7 +14,7 @@ ACTIVE_SKILL = "create_listing"
 @dataclass
 class ListingCreationResult:
     handled: bool
-    response_text: str
+    response_text: Optional[str]
     listing_id: Optional[str] = None
     published: bool = False
     cancelled: bool = False
@@ -97,9 +97,12 @@ def extract_listing_updates(text, existing=None):
     size = re.search(r"\b([0-9][0-9,]*)\s*(?:sf|sq\s*ft|sqft)\b", normalized)
     if size:
         updates["Sq Ft"] = int(size.group(1).replace(",", ""))
-    beds = re.search(r"\b(\d+)\s*(?:\+\s*(\d+))?\s*(?:bed(?:room)?s?)?\b", normalized)
-    if beds and (beds.group(2) or "bed" in beds.group(0)):
-        updates["beds"] = int(beds.group(1))
+    beds = re.search(
+        r"\b(\d+)\s*(?:bed(?:room)?s?)\b|\b(\d+)\s*\+\s*\d+\b",
+        normalized,
+    )
+    if beds:
+        updates["beds"] = int(beds.group(1) or beds.group(2))
     furnishing = None
     if re.search(r"\b(ff|fully furnished)\b", normalized):
         furnishing = "Fully Furnished"
@@ -255,5 +258,7 @@ def handle_listing_creation(
     no_photos = bool(re.search(
         r"\b(no photos?|none yet|do not have any|don't have any)\b", normalized
     ))
-    response = _next_response(listing, condo_name, geo_name, no_photos)
+    response = None if image_url else _next_response(
+        listing, condo_name, geo_name, no_photos
+    )
     return ListingCreationResult(True, response, listing_id)

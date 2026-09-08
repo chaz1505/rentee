@@ -950,6 +950,7 @@ class WhatsAppTests(unittest.TestCase):
             "test_inbound_reply_persists_exact_listing",
             "test_duplicate_inbound_adds_missing_listing_without_overwrite",
             "test_inbound_message_stores_conversation_and_updates_activity",
+            "test_inbound_image_message_is_identifiable_in_bubble",
             "test_new_message_creation_rejects_missing_conversation",
         }
         if self._testMethodName not in direct_persistence_tests:
@@ -2089,6 +2090,58 @@ class WhatsAppTests(unittest.TestCase):
         internal_workflow.assert_not_called()
         property_search.assert_not_called()
 
+    def test_listing_image_is_silent_and_schedules_one_finalizer(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        item = image_webhook_payload(message_id="wamid.photo-1")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        self.mocked_inbound.return_value = ("inbound-image", True)
+        result = SimpleNamespace(
+            handled=True, response_text=None, listing_id="listing-1",
+            published=False, cancelled=False,
+        )
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch("app.get_whatsapp_media_url", return_value="https://meta/photo"), \
+             patch("app.handle_listing_creation", return_value=result), \
+             patch("app.schedule_listing_photo_finalization") as schedule, \
+             patch("app.send_whatsapp_text") as send, \
+             patch("app.persist_sent_whatsapp_text") as persist:
+            app_module._process_whatsapp_message(item)
+
+        schedule.assert_called_once_with(
+            "60123456789", "conversation-general", "listing-1",
+            "wamid.photo-1", "live",
+        )
+        send.assert_not_called()
+        persist.assert_not_called()
+
+    def test_inactive_listing_image_is_ignored_after_publish(self):
+        general = {
+            "_id": "conversation-general", "ActiveSkill": "",
+            "Listing": "listing-1", "CounterParty Role": "Principal",
+            "Rentee Role": "Principal Assistant",
+        }
+        enquiry = {"_id": "conversation-enquiry", "Enquiry": "enquiry-1"}
+        item = image_webhook_payload(message_id="wamid.stale-photo")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(None, "ambiguous", 2, [enquiry, general]),
+        ), patch("app.send_whatsapp_text") as send, patch(
+            "app.handle_listing_creation"
+        ) as listing:
+            app_module._process_whatsapp_message(item)
+        send.assert_not_called()
+        listing.assert_not_called()
+
     def test_active_listing_skill_wins_ambiguous_conversation_routing(self):
         active = {
             "_id": "conversation-listing", "ActiveSkill": "create_listing",
@@ -2101,6 +2154,90 @@ class WhatsAppTests(unittest.TestCase):
         self.assertIs(selected, active)
         self.assertEqual(clue, "listing_creation")
         self.assertEqual(candidates, [active])
+
+    def test_internal_principal_general_candidate_ignores_enquiry_conversations(self):
+        general = {
+            "_id": "conversation-general", "CounterParty Role": "Principal",
+            "Rentee Role": "Principal Assistant",
+        }
+        enquiry = {
+            "_id": "conversation-enquiry", "Enquiry": "enquiry-1",
+            "CounterParty Role": "Principal",
+        }
+        self.assertIs(
+            app_module._principal_general_candidate([enquiry, general]), general
+        )
+
+    def test_photo_finalizer_exits_when_newer_image_exists(self):
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        with patch("app.bubble", side_effect=[conversation]), patch(
+            "app._latest_inbound_image_message",
+            return_value={"whatsappMessageId": "wamid.newer"},
+        ), patch("app.send_whatsapp_text") as send:
+            finalized = app_module.finalize_listing_photo_batch(
+                "60123456789", "conversation-1", "listing-1", "wamid.older"
+            )
+        self.assertFalse(finalized)
+        send.assert_not_called()
+
+    def test_latest_photo_finalizer_sends_one_publish_prompt(self):
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        listing = {"_id": "listing-1", "owner": "user-gwen"}
+        result = SimpleNamespace(
+            handled=True,
+            response_text="One Menerung · A-25-2 · 3 bed · RM16.3k · 4 photos. Publish?",
+        )
+        with patch("app.bubble", side_effect=[conversation, listing]), patch(
+            "app._latest_inbound_image_message",
+            return_value={"whatsappMessageId": "wamid.latest"},
+        ), patch("app.handle_listing_creation", return_value=result), patch(
+            "app.send_whatsapp_text", return_value=["wamid.out"]
+        ) as send, patch("app.persist_sent_whatsapp_text") as persist:
+            finalized = app_module.finalize_listing_photo_batch(
+                "60123456789", "conversation-1", "listing-1", "wamid.latest"
+            )
+        self.assertTrue(finalized)
+        send.assert_called_once_with("60123456789", result.response_text)
+        persist.assert_called_once()
+
+    def test_photo_finalizer_exits_after_listing_was_published(self):
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "",
+            "Listing": "listing-1",
+        }
+        with patch("app.bubble", return_value=conversation), patch(
+            "app._latest_inbound_image_message"
+        ) as latest, patch("app.send_whatsapp_text") as send:
+            finalized = app_module.finalize_listing_photo_batch(
+                "60123456789", "conversation-1", "listing-1", "wamid.image"
+            )
+        self.assertFalse(finalized)
+        latest.assert_not_called()
+        send.assert_not_called()
+
+    def test_send_whatsapp_text_logs_actual_compact_text(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"messages": [{"id": "wamid.out"}]}
+        response.raise_for_status.return_value = None
+        with patch.dict(os.environ, {
+            "WHATSAPP_PHONE_NUMBER_ID": "phone-id",
+            "WHATSAPP_ACCESS_TOKEN": "token",
+        }), patch("app.requests.post", return_value=response), patch(
+            "builtins.print"
+        ) as logged:
+            app_module.send_whatsapp_text("60123456789", "Line one\nLine two")
+        logs = "\n".join(str(call) for call in logged.call_args_list)
+        self.assertIn(
+            "[WHATSAPP OUTBOUND TEXT] phone=...456789 "
+            "text='Line one Line two'", logs,
+        )
+        self.assertNotIn("60123456789", logs)
 
     @patch("app.requests.get")
     def test_download_whatsapp_audio_fetches_meta_url_and_bytes(self, get):
@@ -3215,6 +3352,18 @@ class WhatsAppTests(unittest.TestCase):
         )
         activity.assert_called_once_with("conversation-1", "live")
 
+    @patch("app.conversation_store.update_conversation_last_inbound_at")
+    @patch("app._bubble_create", return_value="inbound-image")
+    @patch("app._bubble_records", return_value=iter([]))
+    def test_inbound_image_message_is_identifiable_in_bubble(
+        self, _records, create, _activity
+    ):
+        app_module.persist_inbound_whatsapp_message(
+            "60123456789", "wamid.image", "",
+            conversation_id="conversation-1", message_type="image",
+        )
+        self.assertEqual(create.call_args.args[2]["messageType"], "image")
+
     @patch("app._bubble_create", return_value="message-current")
     def test_ai_outbound_message_optionally_stores_conversation(self, create):
         app_module.create_whatsapp_ai_message(
@@ -3379,10 +3528,7 @@ class WhatsAppTests(unittest.TestCase):
             "phone=...456789",
             logs,
         )
-        self.assertIn(
-            "[WHATSAPP AI REPLY] phone=...456789 text=Reply",
-            logs,
-        )
+        self.assertNotIn("[WHATSAPP AI REPLY]", logs)
         self.assertNotIn("60123456789", logs)
 
     @patch("app.conversation_store.set_conversation_previous_response_id")
