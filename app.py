@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
+import base64
 import csv
 import datetime
 import difflib
@@ -1833,21 +1834,92 @@ def download_whatsapp_audio(media_id):
     return audio_bytes, mime_type
 
 
-def get_whatsapp_media_url(media_id):
-    """Resolve one Meta media ID to its temporary authenticated URL."""
+def download_whatsapp_image(media_id, message_id=None):
+    """Download and validate one Meta-hosted WhatsApp image."""
     media_id = str(media_id or "").strip()
     if not media_id:
-        raise ValueError("WhatsApp media ID is missing.")
+        raise ValueError("WhatsApp image media ID is missing.")
     access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
-    response = requests.get(
-        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
-        headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+    headers = {"Authorization": f"Bearer {access_token}"}
+    print(
+        f"[WHATSAPP IMAGE] message_id={message_id or 'unknown'} "
+        f"media_id={media_id} action=download_started", flush=True,
     )
-    response.raise_for_status()
-    media_url = str((response.json() or {}).get("url") or "").strip()
+    metadata_response = requests.get(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
+        headers=headers, timeout=30,
+    )
+    metadata_response.raise_for_status()
+    metadata = metadata_response.json() or {}
+    media_url = str(metadata.get("url") or "").strip()
     if not media_url:
         raise ValueError("Meta media metadata did not contain a download URL.")
-    return media_url
+    image_response = requests.get(media_url, headers=headers, timeout=60)
+    image_response.raise_for_status()
+    image_bytes = bytes(image_response.content or b"")
+    if not image_bytes:
+        raise ValueError("Downloaded WhatsApp image was empty.")
+    mime_type = str(
+        metadata.get("mime_type")
+        or image_response.headers.get("Content-Type") or ""
+    ).split(";", 1)[0].strip().casefold()
+    if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise ValueError(f"Unsupported WhatsApp image MIME type: {mime_type or 'missing'}")
+    print(
+        f"[WHATSAPP IMAGE] message_id={message_id or 'unknown'} "
+        f"bytes={len(image_bytes)} mime={mime_type} action=downloaded",
+        flush=True,
+    )
+    return image_bytes, mime_type
+
+
+def persist_whatsapp_image(media_id, message_id, listing_id, bubble_env="live"):
+    """Upload WhatsApp image bytes through Bubble and return its hosted URL."""
+    image_bytes, mime_type = download_whatsapp_image(media_id, message_id)
+    extension = {
+        "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+        "image/gif": "gif",
+    }[mime_type]
+    base_url = get_bubble_base_url(bubble_env)
+    listing_url = f"{base_url}/obj/listing/{listing_id}"
+    listing = bubble(listing_url)
+    existing_photos = list(listing.get("photos") or [])
+    upload_value = {
+        "filename": f"whatsapp-{message_id}.{extension}",
+        "contents": base64.b64encode(image_bytes).decode("ascii"),
+        "private": False,
+    }
+    print(
+        f"[WHATSAPP IMAGE] message_id={message_id} action=upload_started",
+        flush=True,
+    )
+    _bubble_patch(listing_url, {"photos": existing_photos + [upload_value]})
+    stored_listing = bubble(listing_url)
+    stored_photos = list(stored_listing.get("photos") or [])
+    if len(stored_photos) <= len(existing_photos):
+        raise ValueError("Bubble did not return the uploaded Listing photo.")
+    stored_value = stored_photos[-1]
+    stored_url = str(stored_value or "").strip()
+    if (
+        not isinstance(stored_value, str)
+        or not re.match(r"^(?:https?:)?//", stored_url)
+        or "lookaside.fbsbx.com" in stored_url.casefold()
+        or "facebook.com" in stored_url.casefold()
+    ):
+        raise ValueError("Bubble did not return a permanent image URL.")
+    cover_added = not bool(listing.get("coverPhoto"))
+    if cover_added:
+        _bubble_patch(listing_url, {"coverPhoto": stored_url})
+    masked_url = stored_url if len(stored_url) <= 80 else stored_url[:77] + "..."
+    print(
+        f"[WHATSAPP IMAGE] message_id={message_id} "
+        f"stored_url={masked_url!r} action=uploaded", flush=True,
+    )
+    print(
+        f"[LISTING PHOTO] listing_id={listing_id} photos={len(stored_photos)} "
+        f"cover_photo={cover_added}", flush=True,
+    )
+    return stored_url
 
 
 def transcribe_whatsapp_audio(media_id, message_id=None):
@@ -6588,16 +6660,39 @@ def _process_whatsapp_message(message):
                         conversation_id=skill_conversation_id, bubble_env="live",
                         message_type=message_type,
                     )
-                image_url = None
+                photo_stored = False
                 if message_type == "image":
-                    image_url = get_whatsapp_media_url(
-                        (message.get("image") or {}).get("id")
-                    )
+                    media_id = (message.get("image") or {}).get("id")
+                    try:
+                        persist_whatsapp_image(
+                            media_id, message_id,
+                            conversation_store.relationship_id(
+                                skill_conversation.get("Listing")
+                            ), "live",
+                        )
+                        photo_stored = True
+                    except Exception as error:
+                        print(
+                            f"[WHATSAPP IMAGE] message_id={message_id} "
+                            "action=storage_failed "
+                            f"error={type(error).__name__}: {error}", flush=True,
+                        )
+                        retry_text = (
+                            "I couldn't save that photo — could you send it again?"
+                        )
+                        _stop_whatsapp_typing(typing_keepalive)
+                        sent_ids = send_whatsapp_text(phone, retry_text)
+                        persist_sent_whatsapp_text(
+                            phone, retry_text, sent_ids,
+                            skill_conversation_id, bubble_env="live",
+                        )
+                        reply_sent = True
+                        return
                 skill_result = handle_listing_creation(
                     text, skill_conversation, internal_user.get("_id"), base_url,
                     bubble_create=_bubble_create, bubble_patch=_bubble_patch,
                     bubble_get=bubble, bubble_records=_bubble_records,
-                    image_url=image_url,
+                    photo_stored=photo_stored,
                 )
                 if skill_result.handled:
                     _stop_whatsapp_typing(typing_keepalive)

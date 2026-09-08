@@ -183,7 +183,7 @@ def _next_response(listing, condo_name=None, geo_name=None, no_photos=False):
 
 def handle_listing_creation(
     text, conversation, user_id, base_url, *, bubble_create, bubble_patch,
-    bubble_get, bubble_records, image_url=None,
+    bubble_get, bubble_records, stored_image_url=None, photo_stored=False,
 ):
     """Start or continue one Listing identified by Conversation.Listing."""
     conversation = dict(conversation or {})
@@ -245,20 +245,20 @@ def handle_listing_creation(
             updates.update({"condo": condo_id, "propertyType": "Condo"})
         elif geo_id:
             updates["Geo"] = geo_id
-        if image_url:
+        if stored_image_url:
             photos = list(listing.get("photos") or [])
-            if image_url not in photos:
-                photos.append(image_url)
+            if stored_image_url not in photos:
+                photos.append(stored_image_url)
             updates["photos"] = photos
             if not listing.get("coverPhoto"):
-                updates["coverPhoto"] = image_url
+                updates["coverPhoto"] = stored_image_url
         if updates:
             bubble_patch(f"{base_url}/obj/listing/{listing_id}", updates)
             listing.update(updates)
     no_photos = bool(re.search(
         r"\b(no photos?|none yet|do not have any|don't have any)\b", normalized
     ))
-    response = None if image_url else _next_response(
+    response = None if (stored_image_url or photo_stored) else _next_response(
         listing, condo_name, geo_name, no_photos
     )
     return ListingCreationResult(True, response, listing_id)

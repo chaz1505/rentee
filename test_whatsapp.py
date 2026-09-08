@@ -2107,7 +2107,7 @@ class WhatsAppTests(unittest.TestCase):
         with patch(
             "app.find_active_conversation_by_phone",
             return_value=(conversation, "single_active", 1),
-        ), patch("app.get_whatsapp_media_url", return_value="https://meta/photo"), \
+        ), patch("app.persist_whatsapp_image", return_value="https://bubble/photo"), \
              patch("app.handle_listing_creation", return_value=result), \
              patch("app.schedule_listing_photo_finalization") as schedule, \
              patch("app.send_whatsapp_text") as send, \
@@ -2120,6 +2120,85 @@ class WhatsAppTests(unittest.TestCase):
         )
         send.assert_not_called()
         persist.assert_not_called()
+
+    @patch("app.requests.get")
+    def test_whatsapp_image_download_uses_bearer_authentication(self, get):
+        metadata = MagicMock()
+        metadata.json.return_value = {
+            "url": "https://lookaside.facebook.test/image",
+            "mime_type": "image/jpeg",
+        }
+        metadata.raise_for_status.return_value = None
+        image = MagicMock()
+        image.content = b"jpeg-bytes"
+        image.headers = {"Content-Type": "image/jpeg"}
+        image.raise_for_status.return_value = None
+        get.side_effect = [metadata, image]
+
+        content, mime_type = app_module.download_whatsapp_image(
+            "media-1", "wamid.image"
+        )
+
+        self.assertEqual(content, b"jpeg-bytes")
+        self.assertEqual(mime_type, "image/jpeg")
+        expected_auth = {"Authorization": "Bearer wa-token"}
+        self.assertEqual(get.call_args_list[0].kwargs["headers"], expected_auth)
+        self.assertEqual(get.call_args_list[1].kwargs["headers"], expected_auth)
+
+    def test_whatsapp_image_is_uploaded_to_bubble_and_permanent_url_returned(self):
+        before = {"photos": [], "coverPhoto": ""}
+        after = {"photos": ["//s3.amazonaws.com/appforest_uf/photo.jpg"]}
+        with patch(
+            "app.download_whatsapp_image",
+            return_value=(b"jpeg-bytes", "image/jpeg"),
+        ), patch("app.bubble", side_effect=[before, after]), patch(
+            "app._bubble_patch"
+        ) as bubble_patch:
+            stored_url = app_module.persist_whatsapp_image(
+                "media-1", "wamid.image", "listing-1"
+            )
+
+        self.assertEqual(
+            stored_url, "//s3.amazonaws.com/appforest_uf/photo.jpg"
+        )
+        photo_payload = bubble_patch.call_args_list[0].args[1]["photos"][-1]
+        self.assertEqual(photo_payload["filename"], "whatsapp-wamid.image.jpg")
+        self.assertEqual(photo_payload["private"], False)
+        self.assertNotIn("lookaside.facebook", str(photo_payload))
+        bubble_patch.assert_any_call(
+            "https://www.rentee.asia/api/1.1/obj/listing/listing-1",
+            {"coverPhoto": "//s3.amazonaws.com/appforest_uf/photo.jpg"},
+        )
+
+    def test_later_stored_photo_does_not_replace_cover(self):
+        before = {
+            "photos": ["https://bubble/first.jpg"],
+            "coverPhoto": "https://bubble/first.jpg",
+        }
+        after = {"photos": [
+            "https://bubble/first.jpg", "https://bubble/second.jpg",
+        ]}
+        with patch(
+            "app.download_whatsapp_image",
+            return_value=(b"png-bytes", "image/png"),
+        ), patch("app.bubble", side_effect=[before, after]), patch(
+            "app._bubble_patch"
+        ) as bubble_patch:
+            result = app_module.persist_whatsapp_image(
+                "media-2", "wamid.second", "listing-1"
+            )
+        self.assertEqual(result, "https://bubble/second.jpg")
+        self.assertEqual(bubble_patch.call_count, 1)
+
+    def test_failed_permanent_storage_never_patches_listing(self):
+        with patch(
+            "app.download_whatsapp_image", side_effect=RuntimeError("download failed")
+        ), patch("app._bubble_patch") as bubble_patch:
+            with self.assertRaises(RuntimeError):
+                app_module.persist_whatsapp_image(
+                    "media-1", "wamid.failed", "listing-1"
+                )
+        bubble_patch.assert_not_called()
 
     def test_inactive_listing_image_is_ignored_after_publish(self):
         general = {
@@ -2141,6 +2220,33 @@ class WhatsAppTests(unittest.TestCase):
             app_module._process_whatsapp_message(item)
         send.assert_not_called()
         listing.assert_not_called()
+
+    def test_failed_listing_photo_storage_sends_retry_without_finalizer(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        item = image_webhook_payload(message_id="wamid.failed-photo")[
+            "entry"
+        ][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        self.mocked_inbound.return_value = ("inbound-image", True)
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch(
+            "app.persist_whatsapp_image", side_effect=RuntimeError("upload failed")
+        ), patch(
+            "app.schedule_listing_photo_finalization"
+        ) as schedule, patch(
+            "app.send_whatsapp_text", return_value=["wamid.retry"]
+        ) as send, patch("app.persist_sent_whatsapp_text") as persist:
+            app_module._process_whatsapp_message(item)
+
+        retry = "I couldn't save that photo — could you send it again?"
+        send.assert_called_once_with("60123456789", retry)
+        persist.assert_called_once()
+        schedule.assert_not_called()
 
     def test_active_listing_skill_wins_ambiguous_conversation_routing(self):
         active = {

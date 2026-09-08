@@ -20,12 +20,12 @@ class ListingCreationTests(unittest.TestCase):
             self.condos if kind == "condo" else self.geos
         ))
 
-    def handle(self, text, conversation=None, image_url=None):
+    def handle(self, text, conversation=None, stored_image_url=None):
         return creation.handle_listing_creation(
             text, conversation or {"_id": "conversation-1"}, "user-gwen", BASE,
             bubble_create=self.create, bubble_patch=self.patch,
             bubble_get=self.get, bubble_records=self.records,
-            image_url=image_url,
+            stored_image_url=stored_image_url,
         )
 
     def test_start_resolves_condo_and_captures_supplied_shorthand(self):
@@ -90,10 +90,10 @@ class ListingCreationTests(unittest.TestCase):
         }
         conversation = {"_id": "conversation-1", "ActiveSkill": "create_listing",
                         "Listing": "listing-1"}
-        result = self.handle("", conversation, "https://meta.test/photo-1")
+        result = self.handle("", conversation, "https://bubble.test/photo-1")
         self.patch.assert_called_once_with(f"{BASE}/obj/listing/listing-1", {
-            "photos": ["https://meta.test/photo-1"],
-            "coverPhoto": "https://meta.test/photo-1",
+            "photos": ["https://bubble.test/photo-1"],
+            "coverPhoto": "https://bubble.test/photo-1",
         })
         self.assertTrue(result.handled)
         self.assertIsNone(result.response_text)
@@ -123,11 +123,11 @@ class ListingCreationTests(unittest.TestCase):
 
         self.patch.side_effect = apply_patch
         results = [
-            self.handle("", conversation, f"https://meta.test/photo-{index}")
+            self.handle("", conversation, f"https://bubble.test/photo-{index}")
             for index in range(1, 5)
         ]
         self.assertEqual(len(self.listing["photos"]), 4)
-        self.assertEqual(self.listing["coverPhoto"], "https://meta.test/photo-1")
+        self.assertEqual(self.listing["coverPhoto"], "https://bubble.test/photo-1")
         self.assertTrue(all(result.response_text is None for result in results))
 
     def test_no_photos_publish_and_cancel_clear_active_skill(self):
