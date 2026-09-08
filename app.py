@@ -18,6 +18,11 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import conversation as conversation_store
+from listing_creation import (
+    ACTIVE_SKILL as LISTING_CREATION_SKILL,
+    handle_listing_creation,
+    is_listing_creation_intent,
+)
 from location_tools import (
     compare_locations as compare_grounded_locations,
     find_nearby_places as find_grounded_nearby_places,
@@ -147,6 +152,7 @@ def load_ai_skills():
         SKILLS_DIRECTORY / "forwarded_enquiry" / "SKILL.md",
         SKILLS_DIRECTORY / "property_search" / "SKILL.md",
         SKILLS_DIRECTORY / "condo_advice" / "SKILL.md",
+        SKILLS_DIRECTORY / "listing_creation" / "SKILL.md",
     )
     return "\n\n".join(path.read_text(encoding="utf-8").strip() for path in skill_paths)
 
@@ -1825,6 +1831,23 @@ def download_whatsapp_audio(media_id):
     return audio_bytes, mime_type
 
 
+def get_whatsapp_media_url(media_id):
+    """Resolve one Meta media ID to its temporary authenticated URL."""
+    media_id = str(media_id or "").strip()
+    if not media_id:
+        raise ValueError("WhatsApp media ID is missing.")
+    access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    response = requests.get(
+        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/{media_id}",
+        headers={"Authorization": f"Bearer {access_token}"}, timeout=30,
+    )
+    response.raise_for_status()
+    media_url = str((response.json() or {}).get("url") or "").strip()
+    if not media_url:
+        raise ValueError("Meta media metadata did not contain a download URL.")
+    return media_url
+
+
 def transcribe_whatsapp_audio(media_id, message_id=None):
     """Download and transcribe WhatsApp audio without invoking Rentee's chat model."""
     audio_bytes, mime_type = download_whatsapp_audio(media_id)
@@ -2214,6 +2237,15 @@ def route_conversation_by_message_clue(
 ):
     """Filter ambiguous candidates only for high-confidence workflow clues."""
     candidates = [item for item in candidates or [] if item.get("_id")]
+    active_listing = [
+        item for item in candidates
+        if str(item.get("ActiveSkill") or "").strip() == LISTING_CREATION_SKILL
+    ]
+    if active_listing:
+        return (
+            active_listing[0] if len(active_listing) == 1 else None,
+            "listing_creation", active_listing,
+        )
     if not _has_strong_property_search_clue(message_text, bubble_env):
         return None, None, candidates
     compatible = [item for item in candidates if _property_search_conversation(item)]
@@ -6390,6 +6422,60 @@ def _process_whatsapp_message(message):
                 phone, base_url, _bubble_records, bubble, normalize_phone
             )
             safe_phone = f"...{phone[-4:]}" if phone else "unknown"
+            listing_skill_active = (
+                str((routed_conversation or {}).get("ActiveSkill") or "").strip()
+                == LISTING_CREATION_SKILL
+            )
+            if internal_user and (
+                listing_skill_active or is_listing_creation_intent(text)
+            ):
+                skill_conversation = routed_conversation if listing_skill_active else None
+                if not skill_conversation:
+                    skill_conversation = find_general_conversation(
+                        internal_user.get("_id"), phone,
+                        counterparty_user_id=internal_user.get("_id"),
+                        counterparty_role="Principal",
+                        rentee_role="Principal Assistant", bubble_env="live",
+                    )
+                skill_conversation_id = conversation_store.relationship_id(
+                    (skill_conversation or {}).get("_id")
+                )
+                if not skill_conversation_id:
+                    raise RuntimeError(
+                        "Listing creation requires a durable Conversation."
+                    )
+                if not inbound_message_id:
+                    inbound_message_id, _created = persist_inbound_whatsapp_message(
+                        phone, message_id, text,
+                        conversation_id=skill_conversation_id, bubble_env="live",
+                    )
+                image_url = None
+                if message_type == "image":
+                    image_url = get_whatsapp_media_url(
+                        (message.get("image") or {}).get("id")
+                    )
+                skill_result = handle_listing_creation(
+                    text, skill_conversation, internal_user.get("_id"), base_url,
+                    bubble_create=_bubble_create, bubble_patch=_bubble_patch,
+                    bubble_get=bubble, bubble_records=_bubble_records,
+                    image_url=image_url,
+                )
+                if skill_result.handled:
+                    _stop_whatsapp_typing(typing_keepalive)
+                    sent_ids = send_whatsapp_text(phone, skill_result.response_text)
+                    persist_sent_whatsapp_text(
+                        phone, skill_result.response_text, sent_ids,
+                        skill_conversation_id, bubble_env="live",
+                    )
+                    print(
+                        "[LISTING CREATION] "
+                        f"conversation_id={skill_conversation_id} "
+                        f"listing_id={skill_result.listing_id or 'none'} "
+                        f"published={skill_result.published} "
+                        f"cancelled={skill_result.cancelled}", flush=True,
+                    )
+                    reply_sent = True
+                    return
             if extract_handoff_code(text):
                 lead_conversation_id = routed_conversation_id
                 linked_handoff_lead_id = None
@@ -6830,7 +6916,7 @@ def _process_whatsapp_message(message):
 
 
 def _whatsapp_text_messages(payload):
-    """Extract supported inbound text/audio messages; ignore statuses and others."""
+    """Extract supported inbound text/audio/image messages; ignore statuses."""
     messages = []
     if not isinstance(payload, dict) or payload.get("object") != "whatsapp_business_account":
         return messages
@@ -6844,7 +6930,7 @@ def _whatsapp_text_messages(payload):
             }
             for item in value.get("messages", []) or []:
                 message_type = item.get("type")
-                if message_type not in {"text", "audio"}:
+                if message_type not in {"text", "audio", "image"}:
                     continue
                 if not item.get("id") or not item.get("from"):
                     continue
@@ -6852,12 +6938,16 @@ def _whatsapp_text_messages(payload):
                     body = (item.get("text") or {}).get("body")
                     if not isinstance(body, str) or not body.strip():
                         continue
-                else:
+                elif message_type == "audio":
                     media_id = (item.get("audio") or {}).get("id")
                     if not isinstance(media_id, str) or not media_id.strip():
                         # Keep a genuine audio event so the worker can log and send
                         # the standard transcription failure response.
                         item = {**item, "audio": {**(item.get("audio") or {})}}
+                else:
+                    media_id = (item.get("image") or {}).get("id")
+                    if not isinstance(media_id, str) or not media_id.strip():
+                        continue
                 clean = dict(item)
                 clean["customer_name"] = names.get(str(item.get("from")))
                 messages.append(clean)

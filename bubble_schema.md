@@ -19,6 +19,7 @@ Fields:
 | Field | Type | Notes |
 |---|---|---|
 | CounterParty Phone | text | Exact Bubble field name. Normalized WhatsApp counterparty phone |
+| ActiveSkill | text | `create_listing` while an agent is creating inventory over WhatsApp |
 | CounterParty Role | text | Exact Bubble field name |
 | Counterparty User | User | Optional relationship to User |
 | Enquiry | Enquiry | Optional enquiry-specific conversation |
@@ -100,13 +101,24 @@ Message semantics:
 | Field | Notes |
 |---|---|
 | condo | Existing |
+| Geo | Geo relationship |
+| unitNumber | text |
+| propertyType | text; `Condo` or `Landed` |
+| TransactionType | list; known values `Rent/Let` and `Buy/Sell` |
 | beds | Existing |
 | priceRent | Existing |
+| priceSale | Existing |
+| Sq Ft | Existing |
+| Furnishing | Existing canonical furnishing label |
 | sourceURL | Existing |
 | owner | User |
 | ownerContact | Exact known Bubble API field key; lowercase o |
 | availability | Existing |
 | availability_date | Existing |
+| photos | list of images |
+| coverPhoto | image |
+| Description | text |
+| Notes | text |
 
 Important:
 ownerContact is currently the authoritative property-side destination used by the owner-check workflow.

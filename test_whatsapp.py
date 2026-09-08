@@ -45,6 +45,17 @@ def audio_webhook_payload(
     return payload
 
 
+def image_webhook_payload(
+    message_id="wamid.image-1", phone="60123456789", media_id="image-1",
+):
+    payload = webhook_payload(message_id, phone)
+    message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    message["type"] = "image"
+    message.pop("text", None)
+    message["image"] = {"id": media_id, "mime_type": "image/jpeg"}
+    return payload
+
+
 class ImmediateThread:
     def __init__(self, target, args=(), **_kwargs):
         self.target, self.args = target, args
@@ -2040,6 +2051,56 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message["type"], "audio")
         self.assertEqual(message["audio"]["id"], "media-1")
         self.assertEqual(message["customer_name"], "Aisha")
+
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app._process_whatsapp_message")
+    def test_image_webhook_extracts_media_id_and_dispatches(self, mocked_process):
+        response = app_module.app.test_client().post(
+            "/whatsapp/webhook", json=image_webhook_payload()
+        )
+        self.assertEqual(response.status_code, 200)
+        message = mocked_process.call_args.args[0]
+        self.assertEqual(message["type"], "image")
+        self.assertEqual(message["image"]["id"], "image-1")
+
+    def test_active_listing_creation_bypasses_property_search(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        item = webhook_payload(
+            message_id="wamid.listing-unit", text="23-3"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        result = SimpleNamespace(
+            handled=True, response_text="Any photos for this one?",
+            listing_id="listing-1", published=False, cancelled=False,
+        )
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch("app.handle_listing_creation", return_value=result) as listing, \
+             patch("app.handle_internal_user_message") as internal_workflow, \
+             patch("app.run_rentee_turn") as property_search, \
+             patch("app.send_whatsapp_text", return_value=["wamid.reply"]):
+            app_module._process_whatsapp_message(item)
+
+        listing.assert_called_once()
+        internal_workflow.assert_not_called()
+        property_search.assert_not_called()
+
+    def test_active_listing_skill_wins_ambiguous_conversation_routing(self):
+        active = {
+            "_id": "conversation-listing", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        general = {"_id": "conversation-search", "CounterParty Role": "Lead"}
+        selected, clue, candidates = app_module.route_conversation_by_message_clue(
+            "23-3", [general, active]
+        )
+        self.assertIs(selected, active)
+        self.assertEqual(clue, "listing_creation")
+        self.assertEqual(candidates, [active])
 
     @patch("app.requests.get")
     def test_download_whatsapp_audio_fetches_meta_url_and_bytes(self, get):
