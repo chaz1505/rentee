@@ -9,6 +9,7 @@ from typing import Optional
 RENT_TRANSACTION = "Rent/Let"
 BUY_TRANSACTION = "Buy/Sell"
 ACTIVE_SKILL = "create_listing"
+UNKNOWN_UNIT_NUMBER = "Unknown"
 
 
 @dataclass
@@ -26,6 +27,13 @@ def is_listing_creation_intent(text):
         r"\b(new listing|create (?:a )?listing|add (?:a )?listing|new unit|"
         r"add this property|new (?:bungalow|terrace|semi[- ]?d|property))\b",
         normalized,
+    ))
+
+
+def is_listing_publish_confirmation(text):
+    normalized = " ".join(str(text or "").casefold().split())
+    return bool(re.fullmatch(
+        r"(?:yes|yep|correct|publish|go ahead|looks good)", normalized
     ))
 
 
@@ -134,9 +142,24 @@ def extract_listing_updates(text, existing=None):
         updates["propertyType"] = "Landed"
     elif re.fullmatch(r"(?:a )?(?:condo|condominium|apartment)", normalized):
         updates["propertyType"] = "Condo"
-    unit = re.fullmatch(r"(?:unit\s*)?([a-z0-9]+(?:[-/][a-z0-9]+)+)", normalized)
-    if unit:
-        updates["unitNumber"] = unit.group(1).upper()
+    if re.search(
+        r"\b(?:i\s+)?(?:do not|don't)\s+(?:know|have)(?:\s+(?:one|it|the unit(?: number)?))?\b|"
+        r"\b(?:no unit(?: number)?|not sure|unknown)\b",
+        normalized,
+    ):
+        updates["unitNumber"] = UNKNOWN_UNIT_NUMBER
+    else:
+        labelled_unit = re.search(
+            r"\bunit(?:\s+(?:number|no\.?))?\s*(?:is|:)?\s*([^,;]+)", raw,
+            flags=re.IGNORECASE,
+        )
+        bare_unit = re.fullmatch(r"[A-Za-z0-9]+(?:[-/][A-Za-z0-9]+)*", raw)
+        supplied_unit = (
+            labelled_unit.group(1).strip() if labelled_unit else
+            bare_unit.group(0).strip() if bare_unit else None
+        )
+        if supplied_unit:
+            updates["unitNumber"] = supplied_unit
     return updates
 
 
@@ -150,7 +173,8 @@ def _display_price(listing):
 def listing_summary(listing, condo_name=None, geo_name=None):
     parts = [condo_name or geo_name or "Listing"]
     for value in (
-        listing.get("unitNumber"),
+        listing.get("unitNumber")
+        if listing.get("unitNumber") != UNKNOWN_UNIT_NUMBER else None,
         f"{listing['beds']} bed" if listing.get("beds") is not None else None,
         f"{int(listing['Sq Ft']):,} sqft" if listing.get("Sq Ft") else None,
         _display_price(listing), listing.get("Furnishing"),
@@ -198,12 +222,12 @@ def handle_listing_creation(
     if active and re.fullmatch(r"(?:cancel|stop|forget it|never mind|nevermind)", normalized):
         bubble_patch(f"{base_url}/obj/conversation/{conversation_id}", {"ActiveSkill": ""})
         return ListingCreationResult(True, "Okay — I’ve cancelled this listing.", listing_id, cancelled=True)
-    if active and re.fullmatch(r"(?:yes|yep|correct|publish|go ahead|looks good)", normalized):
+    if active and is_listing_publish_confirmation(normalized):
         listing = bubble_get(f"{base_url}/obj/listing/{listing_id}")
         modes = listing.get("TransactionType") or []
         publishable = bool(
             (listing.get("condo") or listing.get("Geo"))
-            and listing.get("propertyType") and listing.get("unitNumber")
+            and listing.get("propertyType")
             and modes
             and ((RENT_TRANSACTION in modes and listing.get("priceRent"))
                  or (BUY_TRANSACTION in modes and listing.get("priceSale")))
@@ -212,8 +236,11 @@ def handle_listing_creation(
             bubble_patch(f"{base_url}/obj/conversation/{conversation_id}", {"ActiveSkill": ""})
             condos = _records(base_url, "condo", bubble_records)
             development = _relationship_name(condos, listing.get("condo"))
+            unit_number = str(listing.get("unitNumber") or "").strip()
+            if unit_number == UNKNOWN_UNIT_NUMBER:
+                unit_number = ""
             name = " ".join(filter(None, (
-                development, str(listing.get("unitNumber") or "").strip()
+                development, unit_number
             ))) or "listing"
             return ListingCreationResult(True, f"Done — {name} is added.", listing_id, published=True)
         return ListingCreationResult(True, _next_response(listing), listing_id)

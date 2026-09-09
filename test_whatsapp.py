@@ -48,12 +48,15 @@ def audio_webhook_payload(
 
 def image_webhook_payload(
     message_id="wamid.image-1", phone="60123456789", media_id="image-1",
+    caption=None,
 ):
     payload = webhook_payload(message_id, phone)
     message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
     message["type"] = "image"
     message.pop("text", None)
     message["image"] = {"id": media_id, "mime_type": "image/jpeg"}
+    if caption is not None:
+        message["image"]["caption"] = caption
     return payload
 
 
@@ -938,6 +941,8 @@ class WhatsAppTests(unittest.TestCase):
         app_module._whatsapp_processed_order.clear()
         app_module._whatsapp_phone_locks.clear()
         app_module._listing_photo_locks.clear()
+        app_module._listing_photo_inflight.clear()
+        app_module._listing_photo_finalized_ids.clear()
         self.internal_user_patcher = patch("app.find_internal_user", return_value=None)
         self.mocked_internal_user = self.internal_user_patcher.start()
         self.addCleanup(self.internal_user_patcher.stop)
@@ -2066,6 +2071,20 @@ class WhatsAppTests(unittest.TestCase):
         self.assertEqual(message["type"], "image")
         self.assertEqual(message["image"]["id"], "image-1")
 
+    @patch("app.threading.Thread", ImmediateThread)
+    @patch("app._process_whatsapp_message")
+    def test_image_caption_is_preserved_as_logical_message_text(self, mocked_process):
+        response = app_module.app.test_client().post(
+            "/whatsapp/webhook", json=image_webhook_payload(
+                caption="One Menerung, 3 beds, 16.3k rent"
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        message = mocked_process.call_args.args[0]
+        self.assertEqual(
+            message["text"]["body"], "One Menerung, 3 beds, 16.3k rent"
+        )
+
     def test_active_listing_creation_bypasses_property_search(self):
         conversation = {
             "_id": "conversation-general", "ActiveSkill": "create_listing",
@@ -2124,6 +2143,100 @@ class WhatsAppTests(unittest.TestCase):
             "60123456789", "conversation-general", "listing-1",
             "wamid.photo-1", "live",
         )
+        send.assert_not_called()
+        persist.assert_not_called()
+
+    def test_listing_photo_caption_updates_same_draft_before_finalization(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        caption = "One Menerung, 3 beds, 16.3k rent"
+        item = image_webhook_payload(
+            message_id="wamid.caption", caption=caption
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        result = SimpleNamespace(
+            handled=True, response_text=None, listing_id="listing-1",
+            published=False, cancelled=False,
+        )
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch(
+            "app.download_whatsapp_image", return_value=(b"image", "image/jpeg")
+        ), patch(
+            "app.store_whatsapp_listing_photo", return_value="https://bubble/photo"
+        ), patch(
+            "app.handle_listing_creation", return_value=result
+        ) as listing, patch("app.schedule_listing_photo_finalization"):
+            app_module._process_whatsapp_message(item)
+        self.assertEqual(listing.call_args.args[0], caption)
+        self.assertEqual(listing.call_args.args[1], conversation)
+        self.assertTrue(listing.call_args.kwargs["photo_stored"])
+
+    def test_first_listing_photo_caption_creates_draft_before_attachment(self):
+        general = {
+            "_id": "conversation-general", "CounterParty Role": "Principal",
+            "Rentee Role": "Principal Assistant",
+        }
+        caption = "New listing One Menerung, 3 beds, 16.3k rent"
+        item = image_webhook_payload(
+            message_id="wamid.first-caption", caption=caption
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        created = SimpleNamespace(
+            handled=True, response_text="Which unit is it?",
+            listing_id="listing-1", published=False, cancelled=False,
+        )
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(general, "single_active", 1),
+        ), patch(
+            "app.find_general_conversation", return_value=general
+        ), patch(
+            "app.handle_listing_creation", return_value=created
+        ) as listing, patch(
+            "app.download_whatsapp_image", return_value=(b"image", "image/jpeg")
+        ), patch(
+            "app.store_whatsapp_listing_photo", return_value="https://bubble/photo"
+        ) as store, patch("app.schedule_listing_photo_finalization") as schedule, \
+             patch("app.send_whatsapp_text") as send:
+            app_module._process_whatsapp_message(item)
+        listing.assert_called_once()
+        self.assertEqual(listing.call_args.args[0], caption)
+        store.assert_called_once_with(
+            "listing-1", b"image", "image/jpeg", "wamid.first-caption", "live"
+        )
+        schedule.assert_called_once()
+        send.assert_not_called()
+
+    def test_listing_details_response_is_deferred_while_photo_is_ingesting(self):
+        conversation = {
+            "_id": "conversation-general", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        item = webhook_payload(
+            message_id="wamid.details", text="3 beds, 16.3k rent"
+        )["entry"][0]["changes"][0]["value"]["messages"][0]
+        self.mocked_internal_user.return_value = {"_id": "user-gwen"}
+        result = SimpleNamespace(
+            handled=True, response_text="Listing · 3 bed · RM16.3k. Publish?",
+            listing_id="listing-1", published=False, cancelled=False,
+        )
+        app_module._listing_photo_ingestion_started("listing-1")
+        self.addCleanup(
+            app_module._listing_photo_ingestion_finished, "listing-1"
+        )
+        with patch(
+            "app.find_active_conversation_by_phone",
+            return_value=(conversation, "single_active", 1),
+        ), patch(
+            "app.handle_listing_creation", return_value=result
+        ), patch("app.send_whatsapp_text") as send, patch(
+            "app.persist_sent_whatsapp_text"
+        ) as persist:
+            app_module._process_whatsapp_message(item)
         send.assert_not_called()
         persist.assert_not_called()
 
@@ -2445,6 +2558,41 @@ class WhatsAppTests(unittest.TestCase):
             )
         self.assertTrue(finalized)
         send.assert_called_once_with("60123456789", result.response_text)
+        persist.assert_called_once()
+
+    def test_duplicate_latest_photo_finalizer_sends_publish_prompt_once(self):
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-1",
+        }
+        listing = {"_id": "listing-1", "owner": "user-gwen", "photos": ["p1"]}
+        latest = {
+            "whatsappMessageId": "wamid.latest",
+            "Created Date": "2026-09-09T00:00:00Z",
+        }
+        result = SimpleNamespace(
+            handled=True, response_text="Listing · 1 photos. Publish?",
+        )
+        with patch("app.bubble", side_effect=lambda url: (
+            conversation if "/conversation/" in url else listing
+        )), patch(
+            "app._latest_inbound_image_message", return_value=latest
+        ), patch(
+            "app._photo_batch_prompt_already_persisted", return_value=False
+        ), patch(
+            "app.handle_listing_creation", return_value=result
+        ), patch(
+            "app.send_whatsapp_text", return_value=["wamid.out"]
+        ) as send, patch("app.persist_sent_whatsapp_text") as persist:
+            first = app_module.finalize_listing_photo_batch(
+                "60123456789", "conversation-1", "listing-1", "wamid.latest"
+            )
+            second = app_module.finalize_listing_photo_batch(
+                "60123456789", "conversation-1", "listing-1", "wamid.latest"
+            )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        send.assert_called_once()
         persist.assert_called_once()
 
     def test_photo_finalizer_exits_after_listing_was_published(self):

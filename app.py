@@ -23,6 +23,7 @@ from listing_creation import (
     ACTIVE_SKILL as LISTING_CREATION_SKILL,
     handle_listing_creation,
     is_listing_creation_intent,
+    is_listing_publish_confirmation,
 )
 from location_tools import (
     compare_locations as compare_grounded_locations,
@@ -110,6 +111,10 @@ _whatsapp_processing_lock = threading.Lock()
 _whatsapp_phone_locks = {}
 _listing_photo_locks = {}
 _listing_photo_locks_guard = threading.Lock()
+_listing_photo_inflight = {}
+_listing_photo_inflight_guard = threading.Lock()
+_listing_photo_finalized_ids = set()
+_listing_photo_finalized_guard = threading.Lock()
 _geo_name_cache = {}
 _geo_name_cache_lock = threading.Lock()
 _location_web_identity_cache = {}
@@ -1877,7 +1882,30 @@ def download_whatsapp_image(media_id, message_id=None):
 
 def _listing_photo_lock(listing_id):
     with _listing_photo_locks_guard:
-        return _listing_photo_locks.setdefault(str(listing_id), threading.Lock())
+        return _listing_photo_locks.setdefault(str(listing_id), threading.RLock())
+
+
+def _listing_photo_ingestion_started(listing_id):
+    listing_id = str(listing_id or "")
+    with _listing_photo_inflight_guard:
+        _listing_photo_inflight[listing_id] = (
+            _listing_photo_inflight.get(listing_id, 0) + 1
+        )
+
+
+def _listing_photo_ingestion_finished(listing_id):
+    listing_id = str(listing_id or "")
+    with _listing_photo_inflight_guard:
+        remaining = _listing_photo_inflight.get(listing_id, 0) - 1
+        if remaining > 0:
+            _listing_photo_inflight[listing_id] = remaining
+        else:
+            _listing_photo_inflight.pop(listing_id, None)
+
+
+def _listing_photo_ingestion_pending(listing_id):
+    with _listing_photo_inflight_guard:
+        return _listing_photo_inflight.get(str(listing_id or ""), 0) > 0
 
 
 def _photo_payload_structure(payload):
@@ -6336,7 +6364,85 @@ def _latest_inbound_image_message(conversation_id, bubble_env="live"):
     return messages[0] if messages else None
 
 
-def finalize_listing_photo_batch(
+def _photo_batch_prompt_already_persisted(
+    conversation_id, latest_image, bubble_env="live",
+):
+    latest_created = str(
+        (latest_image or {}).get("Created Date")
+        or (latest_image or {}).get("created_date") or ""
+    )
+    if not latest_created:
+        return False
+    constraints = [
+        {"key": "Conversation", "constraint_type": "equals",
+         "value": conversation_id},
+        {"key": "direction", "constraint_type": "equals", "value": "Outbound"},
+    ]
+    try:
+        return any(
+            str(message.get("Created Date") or message.get("created_date") or "")
+            >= latest_created
+            and str(message.get("messageContent") or "").strip().endswith(
+                "Publish?"
+            )
+            for message in _bubble_records(
+                get_bubble_base_url(bubble_env), "message", constraints
+            )
+        )
+    except Exception as error:
+        print(
+            "[LISTING CREATION] action=photo_batch_outbound_check_failed "
+            f"conversation_id={conversation_id} error={type(error).__name__}",
+            flush=True,
+        )
+        return False
+
+
+def _claim_photo_batch_finalization(conversation_id, whatsapp_message_id):
+    key = (str(conversation_id), str(whatsapp_message_id))
+    with _listing_photo_finalized_guard:
+        if key in _listing_photo_finalized_ids:
+            return None
+        _listing_photo_finalized_ids.add(key)
+    return key
+
+
+def _release_photo_batch_finalization(key):
+    with _listing_photo_finalized_guard:
+        _listing_photo_finalized_ids.discard(key)
+
+
+def listing_photo_batch_pending(conversation_id, listing_id, bubble_env="live"):
+    if _listing_photo_ingestion_pending(listing_id):
+        return True
+    try:
+        base_url = get_bubble_base_url(bubble_env)
+        listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+        if listing.get("photoUploadBuffer"):
+            return True
+        latest = _latest_inbound_image_message(conversation_id, bubble_env)
+        created = str(
+            (latest or {}).get("Created Date")
+            or (latest or {}).get("created_date") or ""
+        ).strip()
+        if not created:
+            return False
+        created_at = datetime.datetime.fromisoformat(
+            created.replace("Z", "+00:00")
+        )
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+        age = datetime.datetime.now(datetime.timezone.utc) - created_at
+        return age.total_seconds() <= WHATSAPP_PHOTO_DEBOUNCE_SECONDS + 1
+    except Exception as error:
+        print(
+            "[LISTING CREATION] action=photo_batch_state_check_failed "
+            f"listing_id={listing_id} error={type(error).__name__}", flush=True,
+        )
+        return False
+
+
+def _finalize_listing_photo_batch_locked(
     phone, conversation_id, listing_id, whatsapp_message_id, bubble_env="live",
 ):
     """Send one prompt only for the latest image in an active listing burst."""
@@ -6351,6 +6457,15 @@ def finalize_listing_photo_batch(
     if str((latest or {}).get("whatsappMessageId") or "") != whatsapp_message_id:
         return False
     listing = bubble(f"{base_url}/obj/listing/{listing_id}")
+    if (
+        _listing_photo_ingestion_pending(listing_id)
+        or listing.get("photoUploadBuffer")
+    ):
+        return False
+    if _photo_batch_prompt_already_persisted(
+        conversation_id, latest, bubble_env
+    ):
+        return False
     result = handle_listing_creation(
         "", conversation, listing.get("owner"), base_url,
         bubble_create=_bubble_create, bubble_patch=_bubble_patch,
@@ -6358,17 +6473,35 @@ def finalize_listing_photo_batch(
     )
     if not result.handled or not result.response_text:
         return False
-    sent_ids = send_whatsapp_text(phone, result.response_text)
-    persist_sent_whatsapp_text(
-        phone, result.response_text, sent_ids, conversation_id,
-        bubble_env=bubble_env,
+    finalization_key = _claim_photo_batch_finalization(
+        conversation_id, whatsapp_message_id
     )
+    if not finalization_key:
+        return False
+    try:
+        sent_ids = send_whatsapp_text(phone, result.response_text)
+        persist_sent_whatsapp_text(
+            phone, result.response_text, sent_ids, conversation_id,
+            bubble_env=bubble_env,
+        )
+    except Exception:
+        _release_photo_batch_finalization(finalization_key)
+        raise
     print(
         "[LISTING CREATION] action=photo_batch_finalized "
         f"conversation_id={conversation_id} listing_id={listing_id}",
         flush=True,
     )
     return True
+
+
+def finalize_listing_photo_batch(
+    phone, conversation_id, listing_id, whatsapp_message_id, bubble_env="live",
+):
+    with _listing_photo_lock(listing_id):
+        return _finalize_listing_photo_batch_locked(
+            phone, conversation_id, listing_id, whatsapp_message_id, bubble_env
+        )
 
 
 def schedule_listing_photo_finalization(
@@ -6400,7 +6533,10 @@ def _process_whatsapp_message(message):
     typing_keepalive = whatsapp_typing_keepalive(message_id)
     phone = normalize_phone(message["from"])
     message_type = str(message.get("type") or "text").strip().casefold()
-    raw_text = str((message.get("text") or {}).get("body") or "")
+    raw_text = str(
+        (message.get("text") or {}).get("body")
+        or (message.get("image") or {}).get("caption") or ""
+    )
     text = raw_text.strip()
     phone_lock = _whatsapp_phone_locks.setdefault(phone, threading.Lock())
     reply_sent = False
@@ -6771,14 +6907,39 @@ def _process_whatsapp_message(message):
                         conversation_id=skill_conversation_id, bubble_env="live",
                         message_type=message_type,
                     )
+                initial_caption_result = None
+                if (
+                    message_type == "image"
+                    and not conversation_store.relationship_id(
+                        skill_conversation.get("Listing")
+                    )
+                ):
+                    initial_caption_result = handle_listing_creation(
+                        text, skill_conversation, internal_user.get("_id"), base_url,
+                        bubble_create=_bubble_create, bubble_patch=_bubble_patch,
+                        bubble_get=bubble, bubble_records=_bubble_records,
+                    )
+                    if initial_caption_result.listing_id:
+                        skill_conversation = {
+                            **skill_conversation,
+                            "ActiveSkill": LISTING_CREATION_SKILL,
+                            "Listing": initial_caption_result.listing_id,
+                        }
                 photo_stored = False
+                listing_photo_id = None
+                listing_photo_state_lock = None
                 if message_type == "image":
                     media_id = (message.get("image") or {}).get("id")
+                    listing_photo_id = conversation_store.relationship_id(
+                        skill_conversation.get("Listing")
+                    )
+                    _listing_photo_ingestion_started(listing_photo_id)
                     try:
                         image_bytes, image_mime_type = download_whatsapp_image(
                             media_id, message_id
                         )
                     except Exception as error:
+                        _listing_photo_ingestion_finished(listing_photo_id)
                         print(
                             f"[WHATSAPP IMAGE] message_id={message_id} "
                             "action=download_failed "
@@ -6795,14 +6956,20 @@ def _process_whatsapp_message(message):
                         )
                         reply_sent = True
                         return
+                    listing_photo_state_lock = _listing_photo_lock(
+                        listing_photo_id
+                    )
+                    listing_photo_state_lock.acquire()
                     try:
                         store_whatsapp_listing_photo(
-                            conversation_store.relationship_id(
-                                skill_conversation.get("Listing")
-                            ), image_bytes, image_mime_type, message_id, "live",
+                            listing_photo_id, image_bytes, image_mime_type,
+                            message_id, "live",
                         )
                         photo_stored = True
                     except Exception as error:
+                        listing_photo_state_lock.release()
+                        listing_photo_state_lock = None
+                        _listing_photo_ingestion_finished(listing_photo_id)
                         print(
                             f"[WHATSAPP IMAGE] message_id={message_id} "
                             "action=storage_failed "
@@ -6820,21 +6987,75 @@ def _process_whatsapp_message(message):
                         )
                         reply_sent = True
                         return
-                skill_result = handle_listing_creation(
-                    text, skill_conversation, internal_user.get("_id"), base_url,
-                    bubble_create=_bubble_create, bubble_patch=_bubble_patch,
-                    bubble_get=bubble, bubble_records=_bubble_records,
-                    photo_stored=photo_stored,
-                )
+                if not listing_photo_state_lock:
+                    listing_state_id = conversation_store.relationship_id(
+                        skill_conversation.get("Listing")
+                    )
+                    if listing_state_id:
+                        listing_photo_state_lock = _listing_photo_lock(
+                            listing_state_id
+                        )
+                        listing_photo_state_lock.acquire()
+                try:
+                    confirmation_deferred = bool(
+                        message_type == "text"
+                        and is_listing_publish_confirmation(text)
+                        and listing_photo_batch_pending(
+                            skill_conversation_id,
+                            listing_photo_id or conversation_store.relationship_id(
+                                skill_conversation.get("Listing")
+                            ), "live",
+                        )
+                    )
+                    if initial_caption_result and photo_stored:
+                        skill_result = SimpleNamespace(
+                            handled=True, response_text=None,
+                            listing_id=initial_caption_result.listing_id,
+                            published=False, cancelled=False,
+                        )
+                    elif confirmation_deferred:
+                        skill_result = SimpleNamespace(
+                            handled=True, response_text=None,
+                            listing_id=conversation_store.relationship_id(
+                                skill_conversation.get("Listing")
+                            ), published=False, cancelled=False,
+                        )
+                    else:
+                        skill_result = handle_listing_creation(
+                            text, skill_conversation, internal_user.get("_id"), base_url,
+                            bubble_create=_bubble_create, bubble_patch=_bubble_patch,
+                            bubble_get=bubble, bubble_records=_bubble_records,
+                            photo_stored=photo_stored,
+                        )
+                finally:
+                    if listing_photo_state_lock:
+                        listing_photo_state_lock.release()
+                    if listing_photo_id:
+                        _listing_photo_ingestion_finished(listing_photo_id)
                 if skill_result.handled:
                     _stop_whatsapp_typing(typing_keepalive)
-                    if skill_result.response_text:
+                    response_deferred = bool(
+                        skill_result.response_text
+                        and message_type != "image"
+                        and skill_result.listing_id
+                        and listing_photo_batch_pending(
+                            skill_conversation_id,
+                            skill_result.listing_id, "live",
+                        )
+                    )
+                    if skill_result.response_text and not response_deferred:
                         sent_ids = send_whatsapp_text(
                             phone, skill_result.response_text
                         )
                         persist_sent_whatsapp_text(
                             phone, skill_result.response_text, sent_ids,
                             skill_conversation_id, bubble_env="live",
+                        )
+                    elif response_deferred:
+                        print(
+                            "[LISTING CREATION] action=response_deferred "
+                            f"listing_id={skill_result.listing_id} "
+                            "reason=photo_batch_pending", flush=True,
                         )
                     elif (
                         message_type == "image" and inbound_message_created
@@ -7320,6 +7541,12 @@ def _whatsapp_text_messages(payload):
                     media_id = (item.get("image") or {}).get("id")
                     if not isinstance(media_id, str) or not media_id.strip():
                         continue
+                    caption = (item.get("image") or {}).get("caption")
+                    if isinstance(caption, str) and caption.strip():
+                        item = {
+                            **item,
+                            "text": {"body": caption},
+                        }
                 clean = dict(item)
                 clean["customer_name"] = names.get(str(item.get("from")))
                 messages.append(clean)

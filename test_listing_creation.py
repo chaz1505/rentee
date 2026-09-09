@@ -20,12 +20,16 @@ class ListingCreationTests(unittest.TestCase):
             self.condos if kind == "condo" else self.geos
         ))
 
-    def handle(self, text, conversation=None, stored_image_url=None):
+    def handle(
+        self, text, conversation=None, stored_image_url=None,
+        photo_stored=False,
+    ):
         return creation.handle_listing_creation(
             text, conversation or {"_id": "conversation-1"}, "user-gwen", BASE,
             bubble_create=self.create, bubble_patch=self.patch,
             bubble_get=self.get, bubble_records=self.records,
             stored_image_url=stored_image_url,
+            photo_stored=photo_stored,
         )
 
     def test_start_resolves_condo_and_captures_supplied_shorthand(self):
@@ -130,6 +134,41 @@ class ListingCreationTests(unittest.TestCase):
         self.assertEqual(self.listing["coverPhoto"], "https://bubble.test/photo-1")
         self.assertTrue(all(result.response_text is None for result in results))
 
+    def test_details_in_first_or_last_photo_caption_update_one_draft(self):
+        conversation = {"_id": "conversation-1", "ActiveSkill": "create_listing",
+                        "Listing": "listing-1"}
+        caption = "3 beds, 16.3k rent per month, available now"
+        for caption_index in (0, 3):
+            with self.subTest(caption_index=caption_index):
+                self.listing = {
+                    "_id": "listing-1", "condo": "condo-1",
+                    "propertyType": "Condo", "unitNumber": "A-25-2",
+                    "photos": [],
+                }
+                self.patch.reset_mock()
+
+                def apply_patch(url, updates):
+                    if url.endswith("/listing/listing-1"):
+                        self.listing.update(updates)
+
+                self.patch.side_effect = apply_patch
+                for index in range(4):
+                    self.listing["photos"].append(
+                        f"https://bubble.test/photo-{index}"
+                    )
+                    result = self.handle(
+                        caption if index == caption_index else "",
+                        conversation, photo_stored=True,
+                    )
+                    self.assertIsNone(result.response_text)
+                self.assertEqual(self.listing["beds"], 3)
+                self.assertEqual(self.listing["priceRent"], 16300)
+                self.assertEqual(len(self.listing["photos"]), 4)
+                self.assertIn(
+                    "3 bed · RM16.3k · available now · 4 photos",
+                    creation.listing_summary(self.listing, "One Menerung"),
+                )
+
     def test_no_photos_publish_and_cancel_clear_active_skill(self):
         self.listing = {
             "_id": "listing-1", "condo": "condo-1", "propertyType": "Condo",
@@ -151,6 +190,45 @@ class ListingCreationTests(unittest.TestCase):
             f"{BASE}/obj/conversation/conversation-1", {"ActiveSkill": ""}
         )
         self.assertTrue(cancelled.cancelled)
+
+    def test_arbitrary_free_form_unit_identifiers_are_preserved(self):
+        for supplied in ("A-25-2", "25-2", "A25-2", "25A", "12", "25/2"):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(
+                    creation.extract_listing_updates(supplied)["unitNumber"],
+                    supplied,
+                )
+        self.assertEqual(
+            creation.extract_listing_updates("unit Sky Villa")['unitNumber'],
+            "Sky Villa",
+        )
+
+    def test_unknown_unit_is_recorded_omitted_and_not_asked_again(self):
+        self.listing = {
+            "_id": "listing-1", "condo": "condo-1", "propertyType": "Condo",
+            "TransactionType": ["Rent/Let"], "priceRent": 16300,
+            "beds": 3, "photos": ["https://bubble/photo.jpg"],
+        }
+        conversation = {"_id": "conversation-1", "ActiveSkill": "create_listing",
+                        "Listing": "listing-1"}
+        result = self.handle("I don't know", conversation)
+        self.patch.assert_called_with(
+            f"{BASE}/obj/listing/listing-1", {"unitNumber": "Unknown"}
+        )
+        self.assertNotIn("Which unit", result.response_text)
+        self.assertNotIn("Unknown", result.response_text)
+        self.assertIn("3 bed · RM16.3k · 1 photos. Publish?", result.response_text)
+
+    def test_missing_unit_does_not_block_publish(self):
+        self.listing = {
+            "_id": "listing-1", "condo": "condo-1", "propertyType": "Condo",
+            "TransactionType": ["Rent/Let"], "priceRent": 16300,
+        }
+        conversation = {"_id": "conversation-1", "ActiveSkill": "create_listing",
+                        "Listing": "listing-1"}
+        result = self.handle("publish", conversation)
+        self.assertTrue(result.published)
+        self.assertEqual(result.response_text, "Done — One Menerung is added.")
 
     def test_listing_creation_skill_is_loaded(self):
         instructions = Path("skills/listing_creation/SKILL.md").read_text()
