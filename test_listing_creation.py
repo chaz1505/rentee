@@ -50,6 +50,79 @@ class ListingCreationTests(unittest.TestCase):
         )
         self.assertIn("Which unit is it?", result.response_text)
 
+    def test_new_listing_ignores_stale_relationship_when_skill_is_inactive(self):
+        self.listing = {
+            "_id": "listing-old", "Geo": "geo-old", "priceRent": 20000,
+            "Furnishing": "Partially Furnished", "photos": ["old-photo"],
+        }
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "",
+            "Listing": "listing-old",
+        }
+        result = self.handle("new listing", conversation)
+        self.assertEqual(self.create.call_args.args[2], {"owner": "user-gwen"})
+        self.get.assert_not_called()
+        self.patch.assert_called_once_with(
+            f"{BASE}/obj/conversation/conversation-1",
+            {"ActiveSkill": "create_listing", "Listing": "listing-1"},
+        )
+        self.assertEqual(
+            result.response_text, "Which condo or area is the property in?"
+        )
+        self.assertNotIn("Bukit Tunku", result.response_text)
+
+    def test_new_listing_supersedes_an_active_incomplete_draft(self):
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-old",
+        }
+        result = self.handle("new listing", conversation)
+        self.create.assert_called_once_with(
+            BASE, "listing", {"owner": "user-gwen"}
+        )
+        self.get.assert_not_called()
+        self.patch.assert_called_once_with(
+            f"{BASE}/obj/conversation/conversation-1",
+            {"ActiveSkill": "create_listing", "Listing": "listing-1"},
+        )
+        self.assertEqual(result.listing_id, "listing-1")
+
+    def test_normal_continuation_updates_existing_active_draft(self):
+        self.listing = {"_id": "listing-old", "owner": "user-gwen"}
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-old",
+        }
+        result = self.handle("One Menerung", conversation)
+        self.create.assert_not_called()
+        self.get.assert_called_once_with(f"{BASE}/obj/listing/listing-old")
+        self.patch.assert_called_once_with(
+            f"{BASE}/obj/listing/listing-old",
+            {"condo": "condo-1", "propertyType": "Condo"},
+        )
+        self.assertEqual(result.listing_id, "listing-old")
+
+    def test_new_listing_with_details_uses_only_current_message(self):
+        self.listing = {
+            "_id": "listing-old", "Geo": "geo-old", "priceSale": 5000000,
+            "Furnishing": "Fully Furnished", "photos": ["old-photo"],
+        }
+        conversation = {
+            "_id": "conversation-1", "ActiveSkill": "create_listing",
+            "Listing": "listing-old",
+        }
+        result = self.handle(
+            "new listing One Menerung 4 bed RM12k", conversation
+        )
+        self.assertEqual(self.create.call_args.args[2], {
+            "owner": "user-gwen", "condo": "condo-1",
+            "propertyType": "Condo", "beds": 4, "priceRent": 12000,
+            "TransactionType": ["Rent/Let"],
+        })
+        self.get.assert_not_called()
+        self.assertEqual(result.listing_id, "listing-1")
+        self.assertNotIn("old-photo", str(self.create.call_args.args[2]))
+
     def test_active_unit_and_price_correction_update_only_new_fields(self):
         self.listing = {
             "_id": "listing-1", "condo": "condo-1", "propertyType": "Condo",

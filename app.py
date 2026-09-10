@@ -6910,8 +6910,11 @@ def _process_whatsapp_message(message):
                 initial_caption_result = None
                 if (
                     message_type == "image"
-                    and not conversation_store.relationship_id(
-                        skill_conversation.get("Listing")
+                    and (
+                        is_listing_creation_intent(text)
+                        or not conversation_store.relationship_id(
+                            skill_conversation.get("Listing")
+                        )
                     )
                 ):
                     initial_caption_result = handle_listing_creation(

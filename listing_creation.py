@@ -88,7 +88,7 @@ def extract_listing_updates(text, existing=None):
         transaction = RENT_TRANSACTION
         explicit_transaction = True
     price_match = re.search(
-        r"(?:\brm\s*)?\b([0-9]+(?:\.[0-9]+)?)\s*([km])\b", normalized
+        r"\b(?:rm\s*)?([0-9]+(?:\.[0-9]+)?)\s*([km])\b", normalized
     )
     if price_match:
         price = int(float(price_match.group(1)) * {"k": 1000, "m": 1000000}[price_match.group(2)])
@@ -213,12 +213,14 @@ def handle_listing_creation(
     conversation = dict(conversation or {})
     conversation_id = str(conversation.get("_id") or "").strip()
     active = str(conversation.get("ActiveSkill") or "").strip() == ACTIVE_SKILL
-    if not active and not is_listing_creation_intent(text):
+    explicit_new = is_listing_creation_intent(text)
+    if not active and not explicit_new:
         return ListingCreationResult(False, "")
     if not conversation_id or not user_id:
         raise ValueError("Listing creation requires Conversation and User identity.")
     normalized = " ".join(str(text or "").casefold().split())
-    listing_id = str(conversation.get("Listing") or "").strip()
+    previous_listing_id = str(conversation.get("Listing") or "").strip()
+    listing_id = previous_listing_id if active and not explicit_new else ""
     if active and re.fullmatch(r"(?:cancel|stop|forget it|never mind|nevermind)", normalized):
         bubble_patch(f"{base_url}/obj/conversation/{conversation_id}", {"ActiveSkill": ""})
         return ListingCreationResult(True, "Okay — I’ve cancelled this listing.", listing_id, cancelled=True)
@@ -249,21 +251,41 @@ def handle_listing_creation(
     geos = _records(base_url, "geo", bubble_records)
     condo_id, condo_name, condo_ambiguous = _resolve_named_relationship(text, condos)
     geo_id, geo_name, geo_ambiguous = _resolve_named_relationship(text, geos)
-    if condo_ambiguous or (not condo_id and geo_ambiguous):
-        return ListingCreationResult(True, "Which exact condo or area do you mean?", listing_id or None)
     if not listing_id:
         payload = {"owner": user_id}
-        if condo_id:
+        relationship_ambiguous = condo_ambiguous or (
+            not condo_id and geo_ambiguous
+        )
+        if condo_id and not relationship_ambiguous:
             payload.update({"condo": condo_id, "propertyType": "Condo"})
-        elif geo_id:
+        elif geo_id and not relationship_ambiguous:
             payload["Geo"] = geo_id
         payload.update(extract_listing_updates(text))
         listing_id = bubble_create(base_url, "listing", payload)
         bubble_patch(f"{base_url}/obj/conversation/{conversation_id}", {
             "ActiveSkill": ACTIVE_SKILL, "Listing": listing_id,
         })
+        print(
+            "[LISTING CREATION] action=new_draft "
+            f"conversation_id={conversation_id} "
+            f"previous_listing_id={previous_listing_id or 'none'} "
+            f"new_listing_id={listing_id}", flush=True,
+        )
         listing = {"_id": listing_id, **payload}
+        if relationship_ambiguous:
+            return ListingCreationResult(
+                True, "Which exact condo or area do you mean?", listing_id
+            )
     else:
+        print(
+            "[LISTING CREATION] action=continue_draft "
+            f"conversation_id={conversation_id} listing_id={listing_id}",
+            flush=True,
+        )
+        if condo_ambiguous or (not condo_id and geo_ambiguous):
+            return ListingCreationResult(
+                True, "Which exact condo or area do you mean?", listing_id
+            )
         listing = bubble_get(f"{base_url}/obj/listing/{listing_id}")
         condo_name = condo_name or _relationship_name(condos, listing.get("condo"))
         geo_name = geo_name or _relationship_name(geos, listing.get("Geo"))
