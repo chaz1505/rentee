@@ -1351,6 +1351,95 @@ def _bubble_records(base_url, object_type, constraints=None, query_params=None):
         cursor += len(results)
 
 
+def _bubble_records_by_ids(base_url, object_type, record_ids, chunk_size=50):
+    """Load only the requested Bubble records in bounded ID-constrained batches."""
+    ids = list(dict.fromkeys(str(value) for value in record_ids or [] if value))
+    records = []
+    requests_made = 0
+    for offset in range(0, len(ids), chunk_size):
+        group = ids[offset:offset + chunk_size]
+        constraint = {
+            "key": "_id",
+            "constraint_type": "equals" if len(group) == 1 else "in",
+            "value": group[0] if len(group) == 1 else group,
+        }
+        cursor = 0
+        while True:
+            page = bubble(
+                f"{base_url}/obj/{object_type}",
+                params={
+                    "cursor": cursor,
+                    "constraints": json.dumps([constraint], separators=(",", ":")),
+                },
+            )
+            requests_made += 1
+            results = page.get("results", []) or []
+            records.extend(results)
+            if not results or not page.get("remaining"):
+                break
+            cursor += len(results)
+    return records, requests_made
+
+
+def load_folio_listing_records(
+    folio_id, base_url, folio=None, load_listings=True, stats=None
+):
+    """Bulk-load a Folio's items and Listings, reconstructed in Folio order."""
+    total_started = time.perf_counter()
+    total_requests = 1 if folio is not None else 0
+    if folio is None:
+        stage_started = time.perf_counter()
+        folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+        total_requests += 1
+        print(
+            f"[FOLIO LOAD] folio_id={folio_id} stage=folio "
+            f"elapsed={time.perf_counter() - stage_started:.3f}s", flush=True,
+        )
+
+    item_ids = [str(value) for value in folio.get("folioItems", []) or [] if value]
+    stage_started = time.perf_counter()
+    item_records, item_requests = _bubble_records_by_ids(
+        base_url, "folioItem", item_ids
+    )
+    total_requests += item_requests
+    items_by_id = {str(item.get("_id")): item for item in item_records if item.get("_id")}
+    ordered_items = [
+        dict(items_by_id[item_id], _folio_position=position)
+        for position, item_id in enumerate(item_ids, start=1)
+        if item_id in items_by_id
+    ]
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} stage=folio_items "
+        f"count={len(ordered_items)} requests={item_requests} "
+        f"elapsed={time.perf_counter() - stage_started:.3f}s", flush=True,
+    )
+
+    listing_ids = (
+        [item.get("listing") for item in ordered_items if item.get("listing")]
+        if load_listings else []
+    )
+    stage_started = time.perf_counter()
+    listing_records, listing_requests = _bubble_records_by_ids(
+        base_url, "listing", listing_ids
+    )
+    total_requests += listing_requests
+    listings_by_id = {
+        str(listing.get("_id")): listing for listing in listing_records if listing.get("_id")
+    }
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} stage=listings "
+        f"count={len(listings_by_id)} requests={listing_requests} "
+        f"elapsed={time.perf_counter() - stage_started:.3f}s", flush=True,
+    )
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} total_requests={total_requests} "
+        f"total_elapsed={time.perf_counter() - total_started:.3f}s", flush=True,
+    )
+    if stats is not None:
+        stats.update(requests=total_requests, started=total_started)
+    return folio, ordered_items, listings_by_id
+
+
 def find_lead_by_phone(phone, bubble_env="live"):
     canonical = normalize_phone(phone)
     if not canonical:
@@ -3699,22 +3788,17 @@ def get_plausible_listings(
 def get_property_details(folio_id, property_reference, bubble_env):
 
     base_url = get_bubble_base_url(bubble_env)
-    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    _folio, folio_items, listings_by_id = load_folio_listing_records(
+        folio_id, base_url
+    )
     recommended_listings = []
 
-    for folio_item_id in folio.get("folioItems", []) or []:
-        try:
-            folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
-            listing_id = folio_item.get("listing")
-            listing = bubble(f"{base_url}/obj/listing/{listing_id}")
-
-            if listing.get("_id") and not any(
-                item.get("_id") == listing["_id"]
-                for item in recommended_listings
-            ):
-                recommended_listings.append(listing)
-        except Exception as error:
-            print(f"Failed to load Folio Item details: {error}", flush=True)
+    for folio_item in folio_items:
+        listing = listings_by_id.get(str(folio_item.get("listing") or ""))
+        if listing and not any(
+            item.get("_id") == listing["_id"] for item in recommended_listings
+        ):
+            recommended_listings.append(listing)
 
     if not recommended_listings:
         return "I couldn't find any current recommendations to check."
@@ -3842,45 +3926,55 @@ def get_property_details(folio_id, property_reference, bubble_env):
 def get_current_recommendations(folio_id, bubble_env, include_media=False):
     """Return grounded details for the active Folio without changing its shortlist."""
     base_url = get_bubble_base_url(bubble_env)
-    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    load_stats = {}
+    _folio, folio_items, listings_by_id = load_folio_listing_records(
+        folio_id, base_url, stats=load_stats
+    )
     listings = []
-    for position, folio_item_id in enumerate(folio.get("folioItems", []) or [], start=1):
-        try:
-            folio_item = bubble(f"{base_url}/obj/folioItem/{folio_item_id}")
-            listing_id = folio_item.get("listing")
-            if not listing_id:
-                continue
-            listing = bubble(f"{base_url}/obj/listing/{listing_id}")
-            if listing.get("_id") and not any(
-                item["listing_id"] == listing["_id"] for item in listings
-            ):
-                facts = listing_facts(listing)
-                for output_name, field_names in (
-                    ("furnishing", ("Furnishing", "furnished")),
-                    ("size", ("Sq Ft", "size")),
-                    ("availability", ("availability", "Availability")),
-                    ("balcony", ("balcony", "Balcony")),
-                    ("maid_room", ("maid room", "maidRoom", "Maid room")),
-                ):
-                    value = next((listing.get(name) for name in field_names
-                                  if listing.get(name) not in (None, "", [])), None)
-                    if value is not None:
-                        facts[output_name] = value
-                facts["position"] = position
-                facts["listing_id"] = facts.pop("_id")
-                if include_media:
-                    # Retain only the Listing's own media fields for WhatsApp rendering.
-                    facts["coverPhoto"] = listing.get("coverPhoto")
-                    facts["photos"] = listing.get("photos")
-                if folio_item.get("RecoSummary"):
-                    facts["recommendation_reason"] = folio_item["RecoSummary"]
-                listings.append(facts)
-        except Exception as error:
-            print(f"Failed to load current recommendation: {error}", flush=True)
+    for folio_item in folio_items:
+        position = folio_item["_folio_position"]
+        listing = listings_by_id.get(str(folio_item.get("listing") or ""))
+        if not listing or any(
+            item["listing_id"] == listing["_id"] for item in listings
+        ):
+            continue
+        facts = listing_facts(listing)
+        for output_name, field_names in (
+            ("furnishing", ("Furnishing", "furnished")),
+            ("size", ("Sq Ft", "size")),
+            ("availability", ("availability", "Availability")),
+            ("balcony", ("balcony", "Balcony")),
+            ("maid_room", ("maid room", "maidRoom", "Maid room")),
+        ):
+            value = next((listing.get(name) for name in field_names
+                          if listing.get(name) not in (None, "", [])), None)
+            if value is not None:
+                facts[output_name] = value
+        facts["position"] = position
+        facts["listing_id"] = facts.pop("_id")
+        if include_media:
+            facts["coverPhoto"] = listing.get("coverPhoto")
+            facts["photos"] = listing.get("photos")
+        if folio_item.get("RecoSummary"):
+            facts["recommendation_reason"] = folio_item["RecoSummary"]
+        listings.append(facts)
     if not listings:
         return json.dumps({"current_recommendations": []}, ensure_ascii=False)
     condo_ids = [listing.get("condo") for listing in listings if listing.get("condo")]
-    condo_names = get_relationship_names(base_url, "condo", condo_ids)
+    related_started = time.perf_counter()
+    condo_names, related_requests = get_relationship_names(
+        base_url, "condo", condo_ids, return_request_count=True
+    )
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} stage=related_data "
+        f"count={len(condo_names)} requests={related_requests} "
+        f"elapsed={time.perf_counter() - related_started:.3f}s", flush=True,
+    )
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} "
+        f"total_requests={load_stats['requests'] + related_requests} "
+        f"total_elapsed={time.perf_counter() - load_stats['started']:.3f}s", flush=True,
+    )
     for listing in listings:
         condo_name = condo_names.get(str(listing.get("condo") or ""))
         if condo_name:
@@ -4191,37 +4285,32 @@ def known_tenant_profile_context(lead):
     return value or None
 
 
-def get_relationship_names(base_url, object_type, relationship_ids):
+def get_relationship_names(
+    base_url, object_type, relationship_ids, return_request_count=False
+):
     """Bulk-resolve Bubble relationship IDs to customer-facing record names."""
     wanted = {str(value) for value in relationship_ids or [] if value}
     names = {}
-    cursor = 0
-    while wanted:
-        try:
-            page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
-        except requests.RequestException as error:
-            print(f"Could not resolve {object_type} display names: {error}", flush=True)
-            break
-        results = page.get("results", []) or []
-        for record in results:
-            record_id = str(record.get("_id") or "")
-            if record_id not in wanted:
-                continue
-            name = next(
-                (
-                    record.get(field) for field in
-                    ("name", "Name", "Condo name", "title")
-                    if record.get(field)
-                ),
-                None,
-            )
-            if name:
-                names[record_id] = str(name)
-            wanted.remove(record_id)
-        if not results or not page.get("remaining"):
-            break
-        cursor += len(results)
-    return names
+    try:
+        records, _requests = _bubble_records_by_ids(
+            base_url, object_type, wanted
+        )
+    except requests.RequestException as error:
+        print(f"Could not resolve {object_type} display names: {error}", flush=True)
+        return (names, 0) if return_request_count else names
+    for record in records:
+        record_id = str(record.get("_id") or "")
+        name = next(
+            (
+                record.get(field) for field in
+                ("name", "Name", "Condo name", "title")
+                if record.get(field)
+            ),
+            None,
+        )
+        if record_id in wanted and name:
+            names[record_id] = str(name)
+    return (names, _requests) if return_request_count else names
 
 
 def listing_facts(listing, condo_names=None, geo_names=None):
@@ -4539,16 +4628,21 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     base_url = get_bubble_base_url(bubble_env)
     folio_started = time.perf_counter()
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    print(
+        f"[FOLIO LOAD] folio_id={folio_id} stage=folio "
+        f"elapsed={time.perf_counter() - folio_started:.3f}s", flush=True,
+    )
     log_timing("match_lead - Folio lookup", folio_started)
     existing_folio_item_ids = list(folio.get("folioItems", []) or [])
     existing_listing_ids = set()
     previously_new_folio_item_ids = []
 
     existing_items_started = time.perf_counter()
-    for existing_folio_item_id in existing_folio_item_ids:
-        existing_folio_item = bubble(
-            f"{base_url}/obj/folioItem/{existing_folio_item_id}"
-        )
+    _folio, existing_folio_items, _listings = load_folio_listing_records(
+        folio_id, base_url, folio=folio, load_listings=False
+    )
+    for existing_folio_item in existing_folio_items:
+        existing_folio_item_id = str(existing_folio_item.get("_id") or "")
         existing_listing_id = existing_folio_item.get("listing")
 
         if existing_listing_id:

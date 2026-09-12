@@ -321,23 +321,24 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(result["state"]["areas"], ["Bangsar"])
         self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
 
-    @patch("app.get_relationship_names", return_value={"condo-1": "One Menerung"})
+    @patch("app.get_relationship_names", return_value=({"condo-1": "One Menerung"}, 1))
     @patch("app.bubble")
     def test_current_recommendations_reuse_folio_furnishing_and_size_read_only(
         self, mocked_bubble, _mocked_names
     ):
         records = {
             "/obj/folio/folio-1": {"folioItems": ["item-1", "item-2"]},
-            "/obj/folioItem/item-1": {"listing": "listing-1"},
-            "/obj/folioItem/item-2": {"listing": "listing-2"},
-            "/obj/listing/listing-1": {
+            "/obj/folioItem": {"results": [
+                {"_id": "item-2", "listing": "listing-2"},
+                {"_id": "item-1", "listing": "listing-1"},
+            ], "remaining": 0},
+            "/obj/listing": {"results": [{
                 "_id": "listing-1", "condo": "condo-1", "beds": 3,
                 "priceRent": 9000, "Furnishing": "Fully furnished", "Sq Ft": 1500,
-            },
-            "/obj/listing/listing-2": {
+            }, {
                 "_id": "listing-2", "condoName": "Ken Bangsar", "beds": 3,
                 "priceRent": 8500, "furnished": "Partly furnished", "size": 1800,
-            },
+            }], "remaining": 0},
         }
         mocked_bubble.side_effect = lambda url, **_kwargs: next(
             value for suffix, value in records.items() if url.endswith(suffix)
@@ -351,7 +352,54 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(listings[1]["furnishing"], "Partly furnished")
         self.assertEqual(listings[1]["size"], 1800)
         self.assertEqual([item["position"] for item in listings], [1, 2])
-        self.assertEqual(mocked_bubble.call_count, 5)
+        self.assertEqual(mocked_bubble.call_count, 3)
+
+    @patch("app.get_relationship_names", return_value=({}, 0))
+    @patch("app.bubble")
+    def test_bulk_folio_load_skips_missing_records_and_keeps_original_positions(
+        self, mocked_bubble, _mocked_names,
+    ):
+        items = [f"item-{index}" for index in range(1, 7)]
+        folio_items = [
+            {"_id": item_id, "listing": f"listing-{index}"}
+            for index, item_id in enumerate(items, start=1) if index != 3
+        ][::-1]
+        listing_records = [
+            {"_id": f"listing-{index}", "name": f"Home {index}"}
+            for index in (6, 5, 2, 1)
+        ]
+        mocked_bubble.side_effect = [
+            {"folioItems": items},
+            {"results": folio_items, "remaining": 0},
+            {"results": listing_records, "remaining": 0},
+        ]
+        result = json.loads(app_module.get_current_recommendations("folio-1", "live"))
+        listings = result["current_recommendations"]
+        self.assertEqual(
+            [listing["listing_id"] for listing in listings],
+            ["listing-1", "listing-2", "listing-5", "listing-6"],
+        )
+        self.assertEqual([listing["position"] for listing in listings], [1, 2, 5, 6])
+        self.assertEqual(mocked_bubble.call_count, 3)
+
+    @patch("app.load_folio_listing_records")
+    def test_property_details_reuses_ordered_bulk_folio_loader(self, mocked_load):
+        mocked_load.return_value = (
+            {"folioItems": ["item-1", "item-2"]},
+            [
+                {"_id": "item-1", "listing": "listing-1"},
+                {"_id": "item-2", "listing": "listing-2"},
+            ],
+            {
+                "listing-1": {"_id": "listing-1", "name": "First Home"},
+                "listing-2": {"_id": "listing-2", "name": "Second Home"},
+            },
+        )
+        result = app_module.get_property_details("folio-1", "second", "live")
+        self.assertIn("Property: Second Home", result)
+        mocked_load.assert_called_once_with(
+            "folio-1", app_module.get_bubble_base_url("live")
+        )
 
     @patch("app.execute_match_lead_silently")
     @patch("app.get_current_recommendations")
@@ -962,18 +1010,25 @@ class SearchFlowStateTests(unittest.TestCase):
         )
 
     @patch("app.update_folio_items")
+    @patch("app.clear_folio_item_newly_added")
     @patch("app.create_folio_items", return_value=["folio-item-current"])
     @patch("app.get_plausible_listings")
     @patch("app.bubble")
     def test_current_run_result_preserves_but_excludes_historical_folio_items(
-        self, mocked_bubble, mocked_listings, _mocked_create, mocked_update
+        self, mocked_bubble, mocked_listings, _mocked_create, mocked_clear,
+        mocked_update,
     ):
         mocked_bubble.side_effect = [
             {"lead": "lead-1", "folioItems": ["folio-item-historical"]},
-            {"listing": "listing-historical", "newlyAdded": False},
+            {"results": [{"_id": "folio-item-historical",
+                          "listing": "listing-historical", "newlyAdded": True}],
+             "remaining": 0},
             {"TransactionType": ["Rent/Let"], "bedroomsMin": 4, "budgetRent": 15000},
         ]
         mocked_listings.return_value = ([{
+            "_id": "listing-historical", "propertyName": "Old Home",
+            "beds": 4, "priceRent": 14000,
+        }, {
             "_id": "listing-current", "propertyName": "Ampersand",
             "beds": 4, "priceRent": 14500,
         }], 1)
@@ -1001,6 +1056,9 @@ class SearchFlowStateTests(unittest.TestCase):
             "folio-1",
             ["folio-item-historical", "folio-item-current"],
             app_module.get_bubble_base_url("live"),
+        )
+        mocked_clear.assert_called_once_with(
+            "folio-item-historical", app_module.get_bubble_base_url("live")
         )
         self.assertEqual(answer.listing_ids, ["listing-current"])
         self.assertEqual(answer.folio_item_ids, ["folio-item-current"])
