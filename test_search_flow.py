@@ -735,7 +735,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("One Menerung", answer)
         self.assertIn("four-bedroom", answer)
         self.assertIn("RM11,500", answer)
-        self.assertIn("https://www.rentee.asia/folio3/folio-1", answer)
+        self.assertIn("https://www.rentee.asia/folio2/folio-1", answer)
         self.assertTrue(answer.recommendations_available)
         self.assertEqual(answer.listing_ids, [listing_id])
         self.assertEqual(

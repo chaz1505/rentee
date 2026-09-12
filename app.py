@@ -3750,7 +3750,7 @@ def get_current_recommendations(folio_id, bubble_env, include_media=False):
 
 
 def build_folio_url(folio_id):
-    return f"https://www.rentee.asia/folio3/{folio_id}"
+    return f"https://www.rentee.asia/folio2/{folio_id}"
 
 
 def _format_listing_price(listing, transaction_type=None):

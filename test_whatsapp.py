@@ -4293,10 +4293,13 @@ class WhatsAppTests(unittest.TestCase):
         mocked_create.assert_not_called()
 
     def test_build_folio_url_uses_customer_folio_route(self):
+        self.assertEqual(
+            app_module.build_folio_url("123"), "https://www.rentee.asia/folio2/123"
+        )
         folio_id = "1787842581873x206575709934321660"
         self.assertEqual(
             app_module.build_folio_url(folio_id),
-            "https://www.rentee.asia/folio3/1787842581873x206575709934321660",
+            "https://www.rentee.asia/folio2/1787842581873x206575709934321660",
         )
 
     @patch("app.get_current_recommendations")
@@ -4326,7 +4329,7 @@ class WhatsAppTests(unittest.TestCase):
         self.assertIn("4 bed", result)
         self.assertIn("budget and four-bedroom requirement", result)
         self.assertIn("See all 5", result)
-        self.assertIn("https://www.rentee.asia/folio3/folio-active", result)
+        self.assertIn("https://www.rentee.asia/folio2/folio-active", result)
         for index in range(1, 6):
             self.assertNotIn(f"listing-internal-{index}", result)
             self.assertNotIn(f"condo-internal-{index}", result)
@@ -4388,7 +4391,7 @@ class WhatsAppTests(unittest.TestCase):
         mocked_turn.return_value = ("Model recommendation", "resp-1", listings)
         mocked_summary.return_value = (
             "Three grounded recommendations\n\n"
-            "https://www.rentee.asia/folio3/folio-active"
+            "https://www.rentee.asia/folio2/folio-active"
         )
         deliveries = [
             {"whatsapp_message_id": "wamid.A", "message_type": "text",
@@ -4460,7 +4463,7 @@ class WhatsAppTests(unittest.TestCase):
         self.assertNotIn("One Menerung", saved_text)
         self.assertNotIn("3 bed", saved_text)
         self.assertIn(
-            "https://www.rentee.asia/folio3/folio-current", saved_text
+            "https://www.rentee.asia/folio2/folio-current", saved_text
         )
         batch.assert_called_once_with(
             "60123456789", "folio-current", current,
