@@ -303,11 +303,33 @@ def resolve_property_routing(message, bubble_env="live"):
                     "text": match.group(), "span": match.span(), "geo_match": None, "condo_match": None,
                 })
                 candidate[kind + "_match"] = {"name": " ".join(name.split()), "id": row["_id"]}
+    # Keep this alias deliberately narrow: it is a common local shorthand and is
+    # enabled only when the canonical Geo exists and no distinct Geo is literally
+    # named Damansara in the current Bubble vocabulary.
+    geo_rows = records.get("geo", [])
+    canonical_damansara = next((
+        row for row in geo_rows
+        if normalize_condo_name(row.get("name") or row.get("Name")) == "damansara heights"
+    ), None)
+    literal_damansara = any(
+        normalize_condo_name(row.get("name") or row.get("Name")) == "damansara"
+        for row in geo_rows
+    )
+    if canonical_damansara and not literal_damansara:
+        for match in re.finditer(r"(?<!\w)damansara(?!\s+heights\b)(?!\w)", text):
+            candidates[("damansara", match.span())] = {
+                "text": match.group(), "span": match.span(),
+                "geo_match": {
+                    "name": " ".join(str(canonical_damansara.get("name") or canonical_damansara.get("Name")).split()),
+                    "id": canonical_damansara["_id"],
+                },
+                "condo_match": None,
+            }
     # A Geo embedded in a longer development name is not a separate mention.
-    mentions = [item for item in candidates.values() if not any(
+    mentions = sorted((item for item in candidates.values() if not any(
         other["span"][0] <= item["span"][0] and other["span"][1] >= item["span"][1]
         and other["span"] != item["span"] for other in candidates.values()
-    )]
+    )), key=lambda item: item["span"])
     for item in mentions:
         geo, condo = item["geo_match"], item["condo_match"]
         kind = "ambiguous" if geo and condo else "geo" if geo else "condo"
@@ -329,8 +351,10 @@ def resolve_property_routing(message, bubble_env="live"):
     result["mentions"] = mentions
     result["geo_names"] = _unique_search_values(result["geo_names"])
     result["condo_names"] = _unique_search_values(result["condo_names"])
+    if result["geo_names"]:
+        print(f"[GEO RESOLUTION] current_message_geos={result['geo_names']!r}", flush=True)
     inventory = _is_explicit_inventory_search(message)
-    correction = bool(re.search(r"\b(?:i meant|i mean|try|instead|switch|change (?:to|the area))\b", text))
+    correction = bool(re.search(r"\b(?:i meant|i mean|try|check|instead|switch|change (?:to|the area))\b", text))
     location_tool = (_requires_location_comparison_tool(message) or _requires_nearby_places_tool(message)
                      or _requires_travel_time_tool(message))
     if any(item["routing_type"] == "ambiguous" for item in mentions):
@@ -384,6 +408,22 @@ def _folio_has_active_property_search(folio_id, bubble_env):
     )
 
 
+def _folio_accepts_pending_broadening(folio_id, bubble_env, message):
+    """Check whether this turn accepts the current Folio's live area offer."""
+    if not folio_id:
+        return False
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    lead_id = folio.get("lead")
+    if not lead_id:
+        return False
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    state = load_active_search_state(lead, base_url)
+    return broadening_accepted(
+        message, state["pending_broadening"], state, folio_id
+    )
+
+
 def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
     """Conservatively approve direct execution for exact, simple refinements."""
     text = normalize_condo_name(message)
@@ -391,10 +431,18 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
         return False, "entity_resolution_unavailable", False
     if any(item.get("resolved_type") == "ambiguous" for item in routing.get("mentions", [])):
         return False, "ambiguous_entity", False
+    pending_acceptance = False
     if not routing.get("mentions") or not (
         routing.get("geo_names") or routing.get("condo_names")
     ):
-        return False, "no_authoritative_entity", False
+        try:
+            pending_acceptance = _folio_accepts_pending_broadening(
+                folio_id, bubble_env, message
+            )
+        except Exception:
+            pending_acceptance = False
+        if not pending_acceptance:
+            return False, "no_authoritative_entity", False
     if (_requires_location_comparison_tool(message)
             or _requires_nearby_places_tool(message)
             or _requires_travel_time_tool(message)):
@@ -407,14 +455,16 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
         return False, "requires_advisory_reasoning", False
     explicit_inventory = _is_explicit_inventory_search(message)
     substitution = bool(re.search(
-        r"\b(try|how about|instead|again|switch|change (?:to|the area))\b", text
+        r"\b(try|check|how about|instead|again|switch|change (?:to|the area))\b", text
     ))
-    if routing.get("action") != "advance_property_search" and not (
+    if not pending_acceptance and routing.get("action") != "advance_property_search" and not (
         routing.get("action") == "area_information" and substitution
     ):
         return False, "non_search_action", False
     inherited_from_active = False
-    if substitution and not explicit_inventory:
+    if pending_acceptance:
+        inherited_from_active = True
+    elif substitution and not explicit_inventory:
         try:
             inherited_from_active = _folio_has_active_property_search(
                 folio_id, bubble_env
@@ -5156,9 +5206,15 @@ def grounded_search_update(message, update):
     text = normalize_condo_name(message)
     result = dict(update)
     changed = []
+    ignored_model_fields = []
     for field in ("geo_names", "preferred_condo_names"):
         values = [value for value in update.get(field, [])
-                  if re.search(rf"(?<!\w){re.escape(normalize_condo_name(value))}(?!\w)", text)]
+                  if re.search(rf"(?<!\w){re.escape(normalize_condo_name(value))}(?!\w)", text)
+                  or (field == "geo_names"
+                      and normalize_condo_name(value) == "damansara heights"
+                      and re.search(r"(?<!\w)damansara(?!\s+heights\b)(?!\w)", text))]
+        if update.get(field) and not values:
+            ignored_model_fields.append(field)
         result[field] = values
         if values:
             changed.append(field)
@@ -5183,7 +5239,20 @@ def grounded_search_update(message, update):
         for key in (("budget_rent", "budget_buy", "budget_requirement") if field == "budget"
                     else ("bedrooms_min", "bedroom_requirement") if field == "bedrooms_min"
                     else (field,)):
-            result.pop(key, None)
+            if key in result:
+                ignored_model_fields.append(key)
+                result.pop(key, None)
+    if "budget" in changed and not re.search(
+        r"\b(?:budget\s*(?:is|of)?\s*|rm\s*|myr\s*)0(?:\.0+)?\b", text
+    ):
+        for key in ("budget_rent", "budget_buy", "budget_requirement"):
+            try:
+                is_zero = float(result.get(key)) == 0
+            except (TypeError, ValueError):
+                is_zero = False
+            if is_zero:
+                ignored_model_fields.append(key)
+                result.pop(key, None)
     # Qualitative constraints also require current-turn evidence; a continuation
     # cannot acquire model-invented amenities or exclusions.
     for field in ("other_requirements", "priorities", "preference_notes", "regular_destinations",
@@ -5200,7 +5269,14 @@ def grounded_search_update(message, update):
         result.pop(key, None)
     if not re.search(r"\b(new search|start over|start again)\b", text):
         result.pop("new_search", None)
-    print(f"[SEARCH MERGE] source=current_message evidenced_fields={changed!r} inherited=all_other_constraints", flush=True)
+    ignored_model_fields = list(dict.fromkeys(ignored_model_fields))
+    print(f"[SEARCH MERGE] source=current_message evidenced_fields={changed!r} "
+          f"ignored_model_fields={ignored_model_fields!r} inherited=all_other_constraints",
+          flush=True)
+    guarded = [field for field in ("transaction_type", "budget_rent", "budget_buy")
+               if field in ignored_model_fields]
+    if guarded:
+        print(f"[SEARCH STATE GUARD] ignored_unevidenced_fields={guarded!r}", flush=True)
     return result
 
 
@@ -5616,11 +5692,14 @@ def broadening_accepted(message, offer, state, folio_id):
         return False
     if offer.get("scope") != search_geography(state) or time.time() > offer.get("expires_at", 0):
         return False
-    return bool(re.fullmatch(
-        r"(?:yes|yeah|yep|sure|ok|okay|go ahead|please do)(?:[, ]+(?:please|broaden(?: the search)?|"
-        r"go ahead|check (?:those|them)(?: too)?))?[.!]*",
-        normalize_condo_name(message),
-    ))
+    text = normalize_condo_name(message).strip(" .!")
+    patterns = (
+        r"(?:yes|yeah|yep|sure|ok|okay|go ahead|please do)(?:[, ]+(?:please|go ahead))?",
+        r"(?:(?:yes|yeah|yep|sure|ok|okay)\s+)?(?:check|try|include|search)\s+"
+        r"(?:those|them|those areas|the nearby areas)(?:\s+(?:as well|too))?",
+        r"(?:(?:yes|yeah|yep|sure|ok|okay)\s+)?broaden(?:\s+(?:it|the search))?",
+    )
+    return any(re.fullmatch(pattern, text) for pattern in patterns)
 
 
 def load_adjacent_geos(base_url, area_names):
@@ -5974,7 +6053,8 @@ def advance_property_search(folio_id, bubble_env, update):
     if accepted:
         update.update(geo_names=offer["areas"], area_update_mode="add",
                       preferred_condo_names=[], condo_update_mode="reset", search_listings=True)
-        print(f"[SEARCH BROADEN] status=accepted added_geos={offer['areas']!r}", flush=True)
+        print(f"[SEARCH BROADEN] status=accepted source_geos={active_source['areas']!r} "
+              f"added_geos={offer['areas']!r}", flush=True)
     # A pending offer is one-use and invalidated by a different search turn.
     active_source["pending_broadening"] = {}
     resolved = resolve_search_entities(base_url, update, valid_geo_names)

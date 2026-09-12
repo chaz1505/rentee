@@ -560,6 +560,57 @@ class SearchFlowStateTests(unittest.TestCase):
             "try Bukit Tunku", ambiguous, "folio", "live"
         )[0])
 
+    def test_routing_extracts_multiple_geos_in_mention_order_and_safe_alias(self):
+        records = {
+            "geo": [
+                {"_id": "g1", "name": "Damansara Heights"},
+                {"_id": "g2", "name": "Sri Hartamas"},
+            ],
+            "condo": [],
+        }
+        with patch("app._property_entity_records", return_value=records):
+            explicit = app_module.resolve_property_routing(
+                "check Damansara Heights and Sri Hartamas"
+            )
+            shorthand = app_module.resolve_property_routing(
+                "check damansara and sri hartamas"
+            )
+        self.assertEqual(explicit["geo_names"], ["Damansara Heights", "Sri Hartamas"])
+        self.assertEqual(shorthand["geo_names"], ["Damansara Heights", "Sri Hartamas"])
+
+    def test_damansara_alias_is_disabled_when_literal_geo_exists(self):
+        records = {
+            "geo": [
+                {"_id": "g1", "name": "Damansara Heights"},
+                {"_id": "g2", "name": "Damansara"},
+            ],
+            "condo": [],
+        }
+        with patch("app._property_entity_records", return_value=records):
+            routing = app_module.resolve_property_routing("try Damansara")
+        self.assertEqual(routing["geo_names"], ["Damansara"])
+
+    @patch("app._folio_accepts_pending_broadening", return_value=True)
+    def test_pending_broadening_acceptance_is_fast_path_eligible(self, _pending):
+        eligible, reason, inherited = app_module.property_search_fast_path_decision(
+            "ok check those areas as well",
+            {"action": None, "geo_names": [], "condo_names": [], "mentions": []},
+            "folio", "live",
+        )
+        self.assertTrue(eligible)
+        self.assertIsNone(reason)
+        self.assertTrue(inherited)
+
+    @patch("app._folio_accepts_pending_broadening", return_value=False)
+    def test_area_pronoun_without_pending_offer_is_not_fast_path(self, _pending):
+        eligible, reason, _ = app_module.property_search_fast_path_decision(
+            "check those areas",
+            {"action": None, "geo_names": [], "condo_names": [], "mentions": []},
+            "folio", "live",
+        )
+        self.assertFalse(eligible)
+        self.assertEqual(reason, "no_authoritative_entity")
+
     @patch("app.resolve_condo_mentions", return_value=[])
     def test_fast_path_preparation_reuses_explicit_type_and_entity_helpers(self, _condos):
         landed_routing = {

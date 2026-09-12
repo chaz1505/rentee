@@ -116,6 +116,24 @@ class SearchScopeTests(unittest.TestCase):
         self.assertEqual(active["bedroom_requirement"], "3")
         self.assertEqual(len(self.retrieve()), 6)
 
+    def test_location_refinement_ignores_unevidenced_transaction_and_budgets(self):
+        state = self.state("Mont Kiara")
+        state.update(property_types=["Landed", "rent"], budget_rent="25000",
+                     budget_buy="0", budget_requirement="25000")
+        self.lead["searchActive"] = dump_search_state(state)
+        self.geos.append({"_id": "g4", "name": "Sri Hartamas"})
+        with patch("app.get_valid_geo_names", return_value=[g["name"] for g in self.geos]):
+            result = self.advance(
+                "ok - check damansara and sri hartamas",
+                geo_names=["Damansara Heights", "Sri Hartamas"],
+                transaction_type="buy", budget_rent=0, budget_buy=7000000,
+            )
+        active = result["active_state"]
+        self.assertEqual(active["areas"], ["Damansara Heights", "Sri Hartamas"])
+        self.assertEqual(active["property_types"], ["Landed", "rent"])
+        self.assertEqual(active["budget_rent"], "25000")
+        self.assertEqual(active["budget_buy"], "0")
+
     def test_continuations_ignore_invented_constraints(self):
         for message in ("Yes see alternatives", "anything else?", "more options", "show me more",
                         "what else have you got?", "any others?", "other options?", "continue please"):
@@ -330,6 +348,25 @@ class SearchScopeTests(unittest.TestCase):
         self.assertEqual(state["pending_broadening"], {})
         self.assertEqual(state["geography_provenance"]["source"], "explicit_user")
         self.assertEqual(len({l["condo"] for l in self.retrieve()}), 9)
+
+    def test_explicit_pending_offer_wording_adds_areas_once(self):
+        self.exhausted_offer()
+        result = self.advance("ok check those areas as well")
+        self.assertEqual(
+            result["active_state"]["areas"],
+            ["Mont Kiara", "Damansara Heights", "Future District"],
+        )
+        self.assertEqual(result["active_state"]["pending_broadening"], {})
+        repeated = self.advance("check those areas")
+        self.assertEqual(repeated["active_state"]["areas"], result["active_state"]["areas"])
+
+    def test_expired_pending_offer_wording_does_not_add_areas(self):
+        self.exhausted_offer()
+        state = app.load_active_search_state(self.lead)
+        state["pending_broadening"]["expires_at"] = 0
+        self.lead["searchActive"] = dump_search_state(state)
+        result = self.advance("try those areas")
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
 
     def test_bare_yes_without_offer_does_not_broaden(self):
         result = self.advance("yes", geo_names=["Damansara Heights"])
