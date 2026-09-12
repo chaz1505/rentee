@@ -262,6 +262,10 @@ def _is_explicit_inventory_search(user_message):
         r"\bhave you got\b",
         r"\bshow me\b.*\b(?:options|rentals?|units?|condos?|apartments?|houses?|landed)\b",
         r"\bfind me\b",
+        r"\b(?:i(?:'m| am)\s+)?looking to\s+(?:buy|purchase|rent|lease)\b",
+        r"\b(?:i\s+)?want to\s+(?:buy|purchase|rent|lease)\b",
+        r"\blooking for\b.*\b(?:rental|lease|\d+\s*(?:bed|bedroom)|unit|home|house|property)\b",
+        r"\b(?:i\s+)?want (?:a|an)\b.*\b(?:unit|home|house|property)\b",
         r"\bshow me\b.*\b(home|homes|house|houses|propert(?:y|ies)|listing|listings|unit|units|matches)\b",
         r"\bany\b.*\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\bavailable\b",
         r"\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\b(in|around|under)\b",
@@ -6042,6 +6046,7 @@ def advance_property_search(folio_id, bubble_env, update):
     folio = bubble(f"{base_url}/obj/folio/{folio_id}")
     lead_id = folio["lead"]
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    had_active_search = bool(lead.get("searchActive"))
     valid_geo_names = get_valid_geo_names(bubble_env)
     update = dict(update)
     message = update.pop("_user_message", "")
@@ -6143,6 +6148,27 @@ def advance_property_search(folio_id, bubble_env, update):
                                   "bedroom_requirement", "budget_rent", "budget_buy")
                  if key not in changes]
     print(f"[SEARCH MERGE] applied_changes={changes!r} preserved_fields={preserved!r}", flush=True)
+    state_log = {
+        "transaction": sorted(_transaction_modes(active_state["property_types"])),
+        "property_types": _normalized_home_property_types(active_state["property_types"]),
+        "areas": active_state["areas"],
+        "condos": active_state["selected_condos"],
+        "bedrooms": active_state["bedroom_requirement"] or None,
+        "budget_rent": active_state["budget_rent"] or None,
+        "budget_buy": active_state["budget_buy"] or None,
+    }
+    changed_fields = list(changes)
+    inherited_fields = [field for field in (
+        "property_types", "areas", "selected_condos", "bedroom_requirement",
+        "budget_rent", "budget_buy",
+    ) if field not in changes and active_source.get(field)]
+    if not had_active_search:
+        print(f"[SEARCH STATE INIT] evidenced_fields={changed_fields!r} "
+              f"persisted_state={state_log!r}", flush=True)
+    else:
+        print(f"[SEARCH MERGE] current_evidence={changed_fields!r} "
+              f"inherited_fields={inherited_fields!r} changed_fields={changed_fields!r} "
+              f"final_state={state_log!r}", flush=True)
     preferred_names = [
         str(name).strip() for name in update.get("preferred_condo_names", [])
         if str(name).strip()

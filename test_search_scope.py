@@ -134,6 +134,98 @@ class SearchScopeTests(unittest.TestCase):
         self.assertEqual(active["budget_rent"], "25000")
         self.assertEqual(active["budget_buy"], "0")
 
+    def _fresh_condo_search_turn(self, message, condo_name, transaction):
+        self.lead["searchActive"] = ""
+        self.lead["searchBriefJSON"] = dump_search_state(empty_search_state())
+        routing = {
+            "action": "advance_property_search", "geo_names": [],
+            "condo_names": [condo_name], "mentions": [{
+                "text": condo_name.casefold(), "resolved_type": "condo",
+                "routing_type": "condo",
+            }],
+        }
+        prepared = app.prepare_advance_property_search_args(
+            message, "live", {"search_listings": False}, routing
+        )
+        first = app.advance_property_search("folio", "live", prepared)
+        self.assertEqual(first["active_state"]["selected_condos"], [condo_name])
+        self.assertIn(transaction, first["active_state"]["property_types"])
+        return first
+
+    def test_fresh_buy_condo_search_is_inherited_by_budget_bedroom_turn(self):
+        self.condos.append({"_id": "rhombus", "name": "Rhombus", "Geo": "g0"})
+        self._fresh_condo_search_turn(
+            "I'm looking to buy in Rhombus", "Rhombus", "buy"
+        )
+        final = self.advance(
+            "7m 3 beds", transaction_type="buy", budget_buy=7000000,
+            bedrooms_min=3, preferred_condo_names=["Rhombus"],
+        )["active_state"]
+        self.assertEqual(final["selected_condos"], ["Rhombus"])
+        self.assertIn("buy", final["property_types"])
+        self.assertEqual(final["bedroom_requirement"], "3")
+        self.assertEqual(final["budget_buy"], "7000000")
+        lead = app.lead_with_active_search_filters(self.lead, "https://bubble.test")
+        self.assertEqual(lead["_requested_condos"], ["Rhombus"])
+        self.assertEqual(lead["TransactionType"], ["Buy/Sell"])
+        self.assertEqual(lead["budgetBuy"], 7000000)
+        self.calls.clear()
+        app.get_plausible_listings("https://bubble.test", lead)
+        listing_calls = [call for call in self.calls if call[0].endswith("/listing")]
+        self.assertTrue(listing_calls)
+        constraints = [item for _, params in listing_calls
+                       for item in json.loads(params["constraints"])]
+        self.assertTrue(any(item["key"] == "condo" and item["value"] == "rhombus"
+                            for item in constraints))
+        self.assertTrue(any(item["key"] == "TransactionType"
+                            and item["value"] == "Buy/Sell" for item in constraints))
+        self.assertTrue(any(item["key"] == "priceSale" for item in constraints))
+
+    def test_fresh_rent_condo_search_is_inherited_by_budget_bedroom_turn(self):
+        self.condos.append({"_id": "one-menerung", "name": "One Menerung", "Geo": "g0"})
+        self._fresh_condo_search_turn(
+            "I'm looking to rent in One Menerung", "One Menerung", "rent"
+        )
+        final = self.advance(
+            "up to 15k, 3 beds", transaction_type="rent", budget_rent=15000,
+            bedrooms_min=3, preferred_condo_names=["One Menerung"],
+        )["active_state"]
+        self.assertEqual(final["selected_condos"], ["One Menerung"])
+        self.assertIn("rent", final["property_types"])
+        self.assertEqual(final["bedroom_requirement"], "3")
+        self.assertEqual(final["budget_rent"], "15000")
+
+    def test_bedroom_only_refinement_inherits_condo_transaction_and_budget(self):
+        state = self.state()
+        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo", "buy"],
+                     bedroom_requirement="3", budget_buy="7000000",
+                     budget_rent="", budget_requirement="7000000")
+        self.lead["searchActive"] = dump_search_state(state)
+        final = self.advance(
+            "make it 4 beds", bedrooms_min=4, transaction_type="rent",
+            budget_rent=1000, preferred_condo_names=["Wrong Condo"],
+        )["active_state"]
+        self.assertEqual(final["selected_condos"], ["Arcoris"])
+        self.assertEqual(final["property_types"], ["Condo", "buy"])
+        self.assertEqual(final["bedroom_requirement"], "4")
+        self.assertEqual(final["budget_buy"], "7000000")
+
+    def test_explicit_condo_switch_inherits_other_authoritative_filters(self):
+        state = self.state()
+        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo", "buy"],
+                     bedroom_requirement="3", budget_buy="7000000",
+                     budget_rent="", budget_requirement="7000000")
+        self.lead["searchActive"] = dump_search_state(state)
+        self.condos.append({"_id": "other", "name": "One Menerung", "Geo": "g0"})
+        final = self.advance(
+            "try One Menerung instead", preferred_condo_names=["One Menerung"],
+            transaction_type="rent", budget_rent=1000,
+        )["active_state"]
+        self.assertEqual(final["selected_condos"], ["One Menerung"])
+        self.assertEqual(final["property_types"], ["Condo", "buy"])
+        self.assertEqual(final["bedroom_requirement"], "3")
+        self.assertEqual(final["budget_buy"], "7000000")
+
     def test_continuations_ignore_invented_constraints(self):
         for message in ("Yes see alternatives", "anything else?", "more options", "show me more",
                         "what else have you got?", "any others?", "other options?", "continue please"):

@@ -578,6 +578,19 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(explicit["geo_names"], ["Damansara Heights", "Sri Hartamas"])
         self.assertEqual(shorthand["geo_names"], ["Damansara Heights", "Sri Hartamas"])
 
+    def test_transaction_language_with_entity_routes_to_property_search(self):
+        records = {
+            "geo": [{"_id": "g1", "name": "Bangsar"}],
+            "condo": [{"_id": "c1", "name": "Rhombus"}],
+        }
+        with patch("app._property_entity_records", return_value=records):
+            buy = app_module.resolve_property_routing("I'm looking to buy in Rhombus")
+            rent = app_module.resolve_property_routing("Looking for a rental in Bangsar")
+            info = app_module.resolve_property_routing("Tell me about Rhombus")
+        self.assertEqual(buy["action"], "advance_property_search")
+        self.assertEqual(rent["action"], "advance_property_search")
+        self.assertEqual(info["action"], "get_condo_info")
+
     def test_damansara_alias_is_disabled_when_literal_geo_exists(self):
         records = {
             "geo": [
