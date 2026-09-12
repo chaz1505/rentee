@@ -4121,11 +4121,15 @@ def _format_listing_price(listing, transaction_type=None):
     sale = _as_number(listing.get("priceSale"))
 
     if modes == {"buy"}:
-        choices = ((sale, ""), (rent, "/month"))
+        choices = ((sale, ""),)
     elif modes == {"rent"}:
-        choices = ((rent, "/month"), (sale, ""))
+        choices = ((rent, "/month"),)
+    elif modes == {"buy", "rent"} and listing_modes == {"buy"}:
+        choices = ((sale, ""),)
+    elif modes == {"buy", "rent"} and listing_modes == {"rent"}:
+        choices = ((rent, "/month"),)
     else:
-        choices = ((rent, "/month"), (sale, ""))
+        choices = ()
 
     for price, suffix in choices:
         if price is not None:
@@ -4481,7 +4485,8 @@ def ranking_listing_facts(listing, condo_names=None, geo_names=None):
         return {}
     facts = {"listing_id": str(listing_id)}
     for field in (
-        "beds", "baths", "priceRent", "priceSale", "Sq Ft", "Landed_sqft",
+        "beds", "baths", "priceRent", "priceSale", "propertyType", "TransactionType",
+        "Sq Ft", "Landed_sqft",
         "Furnishing", "furnished", "availability", "availability_date",
         "balcony", "family room", "maid room", "outdoor area",
     ):
@@ -4717,7 +4722,94 @@ def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
     return selected
 
 
-def validate_ranking_recommendations(model_recommendations, grounded_listing_facts):
+def _format_deterministic_sale_price(value):
+    price = _as_number(value)
+    if price is None:
+        return None
+    if price >= 1000000:
+        rendered = f"{price / 1000000:.2f}".rstrip("0").rstrip(".")
+        return f"RM{rendered}m"
+    return f"RM{price:,.0f}"
+
+
+def build_deterministic_reco_summary(listing_facts, active_search_state):
+    """Build one concise recommendation reason from grounded facts and active state."""
+    facts = listing_facts or {}
+    state = load_search_state(active_search_state)
+    modes = _transaction_modes(state.get("transaction_type"))
+    listing_modes = _transaction_modes(facts.get("TransactionType") or [])
+    effective_modes = modes
+    if modes == {"rent", "buy"} or not modes:
+        effective_modes = listing_modes
+
+    condo_name = str(facts.get("condo_name") or "").strip()
+    property_name = str(facts.get("property_name") or "").strip()
+    geo_names = facts.get("geo_names") or []
+    geo_name = str(geo_names[0]).strip() if geo_names else ""
+    location = condo_name or property_name or geo_name
+    beds = _as_number(facts.get("beds"))
+    bed_label = None if beds is None else f"{beds:g}-bed"
+    property_type = str(facts.get("propertyType") or "").strip().casefold()
+    type_label = "landed home" if property_type == "landed" else "condo" if property_type == "condo" else "option"
+
+    if location and (condo_name or property_name):
+        opening = " ".join(item for item in (location, bed_label) if item)
+        if not opening:
+            opening = location
+    elif geo_name:
+        opening = " ".join(item for item in (bed_label, type_label, "in", geo_name) if item)
+    elif bed_label:
+        opening = f"Current {bed_label} {type_label}"
+    elif property_type:
+        opening = f"Current {type_label}"
+    else:
+        opening = location
+
+    price_label = None
+    budget = None
+    budget_description = None
+    if effective_modes == {"rent"} and facts.get("priceRent") not in (None, ""):
+        price = _as_number(facts.get("priceRent"))
+        price_label = f"RM{price:,.0f}/month" if price is not None else None
+        budget = _as_number(state.get("budget_rent"))
+        if budget and price is not None:
+            budget_description = (
+                f"within your RM{budget:,.0f} budget" if price <= budget
+                else f"above your RM{budget:,.0f} budget"
+            )
+    elif effective_modes == {"buy"} and facts.get("priceSale") not in (None, ""):
+        price = _as_number(facts.get("priceSale"))
+        price_label = _format_deterministic_sale_price(price)
+        budget = _as_number(state.get("budget_buy"))
+        if budget and price is not None:
+            budget_description = (
+                "within your current purchase budget" if price <= budget
+                else f"above your {_format_deterministic_sale_price(budget)} target"
+            )
+
+    details = []
+    sqft = _as_number(facts.get("Sq Ft") or facts.get("Landed_sqft"))
+    if sqft:
+        details.append(f"{sqft:,.0f} sqft")
+    furnishing = str(facts.get("Furnishing") or facts.get("furnished") or "").strip()
+    if furnishing:
+        details.append(furnishing.casefold() + " furnishing")
+
+    summary = opening
+    if price_label:
+        summary = f"{summary} at {price_label}" if summary else price_label
+    if budget_description:
+        summary += f", {budget_description}"
+    elif details:
+        summary += f" with {details[0]}"
+    if not summary:
+        return "Current property option."
+    return summary[:219].rstrip(" ,;.") + "."
+
+
+def validate_ranking_recommendations(
+    model_recommendations, grounded_listing_facts, active_search_state=None
+):
     """Validate model IDs and fill a useful minimum from deterministic order."""
     available_ids = {facts["listing_id"] for facts in grounded_listing_facts}
     validated = []
@@ -4745,7 +4837,9 @@ def validate_ranking_recommendations(model_recommendations, grounded_listing_fac
             continue
         validated.append({
             "listing_id": listing_id,
-            "reco_summary": "Matches the current structured property search filters.",
+            "reco_summary": build_deterministic_reco_summary(
+                facts, active_search_state
+            ),
         })
         seen.add(listing_id)
     return validated, model_count
@@ -4945,7 +5039,9 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             "recommendations": [
                 {
                     "listing_id": facts["listing_id"],
-                    "reco_summary": "Matches the current structured property search filters.",
+                    "reco_summary": build_deterministic_reco_summary(
+                        facts, validated_state
+                    ),
                 }
                 for facts in grounded_listing_facts
             ],
@@ -4979,7 +5075,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         flush=True,
     )
     validated_recommendations, model_valid_count = validate_ranking_recommendations(
-        result["recommendations"], grounded_listing_facts
+        result["recommendations"], grounded_listing_facts, validated_state
     )
     filled_from_prerank = len(validated_recommendations) - model_valid_count
     if response is None:
@@ -5096,11 +5192,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             "recommendation_reason": recommendation.get("reco_summary") or "",
             "coverPhoto": source_listing.get("coverPhoto"),
             "photos": source_listing.get("photos"),
+            "_search_transaction_type": search_lead.get("TransactionType") or [],
         })
         current_run_listings.append(item)
     recommendation_summary = build_whatsapp_recommendation_summary(
         folio_id, bubble_env, listings=current_run_listings,
-        transaction_type=lead.get("TransactionType"),
+        transaction_type=search_lead.get("TransactionType"),
     )
     if recommendation_summary:
         customer_response = (
@@ -8501,9 +8598,15 @@ def _process_whatsapp_message(message):
             recommendation_listings = []
             if isinstance(recommendation_run, list):
                 recommendation_listings = recommendation_run
+                recommendation_transaction = next((
+                    listing.get("_search_transaction_type")
+                    for listing in recommendation_listings
+                    if listing.get("_search_transaction_type")
+                ), None)
                 recommendation_summary = build_whatsapp_recommendation_summary(
                     folio_id, "live", listings=recommendation_listings,
-                    transaction_type=lead.get("TransactionType"),
+                    transaction_type=(recommendation_transaction
+                                      or lead.get("TransactionType")),
                 )
                 if recommendation_summary:
                     answer = recommendation_summary

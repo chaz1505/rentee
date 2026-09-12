@@ -1205,9 +1205,11 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(len(facts["keyFacts"]), 600)
 
     def test_rank_validation_fills_one_model_choice_to_four(self):
-        facts = [{"listing_id": f"listing-{index}"} for index in range(12)]
+        facts = [{"listing_id": f"listing-{index}", "beds": 3,
+                  "property_name": f"Option {index}"} for index in range(12)]
         validated, model_count = app_module.validate_ranking_recommendations(
-            [{"listing_id": "listing-5", "reco_summary": "Model choice."}], facts
+            [{"listing_id": "listing-5", "reco_summary": "Model choice."}], facts,
+            empty_search_state(),
         )
         self.assertEqual(model_count, 1)
         self.assertEqual(len(validated), 4)
@@ -1216,6 +1218,43 @@ class SearchFlowStateTests(unittest.TestCase):
             [item["listing_id"] for item in validated[1:]],
             ["listing-0", "listing-1", "listing-2"],
         )
+        self.assertTrue(all("3-bed" in item["reco_summary"] for item in validated[1:]))
+        self.assertFalse(any("structured property search filters" in item["reco_summary"]
+                             for item in validated))
+
+    def test_deterministic_recommendation_summaries_are_grounded(self):
+        buy = empty_search_state()
+        buy.update(transaction_type="buy", property_types=["Landed"],
+                   areas=["Damansara Heights"], bedroom_requirement="4",
+                   budget_buy="7000000")
+        buy_summary = app_module.build_deterministic_reco_summary({
+            "listing_id": "landed", "geo_names": ["Damansara Heights"],
+            "propertyType": "Landed", "beds": 4, "priceSale": 6380000,
+            "TransactionType": ["Buy/Sell"],
+        }, buy)
+        self.assertIn("Damansara Heights", buy_summary)
+        self.assertIn("4-bed", buy_summary)
+        self.assertIn("RM6.38m", buy_summary)
+
+        rent = empty_search_state()
+        rent.update(transaction_type="rent", property_types=["Condo"],
+                    areas=["Bangsar"], bedroom_requirement="3", budget_rent="15000")
+        rent_summary = app_module.build_deterministic_reco_summary({
+            "listing_id": "rental", "geo_names": ["Bangsar"],
+            "propertyType": "Condo", "beds": 3, "priceRent": 12000,
+            "TransactionType": ["Rent/Let"],
+        }, rent)
+        self.assertIn("Bangsar", rent_summary)
+        self.assertIn("3-bed", rent_summary)
+        self.assertIn("RM12,000/month", rent_summary)
+        self.assertIn("within", rent_summary)
+
+        limited = app_module.build_deterministic_reco_summary({
+            "listing_id": "limited", "property_name": "One Menerung", "beds": 3,
+        }, empty_search_state())
+        self.assertIn("One Menerung", limited)
+        self.assertIn("3-bed", limited)
+        self.assertNotIn("structured property search filters", limited)
 
     def test_rank_validation_returns_all_when_fewer_than_four_exist(self):
         facts = [{"listing_id": f"listing-{index}"} for index in range(3)]
@@ -1248,7 +1287,8 @@ class SearchFlowStateTests(unittest.TestCase):
                 ]
                 expected_ids = [f"listing-{index}" for index in range(count)]
                 mocked_listings.return_value = ([
-                    {"_id": listing_id, "beds": 3, "priceRent": 10000}
+                    {"_id": listing_id, "beds": 3, "priceRent": 10000,
+                     "TransactionType": ["Rent/Let"]}
                     for listing_id in expected_ids
                 ], count)
                 flow = app_module.match_lead("folio-1", "live", "message-1")
@@ -1262,7 +1302,7 @@ class SearchFlowStateTests(unittest.TestCase):
                 self.assertEqual(answer.listing_ids, expected_ids)
                 self.assertEqual(
                     [item["recommendation_reason"] for item in answer.recommendations],
-                    ["Matches the current structured property search filters."] * count,
+                    ["Current 3-bed option at RM10,000/month."] * count,
                 )
 
     @patch("app.update_folio_items")
@@ -1308,7 +1348,8 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertNotIn(listing_id, answer)
         self.assertIn("One Menerung", answer)
         create.assert_not_called()
-        self.assertIn("Matches the current structured property search filters", answer)
+        self.assertIn("One Menerung 4-bed with 3,200 sqft", answer)
+        self.assertNotIn("Matches the current structured property search filters", answer)
         self.assertIn("RM11,500", answer)
         self.assertIn("https://www.rentee.asia/folio2/folio-1", answer)
         self.assertTrue(answer.recommendations_available)
@@ -2300,7 +2341,8 @@ class SearchFlowStateTests(unittest.TestCase):
             [item["listing_id"] for item in fallback],
             ["listing-1", "listing-2", "listing-3", "listing-4"],
         )
-        self.assertIn("Matches the current structured property search filters", answer)
+        self.assertIn("Current 3-bed option", answer)
+        self.assertNotIn("Matches the current structured property search filters", answer)
         self.assertTrue(answer.recommendations_available)
         mocked_update.assert_called_once()
         logs = " ".join(str(call) for call in mocked_print.call_args_list)

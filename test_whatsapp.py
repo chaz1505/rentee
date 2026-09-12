@@ -4315,6 +4315,7 @@ class WhatsAppTests(unittest.TestCase):
                 "condo": f"condo-internal-{index}",
                 "property_name": name,
                 "priceRent": 10000 + index * 500,
+                "TransactionType": ["Rent/Let"],
                 "beds": 4,
                 "recommendation_reason": f"Fits the customer's budget and four-bedroom requirement {index}.",
             })
@@ -4359,6 +4360,35 @@ class WhatsAppTests(unittest.TestCase):
             app_module._format_listing_price(listing, ["Rent/Let"]),
             "RM15,000/month",
         )
+
+    def test_known_transaction_never_falls_back_to_opposite_price(self):
+        self.assertIsNone(app_module._format_listing_price(
+            {"priceRent": 22000}, ["Buy/Sell"]
+        ))
+        self.assertIsNone(app_module._format_listing_price(
+            {"priceSale": 5000000}, ["Rent/Let"]
+        ))
+
+    def test_both_mode_uses_listing_transaction_type(self):
+        listing = {"priceSale": 5000000, "priceRent": 22000}
+        self.assertEqual(app_module._format_listing_price(
+            dict(listing, TransactionType=["Buy/Sell"]),
+            ["Buy/Sell", "Rent/Let"],
+        ), "RM5,000,000")
+        self.assertEqual(app_module._format_listing_price(
+            dict(listing, TransactionType=["Rent/Let"]),
+            ["Buy/Sell", "Rent/Let"],
+        ), "RM22,000/month")
+
+    def test_buy_recommendation_card_uses_sale_price(self):
+        summary = app_module.build_whatsapp_recommendation_summary(
+            "folio-rhombus", listings=[{
+                "property_name": "Rhombus", "priceSale": 5000000,
+                "priceRent": 22000, "TransactionType": ["Buy/Sell"],
+            }], transaction_type=["Buy/Sell"],
+        )
+        self.assertIn("Rhombus — RM5,000,000", summary)
+        self.assertNotIn("RM22,000/month", summary)
 
     @patch("app.get_current_recommendations", return_value=json.dumps({
         "current_recommendations": []
