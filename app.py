@@ -4322,7 +4322,16 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     lead_started = time.perf_counter()
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     log_timing("match_lead - Lead lookup", lead_started)
-    search_lead = lead_with_active_search_filters(lead, base_url)
+    validated_state = load_active_search_state(lead, base_url)
+    if validated_state != load_active_search_state(lead):
+        save_property_search_state(lead_id, load_search_state(lead.get("searchBriefJSON")),
+                                   base_url, None, validated_state)
+        lead = dict(lead, searchActive=dump_search_state(validated_state))
+    search_lead = lead_with_active_search_filters(lead, base_url, validated_state)
+    if lead.get("searchActive"):
+        condo_scope = list(validated_state["selected_condos"]) or None
+    if validated_state["scope_needs_clarification"]:
+        return "Which area or condo should I search?"
 
     search_lead["_excluded_listing_ids"] = existing_listing_ids
     yield "Searching available properties..."
@@ -4350,10 +4359,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
 
     if not listings:
         log_timing("match_lead TOTAL", match_started)
-        return (
-            "I don't have any additional suitable properties within your current search. "
-            "Would you like to adjust the area or budget?"
-        )
+        return offer_adjacent_search(lead, lead_id, folio_id, base_url, validated_state)
 
     print(
         f"Ranking {len(listings)} candidates (limit: {RANKING_CANDIDATE_LIMIT})",
@@ -4767,7 +4773,7 @@ def grounded_search_update(message, update):
     return result
 
 
-def get_named_object_ids(base_url, object_type, names):
+def get_named_object_ids(base_url, object_type, names, raise_on_error=False):
     """Resolve user-facing Geo/Condo names to existing Bubble relationship IDs."""
     wanted = {normalize_condo_name(name) for name in names or [] if str(name).strip()}
     if not wanted:
@@ -4778,6 +4784,8 @@ def get_named_object_ids(base_url, object_type, names):
         try:
             page = bubble(f"{base_url}/obj/{object_type}", params={"cursor": cursor})
         except requests.RequestException as error:
+            if raise_on_error:
+                raise
             print(
                 f"Bubble {object_type} relationship lookup unavailable; "
                 f"leaving the existing Lead relationship unchanged: {error}",
@@ -5105,7 +5113,135 @@ def area_recommendation_text(search_state):
     return "\n".join(lines)
 
 
-def load_active_search_state(lead):
+def search_geography(state):
+    return {"areas": list(state["areas"]), "condos": list(state["selected_condos"])}
+
+
+def validate_active_search_state(state, lead, base_url):
+    try:
+        return _validate_active_search_state(state, lead, base_url)
+    except requests.RequestException:
+        # A failed lookup is not evidence that a saved entity is invalid.
+        state = load_search_state(state)
+        state["scope_needs_clarification"] = True
+        print("[SEARCH STATE VALIDATION] status=lookup_unavailable preserved_saved_scope=True", flush=True)
+        return state
+
+
+def _validate_active_search_state(state, lead, base_url):
+    """Validate persisted types without turning an old model mistake into intent."""
+    state = load_search_state(state)
+    original = search_geography(state)
+    invalid = []
+    for field, kind in (("areas", "geo"), ("selected_condos", "condo")):
+        valid = []
+        for name in state[field]:
+            ids = get_named_object_ids(base_url, kind, [name], raise_on_error=True)
+            if ids:
+                valid.append(name)
+                continue
+            other = "geo" if kind == "condo" else "condo"
+            other_ids = get_named_object_ids(base_url, other, [name], raise_on_error=True)
+            invalid.append(name)
+            print(f"[SEARCH STATE VALIDATION] stored_type={kind!r} value={name!r} "
+                  f"{kind}_match=[] {other}_match={other_ids!r} invalid_type={bool(other_ids)}",
+                  flush=True)
+        state[field] = valid
+    if invalid:
+        state["recommended_condos"] = [name for name in state["recommended_condos"]
+                                       if name not in invalid]
+        # A cumulative area list is history, not proof of the last explicit scope.
+        # Only a snapshot written with explicit evidence is eligible for recovery.
+        recovered = False
+        for provenance in (state["geography_provenance"],
+                           load_search_state(lead.get("searchBriefJSON"))["geography_provenance"]):
+            snapshot = provenance.get("last_explicit", {})
+            if provenance.get("source") not in {"explicit_user", "inherited_explicit"}:
+                continue
+            areas, condos = snapshot.get("areas", []), snapshot.get("condos", [])
+            if not areas and not condos:
+                continue
+            if all(get_named_object_ids(base_url, "geo", [name], raise_on_error=True) for name in areas) and all(
+                get_named_object_ids(base_url, "condo", [name], raise_on_error=True) for name in condos
+            ):
+                state["areas"], state["selected_condos"] = list(areas), list(condos)
+                state["geography_provenance"] = dict(provenance, source="inherited_explicit")
+                recovered = True
+                break
+        state["scope_needs_clarification"] = not bool(state["areas"] or state["selected_condos"])
+        state["area_status"] = "known" if state["areas"] else "unknown"
+        state["pending_broadening"] = {}
+        print(f"[SEARCH STATE VALIDATION] loaded_scope={original!r} invalid={invalid!r} "
+              f"effective_scope={search_geography(state)!r} recovered_explicit={recovered} "
+              f"recovery={'restored' if recovered else 'not_available'}", flush=True)
+    elif state["areas"] or state["selected_condos"]:
+        state["scope_needs_clarification"] = False
+    return state
+
+
+def broadening_accepted(message, offer, state, folio_id):
+    """A bare approval is meaningful only for an outstanding, unchanged offer."""
+    if not offer or offer.get("folio_id") != folio_id:
+        return False
+    if offer.get("scope") != search_geography(state) or time.time() > offer.get("expires_at", 0):
+        return False
+    return bool(re.fullmatch(
+        r"(?:yes|yeah|yep|sure|ok|okay|go ahead|please do)(?:[, ]+(?:please|broaden(?: the search)?|"
+        r"go ahead|check (?:those|them)(?: too)?))?[.!]*",
+        normalize_condo_name(message),
+    ))
+
+
+def load_adjacent_geos(base_url, area_names):
+    """Use Bubble's populated adjacency relationships; never infer distances."""
+    source_ids = get_named_object_ids(base_url, "geo", area_names)
+    if len(source_ids) != len(_unique_search_values(area_names)):
+        return []
+    adjacent_ids = []
+    for geo_id in source_ids:
+        record = bubble(f"{base_url}/obj/geo/{geo_id}")
+        values = record.get("Adjacent_geos") or []
+        adjacent_ids.extend(values if isinstance(values, list) else [])
+    records = []
+    for geo_id in _unique_search_values(adjacent_ids):
+        if geo_id in source_ids:
+            continue
+        record = bubble(f"{base_url}/obj/geo/{geo_id}")
+        name = record.get("Name") or record.get("name")
+        if record.get("_id") == geo_id and name:
+            records.append({"id": geo_id, "name": name})
+    print(f"[ADJACENT GEO] source_geos={area_names!r} adjacent_geos={records!r}", flush=True)
+    return records
+
+
+def offer_adjacent_search(lead, lead_id, folio_id, base_url, state):
+    fallback = ("I don't have any additional suitable properties within your current search. "
+                "Would you like to adjust the area or budget?")
+    if state["scope_needs_clarification"] or not state["areas"] or state["selected_condos"]:
+        return fallback
+    try:
+        adjacent = load_adjacent_geos(base_url, state["areas"])
+    except requests.RequestException:
+        print("[ADJACENT GEO] status=unavailable", flush=True)
+        return fallback
+    if not adjacent:
+        return fallback
+    state = load_search_state(state)
+    names = [item["name"] for item in adjacent]
+    state["pending_broadening"] = {
+        "folio_id": folio_id, "scope": search_geography(state), "areas": names,
+        "geo_ids": [item["id"] for item in adjacent], "expires_at": time.time() + 900,
+    }
+    if not save_property_search_state(lead_id, load_search_state(lead.get("searchBriefJSON")),
+                                      base_url, None, state):
+        return fallback
+    print(f"[SEARCH BROADEN] status=offered source_geos={state['areas']!r} added_geos={names!r}", flush=True)
+    return ("I don't have any additional matches in " + ", ".join(state["areas"])
+            + ". I can add the adjacent areas " + ", ".join(names)
+            + " while keeping your other requirements. Shall I broaden the search to include them?")
+
+
+def load_active_search_state(lead, base_url=None):
     """Load authoritative current filters, falling back once for existing Leads."""
     raw = lead.get("searchActive")
     valid = False
@@ -5124,10 +5260,10 @@ def load_active_search_state(lead):
             f"budget={state['budget_requirement'] or None}",
             flush=True,
         )
-        return state
+        return validate_active_search_state(state, lead, base_url) if base_url else state
     fallback = load_search_state(lead.get("searchBriefJSON"))
     print("[SEARCH ACTIVE] missing; initialized from current search brief", flush=True)
-    return fallback
+    return validate_active_search_state(fallback, lead, base_url) if base_url else fallback
 
 
 def _unique_search_values(values):
@@ -5298,13 +5434,14 @@ def apply_cumulative_search_update(cumulative_state, update):
     return state
 
 
-def lead_with_active_search_filters(lead, base_url):
+def lead_with_active_search_filters(lead, base_url, validated_state=None):
     """Overlay explicit searchActive refinements on the durable Lead baseline."""
-    state = load_active_search_state(lead)
+    state = (load_search_state(validated_state) if validated_state is not None
+             else load_active_search_state(lead, base_url))
     bubble_env = "development" if "/version-test/" in base_url else "live"
     valid_geo_names = get_valid_geo_names(bubble_env)
     area_resolution = resolve_geo_names(state["areas"], valid_geo_names)
-    unresolved_saved_areas = bool(area_resolution["unresolved"])
+    unresolved_saved_areas = bool(area_resolution["unresolved"] or state["scope_needs_clarification"])
     state["areas"] = area_resolution["resolved"]
     has_state_filters = bool(
         state["areas"] or state["selected_condos"]
@@ -5396,15 +5533,28 @@ def advance_property_search(folio_id, bubble_env, update):
     lead = bubble(f"{base_url}/obj/lead/{lead_id}")
     valid_geo_names = get_valid_geo_names(bubble_env)
     update = dict(update)
-    if "_user_message" in update:
-        update = grounded_search_update(update.pop("_user_message"), update)
+    message = update.pop("_user_message", "")
+    active_source = load_active_search_state(lead, base_url)
+    offer = active_source["pending_broadening"]
+    accepted = broadening_accepted(message, offer, active_source, folio_id)
+    if message or active_source["geography_provenance"].get("last_explicit"):
+        update = grounded_search_update(message, update)
+    if accepted:
+        update.update(geo_names=offer["areas"], area_update_mode="add",
+                      preferred_condo_names=[], condo_update_mode="reset", search_listings=True)
+        print(f"[SEARCH BROADEN] status=accepted added_geos={offer['areas']!r}", flush=True)
+    # A pending offer is one-use and invalidated by a different search turn.
+    active_source["pending_broadening"] = {}
     resolved = resolve_search_entities(base_url, update, valid_geo_names)
     if resolved["unresolved"]:
+        if active_source != load_active_search_state(lead):
+            save_property_search_state(lead_id, load_search_state(lead.get("searchBriefJSON")),
+                                       base_url, None, active_source)
         return {
             "action": "ask", "text": "I couldn't identify " + ", ".join(resolved["unresolved"])
             + ". Which area or condo did you mean?",
             "state": load_search_state(lead.get("searchBriefJSON")),
-            "active_state": load_active_search_state(lead), "lead_id": lead_id,
+            "active_state": active_source, "lead_id": lead_id,
             "geo_resolution": resolved,
         }
     update["geo_names"] = resolved["areas"]
@@ -5429,7 +5579,6 @@ def advance_property_search(folio_id, bubble_env, update):
     )["resolved"]
     if not cumulative_source["areas"] and cumulative_source["area_status"] == "known":
         cumulative_source["area_status"] = "unknown"
-    active_source = load_active_search_state(lead)
     cumulative_update = dict(safe_update)
     if safe_update.get("_transaction_interest_mode") == "add":
         cumulative_modes = _transaction_modes(lead.get("TransactionType") or [])
@@ -5444,9 +5593,28 @@ def advance_property_search(folio_id, bubble_env, update):
     active_state = apply_active_search_update(
         active_source, safe_update
     )
+    geography_changed = bool(
+        resolved["areas"] or resolved["condos"]
+        or safe_update.get("area_update_mode") == "reset"
+        or safe_update.get("condo_update_mode") == "reset"
+    )
+    if geography_changed:
+        active_state["scope_needs_clarification"] = False
+        if message:
+            active_state["geography_provenance"] = {
+                "source": "explicit_user", "evidence": message,
+                "last_explicit": search_geography(active_state),
+            }
+    elif active_state["geography_provenance"].get("last_explicit"):
+        active_state["geography_provenance"]["source"] = "inherited_explicit"
+    if active_state["geography_provenance"].get("last_explicit"):
+        cumulative_state["geography_provenance"] = dict(active_state["geography_provenance"])
     changes = {key: {"before": active_source[key], "after": value}
                for key, value in active_state.items() if active_source[key] != value}
-    print(f"[SEARCH MERGE] applied_changes={changes!r}", flush=True)
+    preserved = [key for key in ("areas", "selected_condos", "property_types",
+                                  "bedroom_requirement", "budget_rent", "budget_buy")
+                 if key not in changes]
+    print(f"[SEARCH MERGE] applied_changes={changes!r} preserved_fields={preserved!r}", flush=True)
     preferred_names = [
         str(name).strip() for name in update.get("preferred_condo_names", [])
         if str(name).strip()
@@ -5471,6 +5639,10 @@ def advance_property_search(folio_id, bubble_env, update):
                 list(lead.get(field) or []) + list(lead_fields[field] or [])
             ))
 
+    if active_state["scope_needs_clarification"]:
+        save_property_search_state(lead_id, cumulative_state, base_url, lead_fields, active_state)
+        return {"action": "ask", "text": "Which area or condo should I search?",
+                "state": cumulative_state, "active_state": active_state, "lead_id": lead_id}
     # Recommendations are results, never implicit constraints.
     scope = list(active_state["selected_condos"])
     if update.get("search_listings"):

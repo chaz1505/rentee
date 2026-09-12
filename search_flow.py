@@ -1,6 +1,7 @@
 """Small durable memory helpers for Rentee property searches."""
 
 import json
+import copy
 
 
 SEARCH_BRIEF_FIELDS = (
@@ -12,6 +13,9 @@ SEARCH_BRIEF_FIELDS = (
 
 def empty_search_state():
     return {
+        "geography_provenance": {},
+        "pending_broadening": {},
+        "scope_needs_clarification": False,
         "area_status": "unchanged",
         "areas": [],
         "regular_destinations": [],
@@ -45,7 +49,7 @@ def load_search_state(value):
     if isinstance(source, dict):
         for key in state:
             if key in source and isinstance(source[key], type(state[key])):
-                state[key] = source[key]
+                state[key] = copy.deepcopy(source[key])
         # Migrate briefs saved before area_status became explicit.
         if "area_status" not in source and source.get("area_unknown") is True:
             state["area_status"] = "unknown"

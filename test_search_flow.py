@@ -102,7 +102,7 @@ class SearchFlowStateTests(unittest.TestCase):
         save.assert_not_called()
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_valid_bangsar_continues_to_listing_search(
         self, bubble, _named_ids, _save,
@@ -157,8 +157,9 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.save_search_state")
     @patch("app.bubble")
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" and names == ["Bangsar"] else [])
     def test_unresolved_current_location_does_not_fall_back_to_saved_area(
-        self, bubble, _save,
+        self, _validated_ids, bubble, _save,
     ):
         stored = dump_search_state(apply_search_update(empty_search_state(), {
             "area_status": "known", "areas": ["Bangsar"],
@@ -220,8 +221,9 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.save_search_state")
     @patch("app.bubble")
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" and names == ["Bangsar"] else [])
     def test_existing_valid_persisted_area_remains_canonical(
-        self, bubble, _save,
+        self, _validated_ids, bubble, _save,
     ):
         stored = dump_search_state(apply_search_update(empty_search_state(), {
             "area_status": "known", "areas": ["Bangsar"],
@@ -553,8 +555,9 @@ class SearchFlowStateTests(unittest.TestCase):
     @patch("app.save_search_state")
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" and names == ["Bangsar"] else [])
     def test_just_recommend_uses_saved_context_and_customer_reaction(
-        self, mocked_bubble, mocked_recommend, _mocked_save
+        self, _validated_ids, mocked_bubble, mocked_recommend, _mocked_save
     ):
         stored = set_recommended_condos(
             complete_state(), ["One Menerung", "The Loft"]
@@ -1657,8 +1660,9 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.save_search_state")
     @patch("app.bubble")
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" and names == ["Bangsar"] else [])
     def test_show_matches_does_not_promote_shortlist_to_active_scope(
-        self, mocked_bubble, _mocked_save
+        self, _validated_ids, mocked_bubble, _mocked_save
     ):
         stored = set_recommended_condos(
             complete_state(), ["One Menerung", "Ken Bangsar", "The Loft"]
@@ -1747,7 +1751,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertNotIn("I'll pull", instructions)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
     def test_budget_followup_recommends_now_and_retains_furnishing(
@@ -1777,7 +1781,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(_mocked_save.call_args.args[3]["budgetRent"], 15000)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
     def test_clear_area_refinement_continues_recommending_without_questions(
@@ -1844,7 +1848,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(payload["bedroomsMin"], 4)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_initial_core_requirements_capture_and_ask_only_for_budget(
         self, mocked_bubble, _mocked_resolve, mocked_save
@@ -1864,7 +1868,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(lead_fields["Geo"], ["geo-bangsar"])
 
     @patch("app.requests.patch")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_multiple_structured_requirements_are_persisted_without_llm_rewrite(
         self, mocked_bubble, _mocked_resolve, mocked_patch
@@ -1923,8 +1927,9 @@ class SearchFlowStateTests(unittest.TestCase):
     @patch("app.save_search_state")
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-bangsar"] if kind == "geo" and names == ["Bangsar"] else [])
     def test_complete_brief_recommends_condos_before_inventory(
-        self, mocked_bubble, mocked_recommend, _mocked_save
+        self, _validated_ids, mocked_bubble, mocked_recommend, _mocked_save
     ):
         mocked_bubble.side_effect = [
             {"lead": "lead-1"}, {"searchBriefJSON": json.dumps(complete_state())}
@@ -2005,7 +2010,7 @@ class SearchFlowStateTests(unittest.TestCase):
         )
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-klcc"] if kind == "geo" else [])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names, **_kwargs: ["geo-klcc"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_klcc_followup_keeps_cumulative_bangsar_but_replaces_active_area(
         self, mocked_bubble, _resolve, mocked_save
@@ -2034,7 +2039,7 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.get_named_object_ids")
     def test_active_area_overrides_geo_without_erasing_lead_baseline(self, resolve):
-        resolve.side_effect = lambda _base, object_type, names: (
+        resolve.side_effect = lambda _base, object_type, names, **_kwargs: (
             ["geo-klcc"] if object_type == "geo" and names == ["KLCC"] else []
         )
         active = apply_search_update(empty_search_state(), {

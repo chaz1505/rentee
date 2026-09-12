@@ -42,6 +42,7 @@ class SearchScopeTests(unittest.TestCase):
         self.lead["searchBriefJSON"] = dump_search_state(cumulative)
         if active is not None:
             self.lead["searchActive"] = dump_search_state(active)
+        return True
 
     def bubble(self, url, params=None):
         self.calls.append((url, params))
@@ -49,6 +50,8 @@ class SearchScopeTests(unittest.TestCase):
             return {"lead": "lead"}
         if "/lead/" in url:
             return dict(self.lead)
+        if "/geo/" in url:
+            return next((g for g in self.geos if g["_id"] == url.rsplit("/", 1)[1]), {})
         kind = url.rsplit("/", 1)[1]
         rows = {"geo": self.geos, "condo": self.condos, "listing": self.listings}[kind]
         for c in json.loads((params or {}).get("constraints", "[]")):
@@ -227,3 +230,180 @@ class SearchScopeTests(unittest.TestCase):
                 "Try Mont Kaira instead", "live", {"geo_names": ["Mont Kiara"]})
         result = self.advance("Try Mont Kaira instead", **update)
         self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+
+    def test_invalid_persisted_condo_removed_without_converting_to_geo(self):
+        state = self.state()
+        state.update(areas=[], selected_condos=["Damansara Heights"])
+        self.lead["searchActive"] = dump_search_state(state)
+        result = self.advance("ok check for me again")
+        self.assertEqual(result["action"], "ask")
+        self.assertEqual(result["active_state"]["selected_condos"], [])
+        self.assertEqual(result["active_state"]["areas"], [])
+        self.assertTrue(result["active_state"]["scope_needs_clarification"])
+        self.assertEqual(self.retrieve(), [])
+        self.assertFalse(any(url.endswith("/listing") for url, _ in self.calls))
+
+    def test_corrupted_state_recovers_last_explicit_snapshot(self):
+        self.advance("Try Mont Kiara", geo_names=["Mont Kiara"])
+        state = app.load_active_search_state(self.lead)
+        state.update(areas=[], selected_condos=["Damansara Heights"])
+        self.lead["searchActive"] = dump_search_state(state)
+        result = self.advance("check again", preferred_condo_names=["Damansara Heights"])
+        self.assertEqual(result["action"], "search_listings")
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+        self.assertEqual(result["active_state"]["selected_condos"], [])
+        self.assertEqual(result["active_state"]["geography_provenance"]["source"], "inherited_explicit")
+        self.assertEqual(len(self.retrieve()), 6)
+
+    def test_cumulative_provenance_recovers_but_cumulative_names_do_not(self):
+        self.advance("Try Mont Kiara", geo_names=["Mont Kiara"])
+        corrupted = self.state()
+        corrupted.update(areas=[], selected_condos=["Damansara Heights"])
+        self.lead["searchActive"] = dump_search_state(corrupted)
+        result = self.advance("check again")
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+        self.lead["searchActive"] = dump_search_state(corrupted)
+        self.lead["searchBriefJSON"] = dump_search_state(self.state())
+        result = self.advance("check again")
+        self.assertEqual(result["action"], "ask")
+        self.assertEqual(result["active_state"]["areas"], [])
+
+    def test_existing_valid_area_survives_invalid_condo_without_provenance(self):
+        state = self.state()
+        state["selected_condos"] = ["Damansara Heights"]
+        self.lead["searchActive"] = dump_search_state(state)
+        result = self.advance("check again")
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+        self.assertEqual(result["active_state"]["selected_condos"], [])
+
+    def test_unknown_persisted_entity_is_removed(self):
+        state = self.state()
+        state.update(areas=[], selected_condos=["Missing Development"])
+        self.lead["searchActive"] = dump_search_state(state)
+        result = self.advance("check again")
+        self.assertEqual(result["active_state"]["selected_condos"], [])
+        self.assertEqual(result["action"], "ask")
+
+    def adjacency(self):
+        self.geos[0]["Adjacent_geos"] = ["g2", "g3", "g2", "g0"]
+        # Exercise the exact case-sensitive Geo display field supplied by user.
+        for geo in self.geos:
+            geo["Name"] = geo.pop("name", geo.get("Name"))
+
+    def exhausted_offer(self):
+        self.adjacency()
+        with patch("app.get_plausible_listings", return_value=([], 0)):
+            return app.execute_match_lead_silently("folio", "live", "message")
+
+    def test_adjacent_relationships_are_loaded_and_deduplicated(self):
+        self.adjacency()
+        result = app.load_adjacent_geos("https://bubble.test", ["Mont Kiara"])
+        self.assertEqual(result, [{"id": "g2", "name": "Damansara Heights"},
+                                  {"id": "g3", "name": "Future District"}])
+        self.assertFalse(any(url.endswith("/condo") or url.endswith("/listing")
+                             for url, _ in self.calls))
+
+    def test_adjacency_not_read_or_applied_on_continuation(self):
+        self.adjacency()
+        self.advance("show alternatives", geo_names=["Damansara Heights"])
+        self.assertEqual(app.load_active_search_state(self.lead)["areas"], ["Mont Kiara"])
+        self.assertEqual(len(self.retrieve()), 6)
+        self.assertFalse(any("/geo/" in url for url, _ in self.calls))
+
+    def test_exhaustion_offers_but_does_not_change_scope(self):
+        text = self.exhausted_offer()
+        self.assertIn("Damansara Heights", text)
+        self.assertIn("Future District", text)
+        state = app.load_active_search_state(self.lead)
+        self.assertEqual(state["areas"], ["Mont Kiara"])
+        self.assertEqual(state["pending_broadening"]["areas"], ["Damansara Heights", "Future District"])
+
+    def test_acceptance_adds_offered_geos_and_queries_all_condos(self):
+        self.exhausted_offer()
+        result = self.advance("yes")
+        state = result["active_state"]
+        self.assertEqual(state["areas"], ["Mont Kiara", "Damansara Heights", "Future District"])
+        self.assertEqual(state["selected_condos"], [])
+        self.assertEqual(state["bedroom_requirement"], "3")
+        self.assertEqual(state["budget_rent"], "25000")
+        self.assertEqual(state["pending_broadening"], {})
+        self.assertEqual(state["geography_provenance"]["source"], "explicit_user")
+        self.assertEqual(len({l["condo"] for l in self.retrieve()}), 9)
+
+    def test_bare_yes_without_offer_does_not_broaden(self):
+        result = self.advance("yes", geo_names=["Damansara Heights"])
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+
+    def test_expired_or_different_scope_offer_is_not_accepted(self):
+        self.exhausted_offer()
+        state = app.load_active_search_state(self.lead)
+        state["pending_broadening"]["expires_at"] = 0
+        self.lead["searchActive"] = dump_search_state(state)
+        self.assertEqual(self.advance("yes")["active_state"]["areas"], ["Mont Kiara"])
+        self.exhausted_offer()
+        state = app.load_active_search_state(self.lead)
+        state["areas"] = ["Bangsar"]
+        self.lead["searchActive"] = dump_search_state(state)
+        self.assertEqual(self.advance("yes")["active_state"]["areas"], ["Bangsar"])
+
+    def test_named_switch_does_not_require_adjacency_and_clears_offer(self):
+        self.exhausted_offer()
+        result = self.advance("try Bangsar instead", geo_names=["Bangsar"])
+        self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
+        self.assertEqual(result["active_state"]["pending_broadening"], {})
+        self.assertEqual(self.advance("yes")["active_state"]["areas"], ["Bangsar"])
+
+    def test_invalid_direct_match_scope_cannot_override_recovered_state(self):
+        self.advance("Try Mont Kiara", geo_names=["Mont Kiara"])
+        state = app.load_active_search_state(self.lead)
+        state.update(areas=[], selected_condos=["Damansara Heights"])
+        self.lead["searchActive"] = dump_search_state(state)
+        with patch("app.get_plausible_listings", return_value=([], 0)) as retrieve:
+            app.execute_match_lead_silently("folio", "live", "message", ["Damansara Heights"])
+        self.assertIsNone(retrieve.call_args.args[2])
+        self.assertEqual(retrieve.call_args.args[1]["Geo"], ["g0"])
+
+    def test_provenance_snapshots_are_not_mutated_by_loading(self):
+        self.advance("Try Mont Kiara", geo_names=["Mont Kiara"])
+        state = app.load_active_search_state(self.lead)
+        copy = app.load_search_state(state)
+        copy["geography_provenance"]["last_explicit"]["areas"].append("Bangsar")
+        self.assertEqual(state["geography_provenance"]["last_explicit"]["areas"], ["Mont Kiara"])
+
+    def test_matches_reach_ranking_without_loading_adjacency(self):
+        self.adjacency()
+        with patch("app.get_relationship_names", return_value={}), patch("app.load_adjacent_geos") as adjacent:
+            flow = app.match_lead("folio", "live", "message")
+            self.assertEqual(next(flow), "Checking your preferences...")
+            self.assertEqual(next(flow), "Searching available properties...")
+            self.assertEqual(next(flow), "Ranking the best matches...")
+            adjacent.assert_not_called()
+            flow.close()
+
+    def test_intervening_search_turn_invalidates_offer(self):
+        self.exhausted_offer()
+        self.advance("budget 15k", budget_rent=15000)
+        result = self.advance("yes")
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+
+    def test_model_only_update_cannot_replace_recorded_explicit_scope(self):
+        self.advance("Try Mont Kiara", geo_names=["Mont Kiara"])
+        result = app.advance_property_search("folio", "live", {
+            "geo_names": ["Damansara Heights"], "search_listings": True})
+        self.assertEqual(result["active_state"]["areas"], ["Mont Kiara"])
+
+    def test_failed_offer_persistence_does_not_request_ambiguous_acceptance(self):
+        self.adjacency()
+        with patch("app.save_property_search_state", return_value=False):
+            text = app.offer_adjacent_search(self.lead, "lead", "folio", "https://bubble.test",
+                                             app.load_active_search_state(self.lead))
+        self.assertNotIn("Damansara Heights", text)
+
+    def test_lookup_failure_preserves_location_and_recovers_after_outage(self):
+        state = self.state()
+        with patch("app.bubble", side_effect=app.requests.ConnectionError("offline")):
+            validated = app.validate_active_search_state(state, self.lead, "https://bubble.test")
+        self.assertEqual(validated["areas"], ["Mont Kiara"])
+        self.assertTrue(validated["scope_needs_clarification"])
+        self.lead["searchActive"] = dump_search_state(validated)
+        self.assertFalse(app.load_active_search_state(self.lead, "https://bubble.test")["scope_needs_clarification"])

@@ -149,3 +149,20 @@ Known fields:
 
 lead
 folioItems
+
+## Geo
+
+| API field | Type | Source / use |
+|---|---|---|
+| Name | text | User-specified Geo display field. Existing readers also support legacy `name` records. |
+| Adjacent_geos | list of Geo relationships | Exact case-sensitive key supplied by the user for the populated Bubble field. Read only to offer broader scope after current-scope exhaustion. |
+
+## Condo
+
+| API field | Type | Source / use |
+|---|---|---|
+| Geo | Geo relationship | User-confirmed relationship; existing `get_geo_condo_ids` queries this exact key. |
+
+Field verification: these spellings follow the supplied Bubble schema and existing access patterns. No authenticated live schema response was available in the development environment during this change. Do not infer adjacency from coordinates or replace `Adjacent_geos` with a Python map.
+
+Search memory stored in Lead.searchActive and Lead.searchBriefJSON now preserves `geography_provenance` (explicit source, user evidence and last explicit area/Condo snapshot). `pending_broadening` is a separate one-use offer bound to the Folio and current scope, expiring after 15 minutes; it does not constrain retrieval until accepted. `scope_needs_clarification` prevents a removed invalid-only scope from becoming an unrestricted Listing query. These are JSON members, not new Bubble columns.
