@@ -230,6 +230,58 @@ class SearchScopeTests(unittest.TestCase):
         self.assertEqual(final["bedroom_requirement"], "3")
         self.assertEqual(final["budget_buy"], "7000000")
 
+    def test_how_about_condo_replaces_active_condo_and_inherits_transaction(self):
+        state = self.state()
+        state.update(areas=[], selected_condos=["Rhombus"],
+                     recommended_condos=["Rhombus"], transaction_type="buy")
+        self.lead["searchActive"] = dump_search_state(state)
+        self.condos.extend([
+            {"_id": "rhombus", "name": "Rhombus", "Geo": "g0"},
+            {"_id": "one-menerung", "name": "One Menerung", "Geo": "g0"},
+        ])
+        prepared = app.prepare_advance_property_search_args(
+            "How about One Menerung", "live", {}, {
+                "action": "advance_property_search", "geo_names": [],
+                "condo_names": ["One Menerung"], "mentions": [],
+            }
+        )
+        final = app.advance_property_search("folio", "live", prepared)["active_state"]
+        self.assertEqual(final["selected_condos"], ["One Menerung"])
+        self.assertEqual(final["transaction_type"], "buy")
+
+    def test_there_resolves_only_one_last_explicit_grounded_scope(self):
+        state = self.state()
+        state.update(areas=[], selected_condos=["One Menerung"],
+                     recommended_condos=["One Menerung"], transaction_type="buy",
+                     geography_provenance={
+                         "source": "explicit_user", "evidence": "How about One Menerung",
+                         "last_explicit": {"areas": [], "condos": ["One Menerung"]},
+                     })
+        self.lead["searchActive"] = dump_search_state(state)
+        self.condos.append({"_id": "one-menerung", "name": "One Menerung", "Geo": "g0"})
+        routing = app.resolve_recent_search_referent(
+            "Ok what have you got there", "folio", "live"
+        )
+        self.assertEqual(routing["condo_names"], ["One Menerung"])
+        prepared = app.prepare_advance_property_search_args(
+            "Ok what have you got there", "live", {
+                "preferred_condo_names": ["Wrong model condo"],
+                "bedrooms_min": 4, "budget_buy": 7000000,
+            }, routing
+        )
+        final = app.advance_property_search("folio", "live", prepared)["active_state"]
+        self.assertEqual(final["selected_condos"], ["One Menerung"])
+        self.assertEqual(final["bedroom_requirement"], "3")
+        self.assertEqual(final["budget_buy"], "")
+
+        state["geography_provenance"]["last_explicit"] = {
+            "areas": ["Bangsar"], "condos": ["One Menerung"],
+        }
+        self.lead["searchActive"] = dump_search_state(state)
+        self.assertIsNone(app.resolve_recent_search_referent(
+            "What have you got there", "folio", "live"
+        ))
+
     def test_continuations_ignore_invented_constraints(self):
         for message in ("Yes see alternatives", "anything else?", "more options", "show me more",
                         "what else have you got?", "any others?", "other options?", "continue please"):

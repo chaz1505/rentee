@@ -563,6 +563,17 @@ class SearchFlowStateTests(unittest.TestCase):
             "try Bukit Tunku", ambiguous, "folio", "live"
         )[0])
 
+        condo_refinement = {
+            "action": "get_condo_info", "geo_names": [],
+            "condo_names": ["One Menerung"], "mentions": [{
+                "resolved_type": "condo", "routing_type": "condo",
+            }],
+        }
+        active.return_value = True
+        self.assertTrue(app_module.property_search_fast_path_decision(
+            "How about One Menerung", condo_refinement, "folio", "live"
+        )[0])
+
     def test_routing_extracts_multiple_geos_in_mention_order_and_safe_alias(self):
         records = {
             "geo": [

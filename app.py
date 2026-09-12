@@ -464,7 +464,7 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
         r"\b(try|check|how about|instead|again|switch|change (?:to|the area))\b", text
     ))
     if not pending_acceptance and not requirement_refinement and routing.get("action") != "advance_property_search" and not (
-        routing.get("action") == "area_information" and substitution
+        routing.get("action") in {"area_information", "get_condo_info"} and substitution
     ):
         return False, "non_search_action", False
     inherited_from_active = False
@@ -487,6 +487,42 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
         if not inherited_from_active:
             return False, "no_active_search", False
     return True, None, inherited_from_active
+
+
+def resolve_recent_search_referent(message, folio_id, bubble_env):
+    """Resolve an inventory 'there' only from one last explicit active location."""
+    text = normalize_condo_name(message)
+    if not re.search(
+        r"\b(?:what (?:have|do) you got|what(?:'s| is) available|show me what(?:'s| is)|"
+        r"anything|what do you have) there\b", text
+    ) or not folio_id:
+        return None
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    lead_id = folio.get("lead")
+    if not lead_id:
+        return None
+    state = load_active_search_state(
+        bubble(f"{base_url}/obj/lead/{lead_id}"), base_url
+    )
+    snapshot = state["geography_provenance"].get("last_explicit") or {}
+    condos = _unique_search_values(snapshot.get("condos") or [])
+    areas = _unique_search_values(snapshot.get("areas") or [])
+    if len(condos) + len(areas) != 1:
+        print("[REFERENT RESOLUTION] token='there' status=ambiguous_or_missing", flush=True)
+        return None
+    kind, names = ("condo", condos) if condos else ("geo", areas)
+    name = names[0]
+    print(f"[REFERENT RESOLUTION] token='there' resolved_type={kind!r} "
+          f"resolved_name={name!r} source='immediately_previous_grounded_entity'", flush=True)
+    return {
+        "mentions": [{"text": "there", "resolved_type": kind,
+                      "routing_type": kind, "source": "recent_search_referent"}],
+        "action": "advance_property_search",
+        "geo_names": names if kind == "geo" else [],
+        "condo_names": names if kind == "condo" else [],
+        "referent_evidence": True,
+    }
 
 
 INTERNAL_ORCHESTRATION_FIELDS = frozenset({
@@ -5320,6 +5356,7 @@ def grounded_search_update(message, update):
     for field in ("geo_names", "preferred_condo_names"):
         values = [value for value in update.get(field, [])
                   if re.search(rf"(?<!\w){re.escape(normalize_condo_name(value))}(?!\w)", text)
+                  or value in (update.get("_referent_evidence_values") or [])
                   or (field == "geo_names"
                       and normalize_condo_name(value) == "damansara heights"
                       and re.search(r"(?<!\w)damansara(?!\s+heights\b)(?!\w)", text))]
@@ -6703,6 +6740,10 @@ def prepare_advance_property_search_args(
             if item["resolved_type"] == "ambiguous"
             and item["routing_type"] != "ambiguous"
         }
+        if entity_routing.get("referent_evidence"):
+            prepared["_referent_evidence_values"] = list(
+                entity_routing["geo_names"] + entity_routing["condo_names"]
+            )
     prepared["_user_message"] = user_message
     return prepared
 
@@ -6729,6 +6770,22 @@ def execute_prepared_property_search(
         output = str(matching_result)
     else:
         output = search_result["text"]
+    active = search_result.get("active_state") or empty_search_state()
+    executed_search = {
+        "transaction": active.get("transaction_type") or None,
+        "property_types": active.get("property_types") or [],
+        "areas": active.get("areas") or [],
+        "condos": active.get("selected_condos") or [],
+        "bedrooms_min": _as_number(active.get("bedroom_requirement")),
+        "budget_rent": _as_number(active.get("budget_rent")),
+        "budget_buy": _as_number(active.get("budget_buy")),
+        "result_count": len(recommendations),
+    }
+    print("[EXECUTED SEARCH] " + " ".join(
+        f"{key}={value!r}" for key, value in executed_search.items()
+    ), flush=True)
+    output = (str(output) + "\n\nAuthoritative executed search: "
+              + json.dumps(executed_search, ensure_ascii=False))
     return {
         "output": output,
         "instructions": (
@@ -7146,6 +7203,15 @@ def chat_stream():
                 # Every model round is buffered until its completed response proves that
                 # no function call follows. This prevents orchestration prose from leaking.
                 entity_routing = resolve_property_routing(message, bubble_env)
+                if not entity_routing.get("mentions"):
+                    try:
+                        referent_routing = resolve_recent_search_referent(
+                            message, folio_id, bubble_env
+                        )
+                    except Exception:
+                        referent_routing = None
+                    if referent_routing:
+                        entity_routing = referent_routing
                 if entity_routing["action"] == "clarify":
                     names = [item["text"] for item in entity_routing["mentions"]
                              if item["routing_type"] == "ambiguous"]
