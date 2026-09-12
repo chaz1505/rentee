@@ -70,7 +70,7 @@ CORS(
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
-# Temporary small batch for validating the end-to-end matching flow.
+# Keep the qualitative reranker small after deterministic factual pre-ranking.
 RANKING_CANDIDATE_LIMIT = 12
 RANKING_RECOMMENDATION_MAX = 6
 RANKING_RECOMMENDATION_MIN = 4
@@ -3545,24 +3545,50 @@ def get_plausible_listings(
             if not requirements["geo_ids"]:
                 return [], 0
     geo_condo_ids = []
-    if requirements["geo_ids"] and not resolved_condo_ids:
-        geo_condo_ids = get_geo_condo_ids(base_url, requirements["geo_ids"])
-        if not geo_condo_ids:
-            print("[LISTING SCOPE] status=empty_geo query_skipped=True", flush=True)
-            return [], 0
-    effective_ids = resolved_condo_ids or geo_condo_ids
-    plan = build_listing_bubble_constraints(requirements, effective_ids)
-    validation_lead = dict(lead)
-    if effective_ids:
-        validation_lead["preferredCondos"] = effective_ids
+    query_branches = []
+    requested_home_types = set(
+        _normalized_home_property_types(requirements["property_types"])
+    )
+    if resolved_condo_ids:
+        plan = build_listing_bubble_constraints(requirements, resolved_condo_ids)
+        validation_lead = dict(lead)
+        validation_lead["preferredCondos"] = resolved_condo_ids
         validation_lead["Geo"] = []
+        query_branches.append(("condo", plan, validation_lead))
+    elif requirements["geo_ids"]:
+        if not requested_home_types or "Condo" in requested_home_types:
+            geo_condo_ids = get_geo_condo_ids(base_url, requirements["geo_ids"])
+            if geo_condo_ids:
+                condo_requirements = dict(requirements)
+                condo_requirements["property_types"] = ["Condo"]
+                condo_plan = build_listing_bubble_constraints(
+                    condo_requirements, geo_condo_ids
+                )
+                condo_lead = dict(lead)
+                condo_lead["_active_property_types"] = ["Condo"]
+                condo_lead["preferredCondos"] = geo_condo_ids
+                condo_lead["Geo"] = []
+                query_branches.append(("condo", condo_plan, condo_lead))
+        if not requested_home_types or "Landed" in requested_home_types:
+            landed_requirements = dict(requirements)
+            landed_requirements["property_types"] = ["Landed"]
+            landed_requirements["preferred_condo_ids"] = []
+            landed_plan = build_listing_bubble_constraints(landed_requirements)
+            landed_lead = dict(lead)
+            landed_lead["_active_property_types"] = ["Landed"]
+            landed_lead["preferredCondos"] = []
+            query_branches.append(("landed", landed_plan, landed_lead))
+    else:
+        query_branches.append((
+            "unrestricted", build_listing_bubble_constraints(requirements), dict(lead)
+        ))
     print(
         f"[LISTING SCOPE] requested_area_names={lead.get('_requested_areas', [])!r} "
         f"resolved_geo_ids={requirements['geo_ids']!r} "
         f"requested_condo_names={condo_scope or lead.get('_requested_condos', [])!r} "
         f"explicit_condo_ids={resolved_condo_ids!r} geo_condo_ids={geo_condo_ids!r} "
-        f"effective_condo_ids={effective_ids!r} "
-        f"effective_scope={'condo' if resolved_condo_ids else 'geo' if geo_condo_ids else 'unrestricted'}",
+        f"effective_scope={'condo' if resolved_condo_ids else 'geo' if requirements['geo_ids'] else 'unrestricted'} "
+        f"property_types={sorted(requested_home_types) or ['Condo', 'Landed']!r}",
         flush=True,
     )
 
@@ -3599,44 +3625,54 @@ def get_plausible_listings(
         f"[LISTING QUERY] budget_rent={requirements['budget_rent']!r} "
         f"budget_buy={requirements['budget_buy']!r}", flush=True,
     )
-    print(f"[LISTING QUERY] bubble_constraints={plan['queries']!r}", flush=True)
-    print(f"[LISTING QUERY] python_only_filters={plan['python_only_filters']!r}", flush=True)
     print("[LISTING QUERY] mode=structured_bubble_query", flush=True)
-    if not effective_ids:
+    if not resolved_condo_ids and not requirements["geo_ids"]:
         print("[LISTING QUERY] scope=unrestricted reason=no_location_constraints", flush=True)
 
-    for constraints in plan["queries"]:
-        cursor = 0
-        seen_cursors = set()
-        while cursor not in seen_cursors and (cursor == 0 or len(plausible) < target):
-            seen_cursors.add(cursor)
-            params = {"cursor": cursor}
-            if constraints:
-                params["constraints"] = json.dumps(constraints, separators=(",", ":"))
-            page = bubble(f"{base_url}/obj/listing", params=params)
-            raw_results = page.get("results", []) or []
-            pages += 1
-            fetched += len(raw_results)
-            results = []
-            for listing in raw_results:
-                listing_id = str(listing.get("_id") or "")
-                if listing_id and (
-                    listing_id in seen_listing_ids
-                    or listing_id in lead.get("_excluded_listing_ids", ())
-                ):
-                    continue
-                if listing_id:
-                    seen_listing_ids.add(listing_id)
-                results.append(listing)
-            page_plausible, page_counts = shortlist_structured_listings(
-                validation_lead, results, return_counts=True
-            )
-            plausible.extend(page_plausible)
-            for key in filter_counts:
-                filter_counts[key] += page_counts[key]
-            if not raw_results or not page.get("remaining"):
-                break
-            cursor += len(raw_results)
+    for branch, plan, validation_lead in query_branches:
+        print(
+            f"[LISTING QUERY] branch={branch} "
+            f"geo_condo_ids={geo_condo_ids!r} "
+            f"geo_ids={requirements['geo_ids']!r} "
+            f"bubble_constraints={plan['queries']!r}", flush=True,
+        )
+        print(
+            f"[LISTING QUERY] branch={branch} "
+            f"python_only_filters={plan['python_only_filters']!r}", flush=True,
+        )
+        for constraints in plan["queries"]:
+            cursor = 0
+            seen_cursors = set()
+            while cursor not in seen_cursors and (cursor == 0 or len(plausible) < target):
+                seen_cursors.add(cursor)
+                params = {"cursor": cursor}
+                if constraints:
+                    params["constraints"] = json.dumps(constraints, separators=(",", ":"))
+                page = bubble(f"{base_url}/obj/listing", params=params)
+                raw_results = page.get("results", []) or []
+                pages += 1
+                fetched += len(raw_results)
+                results = []
+                for listing in raw_results:
+                    listing_id = str(listing.get("_id") or "")
+                    if listing_id and (
+                        listing_id in seen_listing_ids
+                        or listing_id in lead.get("_excluded_listing_ids", ())
+                    ):
+                        continue
+                    if listing_id:
+                        seen_listing_ids.add(listing_id)
+                    results.append(listing)
+                page_plausible, page_counts = shortlist_structured_listings(
+                    validation_lead, results, return_counts=True
+                )
+                plausible.extend(page_plausible)
+                for key in filter_counts:
+                    filter_counts[key] += page_counts[key]
+                if not raw_results or not page.get("remaining"):
+                    break
+                cursor += len(raw_results)
+    print(f"[LISTING QUERY] merged_fetched={fetched}", flush=True)
     print(f"[LISTING QUERY] pages={pages} fetched={fetched}", flush=True)
     print(
         "[LISTING FILTER] "
@@ -4395,7 +4431,6 @@ def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
         requirements["budget_buy"] if modes == {"buy"}
         else requirements["budget_rent"]
     )
-    bedrooms_min = requirements["bedrooms_min"]
     furnishing_preference = normalize_condo_name(requirements["furnishing_preference"])
     preferred_condos = {str(value) for value in requirements["preferred_condo_ids"]}
 
@@ -4429,12 +4464,9 @@ def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
         price = _as_number(
             listing.get("priceSale") if modes == {"buy"} else listing.get("priceRent")
         )
-        beds = _as_number(listing.get("beds"))
-        # Exact bedrooms lead; each additional bedroom is a modest trade-off.
-        bedroom_penalty = (
-            max(0.0, beds - bedrooms_min) * 0.18
-            if beds is not None and bedrooms_min is not None else 0.08
-        )
+        # Bedroom count is a hard minimum upstream. Every surviving count is
+        # neutral here, including missing data, which completeness handles.
+        bedroom_penalty = 0.0
         # Aim near 90% of budget: close to the requested tier with room for value.
         budget_penalty = (
             abs((price / target_budget) - 0.9)
@@ -5663,6 +5695,7 @@ def lead_with_active_search_filters(lead, base_url, validated_state=None):
         )
         return dict(lead)
     active = dict(lead)
+    active.pop("_active_property_types", None)
     # Saved active state owns scope, including intentionally empty relationships.
     active["Geo"] = []
     active["preferredCondos"] = []
@@ -5754,14 +5787,30 @@ def advance_property_search(folio_id, bubble_env, update):
     active_source["pending_broadening"] = {}
     resolved = resolve_search_entities(base_url, update, valid_geo_names)
     if resolved["unresolved"]:
-        if active_source != load_active_search_state(lead):
-            save_property_search_state(lead_id, load_search_state(lead.get("searchBriefJSON")),
-                                       base_url, None, active_source)
+        independent_update = dict(update)
+        independent_update.update(
+            geo_names=[], preferred_condo_names=[],
+            area_update_mode="unchanged", condo_update_mode="unchanged",
+        )
+        updated_active = apply_active_search_update(
+            active_source, independent_update
+        )
+        updated_cumulative = load_search_state(lead.get("searchBriefJSON"))
+        if updated_active != active_source:
+            updated_cumulative = apply_cumulative_search_update(
+                updated_cumulative, independent_update
+            )
+            lead_fields = structured_lead_update(
+                independent_update, base_url, lead.get("TransactionType") or []
+            )
+            save_property_search_state(
+                lead_id, updated_cumulative, base_url, lead_fields, updated_active
+            )
         return {
             "action": "ask", "text": "I couldn't identify " + ", ".join(resolved["unresolved"])
             + ". Which area or condo did you mean?",
-            "state": load_search_state(lead.get("searchBriefJSON")),
-            "active_state": active_source, "lead_id": lead_id,
+            "state": updated_cumulative,
+            "active_state": updated_active, "lead_id": lead_id,
             "geo_resolution": resolved,
         }
     update["geo_names"] = resolved["areas"]
@@ -5940,10 +5989,20 @@ def _explicit_nearby_place(message):
     return None
 
 
+def _is_home_property_type_expression(value):
+    normalized = normalize_condo_name(value)
+    if normalized in {"condos", "condominiums", "apartments"}:
+        normalized = normalized[:-1]
+    return _normalized_home_property_types([normalized]) in (["Landed"], ["Condo"])
+
+
 def _explicit_property_search_location(message):
     """Extract only a location explicitly scoped by the current search request."""
     text = " ".join(str(message or "").split())
     patterns = (
+        r"\b(?:try|how about|what about)\s+"
+        r"(?:landed(?: house| homes?)?|houses?|condos?|condominiums?|apartments?)"
+        r"\s+in\s+(.+?)(?:\s+(?:then|instead))?[?.!]*$",
         r"\b(?:find|show) me\b.*?\bin\s+(.+?)(?:\s+(?:then|instead))?[?.!]*$",
         r"\bwhat (?:have|do) you got\b.*?\bin\s+(.+?)[?.!]*$",
         r"\bshow me\s+(.+?)\s+instead[?.!]*$",
@@ -5952,7 +6011,10 @@ def _explicit_property_search_location(message):
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            return " ".join(match.group(1).strip(" ,.!?").split())
+            candidate = " ".join(match.group(1).strip(" ,.!?").split())
+            if _is_home_property_type_expression(candidate):
+                return None
+            return candidate
     return None
 
 
@@ -5976,6 +6038,21 @@ def _apply_current_search_location(user_message, bubble_env, tool_args):
         )
         return updated
     candidate = _explicit_property_search_location(user_message)
+    if not candidate:
+        location_fields = ("geo_names", "preferred_condo_names")
+        if any(
+            _is_home_property_type_expression(value)
+            for field in location_fields for value in tool_args.get(field, []) or []
+        ):
+            updated = dict(tool_args)
+            for field in location_fields:
+                updated[field] = [
+                    value for value in updated.get(field, []) or []
+                    if not _is_home_property_type_expression(value)
+                ]
+            updated["area_update_mode"] = "unchanged"
+            updated["condo_update_mode"] = "unchanged"
+            tool_args = updated
     condos = resolve_condo_mentions(candidate or user_message)
     if condos:
         updated = dict(tool_args)
