@@ -5,7 +5,7 @@ import copy
 
 
 SEARCH_BRIEF_FIELDS = (
-    "areas", "property_types", "bedroom_requirement", "budget_requirement",
+    "areas", "transaction_type", "property_types", "bedroom_requirement", "budget_requirement",
     "budget_rent", "budget_buy",
     "other_requirements", "priorities",
 )
@@ -21,6 +21,7 @@ def empty_search_state():
         "regular_destinations": [],
         "area_recommendations": [],
         "property_types": [],
+        "transaction_type": "",
         "bedroom_requirement": "",
         "budget_requirement": "",
         "budget_rent": "",
@@ -50,6 +51,25 @@ def load_search_state(value):
         for key in state:
             if key in source and isinstance(source[key], type(state[key])):
                 state[key] = copy.deepcopy(source[key])
+        # Older states stored transaction tokens alongside home types. Migrate
+        # them into their own canonical field and never persist them back there.
+        raw_types = source.get("property_types", [])
+        rendered_types = " ".join(str(item).casefold() for item in raw_types)
+        migrated_modes = set()
+        if "rent" in rendered_types or "let" in rendered_types:
+            migrated_modes.add("rent")
+        if any(word in rendered_types for word in ("buy", "sale", "purchas")):
+            migrated_modes.add("buy")
+        if not state["transaction_type"] and migrated_modes:
+            state["transaction_type"] = (
+                "both" if migrated_modes == {"rent", "buy"} else next(iter(migrated_modes))
+            )
+        state["property_types"] = [
+            item for item in state["property_types"]
+            if str(item).casefold() not in {
+                "rent", "let", "rent/let", "buy", "sale", "buy/sell", "purchase", "both"
+            }
+        ]
         # Migrate briefs saved before area_status became explicit.
         if "area_status" not in source and source.get("area_unknown") is True:
             state["area_status"] = "unknown"
@@ -60,11 +80,9 @@ def load_search_state(value):
         # a purchase budget (or vice versa) after the active mode changes.
         if (source.get("budget_requirement")
                 and "budget_rent" not in source and "budget_buy" not in source):
-            rendered_types = " ".join(
-                str(item).casefold() for item in source.get("property_types", [])
-            )
-            is_rent = "rent" in rendered_types or "let" in rendered_types
-            is_buy = any(word in rendered_types for word in ("buy", "sale", "purchas"))
+            transaction = state["transaction_type"]
+            is_rent = transaction in {"rent", "both"}
+            is_buy = transaction in {"buy", "both"}
             if is_rent and not is_buy:
                 state["budget_rent"] = str(source["budget_requirement"])
             elif is_buy and not is_rent:
@@ -99,12 +117,25 @@ def apply_search_update(state, update):
         if update.get(key):
             value = _unique(update[key])
             if key == "property_types":
+                rendered = " ".join(item.casefold() for item in value)
+                modes = set()
+                if "rent" in rendered or "let" in rendered:
+                    modes.add("rent")
+                if any(word in rendered for word in ("buy", "sale", "purchas")):
+                    modes.add("buy")
+                if modes and not update.get("transaction_type"):
+                    state["transaction_type"] = (
+                        "both" if modes == {"rent", "buy"} else next(iter(modes))
+                    )
+                value = [item for item in value if item.casefold() not in {
+                    "rent", "let", "rent/let", "buy", "sale", "buy/sell", "purchase", "both"
+                }]
                 material_change |= value != state[key]
             elif value != state[key]:
                 state["area_recommendations"] = []
             state[key] = value
     for key in (
-        "bedroom_requirement", "budget_requirement", "budget_rent", "budget_buy",
+        "transaction_type", "bedroom_requirement", "budget_requirement", "budget_rent", "budget_buy",
     ):
         if str(update.get(key) or "").strip():
             value = str(update[key]).strip()
@@ -113,14 +144,9 @@ def apply_search_update(state, update):
     if update.get("budget_requirement") and not (
         update.get("budget_rent") is not None or update.get("budget_buy") is not None
     ):
-        rendered_types = " ".join(item.casefold() for item in state["property_types"])
-        if ("rent" in rendered_types or "let" in rendered_types) and not any(
-            word in rendered_types for word in ("buy", "sale", "purchas")
-        ):
+        if state["transaction_type"] == "rent":
             state["budget_rent"] = str(update["budget_requirement"]).strip()
-        elif any(word in rendered_types for word in ("buy", "sale", "purchas")) and not (
-            "rent" in rendered_types or "let" in rendered_types
-        ):
+        elif state["transaction_type"] == "buy":
             state["budget_buy"] = str(update["budget_requirement"]).strip()
 
     if update.get("other_requirements_answered"):

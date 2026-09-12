@@ -34,7 +34,7 @@ class SearchScopeTests(unittest.TestCase):
 
     def state(self, area="Mont Kiara"):
         state = empty_search_state()
-        state.update(areas=[area], area_status="known", property_types=["Condo", "rent"],
+        state.update(areas=[area], area_status="known", property_types=["Condo"], transaction_type="rent",
                      bedroom_requirement="3", budget_rent="25000", budget_requirement="25000")
         return state
 
@@ -110,7 +110,8 @@ class SearchScopeTests(unittest.TestCase):
                               budget_buy=7000000, geo_names=["Bangsar"])
         active = result["active_state"]
         self.assertEqual(active["areas"], ["Mont Kiara"])
-        self.assertEqual(active["property_types"], ["Condo", "rent"])
+        self.assertEqual(active["property_types"], ["Condo"])
+        self.assertEqual(active["transaction_type"], "rent")
         self.assertEqual(active["budget_rent"], "25000")
         self.assertEqual(active["budget_buy"], "")
         self.assertEqual(active["bedroom_requirement"], "3")
@@ -130,7 +131,8 @@ class SearchScopeTests(unittest.TestCase):
             )
         active = result["active_state"]
         self.assertEqual(active["areas"], ["Damansara Heights", "Sri Hartamas"])
-        self.assertEqual(active["property_types"], ["Landed", "rent"])
+        self.assertEqual(active["property_types"], ["Landed"])
+        self.assertEqual(active["transaction_type"], "rent")
         self.assertEqual(active["budget_rent"], "25000")
         self.assertEqual(active["budget_buy"], "0")
 
@@ -149,7 +151,7 @@ class SearchScopeTests(unittest.TestCase):
         )
         first = app.advance_property_search("folio", "live", prepared)
         self.assertEqual(first["active_state"]["selected_condos"], [condo_name])
-        self.assertIn(transaction, first["active_state"]["property_types"])
+        self.assertEqual(first["active_state"]["transaction_type"], transaction)
         return first
 
     def test_fresh_buy_condo_search_is_inherited_by_budget_bedroom_turn(self):
@@ -162,7 +164,7 @@ class SearchScopeTests(unittest.TestCase):
             bedrooms_min=3, preferred_condo_names=["Rhombus"],
         )["active_state"]
         self.assertEqual(final["selected_condos"], ["Rhombus"])
-        self.assertIn("buy", final["property_types"])
+        self.assertEqual(final["transaction_type"], "buy")
         self.assertEqual(final["bedroom_requirement"], "3")
         self.assertEqual(final["budget_buy"], "7000000")
         lead = app.lead_with_active_search_filters(self.lead, "https://bubble.test")
@@ -191,13 +193,13 @@ class SearchScopeTests(unittest.TestCase):
             bedrooms_min=3, preferred_condo_names=["One Menerung"],
         )["active_state"]
         self.assertEqual(final["selected_condos"], ["One Menerung"])
-        self.assertIn("rent", final["property_types"])
+        self.assertEqual(final["transaction_type"], "rent")
         self.assertEqual(final["bedroom_requirement"], "3")
         self.assertEqual(final["budget_rent"], "15000")
 
     def test_bedroom_only_refinement_inherits_condo_transaction_and_budget(self):
         state = self.state()
-        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo", "buy"],
+        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo"], transaction_type="buy",
                      bedroom_requirement="3", budget_buy="7000000",
                      budget_rent="", budget_requirement="7000000")
         self.lead["searchActive"] = dump_search_state(state)
@@ -206,13 +208,14 @@ class SearchScopeTests(unittest.TestCase):
             budget_rent=1000, preferred_condo_names=["Wrong Condo"],
         )["active_state"]
         self.assertEqual(final["selected_condos"], ["Arcoris"])
-        self.assertEqual(final["property_types"], ["Condo", "buy"])
+        self.assertEqual(final["property_types"], ["Condo"])
+        self.assertEqual(final["transaction_type"], "buy")
         self.assertEqual(final["bedroom_requirement"], "4")
         self.assertEqual(final["budget_buy"], "7000000")
 
     def test_explicit_condo_switch_inherits_other_authoritative_filters(self):
         state = self.state()
-        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo", "buy"],
+        state.update(selected_condos=["Arcoris"], areas=[], property_types=["Condo"], transaction_type="buy",
                      bedroom_requirement="3", budget_buy="7000000",
                      budget_rent="", budget_requirement="7000000")
         self.lead["searchActive"] = dump_search_state(state)
@@ -222,7 +225,8 @@ class SearchScopeTests(unittest.TestCase):
             transaction_type="rent", budget_rent=1000,
         )["active_state"]
         self.assertEqual(final["selected_condos"], ["One Menerung"])
-        self.assertEqual(final["property_types"], ["Condo", "buy"])
+        self.assertEqual(final["property_types"], ["Condo"])
+        self.assertEqual(final["transaction_type"], "buy")
         self.assertEqual(final["bedroom_requirement"], "3")
         self.assertEqual(final["budget_buy"], "7000000")
 
@@ -443,7 +447,7 @@ class SearchScopeTests(unittest.TestCase):
 
     def test_explicit_pending_offer_wording_adds_areas_once(self):
         self.exhausted_offer()
-        result = self.advance("ok check those areas as well")
+        result = self.advance("Yes ok")
         self.assertEqual(
             result["active_state"]["areas"],
             ["Mont Kiara", "Damansara Heights", "Future District"],
@@ -451,6 +455,32 @@ class SearchScopeTests(unittest.TestCase):
         self.assertEqual(result["active_state"]["pending_broadening"], {})
         repeated = self.advance("check those areas")
         self.assertEqual(repeated["active_state"]["areas"], result["active_state"]["areas"])
+
+    def test_explicit_transaction_and_budget_refinements_use_active_context(self):
+        state = self.state("Bangsar")
+        state.update(property_types=["Landed"], transaction_type="buy",
+                     budget_buy="", budget_rent="")
+        self.lead["searchActive"] = dump_search_state(state)
+        prepared = app.prepare_advance_property_search_args(
+            "Landed in Bangsar - 6m", "live", {}, {
+                "action": "advance_property_search", "geo_names": ["Bangsar"],
+                "condo_names": [], "mentions": [],
+            }
+        )
+        bought = app.advance_property_search("folio", "live", prepared)["active_state"]
+        self.assertEqual(bought["transaction_type"], "buy")
+        self.assertEqual(bought["budget_buy"], "6000000")
+        rented = app.advance_property_search("folio", "live",
+            app.prepare_advance_property_search_args(
+                "What about rentals", "live", {"search_listings": True}
+            ))["active_state"]
+        self.assertEqual(rented["transaction_type"], "rent")
+        rent_budget = app.advance_property_search("folio", "live",
+            app.prepare_advance_property_search_args(
+                "Try 20k", "live", {"search_listings": True}
+            ))["active_state"]
+        self.assertEqual(rent_budget["budget_rent"], "20000")
+        self.assertEqual(rent_budget["areas"], ["Bangsar"])
 
     def test_expired_pending_offer_wording_does_not_add_areas(self):
         self.exhausted_offer()
@@ -568,7 +598,8 @@ class SearchScopeTests(unittest.TestCase):
         state = app.load_active_search_state(self.lead)
         self.assertEqual(state["areas"], ["Damansara Heights"])
         self.assertEqual(state["selected_condos"], [])
-        self.assertEqual(state["property_types"], ["Condo", "rent"])
+        self.assertEqual(state["property_types"], ["Condo"])
+        self.assertEqual(state["transaction_type"], "rent")
         self.assertEqual(state["bedroom_requirement"], "3")
         self.assertEqual(state["budget_rent"], "25000")
 

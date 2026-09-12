@@ -407,6 +407,7 @@ def _folio_has_active_property_search(folio_id, bubble_env):
     state = load_search_state(raw)
     return bool(
         state["areas"] or state["selected_condos"] or state["property_types"]
+        or state["transaction_type"]
         or state["bedroom_requirement"] or state["budget_requirement"]
         or state["budget_rent"] or state["budget_buy"]
     )
@@ -436,6 +437,7 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
     if any(item.get("resolved_type") == "ambiguous" for item in routing.get("mentions", [])):
         return False, "ambiguous_entity", False
     pending_acceptance = False
+    requirement_refinement = _explicit_search_refinement(message)
     if not routing.get("mentions") or not (
         routing.get("geo_names") or routing.get("condo_names")
     ):
@@ -445,7 +447,7 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
             )
         except Exception:
             pending_acceptance = False
-        if not pending_acceptance:
+        if not pending_acceptance and not requirement_refinement:
             return False, "no_authoritative_entity", False
     if (_requires_location_comparison_tool(message)
             or _requires_nearby_places_tool(message)
@@ -461,13 +463,20 @@ def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
     substitution = bool(re.search(
         r"\b(try|check|how about|instead|again|switch|change (?:to|the area))\b", text
     ))
-    if not pending_acceptance and routing.get("action") != "advance_property_search" and not (
+    if not pending_acceptance and not requirement_refinement and routing.get("action") != "advance_property_search" and not (
         routing.get("action") == "area_information" and substitution
     ):
         return False, "non_search_action", False
     inherited_from_active = False
     if pending_acceptance:
         inherited_from_active = True
+    elif requirement_refinement and not (routing.get("geo_names") or routing.get("condo_names")):
+        try:
+            inherited_from_active = _folio_has_active_property_search(folio_id, bubble_env)
+        except Exception:
+            return False, "active_search_lookup_failed", False
+        if not inherited_from_active:
+            return False, "no_active_search", False
     elif substitution and not explicit_inventory:
         try:
             inherited_from_active = _folio_has_active_property_search(
@@ -5231,7 +5240,7 @@ def grounded_search_update(message, update):
         result["area_update_mode"] = "unchanged"
         result["condo_update_mode"] = "unchanged"
     evidence = {
-        "transaction_type": r"\b(rent|renting|rental|let|buy|buying|purchase|purchasing|sale)\b",
+        "transaction_type": r"\b(rent|renting|rentals?|lease|leasing|let|buy|buying|purchase|purchasing|sale)\b",
         "property_types": r"\b(landed|houses?|condos?|condominiums?|apartments?)\b",
         "bedrooms_min": r"\b(beds?|bedrooms?|br)\b",
         "budget": r"\b(budget|rm|myr|price|under|below|maximum|max)\b|\d\s*[km]\b",
@@ -5698,10 +5707,11 @@ def broadening_accepted(message, offer, state, folio_id):
         return False
     text = normalize_condo_name(message).strip(" .!")
     patterns = (
-        r"(?:yes|yeah|yep|sure|ok|okay|go ahead|please do)(?:[, ]+(?:please|go ahead))?",
+        r"(?:yes|yeah|yep|sure|ok|okay|go ahead|please do)(?:[, ]+(?:yes|ok|okay|please|go ahead))?",
         r"(?:(?:yes|yeah|yep|sure|ok|okay)\s+)?(?:check|try|include|search)\s+"
         r"(?:those|them|those areas|the nearby areas)(?:\s+(?:as well|too))?",
         r"(?:(?:yes|yeah|yep|sure|ok|okay)\s+)?broaden(?:\s+(?:it|the search))?",
+        r"all those areas(?:\b.*)?",
     )
     return any(re.fullmatch(pattern, text) for pattern in patterns)
 
@@ -5813,9 +5823,7 @@ def apply_active_search_update(active_state, update):
     state = load_search_state(
         empty_search_state() if update.get("new_search") else active_state
     )
-    state["property_types"] = _normalized_search_property_types(
-        state["property_types"]
-    )
+    state["property_types"] = _normalized_home_property_types(state["property_types"])
     previous_areas = list(state["areas"])
     geo_names = update.get("geo_names") or []
     area_mode = update.get("area_update_mode")
@@ -5848,7 +5856,7 @@ def apply_active_search_update(active_state, update):
     if relevant_budget is not None:
         scalar_update["budget_requirement"] = str(relevant_budget)
     transaction = scalar_update.get("transaction_type")
-    prior_modes = _transaction_modes(state["property_types"])
+    prior_modes = _transaction_modes(state["transaction_type"])
     incoming_modes = _transaction_modes(transaction)
     if incoming_modes == {"buy"}:
         state["budget_rent"] = ""
@@ -5858,25 +5866,14 @@ def apply_active_search_update(active_state, update):
             and relevant_budget is None):
         state["budget_requirement"] = ""
     incoming_property_types = _unique_search_values(
-        _normalized_search_property_types(
-            scalar_update.get("property_types") or []
-        )
+        _normalized_home_property_types(scalar_update.get("property_types") or [])
     )
-    existing_transaction_types = [
-        value for value in state["property_types"]
-        if value.casefold() in {"rent", "buy", "both"}
-    ]
-    existing_home_types = [
-        value for value in state["property_types"]
-        if value.casefold() not in {"rent", "buy", "both"}
-    ]
     if transaction and transaction != "unchanged":
-        scalar_update["property_types"] = _unique_search_values(
-            (incoming_property_types or existing_home_types) + [transaction]
-        )
-    elif incoming_property_types:
-        scalar_update["property_types"] = _unique_search_values(
-            incoming_property_types + existing_transaction_types
+        scalar_update["transaction_type"] = transaction
+    if incoming_property_types:
+        mode = scalar_update.pop("property_type_update_mode", "replace")
+        scalar_update["property_types"] = _modify_active_values(
+            state["property_types"], incoming_property_types, mode, "replace"
         )
     preserved_recommended = list(state["recommended_condos"])
     preserved_selected = list(state["selected_condos"])
@@ -5903,12 +5900,10 @@ def apply_active_search_update(active_state, update):
 def apply_cumulative_search_update(cumulative_state, update):
     """Retain historical search knowledge while accepting this turn's new facts."""
     prior_state = load_search_state(cumulative_state)
-    prior_state["property_types"] = _normalized_search_property_types(
-        prior_state["property_types"]
-    )
+    prior_state["property_types"] = _normalized_home_property_types(prior_state["property_types"])
     cumulative_update = dict(update)
     if cumulative_update.get("property_types"):
-        cumulative_update["property_types"] = _normalized_search_property_types(
+        cumulative_update["property_types"] = _normalized_home_property_types(
             cumulative_update["property_types"]
         )
     new_areas = _unique_search_values(update.get("geo_names") or [])
@@ -5932,13 +5927,7 @@ def apply_cumulative_search_update(cumulative_state, update):
         cumulative_update["budget_buy"] = str(cumulative_update["budget_buy"])
     transaction = cumulative_update.get("transaction_type")
     if transaction and transaction != "unchanged":
-        home_types = [
-            value for value in (cumulative_update.get("property_types") or prior_state["property_types"])
-            if value.casefold() not in {"rent", "buy", "both"}
-        ]
-        cumulative_update["property_types"] = _unique_search_values(
-            home_types + [transaction]
-        )
+        cumulative_update["transaction_type"] = transaction
     state = apply_search_update(cumulative_state, cumulative_update)
     preferred = _unique_search_values(update.get("preferred_condo_names") or [])
     if preferred:
@@ -5957,6 +5946,20 @@ def lead_with_active_search_filters(lead, base_url, validated_state=None):
     area_resolution = resolve_geo_names(state["areas"], valid_geo_names)
     unresolved_saved_areas = bool(area_resolution["unresolved"] or state["scope_needs_clarification"])
     state["areas"] = area_resolution["resolved"]
+    state_modes = _transaction_modes(state["transaction_type"])
+    canonical_types = _normalized_home_property_types(state["property_types"])
+    valid_state = canonical_types == state["property_types"] and len(state_modes) <= 1
+    inconsistency = None
+    if state_modes == {"buy"} and state["budget_rent"] and not state["budget_buy"]:
+        inconsistency = "inconsistent_transaction_budget"
+    elif state_modes == {"rent"} and state["budget_buy"] and not state["budget_rent"]:
+        inconsistency = "inconsistent_transaction_budget"
+    print(
+        f"[SEARCH STATE VALIDATION] transaction={sorted(state_modes)!r} "
+        f"property_types={canonical_types!r} budget_rent={state['budget_rent'] or None!r} "
+        f"budget_buy={state['budget_buy'] or None!r} valid={valid_state and not inconsistency}"
+        + (f" reason={inconsistency}" if inconsistency else ""), flush=True,
+    )
     has_state_filters = bool(
         state["areas"] or state["selected_condos"]
         or state["bedroom_requirement"] or state["budget_requirement"]
@@ -5993,7 +5996,7 @@ def lead_with_active_search_filters(lead, base_url, validated_state=None):
     )
     if state["bedroom_requirement"]:
         active["bedroomsMin"] = _as_number(state["bedroom_requirement"])
-    transaction_modes = _transaction_modes(state["property_types"])
+    transaction_modes = _transaction_modes(state["transaction_type"])
     active_home_types = _normalized_home_property_types(state["property_types"])
     if active_home_types:
         active["_active_property_types"] = active_home_types
@@ -6149,7 +6152,7 @@ def advance_property_search(folio_id, bubble_env, update):
                  if key not in changes]
     print(f"[SEARCH MERGE] applied_changes={changes!r} preserved_fields={preserved!r}", flush=True)
     state_log = {
-        "transaction": sorted(_transaction_modes(active_state["property_types"])),
+        "transaction": sorted(_transaction_modes(active_state["transaction_type"])),
         "property_types": _normalized_home_property_types(active_state["property_types"]),
         "areas": active_state["areas"],
         "condos": active_state["selected_condos"],
@@ -6312,6 +6315,8 @@ def _explicit_property_search_location(message):
             candidate = " ".join(match.group(1).strip(" ,.!?").split())
             if _is_home_property_type_expression(candidate):
                 return None
+            if _explicit_budget_value(candidate) is not None:
+                return None
             return candidate
     return None
 
@@ -6425,12 +6430,10 @@ def _apply_current_home_type_intent(user_message, tool_args):
         value for value, present in (("Landed", landed), ("Condo", condo))
         if present
     ]
-    transaction_values = [
-        value for value in _normalized_search_property_types(
-            updated.get("property_types") or []
-        ) if value.casefold() in {"rent", "buy", "both"}
-    ]
-    updated["property_types"] = requested + transaction_values
+    additive = bool(re.search(r"\b(as well|also|too|both|include)\b", text))
+    replace = bool(re.search(r"\b(instead|switch to|only)\b", text))
+    updated["property_types"] = requested
+    updated["property_type_update_mode"] = "add" if additive and not replace else "replace"
     print(
         "[SEARCH OVERRIDE] source=current_message field=property_type "
         f"property_types={requested!r}", flush=True,
@@ -6442,7 +6445,7 @@ def _apply_current_transaction_intent(user_message, tool_args):
     """Normalize explicit current-turn intent before Bubble persistence."""
     text = normalize_condo_name(user_message)
     buy_intent = bool(re.search(r"\b(buy|buying|purchase|purchasing|for sale)\b", text))
-    rent_intent = bool(re.search(r"\b(rent|renting|rental|to let)\b", text))
+    rent_intent = bool(re.search(r"\b(rent|renting|rentals?|lease|leasing|to let)\b", text))
     if not buy_intent and not rent_intent:
         return tool_args
     updated = dict(tool_args)
@@ -6455,6 +6458,35 @@ def _apply_current_transaction_intent(user_message, tool_args):
         flush=True,
     )
     return updated
+
+
+def _explicit_budget_value(message):
+    """Parse only obvious customer budget expressions."""
+    text = normalize_condo_name(message).replace(",", "")
+    match = re.search(
+        r"(?:\brm\s*)?\b(\d+(?:\.\d+)?)\s*(k|m|million)?\b",
+        text,
+    )
+    if not match:
+        return None
+    number = float(match.group(1))
+    suffix = match.group(2)
+    if suffix == "k":
+        number *= 1000
+    elif suffix in {"m", "million"}:
+        number *= 1000000
+    elif not ("rm" in text or re.search(r"\b(budget|up to|try|make it|a month)\b", text)):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _explicit_search_refinement(message):
+    text = normalize_condo_name(message)
+    return bool(
+        _explicit_budget_value(message) is not None
+        or re.search(r"\b\d+\s*(?:beds?|bedrooms?|br)\b", text)
+        or re.search(r"\b(?:rentals?|rent|buy|buying|landed|condos?|apartments?)\b", text)
+    )
 
 
 def _exact_property_name_for_location(message, conversation_context=None):
@@ -6548,6 +6580,15 @@ def prepare_advance_property_search_args(
     """Apply the shared deterministic corrections for a property-search turn."""
     prepared = _apply_current_transaction_intent(user_message, dict(tool_args or {}))
     prepared = _apply_current_home_type_intent(user_message, prepared)
+    budget = _explicit_budget_value(user_message)
+    if budget is not None:
+        transaction = prepared.get("transaction_type")
+        if transaction == "rent":
+            prepared["budget_rent"] = budget
+        elif transaction == "buy":
+            prepared["budget_buy"] = budget
+        else:
+            prepared["budget_requirement"] = budget
     prepared = _apply_current_search_location(
         user_message, bubble_env, prepared, entity_routing
     )
@@ -7111,6 +7152,7 @@ def chat_stream():
                         )
 
                 tool_round = 0
+                completed_search_execution = None
                 if not fast_eligible:
                     has_match_results = False
                     current_run_recommendations = []
@@ -7186,11 +7228,21 @@ def chat_stream():
                             f"buffered_text_discarded chars={buffered_chars}",
                             flush=True,
                         )
-                    execution = execute_chat_tool(
-                        tool_call, folio_id, bubble_env, message_id,
-                        user_message=message, reply_listing_id=reply_listing_id,
-                        conversation_context=conversation_context, entity_routing=entity_routing,
-                    )
+                    if (tool_call.name == "advance_property_search"
+                            and completed_search_execution is not None):
+                        print(
+                            "[TOOL LOOP GUARD] tool=advance_property_search "
+                            "action=duplicate_same_turn_blocked", flush=True,
+                        )
+                        execution = completed_search_execution
+                    else:
+                        execution = execute_chat_tool(
+                            tool_call, folio_id, bubble_env, message_id,
+                            user_message=message, reply_listing_id=reply_listing_id,
+                            conversation_context=conversation_context, entity_routing=entity_routing,
+                        )
+                        if tool_call.name == "advance_property_search":
+                            completed_search_execution = execution
                     if execution["has_match_results"]:
                         has_match_results = True
                     if execution["recommendations"]:

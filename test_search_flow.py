@@ -182,7 +182,8 @@ class SearchFlowStateTests(unittest.TestCase):
             "what about condos?", state, {"geo_names": ["condos"]}
         )
         self.assertEqual(updated["areas"], ["Bangsar"])
-        self.assertEqual(updated["property_types"], ["Condo", "rent"])
+        self.assertEqual(updated["property_types"], ["Condo"])
+        self.assertEqual(updated["transaction_type"], "rent")
 
     def test_landed_in_bukit_tunku_changes_type_and_area(self):
         state = complete_state()
@@ -234,8 +235,10 @@ class SearchFlowStateTests(unittest.TestCase):
         })
         self.assertEqual(result["action"], "ask")
         self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
-        self.assertEqual(result["active_state"]["property_types"], ["Landed", "rent"])
-        self.assertEqual(save.call_args.args[4]["property_types"], ["Landed", "rent"])
+        self.assertEqual(result["active_state"]["property_types"], ["Landed"])
+        self.assertEqual(result["active_state"]["transaction_type"], "rent")
+        self.assertEqual(save.call_args.args[4]["property_types"], ["Landed"])
+        self.assertEqual(save.call_args.args[4]["transaction_type"], "rent")
 
     @patch("app.save_search_state")
     @patch("app.bubble")
@@ -614,6 +617,53 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertTrue(inherited)
 
+    @patch("app._folio_has_active_property_search", return_value=True)
+    @patch("app._folio_accepts_pending_broadening", return_value=False)
+    def test_explicit_requirement_only_refinements_are_fast_path_eligible(
+        self, _pending, _active,
+    ):
+        routing = {"action": None, "geo_names": [], "condo_names": [], "mentions": []}
+        for message in (
+            "What about rentals", "landed instead", "Include condos as well then",
+            "Try 20k", "make it 4 beds",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(app_module.property_search_fast_path_decision(
+                    message, routing, "folio", "live"
+                )[0])
+
+    @patch("app.resolve_condo_mentions", return_value=[])
+    def test_deterministic_budget_parsing_does_not_create_location(self, _condos):
+        for message, expected in (("Try 20k", 20000), ("6m", 6000000),
+                                  ("RM 15000", 15000), ("6 million", 6000000)):
+            with self.subTest(message=message):
+                prepared = app_module.prepare_advance_property_search_args(
+                    message, "live", {"geo_names": ["model place"]}
+                )
+                self.assertEqual(prepared["budget_requirement"], expected)
+                self.assertNotEqual(prepared.get("geo_names"), ["20k"])
+
+    def test_property_type_add_and_replace_semantics(self):
+        active = empty_search_state()
+        active.update(property_types=["Landed"], transaction_type="rent")
+        additive = app_module.prepare_advance_property_search_args(
+            "Include condos as well then", "live", {}
+        )
+        added = app_module.apply_active_search_update(
+            active, app_module.grounded_search_update(
+                "Include condos as well then", additive
+            )
+        )
+        self.assertEqual(added["property_types"], ["Landed", "Condo"])
+        self.assertEqual(added["transaction_type"], "rent")
+        replacement = app_module.prepare_advance_property_search_args(
+            "condos instead", "live", {}
+        )
+        replaced = app_module.apply_active_search_update(
+            active, app_module.grounded_search_update("condos instead", replacement)
+        )
+        self.assertEqual(replaced["property_types"], ["Condo"])
+
     @patch("app._folio_accepts_pending_broadening", return_value=False)
     def test_area_pronoun_without_pending_offer_is_not_fast_path(self, _pending):
         eligible, reason, _ = app_module.property_search_fast_path_decision(
@@ -671,7 +721,8 @@ class SearchFlowStateTests(unittest.TestCase):
             })
         )
         self.assertEqual(refined["areas"], ["Bukit Tunku"])
-        self.assertEqual(refined["property_types"], ["Landed", "rent"])
+        self.assertEqual(refined["property_types"], ["Landed"])
+        self.assertEqual(refined["transaction_type"], "rent")
         self.assertEqual(refined["bedroom_requirement"], "3")
         self.assertEqual(refined["budget_rent"], "25000")
 
@@ -1621,7 +1672,8 @@ class SearchFlowStateTests(unittest.TestCase):
             "searchActive": dump_search_state(active),
         }, "https://www.rentee.asia/api/1.1")
         requirements = app_module.structured_lead_requirements(effective)
-        self.assertEqual(active["property_types"], ["Landed", "rent"])
+        self.assertEqual(active["property_types"], ["Landed"])
+        self.assertEqual(active["transaction_type"], "rent")
         self.assertEqual(requirements["property_types"], ["Landed"])
         self.assertIn({
             "key": "propertyType", "constraint_type": "equals", "value": "Landed",
@@ -1776,7 +1828,7 @@ class SearchFlowStateTests(unittest.TestCase):
             "property_types": ["rent"], "budget_requirement": "15000",
         })
         active = app_module.apply_active_search_update(prior, update)
-        self.assertEqual(app_module._transaction_modes(active["property_types"]), {"buy"})
+        self.assertEqual(app_module._transaction_modes(active["transaction_type"]), {"buy"})
         self.assertEqual(active["budget_requirement"], "")
 
     def test_sale_message_sets_buy_mode_and_preserves_named_condo(self):
@@ -1822,7 +1874,8 @@ class SearchFlowStateTests(unittest.TestCase):
 
         self.assertEqual(result["action"], "search_listings")
         self.assertEqual(result["scope"], ["One Menerung"])
-        self.assertEqual(result["active_state"]["property_types"], ["buy"])
+        self.assertEqual(result["active_state"]["property_types"], [])
+        self.assertEqual(result["active_state"]["transaction_type"], "buy")
         self.assertEqual(result["active_state"]["budget_requirement"], "")
         lead_fields = save.call_args.args[3]
         self.assertEqual(
@@ -1920,7 +1973,8 @@ class SearchFlowStateTests(unittest.TestCase):
         })
 
         active = result["active_state"]
-        self.assertEqual(active["property_types"], ["buy"])
+        self.assertEqual(active["property_types"], [])
+        self.assertEqual(active["transaction_type"], "buy")
         self.assertEqual(active["bedroom_requirement"], "3")
         self.assertEqual(active["budget_buy"], "5000000")
         self.assertEqual(active["budget_rent"], "")
@@ -2037,7 +2091,8 @@ class SearchFlowStateTests(unittest.TestCase):
             "transaction_type": "buy", "search_listings": True,
         })
         self.assertEqual(result["action"], "search_listings")
-        self.assertEqual(result["active_state"]["property_types"], ["buy"])
+        self.assertEqual(result["active_state"]["property_types"], [])
+        self.assertEqual(result["active_state"]["transaction_type"], "buy")
 
     def test_preferred_condo_relationship_constrains_structured_shortlist(self):
         lead = {"preferredCondos": ["condo-one", "condo-loft"]}
@@ -2661,7 +2716,8 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(replaced["areas"], ["KLCC"])
         self.assertEqual(replaced["bedroom_requirement"], "3")
         self.assertEqual(replaced["budget_requirement"], "15000")
-        self.assertEqual(replaced["property_types"], ["rent"])
+        self.assertEqual(replaced["property_types"], [])
+        self.assertEqual(replaced["transaction_type"], "rent")
 
         added = app_module.apply_active_search_update(active, {
             "geo_names": ["KLCC"], "area_update_mode": "add",
@@ -2698,8 +2754,9 @@ class SearchFlowStateTests(unittest.TestCase):
         })
         self.assertEqual(
             (multiple["areas"], multiple["bedroom_requirement"],
-             multiple["budget_requirement"], multiple["property_types"]),
-            (["KLCC"], "2", "12000", ["rent"]),
+             multiple["budget_requirement"], multiple["property_types"],
+             multiple["transaction_type"]),
+            (["KLCC"], "2", "12000", [], "rent"),
         )
 
     @patch("app.save_search_state")

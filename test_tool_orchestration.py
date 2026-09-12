@@ -447,6 +447,31 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertTrue(any(tool.get("name") == "advance_property_search"
                             for tool in second_args["tools"]))
 
+    @patch("app.execute_chat_tool")
+    def test_duplicate_advance_property_search_is_blocked_in_same_turn(self, execute):
+        execute.return_value = {
+            "output": "Grounded matches", "instructions": "Use grounded matches.",
+            "has_match_results": True, "recommendations": [{"listing_id": "one"}],
+        }
+        responses = MagicMock()
+        responses.stream.side_effect = [
+            FakeStream(function_response(
+                "round-1", "advance_property_search", "call-1",
+                {"search_listings": True},
+            )),
+            FakeStream(function_response(
+                "round-2", "advance_property_search", "call-2",
+                {"search_listings": True},
+            ), ["Here are the matches."]),
+            FakeStream(text_response("round-3"), ["Here are the grounded matches."]),
+        ]
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            body = app_module.app.test_client().post("/chat_stream", json={
+                "message": "show me more options", "folio_id": "folio-1",
+            }).get_data(as_text=True)
+        self.assertIn("grounded matches", body)
+        execute.assert_called_once()
+
     @patch("app.get_condo_infos", return_value=json.dumps({"condos": []}))
     def test_tool_loop_stops_safely_at_maximum(self, condo_info):
         responses = MagicMock()
@@ -497,7 +522,7 @@ class ToolOrchestrationTests(unittest.TestCase):
         state = empty_search_state()
         state.update({
             "areas": ["Bangsar"], "area_status": "known",
-            "property_types": ["rent"], "bedroom_requirement": "4",
+            "property_types": [], "transaction_type": "rent", "bedroom_requirement": "4",
             "budget_requirement": "15000",
         })
         updated = app_module.apply_active_search_update(state, {
@@ -508,7 +533,7 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertEqual(updated["areas"], ["Damansara Heights"])
         self.assertEqual(updated["bedroom_requirement"], "4")
         self.assertEqual(updated["budget_requirement"], "15000")
-        self.assertIn("rent", updated["property_types"])
+        self.assertEqual(updated["transaction_type"], "rent")
         self.assertIn("Landed", updated["property_types"])
 
 
