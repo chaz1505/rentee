@@ -78,6 +78,15 @@ class SearchScopeTests(unittest.TestCase):
         return app.advance_property_search("folio", "live", {
             "_user_message": message, "search_listings": True, **update})
 
+    def test_numeric_grounding_reaches_active_state(self):
+        for proposal in ({"bedrooms_min": 4, "budget_rent": 4}, {}):
+            with self.subTest(proposal=proposal):
+                result = self.advance("4 bedrooms, budget RM15k a month", **proposal)
+                active = result["active_state"]
+                self.assertEqual(active["bedroom_requirement"], "4")
+                self.assertEqual(active["budget_rent"], "15000")
+                self.assertEqual(active["transaction_type"], "rent")
+
     def retrieve(self, excluded=()):
         lead = app.lead_with_active_search_filters(self.lead, "https://bubble.test")
         lead["_excluded_listing_ids"] = set(excluded)
@@ -765,3 +774,55 @@ class SearchScopeTests(unittest.TestCase):
             self.assertEqual(records.call_count, 2)
             app._property_entity_records("development")
             self.assertEqual(records.call_count, 4)
+
+
+class NumericSearchGroundingTests(unittest.TestCase):
+    def test_high_confidence_facts(self):
+        cases = [
+            ("4 bedrooms, budget RM15k a month", {"bedrooms_min": 4, "budget_rent": 15000, "transaction_type": "rent"}),
+            ("3 bed, RM12k/month", {"bedrooms_min": 3, "budget_rent": 12000, "transaction_type": "rent"}),
+            ("looking to buy, budget RM6m", {"budget_buy": 6000000, "transaction_type": "buy"}),
+            ("4 bedrooms", {"bedrooms_min": 4}),
+            ("budget 20k", {"budget": 20000}),
+            ("up to RM6m to buy", {"budget_buy": 6000000, "transaction_type": "buy"}),
+            ("20k/month", {"budget_rent": 20000, "transaction_type": "rent"}),
+            ("RM 15,000 monthly", {"budget_rent": 15000, "transaction_type": "rent"}),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(app.extract_grounded_numeric_search_facts(message), expected)
+
+    def test_ambiguous_facts_are_unresolved(self):
+        for message in ("around fifteen maybe a bit more", "4 or maybe 5 if there's a study",
+                        "I could rent but might buy", "budget isn't fixed",
+                        "twenty if it's really worth it", "budget RM12k or RM15k",
+                        "budget RM12k-15k", "rent RM15k, buy RM6m", "15000"):
+            with self.subTest(message=message):
+                self.assertEqual(app.extract_grounded_numeric_search_facts(message), {})
+
+    def test_generic_budget_corrects_values_without_forcing_transaction(self):
+        result = app.grounded_search_update("budget 20k", {"budget_rent": 4})
+        self.assertEqual(result["budget_rent"], 20000)
+        self.assertEqual(result["budget_requirement"], 20000)
+        self.assertNotIn("transaction_type", result)
+
+    def test_bedroom_only_does_not_ground_budget(self):
+        result = app.grounded_search_update("4 bedrooms", {"bedrooms_min": 8, "budget_rent": 4})
+        self.assertEqual(result["bedrooms_min"], 4)
+        self.assertNotIn("budget_rent", result)
+
+    def test_ambiguous_wording_preserves_model_path(self):
+        proposal = {"budget_rent": 15000, "transaction_type": "rent"}
+        result = app.grounded_search_update("I could rent but might buy, budget around fifteen", proposal)
+        for key, value in proposal.items():
+            self.assertEqual(result[key], value)
+
+    def test_typed_budget_removes_conflicting_budget_aliases(self):
+        result = app.grounded_search_update("RM15k a month", {
+            "budget_rent": 4, "budget_buy": 4, "budget_requirement": 4,
+            "transaction_type": "buy",
+        })
+        self.assertEqual(result["budget_rent"], 15000)
+        self.assertEqual(result["transaction_type"], "rent")
+        self.assertNotIn("budget_buy", result)
+        self.assertNotIn("budget_requirement", result)

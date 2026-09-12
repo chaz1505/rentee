@@ -5343,6 +5343,52 @@ def resolve_search_entities(base_url, update, valid_geo_names):
     return result
 
 
+def extract_grounded_numeric_search_facts(message):
+    """Extract only unambiguous labelled numbers from this message, never state.
+
+    Multiple amounts, alternatives, negation and hedging deliberately fall back
+    to the model. This is a value guard, not a general search parser.
+    """
+    text = str(message or "").lower().replace("’", "'")
+    if re.search(r"\b(maybe|might|could|or|not|isn't|isnt|don't|between)\b", text):
+        return {}
+    facts = {}
+    beds = re.findall(r"(?<![\w.,-])(\d+)\s*(?:bedrooms?|beds?)\b", text)
+    if len(beds) == 1 and not re.search(r"\d\s*[km]?\s*(?:[-–/]|to)\s*(?:rm\s*)?\d", text):
+        facts["bedrooms_min"] = int(beds[0])
+
+    number = r"(?<![\w.,-])(?:rm\s*|myr\s*)?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\s*[km]?(?![\w.,\d])"
+    rent = r"(?:a\s+month|per\s+month|/\s*month|monthly|pcm|rent(?:al)?|lease)\b"
+    buy = r"(?:to\s+buy|buying|purchase|for\s+sale)\b"
+    amounts = []
+    for match in re.finditer(number, text):
+        before, after = text[:match.start()], text[match.end():]
+        if re.match(r"\s*(?:bedrooms?|beds?)\b", after):
+            continue
+        labelled = (re.match(r"(?:rm|myr)", match.group()) or
+                    re.search(r"\bbudget\s*(?:(?:is|of|around)\s*)?$", before) or
+                    re.match(r"\s*(?:" + rent + "|" + buy + ")", after) or
+                    re.search(r"\b(?:rent|rental|lease|purchase)\s*$", before))
+        if labelled:
+            raw = re.sub(r"rm|myr|[\s,]", "", match.group())
+            multiplier = 1000 if raw.endswith("k") else 1000000 if raw.endswith("m") else 1
+            value = float(raw.rstrip("km")) * multiplier
+            amounts.append(int(value) if value.is_integer() else value)
+    if len(amounts) != 1 or re.search(r"\d\s*[km]?\s*(?:[-–/]|to)\s*(?:rm\s*)?\d", text):
+        return facts
+    # A single labelled amount and one explicit transaction intent are safe;
+    # competing intents remain for the model to interpret.
+    rental = bool(re.search(rent, text))
+    purchase = bool(re.search(r"\b(?:buy|buying|purchase|purchasing|for sale)\b", text))
+    if rental and purchase:
+        return facts
+    mode = "rent" if rental else "buy" if purchase else None
+    facts["budget_" + mode if mode else "budget"] = amounts[0]
+    if mode:
+        facts["transaction_type"] = mode
+    return facts
+
+
 def grounded_search_update(message, update):
     """Keep only changes evidenced in the latest message, independent of action.
 
@@ -5400,6 +5446,29 @@ def grounded_search_update(message, update):
             if is_zero:
                 ignored_model_fields.append(key)
                 result.pop(key, None)
+    numeric = extract_grounded_numeric_search_facts(message)
+    if "bedrooms_min" in numeric:
+        result["bedrooms_min"] = numeric["bedrooms_min"]
+        if "bedroom_requirement" in result:
+            result["bedroom_requirement"] = str(numeric["bedrooms_min"])
+    budget_key = next((key for key in ("budget_rent", "budget_buy", "budget")
+                       if key in numeric), None)
+    if budget_key:
+        value = numeric[budget_key]
+        for key in ("budget_rent", "budget_buy", "budget_requirement"):
+            if key in result:
+                if result[key] is not None and _as_number(result[key]) != value:
+                    ignored_model_fields.append(key)
+                if budget_key == "budget":
+                    if result[key] is not None:
+                        result[key] = value
+                else:
+                    result.pop(key, None)
+        if budget_key != "budget":
+            result[budget_key] = value
+            result["transaction_type"] = numeric["transaction_type"]
+        else:
+            result["budget_requirement"] = value
     # Qualitative constraints also require current-turn evidence; a continuation
     # cannot acquire model-invented amenities or exclusions.
     for field in ("other_requirements", "priorities", "preference_notes", "regular_destinations",
