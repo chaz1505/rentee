@@ -115,6 +115,8 @@ _listing_photo_inflight = {}
 _listing_photo_inflight_guard = threading.Lock()
 _listing_photo_finalized_ids = set()
 _listing_photo_finalized_guard = threading.Lock()
+_property_entity_cache = {}
+_property_entity_cache_lock = threading.Lock()
 _geo_name_cache = {}
 _geo_name_cache_lock = threading.Lock()
 _location_web_identity_cache = {}
@@ -253,12 +255,110 @@ def _is_explicit_inventory_search(user_message):
     patterns = (
         r"\bwhat (?:have|do) you got\b",
         r"\banything available\b",
+        r"\b(?:anything|rentals?|units?|listings?|options)\s+(?:in|at|around)\b",
+        r"\bhave you got\b",
+        r"\bshow me\b.*\b(?:options|rentals?|units?)\b",
         r"\bfind me\b",
         r"\bshow me\b.*\b(home|homes|house|houses|propert(?:y|ies)|listing|listings|unit|units|matches)\b",
         r"\bany\b.*\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\bavailable\b",
         r"\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\b(in|around|under)\b",
     )
     return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _property_entity_records(bubble_env):
+    """Cache Bubble identity records, independently of the advisory Condo sheet."""
+    now = time.monotonic()
+    with _property_entity_cache_lock:
+        cached = _property_entity_cache.get(bubble_env)
+        if cached and now - cached[0] < GEO_NAME_CACHE_TTL_SECONDS:
+            return cached[1]
+        base_url = get_bubble_base_url(bubble_env)
+        records = {kind: list(_bubble_records(base_url, kind)) for kind in ("geo", "condo")}
+        _property_entity_cache[bubble_env] = (now, records)
+        return records
+
+
+def resolve_property_routing(message, bubble_env="live"):
+    """Resolve identity before deciding whether the customer wants facts or homes."""
+    text = normalize_condo_name(message)
+    result = {"mentions": [], "action": None, "geo_names": [], "condo_names": []}
+    try:
+        records = _property_entity_records(bubble_env)
+    except requests.RequestException:
+        print("[ENTITY RESOLUTION] status=unavailable", flush=True)
+        return dict(result, unavailable=True)
+    candidates = {}
+    for kind, rows in records.items():
+        for row in rows:
+            name = next((row.get(key) for key in ("name", "Name", "Condo name") if row.get(key)), None)
+            if not name or not row.get("_id"):
+                continue
+            normalized = normalize_condo_name(name)
+            for match in re.finditer(rf"(?<!\w){re.escape(normalized)}(?!\w)", text):
+                candidate = candidates.setdefault((normalized, match.span()), {
+                    "text": match.group(), "span": match.span(), "geo_match": None, "condo_match": None,
+                })
+                candidate[kind + "_match"] = {"name": " ".join(name.split()), "id": row["_id"]}
+    # A Geo embedded in a longer development name is not a separate mention.
+    mentions = [item for item in candidates.values() if not any(
+        other["span"][0] <= item["span"][0] and other["span"][1] >= item["span"][1]
+        and other["span"] != item["span"] for other in candidates.values()
+    )]
+    for item in mentions:
+        geo, condo = item["geo_match"], item["condo_match"]
+        kind = "ambiguous" if geo and condo else "geo" if geo else "condo"
+        item["resolved_type"] = kind
+        selected = kind
+        if kind == "ambiguous":
+            start, end = item["span"]
+            qualifier = text[end:]
+            before = text[:start]
+            if re.match(r"\s+(?:the )?(?:area|neighbou?rhood)\b", qualifier) or re.search(r"\b(?:area|neighbou?rhood)\s*$", before):
+                selected = "geo"
+            elif re.match(r"\s+(?:the )?(?:condo|development)\b", qualifier) or re.search(r"\b(?:condo|development)\s*$", before):
+                selected = "condo"
+        item["routing_type"] = selected
+        if selected in {"geo", "condo"}:
+            result[selected + "_names"].append(item[selected + "_match"]["name"])
+        print(f"[ENTITY RESOLUTION] candidate={item['text']!r} geo_match={geo!r} "
+              f"condo_match={condo!r} resolved_type={kind!r} routing_type={selected!r}", flush=True)
+    result["mentions"] = mentions
+    result["geo_names"] = _unique_search_values(result["geo_names"])
+    result["condo_names"] = _unique_search_values(result["condo_names"])
+    inventory = _is_explicit_inventory_search(message)
+    correction = bool(re.search(r"\b(?:i meant|i mean|try|instead|switch|change (?:to|the area))\b", text))
+    location_tool = (_requires_location_comparison_tool(message) or _requires_nearby_places_tool(message)
+                     or _requires_travel_time_tool(message))
+    if any(item["routing_type"] == "ambiguous" for item in mentions):
+        result["action"] = "clarify"
+    elif mentions and not location_tool:
+        if inventory or correction:
+            result["action"] = "advance_property_search"
+        elif result["condo_names"] and not result["geo_names"] and _is_clear_condo_information_question(message, result["condo_names"]):
+            result["action"] = "get_condo_info"
+        elif result["geo_names"]:
+            result["action"] = "area_information"
+    if mentions or inventory or correction:
+        print(f"[INTENT ROUTING] inventory_search={inventory} geography_correction={correction} "
+              f"selected_action={result['action']!r}", flush=True)
+    return result
+
+
+def constrain_property_tools(args, routing):
+    """Keep the same routing guards on the initial and continuation tool sets."""
+    action = routing.get("action")
+    if routing.get("geo_names") or action == "advance_property_search" or routing.get("unavailable"):
+        args["tools"] = [tool for tool in args["tools"] if tool.get("name") != "get_condo_info"]
+        choice = args.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("name") == "get_condo_info":
+            args["tool_choice"] = "auto"
+    if action in {"advance_property_search", "get_condo_info"}:
+        args["tool_choice"] = {"type": "function", "name": action}
+    elif action == "clarify":
+        args["tool_choice"] = "none"
+    args["instructions"] += "\nAuthoritative current-message entities: " + json.dumps(routing, ensure_ascii=False)
+    return args
 
 
 INTERNAL_ORCHESTRATION_FIELDS = frozenset({
@@ -809,11 +909,13 @@ def test_condo():
 
 
 def build_response_args(
-    user_message, previous_response_id=None, conversation_context=None,
+    user_message, previous_response_id=None, conversation_context=None, entity_routing=None,
 ):
     """Build the deliberately small customer-turn context and stable tool contracts."""
+    if entity_routing is None:
+        entity_routing = resolve_property_routing(user_message)
     nearby_required = _requires_nearby_places_tool(user_message)
-    recognized_condos = [] if nearby_required else resolve_condo_mentions(user_message)
+    recognized_condos = entity_routing.get("condo_names", [])
     search_properties = {
         "regular_destinations": {
             "type": "array", "items": {"type": "string"},
@@ -1055,7 +1157,7 @@ def build_response_args(
         args["tool_choice"] = {"type": "function", "name": "find_nearby_places"}
     elif _requires_travel_time_tool(user_message):
         args["tool_choice"] = {"type": "function", "name": "get_travel_time"}
-    return args
+    return constrain_property_tools(args, entity_routing)
 
 
 def get_web_citations(response):
@@ -4697,7 +4799,12 @@ def resolve_search_entities(base_url, update, valid_geo_names):
         condo_ids = get_named_object_ids(base_url, "condo", [candidate])
         # Real entities override advisory typing. If both types exist, ask
         # for clarification rather than trusting the model's proposed type.
-        if geo_ids and condo_ids:
+        choice = update.get("_entity_type_choices", {}).get(normalize_condo_name(candidate))
+        if geo_ids and condo_ids and choice == "geo":
+            kind, name, ids = "areas", geo_name, geo_ids
+        elif geo_ids and condo_ids and choice == "condo":
+            kind, name, ids = "condos", candidate, condo_ids
+        elif geo_ids and condo_ids:
             kind, name, ids = "unresolved", candidate, []
         elif geo_ids:
             kind, name, ids = "areas", geo_name, geo_ids
@@ -5946,9 +6053,21 @@ def _trusted_reply_listing_location(listing_id, bubble_env="live",
 
 def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
                       user_message=None, reply_listing_id=None,
-                      conversation_context=None):
+                      conversation_context=None, entity_routing=None):
     """Execute one supported chat tool and return neutral continuation grounding."""
     tool_args = parse_completed_tool_arguments(tool_call)
+    tool_args.pop("_entity_type_choices", None)
+    if entity_routing and entity_routing.get("action") == "advance_property_search" and tool_call.name in {
+        "get_condo_info", "match_lead", "advance_property_search"
+    }:
+        tool_call = SimpleNamespace(name="advance_property_search")
+    elif entity_routing and tool_call.name == "get_condo_info":
+        if entity_routing.get("geo_names") or entity_routing.get("unavailable"):
+            return {"output": "This is an area, not a resolved Condo. Use the existing location or web-search tools for area information.",
+                    "instructions": "Answer the area question using appropriate grounded sources.",
+                    "has_match_results": False, "recommendations": []}
+        if entity_routing.get("condo_names"):
+            tool_args["condo_names"] = entity_routing["condo_names"]
     explicit_nearby_place = _explicit_nearby_place(user_message)
     trusted_listing = None
     if (tool_call.name in {"find_nearby_places", "get_travel_time", "compare_locations"}
@@ -5973,6 +6092,16 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
         tool_args = _apply_current_search_location(
             user_message, bubble_env, tool_args
         )
+        if entity_routing and entity_routing.get("action") == "advance_property_search":
+            tool_args.update(geo_names=entity_routing["geo_names"],
+                             preferred_condo_names=entity_routing["condo_names"],
+                             area_update_mode="replace" if entity_routing["geo_names"] else "reset",
+                             condo_update_mode="replace" if entity_routing["condo_names"] else "reset",
+                             search_listings=True)
+            tool_args["_entity_type_choices"] = {
+                item["text"]: item["routing_type"] for item in entity_routing["mentions"]
+                if item["resolved_type"] == "ambiguous" and item["routing_type"] != "ambiguous"
+            }
         tool_args["_user_message"] = user_message
         search_result = advance_property_search(folio_id, bubble_env, tool_args)
         if search_result["action"] == "search_listings":
@@ -6357,8 +6486,16 @@ def chat_stream():
 
                 # Every model round is buffered until its completed response proves that
                 # no function call follows. This prevents orchestration prose from leaking.
+                entity_routing = resolve_property_routing(message, bubble_env)
+                if entity_routing["action"] == "clarify":
+                    names = [item["text"] for item in entity_routing["mentions"]
+                             if item["routing_type"] == "ambiguous"]
+                    clarification = "Do you mean the area or the condo named " + ", ".join(names) + "?"
+                    yield f"data: {json.dumps({'delta': clarification})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'response_id': previous, 'recommendations_relevant': False, 'recommendations': []})}\n\n"
+                    return
                 initial_args = build_response_args(
-                    message, previous, conversation_context
+                    message, previous, conversation_context, entity_routing=entity_routing
                 )
                 normal_tools = initial_args["tools"]
                 try:
@@ -6373,7 +6510,7 @@ def chat_stream():
                         flush=True,
                     )
                     retry_args = build_response_args(
-                        message, None, conversation_context
+                        message, None, conversation_context, entity_routing=entity_routing
                     )
                     normal_tools = retry_args["tools"]
                     response, buffered_text = stream_initial_response(
@@ -6458,7 +6595,7 @@ def chat_stream():
                     execution = execute_chat_tool(
                         tool_call, folio_id, bubble_env, message_id,
                         user_message=message, reply_listing_id=reply_listing_id,
-                        conversation_context=conversation_context,
+                        conversation_context=conversation_context, entity_routing=entity_routing,
                     )
                     if execution["has_match_results"]:
                         has_match_results = True

@@ -255,13 +255,13 @@ class ToolOrchestrationTests(unittest.TestCase):
             ["9 Beringin", "9 Beringin"],
         )
 
-    @patch("app.resolve_condo_mentions", return_value=["9 Beringin"])
-    def test_condo_info_still_applies_without_nearby_intent(self, condo_mentions):
+    @patch("app._property_entity_records", return_value={"geo": [], "condo": [{"_id": "beringin", "name": "9 Beringin"}]})
+    def test_condo_info_still_applies_without_nearby_intent(self, records):
         condo = app_module.build_response_args("Tell me about 9 Beringin")
         self.assertEqual(condo["tool_choice"], {
             "type": "function", "name": "get_condo_info",
         })
-        condo_mentions.assert_called_once()
+        records.assert_called_once()
 
     @patch("app.get_travel_time", return_value=json.dumps({"status": "ok"}))
     @patch("app.bubble", return_value={
@@ -392,7 +392,8 @@ class ToolOrchestrationTests(unittest.TestCase):
         self.assertIn("reason=max_output_tokens", logs)
         self.assertIn("action=preserve_text", logs)
 
-    def test_inventory_and_condo_information_routing_are_separate(self):
+    @patch("app._property_entity_records", return_value={"geo": [], "condo": [{"_id": "one", "name": "One Menerung"}]})
+    def test_inventory_and_condo_information_routing_are_separate(self, _records):
         inventory = app_module.build_response_args(
             "What have you got in Damansara Heights - landed ok"
         )

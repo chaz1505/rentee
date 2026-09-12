@@ -1629,7 +1629,8 @@ class SearchFlowStateTests(unittest.TestCase):
             listing_search_scope(complete_state(), use_full_shortlist=True), []
         )
 
-    def test_tool_schema_preserves_direct_information_tools(self):
+    @patch("app._property_entity_records", return_value={"geo": [], "condo": [{"_id": "ken", "name": "Ken Bangsar"}]})
+    def test_tool_schema_preserves_direct_information_tools(self, _records):
         args = app_module.build_response_args("What is Ken Bangsar like?")
         tools = {tool.get("name"): tool for tool in args["tools"]}
         self.assertIn("advance_property_search", tools)
@@ -1819,7 +1820,8 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("neighbourhood", instructions)
         self.assertIn("Answer the actual question first", instructions)
 
-    def test_named_condo_question_still_routes_to_condo_knowledge(self):
+    @patch("app._property_entity_records", return_value={"geo": [], "condo": [{"_id": "ken", "name": "Ken Bangsar"}]})
+    def test_named_condo_question_still_routes_to_condo_knowledge(self, _records):
         args = app_module.build_response_args("What is Ken Bangsar like?")
         instructions = args["instructions"]
         condo_tool = next(

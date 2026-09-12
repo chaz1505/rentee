@@ -2,6 +2,7 @@
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
@@ -407,3 +408,148 @@ class SearchScopeTests(unittest.TestCase):
         self.assertTrue(validated["scope_needs_clarification"])
         self.lead["searchActive"] = dump_search_state(validated)
         self.assertFalse(app.load_active_search_state(self.lead, "https://bubble.test")["scope_needs_clarification"])
+
+    def routing(self, message):
+        with patch("app._property_entity_records", return_value={"geo": self.geos, "condo": self.condos}):
+            return app.resolve_property_routing(message)
+
+    def dispatch_routed(self, message, routing, tool="get_condo_info"):
+        call = SimpleNamespace(name=tool, arguments=json.dumps({"condo_names": ["Wrong Place"]}))
+        with patch("app.execute_match_lead_silently", return_value="matches"), patch("app.get_condo_infos") as info:
+            result = app.execute_chat_tool(call, "folio", "live", "message", user_message=message,
+                                           entity_routing=routing)
+            info.assert_not_called()
+        return result
+
+    def test_prerouting_geo_inventory_rejects_wrong_tool_and_updates_scope(self):
+        message = "have you got anything in damansara heights?"
+        routing = self.routing(message)
+        self.assertEqual(routing["mentions"][0]["resolved_type"], "geo")
+        self.assertEqual(routing["mentions"][0]["geo_match"]["id"], "g2")
+        self.assertEqual(routing["action"], "advance_property_search")
+        args = app.build_response_args(message, entity_routing=routing)
+        self.assertEqual(args["tool_choice"]["name"], "advance_property_search")
+        self.assertNotIn("get_condo_info", [t.get("name") for t in args["tools"]])
+        self.dispatch_routed(message, routing)
+        self.assertEqual(app.load_active_search_state(self.lead)["areas"], ["Damansara Heights"])
+
+    def test_prerouting_geo_correction_preserves_other_requirements(self):
+        message = "no i meant damansara heights the area"
+        self.dispatch_routed(message, self.routing(message))
+        state = app.load_active_search_state(self.lead)
+        self.assertEqual(state["areas"], ["Damansara Heights"])
+        self.assertEqual(state["selected_condos"], [])
+        self.assertEqual(state["property_types"], ["Condo", "rent"])
+        self.assertEqual(state["bedroom_requirement"], "3")
+        self.assertEqual(state["budget_rent"], "25000")
+
+    def test_prerouting_condo_inventory_and_information_are_different_intents(self):
+        inventory = "have you got anything in Arcoris?"
+        routing = self.routing(inventory)
+        self.assertEqual(routing["mentions"][0]["resolved_type"], "condo")
+        self.assertEqual(routing["action"], "advance_property_search")
+        self.assertEqual(routing["geo_names"], [])
+        self.dispatch_routed(inventory, routing)
+        self.assertEqual(app.load_active_search_state(self.lead)["selected_condos"], ["Arcoris"])
+        for message in ("what's Arcoris like?", "does Arcoris have a pool?", "tell me about Arcoris"):
+            route = self.routing(message)
+            self.assertEqual(route["action"], "get_condo_info")
+            args = app.build_response_args(message, entity_routing=route)
+            self.assertEqual(args["tool_choice"]["name"], "get_condo_info")
+            with patch("app.get_condo_infos", return_value="facts") as info:
+                app.execute_chat_tool(SimpleNamespace(name="get_condo_info", arguments='{"condo_names":["wrong"]}'),
+                                      "folio", "live", "message", user_message=message, entity_routing=route)
+                info.assert_called_once_with(["Arcoris"])
+
+    def test_every_fixture_geo_inventory_and_correction_excludes_condo_info(self):
+        for geo in self.geos:
+            for message in (f"anything in {geo['name']}?", f"I mean {geo['name']}",
+                            f"rentals in {geo['name']}", f"show me {geo['name']} options",
+                            f"what have you got in {geo['name']}?"):
+                with self.subTest(message=message):
+                    route = self.routing(message)
+                    args = app.build_response_args(message, entity_routing=route)
+                    self.assertEqual(route["action"], "advance_property_search")
+                    self.assertNotIn("get_condo_info", [t.get("name") for t in args["tools"]])
+
+    def test_prerouting_case_and_whitespace_share_canonical_identity(self):
+        for message in ("damansara heights", " Damansara   Heights "):
+            match = self.routing(message)["mentions"][0]
+            self.assertEqual(match["geo_match"], {"name": "Damansara Heights", "id": "g2"})
+
+    def test_prerouting_collision_asks_unless_type_is_explicit(self):
+        self.condos.append({"_id": "collision", "name": "Damansara Heights", "Geo": "g2"})
+        route = self.routing("anything in Damansara Heights?")
+        self.assertEqual(route["mentions"][0]["resolved_type"], "ambiguous")
+        self.assertEqual(route["action"], "clarify")
+        for suffix, field in (("the area", "areas"), ("the condo", "selected_condos")):
+            message = f"try Damansara Heights {suffix}"
+            route = self.routing(message)
+            self.assertEqual(route["mentions"][0]["resolved_type"], "ambiguous")
+            self.dispatch_routed(message, route)
+            self.assertEqual(app.load_active_search_state(self.lead)[field], ["Damansara Heights"])
+
+    def test_geo_information_uses_existing_location_or_web_path(self):
+        route = self.routing("tell me about Damansara Heights")
+        self.assertEqual(route["action"], "area_information")
+        args = app.build_response_args("tell me about Damansara Heights", entity_routing=route)
+        self.assertEqual(args["tool_choice"], "auto")
+        self.assertNotIn("get_condo_info", [t.get("name") for t in args["tools"]])
+        self.assertTrue(any(t["type"] == "web_search" for t in args["tools"]))
+
+    def test_nested_names_preserve_separately_mentioned_geo(self):
+        self.condos.append({"_id": "pines", "name": "Mont Kiara Pines", "Geo": "g0"})
+        route = self.routing("anything in Mont Kiara Pines?")
+        self.assertEqual(route["geo_names"], [])
+        self.assertEqual(route["condo_names"], ["Mont Kiara Pines"])
+        route = self.routing("anything in Mont Kiara Pines or Mont Kiara?")
+        self.assertEqual(route["geo_names"], ["Mont Kiara"])
+
+    def test_identity_records_without_ids_are_not_authoritative(self):
+        self.condos.append({"name": "Unknown Tower"})
+        self.assertEqual(self.routing("anything in Unknown Tower?")["mentions"], [])
+
+    def test_stream_resolves_before_model_and_guards_wrong_tool(self):
+        from test_tool_orchestration import FakeStream, function_response, text_response
+        events = []
+        def records(env):
+            events.append("resolved")
+            return {"geo": self.geos, "condo": self.condos}
+        calls = [function_response("first", "get_condo_info", "call", {"condo_names": ["Damansara Heights"]}),
+                 text_response("final")]
+        def stream(**args):
+            self.assertEqual(events[0], "resolved")
+            events.append("model")
+            self.assertNotIn("get_condo_info", [t.get("name") for t in args.get("tools", [])])
+            return FakeStream(calls.pop(0), () if calls else ("Found matches",))
+        with patch("app._property_entity_records", side_effect=records), patch.object(app.client.responses, "stream", side_effect=stream), patch("app.execute_match_lead_silently", return_value="matches"), patch("app.get_condo_infos") as info:
+            response = app.app.test_client().post("/chat_stream", json={
+                "message": "have you got anything in damansara heights?", "folio_id": "folio"})
+            body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Found matches", body)
+        self.assertEqual(events, ["resolved", "model", "model"])
+        info.assert_not_called()
+        self.assertEqual(app.load_active_search_state(self.lead)["areas"], ["Damansara Heights"])
+
+    def test_stream_ambiguous_entity_asks_before_any_model_or_search(self):
+        self.condos.append({"_id": "collision", "name": "Damansara Heights", "Geo": "g2"})
+        with patch("app._property_entity_records", return_value={"geo": self.geos, "condo": self.condos}), patch.object(app.client.responses, "stream") as stream, patch("app.advance_property_search") as advance:
+            response = app.app.test_client().post("/chat_stream", json={
+                "message": "anything in Damansara Heights?", "folio_id": "folio"})
+            body = response.get_data(as_text=True)
+        self.assertIn("Do you mean the area or the condo", body)
+        stream.assert_not_called()
+        advance.assert_not_called()
+
+    def test_property_identity_cache_is_environment_scoped(self):
+        app._property_entity_cache.clear()
+        self.addCleanup(app._property_entity_cache.clear)
+        with patch("app._bubble_records", side_effect=lambda base, kind: iter(
+            self.geos if kind == "geo" else self.condos)) as records:
+            first = app._property_entity_records("live")
+            second = app._property_entity_records("live")
+            self.assertIs(first, second)
+            self.assertEqual(records.call_count, 2)
+            app._property_entity_records("development")
+            self.assertEqual(records.call_count, 4)

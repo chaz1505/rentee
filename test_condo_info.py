@@ -23,6 +23,14 @@ class CondoInfoTests(unittest.TestCase):
         app_module._condo_cache = None
         app_module._condo_cache_checked_at = 0.0
         app_module.app.config["TESTING"] = True
+        records = patch("app._property_entity_records", return_value={
+            "geo": [], "condo": [
+                {"_id": "condo-ken", "name": "Ken Bangsar"},
+                {"_id": "condo-one", "name": "One Menerung"},
+            ],
+        })
+        records.start()
+        self.addCleanup(records.stop)
 
     def response(self, csv_text=CSV_DATA):
         response = MagicMock()
@@ -299,7 +307,7 @@ class CondoInfoTests(unittest.TestCase):
             )
             body = response.get_data(as_text=True)
 
-        mocked_condo_infos.assert_called_once_with(["one menerung"])
+        mocked_condo_infos.assert_called_once_with(["One Menerung"])
         self.assertEqual(
             responses.stream.call_args_list[0].kwargs["tool_choice"],
             {"type": "function", "name": "get_condo_info"},
