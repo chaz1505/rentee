@@ -81,7 +81,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(get.call_count, 1)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids")
+    @patch("app.get_named_object_ids", return_value=[])
     @patch("app.bubble")
     def test_bexley_is_not_saved_or_passed_to_listing_search(
         self, bubble, named_ids, save,
@@ -98,12 +98,11 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertNotIn("Bexley", result["state"]["areas"])
         self.assertNotIn("Bexley", result["active_state"]["areas"])
         self.assertEqual(result["geo_resolution"]["unresolved"], ["Bexley"])
-        named_ids.assert_not_called()
-        saved_payload = save.call_args.args
-        self.assertNotIn("Geo", saved_payload[3])
+        named_ids.assert_called_once()
+        save.assert_not_called()
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_valid_bangsar_continues_to_listing_search(
         self, bubble, _named_ids, _save,
@@ -167,6 +166,7 @@ class SearchFlowStateTests(unittest.TestCase):
         bubble.side_effect = [
             {"lead": "lead-1"},
             {"_id": "lead-1", "searchBriefJSON": stored, "searchActive": stored},
+            {"results": [], "remaining": 0},
         ]
         update = app_module._apply_current_search_location(
             "show me something in CompletelyFakeCondoName", "live",
@@ -174,7 +174,7 @@ class SearchFlowStateTests(unittest.TestCase):
         )
         result = app_module.advance_property_search("folio-1", "live", update)
         self.assertEqual(result["action"], "ask")
-        self.assertEqual(result["active_state"]["areas"], [])
+        self.assertEqual(result["active_state"]["areas"], ["Bangsar"])
         self.assertEqual(
             result["geo_resolution"]["unresolved"],
             ["CompletelyFakeCondoName"],
@@ -369,7 +369,7 @@ class SearchFlowStateTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("What's your budget?", body)
-        mocked_advance.assert_called_once_with("folio-1", "live", tool_args)
+        mocked_advance.assert_called_once_with("folio-1", "live", {**tool_args, "_user_message": "I need 4 bedrooms"})
         responses.create.assert_not_called()
 
     @patch("app.save_search_state")
@@ -841,64 +841,40 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertFalse(any(item.get("value") == "geo-damansara" for item in constraints))
 
     @patch("app.bubble")
-    def test_listing_query_pushes_each_area_and_deduplicates(self, mocked_bubble):
-        mocked_bubble.side_effect = [
-            {"results": [{"_id": "shared", "Geo": ["geo-bangsar"], "beds": 3}],
-             "remaining": 0},
-            {"results": [
-                {"_id": "shared", "Geo": ["geo-bangsar"], "beds": 3},
-                {"_id": "klcc", "Geo": ["geo-klcc"], "beds": 3},
-            ], "remaining": 0},
-        ]
-        lead = {"Geo": ["geo-bangsar", "geo-klcc"], "bedroomsMin": 3}
+    def test_listing_query_expands_geos_and_batches_condos(self, mocked_bubble):
+        def response(url, params):
+            constraints = json.loads(params["constraints"])
+            if url.endswith("/condo"):
+                geo = constraints[0]["value"]
+                return {"results": [{"_id": geo + str(i), "Geo": geo}
+                                    for i in range(3)], "remaining": 0}
+            ids = next(c["value"] for c in constraints if c["key"] == "condo")
+            return {"results": [{"_id": cid, "condo": cid, "beds": 3}
+                                for cid in ids], "remaining": 0}
+        mocked_bubble.side_effect = response
         listings, fetched = app_module.get_plausible_listings(
-            "https://bubble.test", lead
+            "https://bubble.test", {"Geo": ["geo-a", "geo-b"], "bedroomsMin": 3}
         )
-        self.assertEqual([item["_id"] for item in listings], ["shared", "klcc"])
-        self.assertEqual(fetched, 3)
-        self.assertEqual(mocked_bubble.call_count, 2)
-        query_constraints = [
-            json.loads(call.kwargs["params"]["constraints"])
-            for call in mocked_bubble.call_args_list
-        ]
-        geo_constraints = [
-            next(item for item in constraints if item["key"] == "Geo")
-            for constraints in query_constraints
-        ]
-        self.assertEqual(
-            {item["value"] for item in geo_constraints},
-            {"geo-bangsar", "geo-klcc"},
-        )
-        self.assertTrue(all(item["constraint_type"] == "equals" for item in geo_constraints))
-        self.assertFalse(any(
-            item["constraint_type"] == "contains" for item in geo_constraints
-        ))
+        self.assertEqual(len(listings), 6)
+        self.assertEqual(fetched, 6)
+        self.assertEqual(mocked_bubble.call_count, 3)
+        constraints = json.loads(mocked_bubble.call_args.kwargs["params"]["constraints"])
+        self.assertEqual(next(c for c in constraints if c["key"] == "condo")["constraint_type"], "in")
+        self.assertFalse(any(c["key"] == "Geo" for c in constraints))
 
     @patch("app.get_named_object_ids", return_value=["condo-one", "condo-two"])
     @patch("app.bubble")
-    def test_listing_query_uses_one_query_per_condo_and_deduplicates(
-        self, mocked_bubble, _mocked_ids,
-    ):
-        mocked_bubble.side_effect = [
-            {"results": [{"_id": "shared", "condo": "condo-one"}], "remaining": 0},
-            {"results": [
-                {"_id": "shared", "condo": "condo-one"},
-                {"_id": "two", "condo": "condo-two"},
-            ], "remaining": 0},
-        ]
-        listings, _fetched = app_module.get_plausible_listings(
-            "https://bubble.test", {}, ["One Menerung", "Condo Two"]
+    def test_listing_query_batches_explicit_condos(self, mocked_bubble, _ids):
+        mocked_bubble.return_value = {"results": [
+            {"_id": "one", "condo": "condo-one"},
+            {"_id": "two", "condo": "condo-two"},
+            {"_id": "one", "condo": "condo-one"},
+        ], "remaining": 0}
+        listings, _ = app_module.get_plausible_listings(
+            "https://bubble.test", {}, ["One", "Two"]
         )
-        self.assertEqual([item["_id"] for item in listings], ["shared", "two"])
-        self.assertEqual(mocked_bubble.call_count, 2)
-        condo_values = {
-            next(
-                item for item in json.loads(call.kwargs["params"]["constraints"])
-                if item["key"] == "condo"
-            )["value"]
-            for call in mocked_bubble.call_args_list
-        }
-        self.assertEqual(condo_values, {"condo-one", "condo-two"})
+        self.assertEqual([l["_id"] for l in listings], ["one", "two"])
+        self.assertEqual(mocked_bubble.call_count, 1)
 
     def test_listing_query_keeps_budget_python_side_to_preserve_tolerance(self):
         plan = app_module.build_listing_bubble_constraints({
@@ -1681,7 +1657,7 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.save_search_state")
     @patch("app.bubble")
-    def test_show_matches_uses_entire_saved_condo_shortlist(
+    def test_show_matches_does_not_promote_shortlist_to_active_scope(
         self, mocked_bubble, _mocked_save
     ):
         stored = set_recommended_condos(
@@ -1694,9 +1670,8 @@ class SearchFlowStateTests(unittest.TestCase):
             "folio-1", "live", {"search_listings": True}
         )
         self.assertEqual(result["action"], "search_listings")
-        self.assertEqual(
-            result["scope"], ["One Menerung", "Ken Bangsar", "The Loft"]
-        )
+        self.assertIsNone(result["scope"])
+        self.assertEqual(result["active_state"]["selected_condos"], [])
 
     @patch("app.save_search_state")
     @patch("app.bubble")
@@ -1747,7 +1722,7 @@ class SearchFlowStateTests(unittest.TestCase):
                     break
         create.assert_not_called()
         lowered = answer.casefold()
-        self.assertIn("don't have a suitable current property match", lowered)
+        self.assertIn("don't have any additional suitable properties", lowered)
         for phantom in ("which of these", "these properties", "options above", "which one"):
             self.assertNotIn(phantom, lowered)
 
@@ -1772,7 +1747,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertNotIn("I'll pull", instructions)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
     def test_budget_followup_recommends_now_and_retains_furnishing(
@@ -1802,7 +1777,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(_mocked_save.call_args.args[3]["budgetRent"], 15000)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.recommend_condos_for_search")
     @patch("app.bubble")
     def test_clear_area_refinement_continues_recommending_without_questions(
@@ -1869,7 +1844,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(payload["bedroomsMin"], 4)
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_initial_core_requirements_capture_and_ask_only_for_budget(
         self, mocked_bubble, _mocked_resolve, mocked_save
@@ -1889,7 +1864,7 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertEqual(lead_fields["Geo"], ["geo-bangsar"])
 
     @patch("app.requests.patch")
-    @patch("app.get_named_object_ids", return_value=["geo-bangsar"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-bangsar"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_multiple_structured_requirements_are_persisted_without_llm_rewrite(
         self, mocked_bubble, _mocked_resolve, mocked_patch
@@ -2030,7 +2005,7 @@ class SearchFlowStateTests(unittest.TestCase):
         )
 
     @patch("app.save_search_state")
-    @patch("app.get_named_object_ids", return_value=["geo-klcc"])
+    @patch("app.get_named_object_ids", side_effect=lambda base, kind, names: ["geo-klcc"] if kind == "geo" else [])
     @patch("app.bubble")
     def test_klcc_followup_keeps_cumulative_bangsar_but_replaces_active_area(
         self, mocked_bubble, _resolve, mocked_save
@@ -2077,7 +2052,7 @@ class SearchFlowStateTests(unittest.TestCase):
         )
         requirements = app_module.structured_lead_requirements(filtered)
         self.assertEqual(requirements["geo_ids"], ["geo-klcc"])
-        self.assertEqual(requirements["preferred_condo_ids"], ["condo-one-menerung"])
+        self.assertEqual(requirements["preferred_condo_ids"], [])
         self.assertEqual(requirements["bedrooms_min"], 3)
         self.assertEqual(requirements["budget_rent"], 15000)
 
@@ -2094,17 +2069,17 @@ class SearchFlowStateTests(unittest.TestCase):
             lead, "https://bubble.test"
         )
         requirements = app_module.structured_lead_requirements(effective)
-        self.assertEqual(requirements["bedrooms_min"], 4)
-        self.assertEqual(requirements["budget_rent"], 15000)
-        self.assertEqual(requirements["geo_ids"], ["geo-bangsar"])
-        self.assertEqual(requirements["preferred_condo_ids"], ["condo-one"])
+        self.assertEqual(requirements["bedrooms_min"], None)
+        self.assertEqual(requirements["budget_rent"], None)
+        self.assertEqual(requirements["geo_ids"], [])
+        self.assertEqual(requirements["preferred_condo_ids"], [])
         self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
         self.assertEqual(requirements["pets"], "a small dog")
 
     @patch("app.get_named_object_ids")
     def test_active_budget_override_preserves_other_lead_fields(self, resolve):
         active = apply_search_update(
-            empty_search_state(), {"budget_requirement": "12000"}
+            empty_search_state(), {"budget_requirement": "12000", "property_types": ["rent"], "bedroom_requirement": "4"}
         )
         lead = {
             "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
@@ -2118,7 +2093,7 @@ class SearchFlowStateTests(unittest.TestCase):
         requirements = app_module.structured_lead_requirements(effective)
         self.assertEqual(requirements["budget_rent"], 12000)
         self.assertEqual(requirements["bedrooms_min"], 4)
-        self.assertEqual(requirements["geo_ids"], ["geo-bangsar"])
+        self.assertEqual(requirements["geo_ids"], [])
         self.assertEqual(requirements["furnishing_preference"], "Fully Furnished")
         self.assertEqual(requirements["pets"], "small dog")
         resolve.assert_not_called()
@@ -2130,6 +2105,7 @@ class SearchFlowStateTests(unittest.TestCase):
     ):
         active = apply_search_update(empty_search_state(), {
             "area_status": "known", "areas": ["Petaling Jaya"],
+            "property_types": ["rent"], "bedroom_requirement": "4", "budget_rent": "15000",
         })
         lead = {
             "TransactionType": ["Rent/Let"], "bedroomsMin": 4,
