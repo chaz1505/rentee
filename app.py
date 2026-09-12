@@ -260,7 +260,7 @@ def _is_explicit_inventory_search(user_message):
         r"\banything available\b",
         r"\b(?:anything|rentals?|units?|listings?|options)\s+(?:in|at|around)\b",
         r"\bhave you got\b",
-        r"\bshow me\b.*\b(?:options|rentals?|units?)\b",
+        r"\bshow me\b.*\b(?:options|rentals?|units?|condos?|apartments?|houses?|landed)\b",
         r"\bfind me\b",
         r"\bshow me\b.*\b(home|homes|house|houses|propert(?:y|ies)|listing|listings|unit|units|matches)\b",
         r"\bany\b.*\b(home|homes|house|houses|landed|propert(?:y|ies)|listing|listings|unit|units|option|options)\b.*\bavailable\b",
@@ -362,6 +362,68 @@ def constrain_property_tools(args, routing):
         args["tool_choice"] = "none"
     args["instructions"] += "\nAuthoritative current-message entities: " + json.dumps(routing, ensure_ascii=False)
     return args
+
+
+def _folio_has_active_property_search(folio_id, bubble_env):
+    if not folio_id:
+        return False
+    base_url = get_bubble_base_url(bubble_env)
+    folio = bubble(f"{base_url}/obj/folio/{folio_id}")
+    lead_id = folio.get("lead")
+    if not lead_id:
+        return False
+    lead = bubble(f"{base_url}/obj/lead/{lead_id}")
+    raw = lead.get("searchActive")
+    if not raw:
+        return False
+    state = load_search_state(raw)
+    return bool(
+        state["areas"] or state["selected_condos"] or state["property_types"]
+        or state["bedroom_requirement"] or state["budget_requirement"]
+        or state["budget_rent"] or state["budget_buy"]
+    )
+
+
+def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
+    """Conservatively approve direct execution for exact, simple refinements."""
+    text = normalize_condo_name(message)
+    if routing.get("unavailable"):
+        return False, "entity_resolution_unavailable", False
+    if any(item.get("resolved_type") == "ambiguous" for item in routing.get("mentions", [])):
+        return False, "ambiguous_entity", False
+    if not routing.get("mentions") or not (
+        routing.get("geo_names") or routing.get("condo_names")
+    ):
+        return False, "no_authoritative_entity", False
+    if (_requires_location_comparison_tool(message)
+            or _requires_nearby_places_tool(message)
+            or _requires_travel_time_tool(message)):
+        return False, "requires_location_tool", False
+    if re.search(
+        r"\b(somewhere|nicer|better|more space|cheaper|suit(?:able)?|compare|"
+        r"near|nearby|how long|travel|commute|where should|best for|"
+        r"convenient for|kids? go)\b", text
+    ):
+        return False, "requires_advisory_reasoning", False
+    explicit_inventory = _is_explicit_inventory_search(message)
+    substitution = bool(re.search(
+        r"\b(try|how about|instead|again|switch|change (?:to|the area))\b", text
+    ))
+    if routing.get("action") != "advance_property_search" and not (
+        routing.get("action") == "area_information" and substitution
+    ):
+        return False, "non_search_action", False
+    inherited_from_active = False
+    if substitution and not explicit_inventory:
+        try:
+            inherited_from_active = _folio_has_active_property_search(
+                folio_id, bubble_env
+            )
+        except Exception:
+            return False, "active_search_lookup_failed", False
+        if not inherited_from_active:
+            return False, "no_active_search", False
+    return True, None, inherited_from_active
 
 
 INTERNAL_ORCHESTRATION_FIELDS = frozenset({
@@ -3534,14 +3596,10 @@ def build_listing_bubble_constraints(requirements, condo_ids=None):
             "key": "propertyType", "constraint_type": "equals",
             "value": next(iter(home_types)),
         })
-    bedrooms_min = requirements.get("bedrooms_min")
-    if bedrooms_min is not None:
-        # Bubble exposes strict numeric comparison; subtracting a tiny epsilon preserves
-        # the existing inclusive bedrooms_min semantic.
-        base_constraints.append({
-            "key": "beds", "constraint_type": "greater than",
-            "value": bedrooms_min - 0.000001,
-        })
+    if requirements.get("bedrooms_min") is not None:
+        # Bubble numeric comparisons exclude null values. Keep bedroom filtering
+        # in Python so unknown inventory remains eligible for completeness ranking.
+        python_only_filters.append("bedrooms")
 
     modes = _transaction_modes(requirements.get("transaction_type"))
     budget_rent = requirements.get("budget_rent")
@@ -3609,6 +3667,7 @@ def get_plausible_listings(
         key: 0 for key in (
             "fetched", "after_transaction", "after_property_type", "after_condo", "after_bedrooms",
             "after_budget", "after_geo", "plausible", "rejected_budget",
+            "unknown_bedrooms", "rejected_bedrooms",
         )
     }
     pages = 0
@@ -3771,6 +3830,8 @@ def get_plausible_listings(
         f"after_property_type={filter_counts['after_property_type']} "
         f"after_condo={filter_counts['after_condo']} "
         f"after_bedrooms={filter_counts['after_bedrooms']} "
+        f"unknown_bedrooms={filter_counts['unknown_bedrooms']} "
+        f"rejected_bedrooms={filter_counts['rejected_bedrooms']} "
         f"after_budget={filter_counts['after_budget']} "
         f"rejected_budget={filter_counts['rejected_budget']} "
         f"after_geo={filter_counts['after_geo']} "
@@ -4467,6 +4528,7 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
         "fetched": len(listings), "after_transaction": 0,
         "after_property_type": 0, "after_condo": 0,
         "after_bedrooms": 0, "after_budget": 0, "after_geo": 0,
+        "unknown_bedrooms": 0, "rejected_bedrooms": 0,
     }
 
     for listing in listings:
@@ -4487,8 +4549,12 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
             continue
         counts["after_condo"] += 1
         beds = _as_number(listing.get("beds"))
-        if bedrooms_min is not None and beds is not None and beds < bedrooms_min:
-            continue
+        if bedrooms_min is not None:
+            if beds is None:
+                counts["unknown_bedrooms"] += 1
+            elif beds < bedrooms_min:
+                counts["rejected_bedrooms"] += 1
+                continue
         counts["after_bedrooms"] += 1
         if budget_rent and "buy" not in modes and rent:
             if rent > budget_rent * 1.2 or rent < budget_rent * 0.45:
@@ -6144,7 +6210,9 @@ def _explicit_property_search_location(message):
     return None
 
 
-def _apply_current_search_location(user_message, bubble_env, tool_args):
+def _apply_current_search_location(
+    user_message, bubble_env, tool_args, authoritative_routing=None
+):
     """Make this turn's explicit location authoritative over model history."""
     normalized = " ".join(str(user_message or "").casefold().split())
     unrestricted_patterns = (
@@ -6161,6 +6229,20 @@ def _apply_current_search_location(user_message, bubble_env, tool_args):
         print(
             "[SEARCH OVERRIDE] source=current_message field=location "
             "scope=unrestricted condos=[] areas=[]", flush=True,
+        )
+        return updated
+    if (authoritative_routing
+            and authoritative_routing.get("action") == "advance_property_search"):
+        updated = dict(tool_args)
+        updated.update(
+            geo_names=authoritative_routing.get("geo_names") or [],
+            preferred_condo_names=authoritative_routing.get("condo_names") or [],
+            area_update_mode=(
+                "replace" if authoritative_routing.get("geo_names") else "reset"
+            ),
+            condo_update_mode=(
+                "replace" if authoritative_routing.get("condo_names") else "reset"
+            ),
         )
         return updated
     candidate = _explicit_property_search_location(user_message)
@@ -6354,6 +6436,67 @@ def _trusted_reply_listing_location(listing_id, bubble_env="live",
             "coordinates": coordinates}
 
 
+def prepare_advance_property_search_args(
+    user_message, bubble_env, tool_args=None, entity_routing=None
+):
+    """Apply the shared deterministic corrections for a property-search turn."""
+    prepared = _apply_current_transaction_intent(user_message, dict(tool_args or {}))
+    prepared = _apply_current_home_type_intent(user_message, prepared)
+    prepared = _apply_current_search_location(
+        user_message, bubble_env, prepared, entity_routing
+    )
+    if entity_routing and entity_routing.get("action") == "advance_property_search":
+        prepared.update(
+            geo_names=entity_routing["geo_names"],
+            preferred_condo_names=entity_routing["condo_names"],
+            area_update_mode="replace" if entity_routing["geo_names"] else "reset",
+            condo_update_mode="replace" if entity_routing["condo_names"] else "reset",
+            search_listings=True,
+        )
+        prepared["_entity_type_choices"] = {
+            item["text"]: item["routing_type"]
+            for item in entity_routing["mentions"]
+            if item["resolved_type"] == "ambiguous"
+            and item["routing_type"] != "ambiguous"
+        }
+    prepared["_user_message"] = user_message
+    return prepared
+
+
+def execute_prepared_property_search(
+    folio_id, bubble_env, message_id, prepared_args
+):
+    """Run the existing search and matching pipeline from canonical arguments."""
+    search_result = advance_property_search(folio_id, bubble_env, prepared_args)
+    has_match_results = False
+    recommendations = []
+    if search_result["action"] == "search_listings":
+        matching_result = execute_match_lead_silently(
+            folio_id, bubble_env, message_id, search_result["scope"]
+        )
+        save_property_search_state(
+            search_result["lead_id"], search_result["state"],
+            get_bubble_base_url(bubble_env),
+        )
+        has_match_results = bool(getattr(
+            matching_result, "recommendations_available", False
+        ))
+        recommendations = list(getattr(matching_result, "recommendations", []))
+        output = str(matching_result)
+    else:
+        output = search_result["text"]
+    return {
+        "output": output,
+        "instructions": (
+            "The supplied result is grounded property-search output. Use it if it answers "
+            "the customer's request. If another supported tool is genuinely required, call "
+            "that tool. Never expose search arguments or internal state."
+        ),
+        "has_match_results": has_match_results,
+        "recommendations": recommendations,
+    }
+
+
 def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
                       user_message=None, reply_listing_id=None,
                       conversation_context=None, entity_routing=None):
@@ -6390,42 +6533,11 @@ def execute_chat_tool(tool_call, folio_id, bubble_env, message_id,
     has_match_results = False
     recommendations = []
     if tool_call.name == "advance_property_search":
-        tool_args = _apply_current_transaction_intent(user_message, tool_args)
-        tool_args = _apply_current_home_type_intent(user_message, tool_args)
-        tool_args = _apply_current_search_location(
-            user_message, bubble_env, tool_args
+        tool_args = prepare_advance_property_search_args(
+            user_message, bubble_env, tool_args, entity_routing
         )
-        if entity_routing and entity_routing.get("action") == "advance_property_search":
-            tool_args.update(geo_names=entity_routing["geo_names"],
-                             preferred_condo_names=entity_routing["condo_names"],
-                             area_update_mode="replace" if entity_routing["geo_names"] else "reset",
-                             condo_update_mode="replace" if entity_routing["condo_names"] else "reset",
-                             search_listings=True)
-            tool_args["_entity_type_choices"] = {
-                item["text"]: item["routing_type"] for item in entity_routing["mentions"]
-                if item["resolved_type"] == "ambiguous" and item["routing_type"] != "ambiguous"
-            }
-        tool_args["_user_message"] = user_message
-        search_result = advance_property_search(folio_id, bubble_env, tool_args)
-        if search_result["action"] == "search_listings":
-            matching_result = execute_match_lead_silently(
-                folio_id, bubble_env, message_id, search_result["scope"]
-            )
-            save_property_search_state(
-                search_result["lead_id"], search_result["state"],
-                get_bubble_base_url(bubble_env),
-            )
-            has_match_results = bool(getattr(
-                matching_result, "recommendations_available", False
-            ))
-            recommendations = list(getattr(matching_result, "recommendations", []))
-            output = str(matching_result)
-        else:
-            output = search_result["text"]
-        instructions = (
-            "The supplied result is grounded property-search output. Use it if it answers "
-            "the customer's request. If another supported tool is genuinely required, call "
-            "that tool. Never expose search arguments or internal state."
+        return execute_prepared_property_search(
+            folio_id, bubble_env, message_id, tool_args
         )
     elif tool_call.name == "match_lead":
         matching_result = execute_match_lead_silently(
@@ -6797,32 +6909,105 @@ def chat_stream():
                     yield f"data: {json.dumps({'delta': clarification})}\n\n"
                     yield f"data: {json.dumps({'done': True, 'response_id': previous, 'recommendations_relevant': False, 'recommendations': []})}\n\n"
                     return
-                initial_args = build_response_args(
-                    message, previous, conversation_context, entity_routing=entity_routing
+                fast_eligible, fast_reason, inherited_from_active = (
+                    property_search_fast_path_decision(
+                        message, entity_routing, folio_id, bubble_env
+                    )
                 )
-                normal_tools = initial_args["tools"]
-                try:
-                    response, buffered_text = stream_initial_response(
-                        initial_args, "Initial OpenAI/tool selection"
-                    )
-                except Exception as error:
-                    if "No tool output found for function call" not in str(error):
-                        raise
+                if fast_eligible:
+                    fast_executed = False
+                    try:
+                        fast_routing = dict(entity_routing, action="advance_property_search")
+                        prepared_args = prepare_advance_property_search_args(
+                            message, bubble_env, {}, fast_routing
+                        )
+                        explicit_changes = [
+                            field for field in (
+                                "geo_names", "preferred_condo_names",
+                                "property_types", "transaction_type",
+                            ) if prepared_args.get(field)
+                        ]
+                        print(
+                            "[SEARCH FAST PATH] eligible=True "
+                            "action=advance_property_search model_skipped=True",
+                            flush=True,
+                        )
+                        print(
+                            f"[SEARCH FAST PATH] explicit_changes={explicit_changes!r}",
+                            flush=True,
+                        )
+                        print(
+                            "[SEARCH FAST PATH] inherited_from_active="
+                            f"{inherited_from_active}", flush=True,
+                        )
+                        execution = execute_prepared_property_search(
+                            folio_id, bubble_env, message_id, prepared_args
+                        )
+                        fast_executed = True
+                        final_args = build_response_args(
+                            message, previous, conversation_context,
+                            entity_routing=fast_routing,
+                        )
+                        normal_tools = final_args["tools"]
+                        final_args.update({
+                            "instructions": (
+                                rentee_instructions() + "\n\n" + execution["instructions"]
+                                + "\nThe deterministic search action is already complete. "
+                                "Answer the customer from the grounded result below."
+                            ),
+                            "input": (
+                                f"Customer request: {message}\n\n"
+                                f"Grounded property-search result: {execution['output']}"
+                            ),
+                            "tool_choice": "none",
+                        })
+                        final_args.pop("tools", None)
+                        response, buffered_text = stream_initial_response(
+                            final_args, "Search fast-path continuation"
+                        )
+                        has_match_results = execution["has_match_results"]
+                        current_run_recommendations = execution["recommendations"]
+                    except Exception as error:
+                        if fast_executed:
+                            raise
+                        fast_eligible = False
+                        fast_reason = f"execution_failed:{type(error).__name__}"
+                        print(
+                            f"[SEARCH FAST PATH] eligible=False reason={fast_reason!r}",
+                            flush=True,
+                        )
+                else:
                     print(
-                        "Broken previous_response_id detected; starting a fresh conversation",
-                        flush=True,
+                        f"[SEARCH FAST PATH] eligible=False reason={fast_reason!r}", flush=True,
                     )
-                    retry_args = build_response_args(
-                        message, None, conversation_context, entity_routing=entity_routing
+                if not fast_eligible:
+                    initial_args = build_response_args(
+                        message, previous, conversation_context, entity_routing=entity_routing
                     )
-                    normal_tools = retry_args["tools"]
-                    response, buffered_text = stream_initial_response(
-                        retry_args, "Initial OpenAI/tool selection retry"
-                    )
+                    normal_tools = initial_args["tools"]
+                    try:
+                        response, buffered_text = stream_initial_response(
+                            initial_args, "Initial OpenAI/tool selection"
+                        )
+                    except Exception as error:
+                        if "No tool output found for function call" not in str(error):
+                            raise
+                        print(
+                            "Broken previous_response_id detected; starting a fresh conversation",
+                            flush=True,
+                        )
+                        retry_args = build_response_args(
+                            message, None, conversation_context, entity_routing=entity_routing
+                        )
+                        normal_tools = retry_args["tools"]
+                        response, buffered_text = stream_initial_response(
+                            retry_args, "Initial OpenAI/tool selection retry"
+                        )
 
                 tool_round = 0
-                has_match_results = False
-                current_run_recommendations = []
+                if not fast_eligible:
+                    has_match_results = False
+                    current_run_recommendations = []
                 while True:
                     if any(
                         getattr(item, "type", None) == "web_search_call"

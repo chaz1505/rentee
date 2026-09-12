@@ -482,6 +482,135 @@ class SearchFlowStateTests(unittest.TestCase):
         self.assertIn("read-only", current)
         self.assertIn("changes the search", search)
 
+    @patch("app._folio_has_active_property_search", return_value=True)
+    @patch("app.execute_prepared_property_search")
+    @patch("app.resolve_property_routing")
+    def test_exact_geo_refinement_skips_initial_model_selection(
+        self, mocked_routing, mocked_execute, _active,
+    ):
+        routing = {
+            "action": "advance_property_search",
+            "geo_names": ["Bukit Tunku"], "condo_names": [],
+            "mentions": [{"text": "bukit tunku", "resolved_type": "geo",
+                          "routing_type": "geo"}],
+        }
+        mocked_routing.return_value = routing
+        mocked_execute.return_value = {
+            "output": "Grounded matches", "instructions": "Use grounded matches.",
+            "has_match_results": True, "recommendations": [{"listing_id": "one"}],
+        }
+        final = SimpleNamespace(id="final", output=[], usage=None)
+
+        class FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+            def __iter__(self):
+                return iter([SimpleNamespace(
+                    type="response.output_text.delta", delta="Here are the matches."
+                )])
+            def get_final_response(self): return final
+
+        responses = MagicMock()
+        responses.stream.return_value = FakeStream()
+        with patch.object(app_module, "client", SimpleNamespace(responses=responses)):
+            response = app_module.app.test_client().post("/chat_stream", json={
+                "message": "try Bukit Tunku", "folio_id": "folio-1",
+                "message_id": "message-1",
+            })
+        self.assertIn("Here are the matches", response.get_data(as_text=True))
+        self.assertEqual(responses.stream.call_count, 1)
+        final_request = responses.stream.call_args.kwargs
+        self.assertIn("Grounded property-search result", final_request["input"])
+        self.assertNotIn("tools", final_request)
+        prepared = mocked_execute.call_args.args[3]
+        self.assertEqual(prepared["geo_names"], ["Bukit Tunku"])
+        self.assertTrue(prepared["search_listings"])
+
+    @patch("app._folio_has_active_property_search")
+    def test_search_fast_path_eligibility_is_conservative(self, active):
+        geo = {
+            "action": "advance_property_search", "geo_names": ["Bukit Tunku"],
+            "condo_names": [], "mentions": [
+                {"resolved_type": "geo", "routing_type": "geo"}
+            ],
+        }
+        active.return_value = True
+        self.assertTrue(app_module.property_search_fast_path_decision(
+            "how about Bukit Tunku?", dict(geo, action="area_information"),
+            "folio", "live"
+        )[0])
+        active.return_value = False
+        self.assertFalse(app_module.property_search_fast_path_decision(
+            "how about Bukit Tunku?", dict(geo, action="area_information"),
+            "folio", "live"
+        )[0])
+        for message in (
+            "something nicer", "where should we live if the kids go to Alice Smith?",
+            "compare Bukit Tunku with Bangsar", "what is near Bukit Tunku?",
+            "how long to drive from Bukit Tunku to KLCC?",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(app_module.property_search_fast_path_decision(
+                    message, geo, "folio", "live"
+                )[0])
+        ambiguous = dict(geo, mentions=[
+            {"resolved_type": "ambiguous", "routing_type": "ambiguous"}
+        ])
+        self.assertFalse(app_module.property_search_fast_path_decision(
+            "try Bukit Tunku", ambiguous, "folio", "live"
+        )[0])
+
+    @patch("app.resolve_condo_mentions", return_value=[])
+    def test_fast_path_preparation_reuses_explicit_type_and_entity_helpers(self, _condos):
+        landed_routing = {
+            "action": "advance_property_search",
+            "geo_names": ["Damansara Heights"], "condo_names": [], "mentions": [],
+        }
+        landed = app_module.prepare_advance_property_search_args(
+            "any landed in Damansara Heights?", "live", {}, landed_routing
+        )
+        self.assertEqual(landed["property_types"], ["Landed"])
+        self.assertEqual(landed["geo_names"], ["Damansara Heights"])
+        condo_geo = app_module.prepare_advance_property_search_args(
+            "show me condos in Bangsar", "live", {}, {
+                "action": "advance_property_search", "geo_names": ["Bangsar"],
+                "condo_names": [], "mentions": [],
+            }
+        )
+        self.assertEqual(condo_geo["property_types"], ["Condo"])
+        self.assertEqual(condo_geo["geo_names"], ["Bangsar"])
+        condo_routing = {
+            "action": "advance_property_search", "geo_names": [],
+            "condo_names": ["One Menerung"], "mentions": [],
+        }
+        condo = app_module.prepare_advance_property_search_args(
+            "try One Menerung", "live", {}, condo_routing
+        )
+        self.assertEqual(condo["preferred_condo_names"], ["One Menerung"])
+        self.assertEqual(condo["area_update_mode"], "reset")
+
+        active = empty_search_state()
+        active.update(
+            areas=["Damansara Heights"], area_status="known",
+            property_types=["Landed", "rent"], bedroom_requirement="3",
+            budget_requirement="25000", budget_rent="25000",
+        )
+        refined = app_module.apply_active_search_update(
+            active, app_module.grounded_search_update("try Bukit Tunku", {
+                **app_module.prepare_advance_property_search_args(
+                    "try Bukit Tunku", "live", {}, {
+                        "action": "advance_property_search",
+                        "geo_names": ["Bukit Tunku"], "condo_names": [],
+                        "mentions": [],
+                    }
+                )
+            })
+        )
+        self.assertEqual(refined["areas"], ["Bukit Tunku"])
+        self.assertEqual(refined["property_types"], ["Landed", "rent"])
+        self.assertEqual(refined["bedroom_requirement"], "3")
+        self.assertEqual(refined["budget_rent"], "25000")
+
     @patch("app.advance_property_search")
     def test_chat_guided_search_uses_structured_search_action(self, mocked_advance):
         tool_args = {
@@ -1153,12 +1282,13 @@ class SearchFlowStateTests(unittest.TestCase):
 
     @patch("app.get_named_object_ids", return_value=["condo-one"])
     @patch("app.bubble")
-    def test_listing_query_pushes_condo_and_bedrooms_then_validates_in_python(
+    def test_listing_query_keeps_bedrooms_python_side_with_condo_scope(
         self, mocked_bubble, mocked_ids,
     ):
         mocked_bubble.return_value = {"results": [
             {"_id": "fit", "condo": "condo-one", "beds": 3, "priceRent": 14000, "TransactionType": ["Rent/Let"]},
             {"_id": "too-small", "condo": "condo-one", "beds": 2, "priceRent": 14000, "TransactionType": ["Rent/Let"]},
+            {"_id": "unknown", "condo": "condo-one", "beds": None, "priceRent": 14000, "TransactionType": ["Rent/Let"]},
         ], "remaining": 0}
         lead = {
             "TransactionType": ["Rent/Let"], "bedroomsMin": 3,
@@ -1168,8 +1298,8 @@ class SearchFlowStateTests(unittest.TestCase):
         listings, fetched = app_module.get_plausible_listings(
             "https://bubble.test", lead, ["One Menerung"]
         )
-        self.assertEqual([item["_id"] for item in listings], ["fit"])
-        self.assertEqual(fetched, 2)
+        self.assertEqual([item["_id"] for item in listings], ["fit", "unknown"])
+        self.assertEqual(fetched, 3)
         mocked_ids.assert_called_once_with(
             "https://bubble.test", "condo", ["One Menerung"]
         )
@@ -1178,10 +1308,7 @@ class SearchFlowStateTests(unittest.TestCase):
             {"key": "condo", "constraint_type": "equals", "value": "condo-one"},
             constraints,
         )
-        self.assertTrue(any(
-            item["key"] == "beds" and item["constraint_type"] == "greater than"
-            for item in constraints
-        ))
+        self.assertFalse(any(item["key"] == "beds" for item in constraints))
         self.assertFalse(any(item.get("value") == "geo-damansara" for item in constraints))
 
     @patch("app.bubble")
@@ -1322,11 +1449,11 @@ class SearchFlowStateTests(unittest.TestCase):
             "furnishing_preference": None,
         })
         self.assertEqual(plan["queries"][0], [
-            {"key": "beds", "constraint_type": "greater than", "value": 2.999999},
             {"key": "TransactionType", "constraint_type": "contains", "value": "Rent/Let"},
             {"key": "priceRent", "constraint_type": "is_not_empty"},
         ])
         self.assertIn("budget", plan["python_only_filters"])
+        self.assertIn("bedrooms", plan["python_only_filters"])
 
     def test_listing_query_without_budget_pushes_transaction_price_presence(self):
         plan = app_module.build_listing_bubble_constraints({
@@ -1352,11 +1479,73 @@ class SearchFlowStateTests(unittest.TestCase):
 
         self.assertEqual(plan["queries"], [[
             {"key": "propertyType", "constraint_type": "equals", "value": "Landed"},
-            {"key": "beds", "constraint_type": "greater than", "value": 3.999999},
             {"key": "TransactionType", "constraint_type": "contains", "value": "Rent/Let"},
             {"key": "priceRent", "constraint_type": "is_not_empty"},
             {"key": "Geo", "constraint_type": "equals", "value": "geo-bangsar"},
         ]])
+
+    def test_bedroom_minimum_keeps_unknown_and_rejects_only_known_shortfall(self):
+        lead = {"bedroomsMin": 3}
+        listings = [
+            {"_id": "unknown", "beds": None},
+            {"_id": "two", "beds": 2},
+            {"_id": "three", "beds": 3},
+            {"_id": "five", "beds": 5},
+        ]
+        plausible, counts = app_module.shortlist_structured_listings(
+            lead, listings, return_counts=True
+        )
+        self.assertEqual(
+            [listing["_id"] for listing in plausible],
+            ["unknown", "three", "five"],
+        )
+        self.assertEqual(counts["unknown_bedrooms"], 1)
+        self.assertEqual(counts["rejected_bedrooms"], 1)
+
+    def test_bedroom_python_filter_preserves_other_structured_constraints(self):
+        lead = {
+            "bedroomsMin": 3, "Geo": ["geo-bukit-tunku"],
+            "_active_property_types": ["Landed"],
+            "TransactionType": ["Rent/Let"],
+        }
+        listings = [
+            {"_id": "match", "beds": None, "Geo": "geo-bukit-tunku",
+             "propertyType": "Landed", "TransactionType": ["Rent/Let"],
+             "priceRent": 20000},
+            {"_id": "wrong-geo", "beds": None, "Geo": "geo-other",
+             "propertyType": "Landed", "TransactionType": ["Rent/Let"],
+             "priceRent": 20000},
+            {"_id": "wrong-type", "beds": None, "Geo": "geo-bukit-tunku",
+             "propertyType": "Condo", "TransactionType": ["Rent/Let"],
+             "priceRent": 20000},
+            {"_id": "wrong-transaction", "beds": None, "Geo": "geo-bukit-tunku",
+             "propertyType": "Landed", "TransactionType": ["Buy/Sell"],
+             "priceSale": 2000000},
+            {"_id": "missing-rent", "beds": None, "Geo": "geo-bukit-tunku",
+             "propertyType": "Landed", "TransactionType": ["Rent/Let"]},
+        ]
+        self.assertEqual(
+            [listing["_id"] for listing in app_module.shortlist_structured_listings(
+                lead, listings
+            )],
+            ["match"],
+        )
+
+    def test_unknown_bedrooms_are_omitted_from_facts_and_penalized_as_incomplete(self):
+        unknown = {
+            "_id": "unknown", "priceRent": 20000, "condo": "condo-one",
+            "Sq Ft": 2000, "Furnishing": "Furnished",
+            "availability": "Available", "keyFacts": "Quiet street",
+        }
+        known = dict(unknown, _id="known", beds=3)
+        facts = app_module.ranking_listing_facts(unknown)
+        self.assertNotIn("beds", facts)
+        ranked = app_module.reduce_listing_candidates(
+            {"TransactionType": ["Rent/Let"], "budgetRent": 25000,
+             "bedroomsMin": 3},
+            [unknown, known],
+        )
+        self.assertEqual([listing["_id"] for listing in ranked], ["known", "unknown"])
 
     def test_landed_property_type_reaches_bubble_and_python_filters(self):
         active = app_module.apply_active_search_update(empty_search_state(), {
