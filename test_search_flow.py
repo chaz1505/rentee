@@ -401,6 +401,36 @@ class SearchFlowStateTests(unittest.TestCase):
             "folio-1", app_module.get_bubble_base_url("live")
         )
 
+    @patch("app.bubble")
+    def test_match_existing_bulk_load_is_constant_for_one_and_twenty_three_items(
+        self, mocked_bubble,
+    ):
+        for count in (1, 23):
+            with self.subTest(count=count):
+                ids = [f"item-{index}" for index in range(count)]
+                records = [
+                    {"_id": item_id, "listing": f"listing-{index}",
+                     "newlyAdded": index % 5 == 0}
+                    for index, item_id in enumerate(ids)
+                ]
+                mocked_bubble.reset_mock()
+                mocked_bubble.return_value = {"results": records, "remaining": 0}
+                stats = {}
+                _folio, loaded, _listings = app_module.load_folio_listing_records(
+                    "folio-1", "https://bubble.test",
+                    folio={"folioItems": ids}, load_listings=False, stats=stats,
+                )
+                self.assertEqual(
+                    {item["listing"] for item in loaded},
+                    {f"listing-{index}" for index in range(count)},
+                )
+                self.assertEqual(
+                    [item["_id"] for item in loaded if item["newlyAdded"]],
+                    [f"item-{index}" for index in range(count) if index % 5 == 0],
+                )
+                self.assertEqual(mocked_bubble.call_count, 1)
+                self.assertEqual(stats["requests"], 2)
+
     @patch("app.execute_match_lead_silently")
     @patch("app.get_current_recommendations")
     def test_furnishing_followup_uses_current_recommendations_not_matching(
@@ -959,6 +989,38 @@ class SearchFlowStateTests(unittest.TestCase):
             ["listing-0", "listing-1", "listing-2", "listing-3"],
         )
 
+    def test_five_and_six_candidates_skip_model_and_preserve_preranked_order(self):
+        for count in (5, 6):
+            with self.subTest(count=count), \
+                    patch("app.bubble") as mocked_bubble, \
+                    patch("app.get_plausible_listings") as mocked_listings, \
+                    patch("app.get_relationship_names", return_value={}), \
+                    patch("app.create_folio_items", return_value=["item-new"]), \
+                    patch("app.update_folio_items"), \
+                    patch.object(app_module.client.responses, "create") as create:
+                mocked_bubble.side_effect = [
+                    {"lead": "lead-1", "folioItems": []},
+                    {"TransactionType": ["Rent/Let"]},
+                ]
+                expected_ids = [f"listing-{index}" for index in range(count)]
+                mocked_listings.return_value = ([
+                    {"_id": listing_id, "beds": 3, "priceRent": 10000}
+                    for listing_id in expected_ids
+                ], count)
+                flow = app_module.match_lead("folio-1", "live", "message-1")
+                while True:
+                    try:
+                        next(flow)
+                    except StopIteration as completed:
+                        answer = completed.value
+                        break
+                create.assert_not_called()
+                self.assertEqual(answer.listing_ids, expected_ids)
+                self.assertEqual(
+                    [item["recommendation_reason"] for item in answer.recommendations],
+                    ["Matches the current structured property search filters."] * count,
+                )
+
     @patch("app.update_folio_items")
     @patch("app.create_folio_items", return_value=["folio-item-new"])
     @patch("app.get_plausible_listings")
@@ -989,7 +1051,9 @@ class SearchFlowStateTests(unittest.TestCase):
             }),
             usage=None,
         )
-        with patch.object(app_module.client.responses, "create", return_value=model_response):
+        with patch.object(
+            app_module.client.responses, "create", return_value=model_response
+        ) as create:
             flow = app_module.match_lead("folio-1", "live", "message-1")
             while True:
                 try:
@@ -999,7 +1063,8 @@ class SearchFlowStateTests(unittest.TestCase):
                     break
         self.assertNotIn(listing_id, answer)
         self.assertIn("One Menerung", answer)
-        self.assertIn("four-bedroom", answer)
+        create.assert_not_called()
+        self.assertIn("Matches the current structured property search filters", answer)
         self.assertIn("RM11,500", answer)
         self.assertIn("https://www.rentee.asia/folio2/folio-1", answer)
         self.assertTrue(answer.recommendations_available)
@@ -1762,10 +1827,10 @@ class SearchFlowStateTests(unittest.TestCase):
             },
         ]
         mocked_listings.return_value = ([{
-            "_id": "listing-1", "beds": 3, "priceRent": 11500,
+            "_id": f"listing-{index}", "beds": 3, "priceRent": 11500 + index,
             "AIsearchtext": "LEGACY GENERATED LISTING",
             "Description": "A real structured description",
-        }], 1)
+        } for index in range(1, 8)], 7)
         model_response = SimpleNamespace(
             output_text=json.dumps({"recommendations": [], "customer_response": "No fit."}),
             usage=None,
@@ -1900,9 +1965,9 @@ class SearchFlowStateTests(unittest.TestCase):
             {"TransactionType": ["Rent/Let"], "bedroomsMin": 3, "budgetRent": 15000},
         ]
         mocked_listings.return_value = ([
-            {"_id": "listing-1", "beds": 3, "priceRent": 14000},
-            {"_id": "listing-2", "beds": 3, "priceRent": 14500},
-        ], 2)
+            {"_id": f"listing-{index}", "beds": 3, "priceRent": 14000 + index}
+            for index in range(1, 8)
+        ], 7)
         response = SimpleNamespace(
             output_text=json.dumps({
                 "recommendations": [{
@@ -1925,14 +1990,14 @@ class SearchFlowStateTests(unittest.TestCase):
         fallback = mocked_create.call_args.args[0]
         self.assertEqual(
             [item["listing_id"] for item in fallback],
-            ["listing-1", "listing-2"],
+            ["listing-1", "listing-2", "listing-3", "listing-4"],
         )
         self.assertIn("Matches the current structured property search filters", answer)
         self.assertTrue(answer.recommendations_available)
         mocked_update.assert_called_once()
         logs = " ".join(str(call) for call in mocked_print.call_args_list)
         self.assertIn("'invented-id'", logs)
-        self.assertIn("valid_candidate_ids=['listing-1', 'listing-2']", logs)
+        self.assertIn("valid_candidate_ids=['listing-1', 'listing-2'", logs)
         self.assertIn("reason=invalid_model_listing_ids", logs)
 
     def test_geo_filter_accepts_listing_relationship_id(self):
@@ -1957,9 +2022,10 @@ class SearchFlowStateTests(unittest.TestCase):
             {"lead": "lead-1", "folioItems": []},
             {"TransactionType": ["Rent/Let"], "bedroomsMin": 3, "budgetRent": 15000},
         ]
-        mocked_listings.return_value = ([{
-            "_id": "listing-1", "beds": 3, "priceRent": 12000,
-        }], 1)
+        mocked_listings.return_value = ([
+            {"_id": f"listing-{index}", "beds": 3, "priceRent": 12000 + index}
+            for index in range(1, 8)
+        ], 7)
         response = SimpleNamespace(
             output_text='{"recommendations":[{"listing_id":"listing-1","reco_summary":"unterminated',
             usage=None,

@@ -74,6 +74,7 @@ BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 RANKING_CANDIDATE_LIMIT = 12
 RANKING_RECOMMENDATION_MAX = 6
 RANKING_RECOMMENDATION_MIN = 4
+DIRECT_RECOMMENDATION_MAX = 6
 RETRIEVAL_CANDIDATE_TARGET = 120
 INITIAL_MAX_OUTPUT_TOKENS = 800
 RANKING_MAX_OUTPUT_TOKENS = 3000
@@ -4638,8 +4639,10 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
     previously_new_folio_item_ids = []
 
     existing_items_started = time.perf_counter()
+    existing_load_stats = {}
     _folio, existing_folio_items, _listings = load_folio_listing_records(
-        folio_id, base_url, folio=folio, load_listings=False
+        folio_id, base_url, folio=folio, load_listings=False,
+        stats=existing_load_stats,
     )
     for existing_folio_item in existing_folio_items:
         existing_folio_item_id = str(existing_folio_item.get("_id") or "")
@@ -4654,6 +4657,13 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "match_lead - load existing FolioItems",
         existing_items_started,
         f" ({len(existing_folio_item_ids)} items)"
+    )
+    print(
+        f"[FOLIO LOAD] purpose=match_existing "
+        f"items={len(existing_folio_items)} "
+        f"requests={max(0, existing_load_stats['requests'] - 1)} "
+        f"elapsed={time.perf_counter() - existing_items_started:.3f}s",
+        flush=True,
     )
 
     lead_id = folio["lead"]
@@ -4700,11 +4710,6 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         log_timing("match_lead TOTAL", match_started)
         return offer_adjacent_search(lead, lead_id, folio_id, base_url, validated_state)
 
-    print(
-        f"Ranking {len(listings)} candidates (limit: {RANKING_CANDIDATE_LIMIT})",
-        flush=True
-    )
-
     prompt_started = time.perf_counter()
     condo_names = get_relationship_names(
         base_url, "condo", [listing.get("condo") for listing in listings]
@@ -4749,16 +4754,22 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "matching the supplied schema.\n\n"
         + json.dumps(matching_input, ensure_ascii=False)
     )
-    print(
-        f"Ranking input size: chars={len(prompt)} "
-        f"approx_tokens={max(1, len(prompt) // 4)}",
-        flush=True,
-    )
-    log_timing("match_lead - build matching input", prompt_started)
+    response = None
+    if len(listings) > DIRECT_RECOMMENDATION_MAX:
+        print(
+            f"Ranking {len(listings)} candidates (limit: {RANKING_CANDIDATE_LIMIT})",
+            flush=True
+        )
+        print(
+            f"Ranking input size: chars={len(prompt)} "
+            f"approx_tokens={max(1, len(prompt) // 4)}",
+            flush=True,
+        )
+        log_timing("match_lead - build matching input", prompt_started)
 
-    yield "Ranking the best matches..."
-    matching_started = time.perf_counter()
-    response = client.responses.create(
+        yield "Ranking the best matches..."
+        matching_started = time.perf_counter()
+        response = client.responses.create(
 
         model="gpt-5-mini",
 
@@ -4794,18 +4805,33 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             }
         }
 
-    )
-    log_timing("match_lead - OpenAI matching", matching_started)
-    log_token_usage("Matching", response)
+        )
+        log_timing("match_lead - OpenAI matching", matching_started)
+        log_token_usage("Matching", response)
+        print("Matching model response received", flush=True)
 
-    print("Matching model response received", flush=True)
     parse_started = time.perf_counter()
-    try:
-        result = json.loads(response.output_text)
-    except json.JSONDecodeError as error:
-        print(f"Failed to parse matching JSON: {error}", flush=True)
-        log_timing("match_lead TOTAL", match_started)
-        return "I’m sorry, I couldn’t prepare your recommendations just now."
+    if response is None:
+        result = {
+            "recommendations": [
+                {
+                    "listing_id": facts["listing_id"],
+                    "reco_summary": "Matches the current structured property search filters.",
+                }
+                for facts in grounded_listing_facts
+            ],
+            "customer_response": (
+                "I found a few current listings that match your search. "
+                "Here are the strongest available options."
+            ),
+        }
+    else:
+        try:
+            result = json.loads(response.output_text)
+        except json.JSONDecodeError as error:
+            print(f"Failed to parse matching JSON: {error}", flush=True)
+            log_timing("match_lead TOTAL", match_started)
+            return "I’m sorry, I couldn’t prepare your recommendations just now."
 
     available_listing_ids = {
         facts["listing_id"] for facts in grounded_listing_facts
@@ -4827,6 +4853,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         result["recommendations"], grounded_listing_facts
     )
     filled_from_prerank = len(validated_recommendations) - model_valid_count
+    if response is None:
+        print(
+            f"[RANK FAST PATH] candidates={len(grounded_listing_facts)} "
+            f"model_skipped=True final_count={len(validated_recommendations)}",
+            flush=True,
+        )
     fallback_reason = None
     if filled_from_prerank:
         fallback_reason = (

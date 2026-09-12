@@ -371,13 +371,13 @@ class SearchScopeTests(unittest.TestCase):
         copy["geography_provenance"]["last_explicit"]["areas"].append("Bangsar")
         self.assertEqual(state["geography_provenance"]["last_explicit"]["areas"], ["Mont Kiara"])
 
-    def test_matches_reach_ranking_without_loading_adjacency(self):
+    def test_small_match_set_reaches_update_without_loading_adjacency(self):
         self.adjacency()
         with patch("app.get_relationship_names", return_value={}), patch("app.load_adjacent_geos") as adjacent:
             flow = app.match_lead("folio", "live", "message")
             self.assertEqual(next(flow), "Checking your preferences...")
             self.assertEqual(next(flow), "Searching available properties...")
-            self.assertEqual(next(flow), "Ranking the best matches...")
+            self.assertEqual(next(flow), "Updating your shortlist...")
             adjacent.assert_not_called()
             flow.close()
 
