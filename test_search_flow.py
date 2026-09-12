@@ -574,6 +574,66 @@ class SearchFlowStateTests(unittest.TestCase):
             "How about One Menerung", condo_refinement, "folio", "live"
         )[0])
 
+    @patch("app._folio_has_active_property_search", return_value=True)
+    def test_complex_relocation_and_advisory_turns_use_model_path(self, _active):
+        relocation = (
+            "Hi, I’m moving to KL with my wife and two kids in a couple of months. "
+            "I’ll be working around KLCC and the kids will probably go to Alice Smith. "
+            "We’d like somewhere family-friendly, ideally 4 bedrooms, and probably a condo "
+            "but open to landed if it makes sense. Budget is around RM15k a month. "
+            "We don’t really know the areas yet, so would be good to get your view on where we should live."
+        )
+        explicit_inventory = (
+            "We want to rent a 4-bed condo in Bangsar, budget RM15k, fully furnished, "
+            "show me available units."
+        )
+        for message in (relocation, explicit_inventory):
+            with self.subTest(message=message):
+                routing = {
+                    "action": "advance_property_search", "geo_names": ["Bangsar"],
+                    "condo_names": [], "mentions": [{"resolved_type": "geo"}],
+                }
+                eligible, reason, _ = app_module.property_search_fast_path_decision(
+                    message, routing, "folio", "live"
+                )
+                self.assertFalse(eligible)
+                self.assertEqual(reason, "complex_or_advisory_turn")
+        self.assertTrue(app_module._is_explicit_inventory_search(explicit_inventory))
+
+    def test_advisory_destination_geo_is_not_residential_scope(self):
+        records = {
+            "geo": [{"_id": "g1", "name": "KLCC"}],
+            "condo": [],
+        }
+        message = "I work in KLCC and kids go to Alice Smith — where should we live?"
+        with patch("app._property_entity_records", return_value=records):
+            routing = app_module.resolve_property_routing(message)
+        self.assertTrue(routing["turn_complexity"]["advisory"])
+        self.assertEqual(routing["geo_names"], [])
+        self.assertEqual(routing["destination_geo_names"], ["KLCC"])
+        self.assertIsNone(routing["action"])
+
+    @patch("app._folio_has_active_property_search", return_value=True)
+    @patch("app._folio_accepts_pending_broadening", return_value=False)
+    def test_short_single_delta_turns_remain_fast(self, _pending, _active):
+        cases = (
+            ("Try One Menerung", {
+                "action": "get_condo_info", "geo_names": [],
+                "condo_names": ["One Menerung"],
+                "mentions": [{"resolved_type": "condo", "routing_type": "condo"}],
+            }),
+            ("Make it 4 beds", {"action": None, "geo_names": [], "condo_names": [], "mentions": []}),
+            ("What about rentals", {"action": None, "geo_names": [], "condo_names": [], "mentions": []}),
+            ("Try 20k", {"action": None, "geo_names": [], "condo_names": [], "mentions": []}),
+            ("Include condos too", {"action": None, "geo_names": [], "condo_names": [], "mentions": []}),
+        )
+        for message, routing in cases:
+            with self.subTest(message=message):
+                self.assertFalse(app_module.property_search_turn_complexity(message)["complex"])
+                self.assertTrue(app_module.property_search_fast_path_decision(
+                    message, routing, "folio", "live"
+                )[0])
+
     def test_routing_extracts_multiple_geos_in_mention_order_and_safe_alias(self):
         records = {
             "geo": [

@@ -273,6 +273,38 @@ def _is_explicit_inventory_search(user_message):
     return any(re.search(pattern, text) for pattern in patterns)
 
 
+def property_search_turn_complexity(message):
+    """Classify turns that need whole-message interpretation before execution."""
+    text = normalize_condo_name(message)
+    advisory = bool(re.search(
+        r"\b(where should (?:we|i) live|what do you recommend|which areas?|"
+        r"what area would suit (?:us|me)|don'?t (?:really )?know kl|"
+        r"your view on where|compare (?:areas?|locations?))\b", text
+    ))
+    signals = 0
+    raw_message = str(message or "")
+    signals += (len(re.findall(r"[.!?;]|\s[-–—]\s", raw_message)) >= 2
+                or raw_message.count(",") >= 3)
+    signals += len(re.findall(
+        r"\b(?:bedrooms?|beds?|budget|rm\s*\d|rent(?:al|ing)?|buy(?:ing)?|"
+        r"condos?|landed|furnished|family[- ]friendly)\b", text
+    )) >= 3
+    signals += len(re.findall(r"(?<!\w)\d+(?:\.\d+)?\s*[km]?(?!\w)", text)) >= 2
+    signals += bool(re.search(r"\b(?:work(?:ing)?|office|school|kids?|children|wife|husband|family)\b", text))
+    signals += bool(re.search(
+        r"\b(?:probably|maybe|open to|ideally|if it makes sense|not sure|"
+        r"prefer|would like|we'd like)\b", text
+    ))
+    # Advisory intent is decisive; otherwise require several independent signs
+    # so a merely long but straightforward sentence is not penalized.
+    return {
+        "complex": (advisory or signals >= 3
+                    or (_is_explicit_inventory_search(message) and signals >= 2)),
+        "advisory": advisory,
+        "signals": signals,
+    }
+
+
 def _property_entity_records(bubble_env):
     """Cache Bubble identity records, independently of the advisory Condo sheet."""
     now = time.monotonic()
@@ -358,12 +390,19 @@ def resolve_property_routing(message, bubble_env="live"):
     if result["geo_names"]:
         print(f"[GEO RESOLUTION] current_message_geos={result['geo_names']!r}", flush=True)
     inventory = _is_explicit_inventory_search(message)
+    complexity = property_search_turn_complexity(message)
+    result["turn_complexity"] = complexity
+    if complexity["advisory"] and result["geo_names"]:
+        # In an advisory brief, exact Geo identity is useful grounding, but a
+        # mentioned workplace or school destination is not residential scope.
+        result["destination_geo_names"] = result["geo_names"]
+        result["geo_names"] = []
     correction = bool(re.search(r"\b(?:i meant|i mean|try|check|instead|switch|change (?:to|the area))\b", text))
     location_tool = (_requires_location_comparison_tool(message) or _requires_nearby_places_tool(message)
                      or _requires_travel_time_tool(message))
     if any(item["routing_type"] == "ambiguous" for item in mentions):
         result["action"] = "clarify"
-    elif mentions and not location_tool:
+    elif mentions and not location_tool and not complexity["advisory"]:
         if inventory or correction:
             result["action"] = "advance_property_search"
         elif result["condo_names"] and not result["geo_names"] and _is_clear_condo_information_question(message, result["condo_names"]):
@@ -432,6 +471,9 @@ def _folio_accepts_pending_broadening(folio_id, bubble_env, message):
 def property_search_fast_path_decision(message, routing, folio_id, bubble_env):
     """Conservatively approve direct execution for exact, simple refinements."""
     text = normalize_condo_name(message)
+    complexity = routing.get("turn_complexity") or property_search_turn_complexity(message)
+    if complexity["complex"]:
+        return False, "complex_or_advisory_turn", False
     if routing.get("unavailable"):
         return False, "entity_resolution_unavailable", False
     if any(item.get("resolved_type") == "ambiguous" for item in routing.get("mentions", [])):
