@@ -71,7 +71,9 @@ client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
 # Temporary small batch for validating the end-to-end matching flow.
-RANKING_CANDIDATE_LIMIT = 40
+RANKING_CANDIDATE_LIMIT = 12
+RANKING_RECOMMENDATION_MAX = 6
+RANKING_RECOMMENDATION_MIN = 4
 RETRIEVAL_CANDIDATE_TARGET = 120
 INITIAL_MAX_OUTPUT_TOKENS = 800
 RANKING_MAX_OUTPUT_TOKENS = 3000
@@ -4223,11 +4225,41 @@ def listing_facts(listing, condo_names=None, geo_names=None):
 
 
 def ranking_listing_facts(listing, condo_names=None, geo_names=None):
-    """Expose one canonical Bubble Listing identifier to the ranking model."""
-    facts = listing_facts(listing, condo_names, geo_names)
-    listing_id = facts.pop("_id", None)
-    if listing_id:
-        facts["listing_id"] = str(listing_id)
+    """Return only grounded facts that can materially affect ranking."""
+    listing_id = listing.get("_id")
+    if not listing_id:
+        return {}
+    facts = {"listing_id": str(listing_id)}
+    for field in (
+        "beds", "baths", "priceRent", "priceSale", "Sq Ft", "Landed_sqft",
+        "Furnishing", "furnished", "availability", "availability_date",
+        "balcony", "family room", "maid room", "outdoor area",
+    ):
+        if listing.get(field) not in (None, "", []):
+            facts[field] = listing[field]
+    condo_name = (condo_names or {}).get(str(listing.get("condo") or ""))
+    listing_name = next(
+        (listing.get(field) for field in ("name", "title", "condoName") if listing.get(field)),
+        None,
+    )
+    if condo_name:
+        facts["condo_name"] = condo_name
+    if listing_name or condo_name:
+        facts["property_name"] = str(listing_name or condo_name)
+    geo_value = listing.get("Geo")
+    geo_ids = geo_value if isinstance(geo_value, list) else [geo_value]
+    resolved_geos = [
+        (geo_names or {}).get(str(geo_id)) for geo_id in geo_ids if geo_id
+    ]
+    if any(resolved_geos):
+        facts["geo_names"] = [name for name in resolved_geos if name]
+    key_facts = listing.get("keyFacts")
+    if key_facts not in (None, "", []):
+        if isinstance(key_facts, str):
+            facts["keyFacts"] = key_facts[:600]
+        else:
+            rendered = json.dumps(key_facts, ensure_ascii=False, separators=(",", ":"))
+            facts["keyFacts"] = rendered[:600]
     return facts
 
 
@@ -4356,9 +4388,7 @@ def shortlist_structured_listings(lead, listings, return_counts=False):
 
 
 def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
-    """Bound ranking context while preserving the strongest factual candidates."""
-    if len(listings) <= limit:
-        return list(listings)
+    """Pre-rank grounded candidates with a small, explainable penalty score."""
     requirements = structured_lead_requirements(lead)
     modes = _transaction_modes(requirements["transaction_type"])
     target_budget = (
@@ -4366,27 +4396,108 @@ def reduce_listing_candidates(lead, listings, limit=RANKING_CANDIDATE_LIMIT):
         else requirements["budget_rent"]
     )
     bedrooms_min = requirements["bedrooms_min"]
+    furnishing_preference = normalize_condo_name(requirements["furnishing_preference"])
+    preferred_condos = {str(value) for value in requirements["preferred_condo_ids"]}
 
-    def candidate_key(listing):
+    def furnishing_penalty(listing):
+        if not furnishing_preference:
+            return 0.0
+        actual = normalize_condo_name(
+            listing.get("Furnishing") or listing.get("furnished")
+        )
+        if not actual:
+            return 0.08
+        if actual == furnishing_preference or actual in furnishing_preference \
+                or furnishing_preference in actual:
+            return 0.0
+        return 0.35
+
+    def availability_penalty(listing):
+        value = normalize_condo_name(
+            listing.get("availability") or listing.get("availability_date")
+        )
+        if not value:
+            return 0.08
+        if any(word in value for word in ("unavailable", "not available", "rented", "sold")):
+            return 0.5
+        if any(word in value for word in ("available", "vacant", "immediate", "ready")):
+            return 0.0
+        return 0.08
+
+    def candidate_key(index_and_listing):
+        index, listing = index_and_listing
         price = _as_number(
             listing.get("priceSale") if modes == {"buy"} else listing.get("priceRent")
         )
         beds = _as_number(listing.get("beds"))
-        budget_distance = (
-            abs(price - target_budget) / target_budget
-            if price is not None and target_budget else 0
+        # Exact bedrooms lead; each additional bedroom is a modest trade-off.
+        bedroom_penalty = (
+            max(0.0, beds - bedrooms_min) * 0.18
+            if beds is not None and bedrooms_min is not None else 0.08
         )
-        bedroom_distance = (
-            abs(beds - bedrooms_min)
-            if beds is not None and bedrooms_min is not None else 0
+        # Aim near 90% of budget: close to the requested tier with room for value.
+        budget_penalty = (
+            abs((price / target_budget) - 0.9)
+            if price is not None and target_budget else 0.08
         )
+        if price is not None and target_budget and price > target_budget:
+            budget_penalty += 0.25
         missing_facts = sum(
             listing.get(field) in (None, "", [])
-            for field in ("beds", "priceRent" if modes != {"buy"} else "priceSale", "condo")
+            for field in (
+                "beds", "priceRent" if modes != {"buy"} else "priceSale", "condo",
+                "Sq Ft", "Furnishing", "availability", "keyFacts",
+            )
         )
-        return budget_distance, bedroom_distance, missing_facts
+        completeness_penalty = missing_facts * 0.025
+        preference_boost = -0.1 if str(listing.get("condo")) in preferred_condos else 0.0
+        total = (
+            bedroom_penalty + budget_penalty + furnishing_penalty(listing)
+            + availability_penalty(listing) + completeness_penalty + preference_boost
+        )
+        return total, bedroom_penalty, budget_penalty, completeness_penalty, index
 
-    return sorted(listings, key=candidate_key)[:limit]
+    ranked = sorted(enumerate(listings), key=candidate_key)
+    selected = [listing for _index, listing in ranked[:limit]]
+    print(
+        f"[PRE-RANK] plausible={len(listings)} selected={len(selected)} limit={limit}",
+        flush=True,
+    )
+    return selected
+
+
+def validate_ranking_recommendations(model_recommendations, grounded_listing_facts):
+    """Validate model IDs and fill a useful minimum from deterministic order."""
+    available_ids = {facts["listing_id"] for facts in grounded_listing_facts}
+    validated = []
+    seen = set()
+    for recommendation in model_recommendations or []:
+        listing_id = str(recommendation.get("listing_id"))
+        if listing_id not in available_ids:
+            print(f"Ignoring invalid recommended listing ID: {listing_id!r}", flush=True)
+            continue
+        if listing_id in seen or len(validated) >= RANKING_RECOMMENDATION_MAX:
+            continue
+        validated.append({
+            "listing_id": listing_id,
+            "reco_summary": str(recommendation.get("reco_summary") or "")[:240],
+        })
+        seen.add(listing_id)
+
+    model_count = len(validated)
+    target_min = min(RANKING_RECOMMENDATION_MIN, len(grounded_listing_facts))
+    for facts in grounded_listing_facts:
+        if len(validated) >= target_min:
+            break
+        listing_id = facts["listing_id"]
+        if listing_id in seen:
+            continue
+        validated.append({
+            "listing_id": listing_id,
+            "reco_summary": "Matches the current structured property search filters.",
+        })
+        seen.add(listing_id)
+    return validated, model_count
 
 
 def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
@@ -4496,14 +4607,15 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         "context and for grounded trade-offs; do not turn it into hard retrieval "
         "criteria or let it override the structured search requirements. Use the "
         "structured listing facts and make sensible trade-offs, including fit with the "
-        "customer's budget tier. The supplied available_listings have already passed "
-        "structured retrieval and are plausible candidates. Your primary job is to rank "
-        "and select the strongest candidates, not to independently re-run retrieval. If "
+        "customer's budget tier. The supplied available_listings are already the strongest "
+        "deterministically pre-ranked candidates that passed structured retrieval. Your role "
+        "is qualitative ordering and concise grounded trade-offs, not re-running retrieval. If "
         "one or more candidates are reasonably suitable, you MUST return recommendations. "
         "Return an empty recommendations array only when every candidate has a concrete, "
         "material mismatch that makes it unsuitable. Do not reject every candidate merely "
-        "because none is perfect. Prefer the strongest 3 to 7 available options when there "
-        "are plausible candidates, make sensible trade-offs, and state compromises in each "
+        "because none is perfect. Normally return the strongest 4 to 6 available options when "
+        "at least four candidates exist; return every suitable candidate when fewer exist. "
+        "Make sensible trade-offs and state compromises in each "
         "reco_summary. Keep each reco_summary concise. Never invent "
         "facts. Copy each selected listing_id exactly from available_listings; do not alter, "
         "shorten, or invent it. Use property_name or condo_name in customer-facing prose and "
@@ -4537,7 +4649,7 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
                     "properties": {
                         "recommendations": {
                             "type": "array",
-                            "maxItems": 7,
+                            "maxItems": RANKING_RECOMMENDATION_MAX,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -4585,35 +4697,17 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
         f"[RANK DEBUG] returned_listing_ids={returned_listing_ids}",
         flush=True,
     )
-    validated_recommendations = []
-    seen_recommended_listing_ids = set()
-
-    for recommendation in result["recommendations"]:
-        listing_id = str(recommendation["listing_id"])
-        if listing_id not in available_listing_ids:
-            print(
-                f"Ignoring invalid recommended listing ID: {listing_id!r}",
-                flush=True,
-            )
-        elif listing_id not in seen_recommended_listing_ids:
-            recommendation["listing_id"] = listing_id
-            validated_recommendations.append(recommendation)
-            seen_recommended_listing_ids.add(listing_id)
-
+    validated_recommendations, model_valid_count = validate_ranking_recommendations(
+        result["recommendations"], grounded_listing_facts
+    )
+    filled_from_prerank = len(validated_recommendations) - model_valid_count
     fallback_reason = None
-    if grounded_listing_facts and not validated_recommendations:
+    if filled_from_prerank:
         fallback_reason = (
-            "invalid_model_listing_ids" if result["recommendations"]
-            else "empty_model_recommendations"
+            "invalid_model_listing_ids" if not model_valid_count and result["recommendations"]
+            else "empty_model_recommendations" if not result["recommendations"]
+            else "undersized_model_shortlist"
         )
-        fallback_facts = grounded_listing_facts[:3]
-        validated_recommendations = [
-            {
-                "listing_id": facts["listing_id"],
-                "reco_summary": "Matches the current structured property search filters.",
-            }
-            for facts in fallback_facts
-        ]
         print(
             f"[RANK FALLBACK] reason={fallback_reason} "
             f"candidate_count={len(grounded_listing_facts)} "
@@ -4625,6 +4719,12 @@ def match_lead(folio_id, bubble_env, message_id, condo_scope=None):
             "I found a few current listings that match your search. "
             "Here are the strongest available options."
         )
+    print(
+        f"[RANK VALIDATION] model_count={model_valid_count} "
+        f"final_count={len(validated_recommendations)} "
+        f"filled_from_prerank={filled_from_prerank}",
+        flush=True,
+    )
 
     new_recommendations = [
         recommendation
