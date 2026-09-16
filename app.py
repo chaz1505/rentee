@@ -7935,6 +7935,34 @@ def _process_whatsapp_message(message):
                     f"[WHATSAPP AUDIO] message_id={message_id} "
                     "processing_transcript_as_text", flush=True,
                 )
+            if message_type in {"text", "audio"}:
+                # Local import avoids coupling app startup to the importer while
+                # keeping this gate ahead of Conversation, Lead and Folio routing.
+                from whatsapp_importer import (
+                    detect_import_intent, process_whatsapp_import,
+                )
+                import_intent = detect_import_intent(text)
+                if import_intent["intent"] in {"lead_import", "listing_import"}:
+                    import_type = import_intent["intent"].removesuffix("_import")
+                    print(
+                        "[WHATSAPP IMPORT ROUTING] action=import "
+                        f"type={import_type}", flush=True,
+                    )
+                    import_result = process_whatsapp_import(
+                        text, import_type=import_type, bubble_env="live"
+                    )
+                    confirmation = import_result.get("confirmation") or (
+                        "I couldn't add that property record because its details "
+                        "couldn't be read reliably. Please check the message and resend it."
+                    )
+                    _stop_whatsapp_typing(typing_keepalive)
+                    send_whatsapp_text(phone, confirmation)
+                    reply_sent = True
+                    return
+                print(
+                    "[WHATSAPP IMPORT ROUTING] action=continue_normal_chat",
+                    flush=True,
+                )
             base_url = get_bubble_base_url("live")
             inbound_message_id = None
             inbound_message_created = False
