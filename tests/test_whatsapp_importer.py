@@ -31,6 +31,7 @@ def full_model_output(**updates):
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
         "budget": None, "asking_price": None, "bedrooms_min": None, "beds": None,
+        "proposing_agent": {"name": None, "phone": None, "ren": None},
     }
     value.update(updates)
     return value
@@ -63,6 +64,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             "type": "lead", "geo_names": ["Bangsar"],
             "preferred_development_names": [],
             "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "proposing_agent": {"name": None, "phone": None, "ren": None},
             "budget": 8000, "bedrooms_min": 3,
         })
         payload = importer.build_lead_payload(
@@ -542,6 +544,182 @@ Polygon Properties
         self.assertEqual(result["id"], "dev-raced")
         self.assertEqual(fresh.call_count, 2)
         create.assert_called_once()
+
+    def test_malaysian_phone_formats_and_email_are_deterministic(self):
+        variants = ("016-4697992", "+60 16-469 7992", "60164697992")
+        self.assertEqual([importer.normalize_phone_number(v) for v in variants],
+                         ["60164697992"] * 3)
+        expected = "whatsapp-60164697992@users.rentee.internal"
+        self.assertEqual(importer.build_internal_user_email("60164697992"), expected)
+        self.assertEqual(importer.build_internal_user_email("60164697992"), expected)
+
+    def test_existing_proposing_agent_is_reused_without_create(self):
+        user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
+                "REN": "E2265", "email": "alex@example.com"}
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer.rentee_app, "_bubble_patch") as patch_user:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex Goh", "016-4697992", "E2265")
+        self.assertEqual(result["user_id"], "user-agent")
+        create.assert_not_called()
+        patch_user.assert_not_called()
+
+    def test_new_proposing_agent_creation_payload(self):
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="user-new") as create:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex Goh", "016-4697992", "E2265")
+        self.assertEqual(create.call_args.args, (
+            "https://www.rentee.asia/api/1.1", "user", {
+                "phone": "60164697992", "name": "Alex Goh", "REN": "E2265",
+                "email": "whatsapp-60164697992@users.rentee.internal",
+            },
+        ))
+        self.assertEqual(result["user_id"], "user-new")
+
+    def test_missing_ren_or_name_still_allows_user_creation(self):
+        for index, name in enumerate(("Alex Goh", None)):
+            with self.subTest(name=name), \
+                 patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                              return_value=[]), \
+                 patch.object(importer.rentee_app, "_bubble_create",
+                              return_value=f"user-{index}") as create:
+                importer.resolve_or_create_proposing_agent(
+                    name, "0164697992", None)
+            payload = create.call_args.args[2]
+            self.assertEqual(payload["phone"], "60164697992")
+            self.assertEqual(payload["email"],
+                             "whatsapp-60164697992@users.rentee.internal")
+            self.assertNotIn("REN", payload)
+            self.assertEqual(payload.get("name"), name)
+
+    def test_no_phone_skips_user_creation_and_import_fields(self):
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone") as find, \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex Goh", None, "E2265")
+        self.assertEqual(result["status"], "no_phone")
+        find.assert_not_called()
+        create.assert_not_called()
+        payload = importer.build_lead_payload(
+            {"transaction_types": ["Rent/Let"], "property_types": []}, [], [], result)
+        self.assertNotIn("ProposingAgentNumber", payload)
+
+    def test_existing_user_missing_ren_is_patched_without_email_change(self):
+        user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
+                "REN": "", "email": "alex.real@example.com"}
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_patch") as patch_user:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex Goh", "0164697992", "E2265")
+        patch_user.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/user-agent", {"REN": "E2265"})
+        self.assertEqual(result["ren"], "E2265")
+        self.assertEqual(result["user"]["email"], "alex.real@example.com")
+
+    def test_conflicting_identity_values_are_preserved_and_logged(self):
+        user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
+                "REN": "E2265"}
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_patch") as patch_user, \
+             patch("builtins.print") as log:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex", "0164697992", "E2266")
+        patch_user.assert_not_called()
+        self.assertEqual((result["name"], result["ren"]), ("Alex Goh", "E2265"))
+        self.assertTrue(any("conflict=REN" in str(call) for call in log.call_args_list))
+
+    def test_real_agent_block_flows_to_user_and_lead_payload(self):
+        text = """Want To Rent
+- China Family Tenant
+- need 3 bedroom
+- budget Rm4k-5k.
+
+Alex Goh (E2265)
+Polygon Properties
+016-4697992"""
+        parsed = {
+            "type": "lead", "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "budget": 5000, "bedrooms_min": 3,
+            "proposing_agent": {
+                "name": "Alex Goh", "phone": "016-4697992", "ren": "E2265",
+            },
+        }
+        create = MagicMock(side_effect=["user-agent", "lead-1"])
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create", create):
+            result = importer.process_whatsapp_import(
+                text, import_type="lead", geo_records=[], development_records=[])
+        user_payload = create.call_args_list[0].args[2]
+        lead_payload = create.call_args_list[1].args[2]
+        self.assertEqual(user_payload["REN"], "E2265")
+        self.assertEqual(lead_payload["ProposingAgentName"], "Alex Goh")
+        self.assertEqual(lead_payload["ProposingAgentNumber"], "60164697992")
+        self.assertEqual(result["proposing_agent_user_id"], "user-agent")
+
+    def test_multiple_numbers_parser_selects_signature_agent_only(self):
+        output = full_model_output(
+            type="listing", development_name="One Menerung",
+            transaction_types=["Rent/Let"], asking_price=8500,
+            proposing_agent={
+                "name": "Alex Goh", "phone": "016-4697992", "ren": "E2265",
+            },
+        )
+        message = ("Owner contact 012-1111111\nOne Menerung for rent RM8,500\n\n"
+                   "Agent Alex Goh (E2265)\nPolygon Properties\n016-4697992")
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(status="completed", output_text=json.dumps(output)),
+        ):
+            parsed = importer.parse_forwarded_message(message, import_type="listing")
+        self.assertEqual(parsed["proposing_agent"], {
+            "name": "Alex Goh", "phone": "016-4697992", "ren": "E2265",
+        })
+
+    def test_duplicate_phone_users_do_not_create_another_user(self):
+        duplicates = [
+            {"_id": "user-1", "phone": "60164697992"},
+            {"_id": "user-2", "phone": "60164697992"},
+        ]
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=duplicates), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            result = importer.resolve_or_create_proposing_agent(
+                "Alex Goh", "0164697992", "E2265")
+        self.assertEqual(result["status"], "duplicate_existing")
+        self.assertIsNone(result["user_id"])
+        create.assert_not_called()
+
+    def test_agent_lookup_failure_does_not_stop_listing_import(self):
+        parsed = {
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Rent/Let"], "asking_price": 8500,
+            "proposing_agent": {
+                "name": "Alex Goh", "phone": "0164697992", "ren": "E2265",
+            },
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          side_effect=RuntimeError("Bubble unavailable")), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="listing-1") as create:
+            result = importer.process_whatsapp_import(
+                "listing", import_type="listing", geo_records=GEOS,
+                development_records=DEVELOPMENTS)
+        self.assertEqual(result["status"], "processed")
+        self.assertIsNone(result["proposing_agent_user_id"])
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["ProposingAgentName"], "Alex Goh")
+        self.assertEqual(payload["ProposingAgentNumber"], "60164697992")
 
 
 if __name__ == "__main__":

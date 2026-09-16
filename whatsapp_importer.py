@@ -69,11 +69,22 @@ PARSER_SCHEMA = {
         "asking_price": {"type": ["number", "null"], "minimum": 0},
         "bedrooms_min": {"type": ["integer", "null"], "minimum": 0},
         "beds": {"type": ["integer", "null"], "minimum": 0},
+        "proposing_agent": {
+            "type": "object",
+            "properties": {
+                "name": {"type": ["string", "null"]},
+                "phone": {"type": ["string", "null"]},
+                "ren": {"type": ["string", "null"]},
+            },
+            "required": ["name", "phone", "ren"],
+            "additionalProperties": False,
+        },
     },
     "required": [
         "type", "geo_names", "geo_name", "preferred_development_names",
         "development_name", "transaction_types", "property_types",
         "property_type", "budget", "asking_price", "bedrooms_min", "beds",
+        "proposing_agent",
     ],
     "additionalProperties": False,
 }
@@ -131,6 +142,12 @@ def _validate_parsed(value: Any) -> dict:
     property_type = value.get("property_type")
     if property_type not in PROPERTY_TYPES:
         property_type = None
+    raw_agent = value.get("proposing_agent")
+    raw_agent = raw_agent if isinstance(raw_agent, dict) else {}
+    proposing_agent = {
+        key: (_compact(raw_agent.get(key)) or None)
+        for key in ("name", "phone", "ren")
+    }
 
     if value["type"] == "lead":
         result = {
@@ -141,6 +158,7 @@ def _validate_parsed(value: Any) -> dict:
             ),
             "transaction_types": transactions,
             "property_types": property_types,
+            "proposing_agent": proposing_agent,
         }
         for key in ("budget", "bedrooms_min"):
             if isinstance(value.get(key), (int, float)) and value[key] >= 0:
@@ -150,6 +168,7 @@ def _validate_parsed(value: Any) -> dict:
     result = {
         "type": "listing",
         "transaction_types": transactions,
+        "proposing_agent": proposing_agent,
     }
     if _compact(value.get("geo_name")):
         result["geo_name"] = _compact(value["geo_name"])
@@ -198,7 +217,12 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "development name. Put areas and developments in their distinct fields. Geo fields "
             "are only residential search areas or listing locations explicitly stated as such. "
             "Never put schools, workplaces, malls, landmarks, offices, or stations in Geo fields; "
-            "they remain context only. Return "
+            "they remain context only. Extract proposing_agent only from a credible agent/contact "
+            "signature, such as a final name + registration/REN + agency + phone block, or an "
+            "explicit agent/negotiator/contact/PIC association. Registration forms include REN "
+            "12345, REN12345, E2265, and PEA 1234. If multiple phone numbers make ownership "
+            "ambiguous, leave the agent phone null. Do not mistake tenant or owner contacts for "
+            "the proposing agent. Never invent agent fields. Return "
             "null/empty values when evidence is weak; do not invent facts. For unknown, leave "
             "all other fields empty/null.\n\nMESSAGE:\n" + text
         ),
@@ -219,6 +243,132 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
     result = _validate_parsed(parsed)
     print(f"{LOG_PREFIX} parsed type={result['type']}", flush=True)
     return result
+
+
+def normalize_phone_number(raw_phone: str | None) -> str | None:
+    """Canonicalize a Malaysian mobile using Rentee's WhatsApp digit normalization."""
+    digits = rentee_app.normalize_phone(raw_phone)
+    if digits.startswith("0"):
+        digits = "60" + digits[1:]
+    if not re.fullmatch(r"601\d{8,9}", digits):
+        return None
+    return digits
+
+
+def build_internal_user_email(normalized_phone: str) -> str:
+    """Use the repository's deterministic WhatsApp-only User email convention."""
+    return f"whatsapp-{normalized_phone}@users.rentee.internal"
+
+
+def _agent_value(value):
+    return _compact(value) or None
+
+
+def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env):
+    updates = {}
+    existing_name = _agent_value(user.get("name"))
+    existing_ren = _agent_value(user.get("REN"))
+    if name and not existing_name:
+        updates["name"] = name
+    elif name and existing_name and name.casefold() != existing_name.casefold():
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=name "
+              f"existing={existing_name!r} incoming={name!r}", flush=True)
+    if ren and not existing_ren:
+        updates["REN"] = ren
+    elif ren and existing_ren and ren.casefold() != existing_ren.casefold():
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=REN "
+              f"existing={existing_ren!r} incoming={ren!r}", flush=True)
+    if updates:
+        try:
+            rentee_app._bubble_patch(
+                f"{rentee_app.get_bubble_base_url(bubble_env)}/obj/user/{user['_id']}",
+                updates,
+            )
+        except Exception as error:
+            print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} "
+                  f"action=update_failed error={type(error).__name__}", flush=True)
+        else:
+            user = {**user, **updates}
+            for field in updates:
+                print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} "
+                      f"action=updated field={field}", flush=True)
+    return user
+
+
+def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
+                                      ren: str | None,
+                                      bubble_env: str = "live") -> dict:
+    """Resolve one proposing agent by canonical phone, creating conservatively."""
+    clean_name, clean_ren = _agent_value(name), _agent_value(ren)
+    normalized = normalize_phone_number(phone)
+    print(f"[WHATSAPP IMPORT AGENT] raw_phone={_compact(phone)!r} "
+          f"normalized={normalized!r}", flush=True)
+    if not normalized:
+        return {"status": "no_phone", "user_id": None,
+                "normalized_phone": None, "name": clean_name, "ren": clean_ren}
+    try:
+        matches = rentee_app.find_bubble_users_by_phone(normalized, bubble_env)
+    except Exception as error:
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=lookup_failed "
+              f"error={type(error).__name__}", flush=True)
+        return {"status": "error", "user_id": None,
+                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+    if len(matches) > 1:
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} "
+              f"action=duplicate_existing count={len(matches)}", flush=True)
+        return {"status": "duplicate_existing", "user_id": None,
+                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+    if len(matches) == 1:
+        user = _enrich_existing_agent(
+            dict(matches[0]), clean_name, clean_ren, normalized, bubble_env
+        )
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
+              f"user_id={user['_id']}", flush=True)
+        return {"status": "existing", "user_id": str(user["_id"]),
+                "normalized_phone": normalized,
+                "name": _agent_value(user.get("name")) or clean_name,
+                "ren": _agent_value(user.get("REN")) or clean_ren,
+                "user": user}
+    payload = {
+        "phone": normalized,
+        "email": build_internal_user_email(normalized),
+    }
+    if clean_name:
+        payload["name"] = clean_name
+    if clean_ren:
+        payload["REN"] = clean_ren
+    try:
+        user_id = rentee_app._bubble_create(
+            rentee_app.get_bubble_base_url(bubble_env), "user", payload
+        )
+    except Exception as create_error:
+        # Mirror the existing WhatsApp identity race recovery: query once after
+        # a failed create and reuse a concurrently-created exact phone match.
+        try:
+            raced = rentee_app.find_bubble_users_by_phone(normalized, bubble_env)
+        except Exception:
+            raced = []
+        if len(raced) == 1:
+            user = _enrich_existing_agent(
+                dict(raced[0]), clean_name, clean_ren, normalized, bubble_env
+            )
+            print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
+                  f"user_id={user['_id']}", flush=True)
+            return {"status": "existing", "user_id": str(user["_id"]),
+                    "normalized_phone": normalized,
+                    "name": _agent_value(user.get("name")) or clean_name,
+                    "ren": _agent_value(user.get("REN")) or clean_ren,
+                    "user": user}
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=create_failed "
+              f"error={type(create_error).__name__}", flush=True)
+        return {"status": "error", "user_id": None,
+                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+    user = {"_id": user_id, **payload}
+    print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=created "
+          f"user_id={user_id}", flush=True)
+    return {"status": "created", "user_id": str(user_id),
+            "normalized_phone": normalized, "name": clean_name, "ren": clean_ren,
+            "user": user}
 
 
 def _detector_result(intent, confidence, signals, reason, marker=None):
@@ -644,7 +794,19 @@ def _matched_ids(resolutions: Iterable[dict]) -> list[str]:
     return list(dict.fromkeys(item["id"] for item in resolutions or [] if item.get("matched")))
 
 
-def build_lead_payload(parsed, resolved_geos, resolved_developments) -> dict:
+def _apply_proposing_agent_payload(payload, proposing_agent):
+    if not proposing_agent:
+        return
+    normalized = proposing_agent.get("normalized_phone")
+    name = _agent_value(proposing_agent.get("name"))
+    if normalized:
+        payload["ProposingAgentNumber"] = normalized
+        if name:
+            payload["ProposingAgentName"] = name
+
+
+def build_lead_payload(parsed, resolved_geos, resolved_developments,
+                       proposing_agent=None) -> dict:
     payload = {}
     geo_ids = _matched_ids(resolved_geos)
     development_ids = _matched_ids(resolved_developments)
@@ -665,10 +827,12 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments) -> dict:
             payload["budgetRent"] = parsed["budget"]
         if "Buy/Sell" in transactions:
             payload["budgetBuy"] = parsed["budget"]
+    _apply_proposing_agent_payload(payload, proposing_agent)
     return payload
 
 
-def build_listing_payload(parsed, resolved_geo, resolved_development) -> dict:
+def build_listing_payload(parsed, resolved_geo, resolved_development,
+                          proposing_agent=None) -> dict:
     payload = {}
     if resolved_geo and resolved_geo.get("matched"):
         payload["Geo"] = resolved_geo["id"]
@@ -686,6 +850,7 @@ def build_listing_payload(parsed, resolved_geo, resolved_development) -> dict:
             payload["priceRent"] = parsed["asking_price"]
         if "Buy/Sell" in transactions:
             payload["priceSale"] = parsed["asking_price"]
+    _apply_proposing_agent_payload(payload, proposing_agent)
     return payload
 
 
@@ -747,6 +912,23 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         return {"status": "unknown", "type": "unknown"}
     if bubble_env not in {"live", "development"}:
         raise ValueError("bubble_env must be 'live' or 'development'.")
+    parsed_agent = parsed.get("proposing_agent")
+    parsed_agent = parsed_agent if isinstance(parsed_agent, dict) else {}
+    try:
+        proposing_agent = resolve_or_create_proposing_agent(
+            parsed_agent.get("name"), parsed_agent.get("phone"),
+            parsed_agent.get("ren"), bubble_env,
+        )
+    except Exception as error:
+        normalized = normalize_phone_number(parsed_agent.get("phone"))
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=failed "
+              f"error={type(error).__name__}", flush=True)
+        proposing_agent = {
+            "status": "error", "user_id": None,
+            "normalized_phone": normalized,
+            "name": _agent_value(parsed_agent.get("name")),
+            "ren": _agent_value(parsed_agent.get("ren")),
+        }
     if geo_records is None or development_records is None:
         records = rentee_app._property_entity_records(bubble_env)
         geo_records = records["geo"] if geo_records is None else geo_records
@@ -762,13 +944,21 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         )
         if not any(item.get("matched") for item in geos):
             geos.extend(_derived_geos(developments, geo_records))
-        payload = build_lead_payload(parsed, geos, developments)
+        payload = build_lead_payload(
+            parsed, geos, developments, proposing_agent
+        )
         bubble_id = rentee_app._bubble_create(
             rentee_app.get_bubble_base_url(bubble_env), "lead", payload
         )
         result = {
             "status": "processed", "type": "lead", "bubble_id": bubble_id,
             "parsed": parsed,
+            "proposing_agent_user_id": proposing_agent.get("user_id"),
+            "proposing_agent": {
+                key: proposing_agent.get(key) for key in (
+                    "status", "user_id", "normalized_phone", "name", "ren",
+                )
+            },
             "resolved_geos": [_public_resolution(item) for item in geos if item.get("matched")],
             "resolved_developments": [_public_resolution(item) for item in developments
                                       if item.get("matched")],
@@ -793,7 +983,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         if explicit and explicit.get("matched") and derived and explicit["id"] != derived[0]["id"]:
             print(f"{LOG_PREFIX} geo conflict explicit={explicit['name']!r} "
                   f"development_geo={derived[0]['name']!r}", flush=True)
-        payload = build_listing_payload(parsed, resolved_geo, development)
+        payload = build_listing_payload(
+            parsed, resolved_geo, development, proposing_agent
+        )
         bubble_id = rentee_app._bubble_create(
             rentee_app.get_bubble_base_url(bubble_env), "listing", payload
         )
@@ -802,6 +994,12 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         result = {
             "status": "processed", "type": "listing", "bubble_id": bubble_id,
             "parsed": parsed,
+            "proposing_agent_user_id": proposing_agent.get("user_id"),
+            "proposing_agent": {
+                key: proposing_agent.get(key) for key in (
+                    "status", "user_id", "normalized_phone", "name", "ren",
+                )
+            },
             "resolved_geo": _public_resolution(resolved_geo),
             "resolved_development": _public_resolution(development) if development and development.get("matched") else None,
             "created_developments": [_public_resolution(item)
