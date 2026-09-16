@@ -172,7 +172,10 @@ class WhatsAppImporterTests(unittest.TestCase):
             "development_name": "Alam Sanctuary",
             "transaction_types": ["Rent/Let"], "asking_price": 5000, "beds": 2,
         }
-        result, create = self.process_as(parsed)
+        with patch.object(importer, "verify_development_candidate", return_value={
+            "status": "not_found", "raw_name": "Alam Sanctuary",
+        }):
+            result, create = self.process_as(parsed)
         payload = create.call_args.args[2]
         self.assertNotIn("development", payload)
         self.assertEqual(result["unresolved_development_names"], ["Alam Sanctuary"])
@@ -309,6 +312,236 @@ Polygon Properties
         conversations.assert_not_called()
         nearby.assert_not_called()
         advance.assert_not_called()
+
+    def test_existing_development_skips_web_and_creation(self):
+        parsed = {
+            "type": "listing", "development_name": "One Menerung",
+            "transaction_types": ["Rent/Let"], "asking_price": 8500, "beds": 3,
+        }
+        with patch.object(importer, "verify_development_candidate") as verify, \
+             patch.object(importer, "create_verified_development") as create_development:
+            result, create_listing = self.process_as(parsed)
+        verify.assert_not_called()
+        create_development.assert_not_called()
+        self.assertEqual(create_listing.call_args.args[2]["development"], "dev-one")
+        self.assertEqual(result["resolved_development"]["id"], "dev-one")
+
+    def test_verified_missing_development_is_created_with_exact_fields(self):
+        parsed = {
+            "type": "lead", "geo_names": [],
+            "preferred_development_names": ["Sefina"],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "budget": 5000, "bedrooms_min": 3,
+        }
+        verification = {
+            "status": "verified", "raw_name": "Sefina",
+            "canonical_name": "Sefina Mont Kiara", "geo_name": "Mont Kiara",
+            "verification_url": "https://example.com/sefina", "confidence": 0.97,
+        }
+        geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
+        create = MagicMock(side_effect=["dev-sefina", "lead-1"])
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate", return_value=verification), \
+             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create", create):
+            result = importer.process_whatsapp_import(
+                "Want To Rent near Sefina", geo_records=geos,
+                development_records=DEVELOPMENTS,
+            )
+        development_call, lead_call = create.call_args_list
+        self.assertEqual(development_call.args[1], "condo")
+        self.assertEqual(development_call.args[2], {
+            "Name": "Sefina Mont Kiara", "Geo": "geo-mk",
+            "verification_status": "Verified", "source": "WhatsApp Import",
+            "verification_url": "https://example.com/sefina",
+        })
+        self.assertEqual(lead_call.args[2]["preferredDevelopments"], ["dev-sefina"])
+        self.assertEqual(lead_call.args[2]["Geo"], ["geo-mk"])
+        self.assertEqual(result["created_developments"][0]["id"], "dev-sefina")
+
+    def test_verified_canonical_development_is_reused_without_post(self):
+        parsed = {
+            "type": "listing", "development_name": "Sefina",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        records = DEVELOPMENTS + [
+            {"_id": "dev-sefina", "Name": "Sefina Mont Kiara", "Geo": "geo-mk"}
+        ]
+        geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
+        verification = {
+            "status": "verified", "canonical_name": "Sefina Mont Kiara",
+            "geo_name": "Mont Kiara", "verification_url": "https://example.com/sefina",
+            "confidence": 0.97,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate", return_value=verification), \
+             patch.object(importer, "create_verified_development") as create_development, \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+            result = importer.process_whatsapp_import(
+                "Sefina", geo_records=geos, development_records=records
+            )
+        create_development.assert_not_called()
+        self.assertEqual(create.call_args.args[1], "listing")
+        self.assertEqual(create.call_args.args[2]["development"], "dev-sefina")
+        self.assertEqual(result["created_developments"], [])
+
+    def test_ambiguous_verification_leaves_development_unresolved(self):
+        parsed = {
+            "type": "listing", "development_name": "Sunshine Residence",
+            "transaction_types": ["Buy/Sell"], "asking_price": 900000,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate", return_value={
+                 "status": "ambiguous", "raw_name": "Sunshine Residence",
+                 "candidates": [{"name": "A"}, {"name": "B"}], "confidence": 0.45,
+             }), patch.object(importer, "create_verified_development") as create_dev, \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+            result = importer.process_whatsapp_import(
+                "Sunshine Residence", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        create_dev.assert_not_called()
+        self.assertNotIn("development", create.call_args.args[2])
+        self.assertEqual(result["unresolved_development_names"], ["Sunshine Residence"])
+
+    def test_verified_development_with_unresolved_geo_is_not_created(self):
+        parsed = {
+            "type": "listing", "development_name": "Sefina",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate", return_value={
+                 "status": "verified", "canonical_name": "Sefina Mont Kiara",
+                 "geo_name": "Unknown Area", "verification_url": "https://example.com/sefina",
+                 "confidence": 0.97,
+             }), patch.object(importer, "create_verified_development") as create_dev, \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+            result = importer.process_whatsapp_import(
+                "Sefina", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        create_dev.assert_not_called()
+        self.assertNotIn("development", create.call_args.args[2])
+        self.assertEqual(result["unresolved_development_names"], ["Sefina"])
+
+    def test_multiple_developments_mix_created_and_unresolved(self):
+        parsed = {
+            "type": "lead", "geo_names": [],
+            "preferred_development_names": [
+                "Inspirasi", "MK Astana", "Ceriaan Kiara", "Sefina", "Sefina",
+            ],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "budget": 5000, "bedrooms_min": 3,
+        }
+        outcomes = {
+            "Inspirasi": {"status": "verified", "canonical_name": "Inspirasi Mont Kiara",
+                          "geo_name": "Mont Kiara", "verification_url": "https://x/inspirasi"},
+            "MK Astana": {"status": "ambiguous", "candidates": []},
+            "Ceriaan Kiara": {"status": "not_found"},
+            "Sefina": {"status": "verified", "canonical_name": "Sefina Mont Kiara",
+                       "geo_name": "Mont Kiara", "verification_url": "https://x/sefina"},
+        }
+        def verify(name, _context, _env):
+            return outcomes[name]
+        created_ids = iter(["dev-inspirasi", "dev-sefina", "lead-1"])
+        geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate", side_effect=verify) as verifier, \
+             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=lambda *_args: next(created_ids)) as create:
+            result = importer.process_whatsapp_import(
+                "structured lead", geo_records=geos, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(verifier.call_count, 4)
+        lead_payload = create.call_args_list[-1].args[2]
+        self.assertEqual(lead_payload["preferredDevelopments"],
+                         ["dev-inspirasi", "dev-sefina"])
+        self.assertEqual(lead_payload["Geo"], ["geo-mk"])
+        self.assertEqual(result["unresolved_development_names"],
+                         ["MK Astana", "Ceriaan Kiara"])
+        self.assertEqual(len(result["created_developments"]), 2)
+
+    def test_school_is_context_not_geo_in_parser(self):
+        output = full_model_output(
+            type="lead", geo_names=[],
+            preferred_development_names=["Inspirasi", "Sefina"],
+            transaction_types=["Rent/Let"], property_types=["Condo"],
+        )
+        response = SimpleNamespace(status="completed", output_text=json.dumps(output))
+        text = ("Daughters study at Garden International School. "
+                "Looking for Inspirasi or Sefina.")
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create:
+            parsed = importer.parse_forwarded_message(text, import_type="lead")
+        self.assertNotIn("Garden International School", parsed["geo_names"])
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("Never put schools, workplaces", prompt)
+        context = importer._verification_context(parsed, text)
+        self.assertIn("Garden International School", context["raw_text"])
+
+    def test_web_verifier_reuses_responses_web_search_and_context(self):
+        output = {
+            "status": "verified", "canonical_name": "Sefina Mont Kiara",
+            "geo_name": "Mont Kiara",
+            "verification_url": "https://developer.example/sefina",
+            "evidence": [
+                {"url": "https://developer.example/sefina", "source": "Developer",
+                 "support": "Official project identity and location"},
+                {"url": "https://portal.example/sefina", "source": "Property portal",
+                 "support": "Corroborates name and Mont Kiara area"},
+            ],
+            "candidates": [], "confidence": 0.97,
+        }
+        response = SimpleNamespace(output_text=json.dumps(output))
+        context = {
+            "property_types": ["Condo"],
+            "raw_text": "Daughters study at Garden International School",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create:
+            result = importer.verify_development_candidate("Sefina", context)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(create.call_args.kwargs["tools"], [{"type": "web_search"}])
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("Sefina", prompt)
+        self.assertIn("Garden International School", prompt)
+        self.assertIn("never the returned residential geo_name", prompt)
+
+    def test_weak_single_source_verification_is_downgraded(self):
+        output = {
+            "status": "verified", "canonical_name": "Sunshine Residence",
+            "geo_name": "Kuala Lumpur",
+            "verification_url": "https://weak.example/sunshine",
+            "evidence": [{
+                "url": "https://weak.example/sunshine", "source": "Unknown",
+                "support": "Mentions the same words",
+            }],
+            "candidates": [], "confidence": 0.96,
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("Sunshine Residence", {})
+        self.assertEqual(result["status"], "ambiguous")
+
+    def test_development_creation_race_requeries_once_and_reuses(self):
+        geo = importer.resolve_geo_name("Bangsar", GEOS)
+        raced_record = {"_id": "dev-raced", "Name": "Sefina Mont Kiara",
+                        "Geo": "geo-bangsar"}
+        with patch.object(
+            importer, "_fresh_development_records", side_effect=[[], [raced_record]]
+        ) as fresh, patch.object(
+            importer.rentee_app, "_bubble_create", side_effect=RuntimeError("duplicate")
+        ) as create:
+            result = importer.create_verified_development(
+                "Sefina Mont Kiara", geo, "https://example.com/sefina"
+            )
+        self.assertEqual(result["id"], "dev-raced")
+        self.assertEqual(fresh.call_count, 2)
+        create.assert_called_once()
 
 
 if __name__ == "__main__":
