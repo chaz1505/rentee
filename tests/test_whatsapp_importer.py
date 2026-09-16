@@ -95,6 +95,32 @@ class WhatsAppImporterTests(unittest.TestCase):
         resolved = importer.resolve_geo_names(parsed["geo_names"], GEOS)
         self.assertEqual([item["id"] for item in resolved], ["geo-brickfields", "geo-pj"])
 
+    def test_mont_kiara_geo_format_variants_resolve_canonically(self):
+        geos = [{"_id": "geo-mk", "Name": "Mont Kiara"}]
+        variants = [
+            "Mont Kiara", "Mont'Kiara", "Mont' Kiara", "Mont’ Kiara",
+            "Mont' Kiara, Kuala Lumpur",
+            "Mont' Kiara (Jalan Kiara 3), Kuala Lumpur",
+            "Mont Kiara, Kuala Lumpur, Malaysia",
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                resolved = importer.resolve_geo_name(variant, geos)
+                self.assertTrue(resolved["matched"])
+                self.assertEqual(resolved["id"], "geo-mk")
+                self.assertEqual(resolved["name"], "Mont Kiara")
+
+    def test_geo_normalization_does_not_choose_duplicate_canonical_key(self):
+        geos = [
+            {"_id": "geo-mk-1", "Name": "Mont Kiara"},
+            {"_id": "geo-mk-2", "Name": "Mont'Kiara"},
+        ]
+        result = importer.resolve_geo_name(
+            "Mont' Kiara (Jalan Kiara 3), Kuala Lumpur", geos
+        )
+        self.assertFalse(result["matched"])
+        self.assertEqual(result["reason"], "ambiguous")
+
     def test_preferred_developments_derive_unique_lead_geos(self):
         parsed = {
             "type": "lead", "geo_names": [],
@@ -361,6 +387,37 @@ Polygon Properties
         self.assertEqual(lead_call.args[2]["Geo"], ["geo-mk"])
         self.assertEqual(result["created_developments"][0]["id"], "dev-sefina")
 
+    def test_verified_development_verbose_geo_uses_existing_canonical_geo(self):
+        parsed = {
+            "type": "listing", "development_name": "Ceriaan Kiara",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        verification = {
+            "status": "verified", "raw_name": "Ceriaan Kiara",
+            "canonical_name": "Ceriaan Kiara",
+            "geo_name": "Mont' Kiara (Jalan Kiara 3), Kuala Lumpur",
+            "verification_url": "https://example.com/ceriaan",
+            "confidence": 0.90, "reason": "credible_match",
+        }
+        geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
+        create = MagicMock(side_effect=["dev-ceriaan", "listing-1"])
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_development_candidate",
+                          return_value=verification), \
+             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create", create):
+            result = importer.process_whatsapp_import(
+                "Ceriaan Kiara", geo_records=geos,
+                development_records=DEVELOPMENTS,
+            )
+        development_payload = create.call_args_list[0].args[2]
+        listing_payload = create.call_args_list[1].args[2]
+        self.assertEqual(development_payload["Geo"], "geo-mk")
+        self.assertEqual(development_payload["Name"], "Ceriaan Kiara")
+        self.assertEqual(listing_payload["development"], "dev-ceriaan")
+        self.assertEqual(listing_payload["Geo"], "geo-mk")
+        self.assertEqual(result["created_developments"][0]["id"], "dev-ceriaan")
+
     def test_verified_canonical_development_is_reused_without_post(self):
         parsed = {
             "type": "listing", "development_name": "Sefina",
@@ -524,8 +581,8 @@ Polygon Properties
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
             result = importer.verify_development_candidate("Sunshine Residence", {})
-        self.assertEqual(result["status"], "not_found")
-        self.assertEqual(result["reason"], "no_credible_property_match")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "schema_validation_failed")
 
     def test_verifier_reports_no_search_results_reason(self):
         output = {
@@ -584,6 +641,46 @@ Polygon Properties
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"],
                          "verification_confidence_below_threshold")
+
+    def test_verifier_invalid_json_is_error(self):
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text="not JSON"),
+        ), patch("builtins.print") as log:
+            result = importer.verify_development_candidate("Inspirasi", {})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "invalid_json")
+        self.assertIn("reason='invalid_json'", " ".join(
+            str(call) for call in log.call_args_list
+        ))
+
+    def test_verifier_missing_required_field_is_error(self):
+        output = {
+            "status": "verified", "canonical_name": "Inspirasi Mont Kiara",
+            "geo_name": "Mont Kiara", "confidence": 0.96,
+            "reason": "credible_match",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("Inspirasi", {})
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["reason"], "missing_verification_url")
+
+    def test_valid_not_found_is_not_a_verifier_error(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "confidence": 0.1,
+            "reason": "no_credible_property_match",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("Not Real Place", {})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"], "no_credible_property_match")
 
     def test_context_is_passed_to_web_model_without_raw_log_dump(self):
         output = {
@@ -744,8 +841,9 @@ Polygon Properties
         user_payload = create.call_args_list[0].args[2]
         lead_payload = create.call_args_list[1].args[2]
         self.assertEqual(user_payload["REN"], "E2265")
-        self.assertEqual(lead_payload["proposingAgentNameLead"], "Alex Goh")
+        self.assertEqual(lead_payload["ProposedAgentNameLead"], "Alex Goh")
         self.assertEqual(lead_payload["ProposedAgentNumberLead"], "60164697992")
+        self.assertNotIn("proposingAgentNameLead", lead_payload)
         self.assertNotIn("ProposingAgentName", lead_payload)
         self.assertNotIn("ProposingAgentNumber", lead_payload)
         self.assertEqual(result["proposing_agent_user_id"], "user-agent")
@@ -810,7 +908,7 @@ Polygon Properties
         error = RuntimeError("request failed")
         error.response = response
         payload = {
-            "proposingAgentNameLead": "Alex Goh",
+            "ProposedAgentNameLead": "Alex Goh",
             "token": "must-not-appear",
         }
         with patch.object(importer.rentee_app, "_bubble_create", side_effect=error), \
@@ -821,7 +919,7 @@ Polygon Properties
         self.assertIn("type=lead", rendered)
         self.assertIn("status=400", rendered)
         self.assertIn("Bubble invalid field", rendered)
-        self.assertIn("proposingAgentNameLead", rendered)
+        self.assertIn("ProposedAgentNameLead", rendered)
         self.assertIn("[REDACTED]", rendered)
         self.assertNotIn("must-not-appear", rendered)
 

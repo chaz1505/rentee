@@ -99,6 +99,22 @@ def _normalized(value: Any) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
 
 
+def _normalized_geo(value: Any) -> str:
+    """Normalize harmless Geo formatting without erasing meaningful area words."""
+    text = _compact(value).casefold()
+    text = re.sub(r"\s*\([^)]*\)\s*", " ", text)
+    # These broad suffixes add no useful identity when matching Rentee's local Geos.
+    previous = None
+    while text != previous:
+        previous = text
+        text = re.sub(
+            r"\s*,\s*(?:kuala\s+lumpur|malaysia)\s*$", "", text,
+            flags=re.IGNORECASE,
+        )
+    text = text.replace("’", "'").replace("'", " ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
 def _record_name(record: dict) -> str:
     return _compact(next(
         (record.get(key) for key in ("name", "Name", "Condo name") if record.get(key)),
@@ -496,10 +512,11 @@ def _resolve_name(name: Any, records: Iterable[dict], kind: str) -> dict:
         exact = [(record, canonical) for record, canonical in candidates
                  if canonical.casefold() == raw.casefold()]
         method = "case_insensitive_exact"
+    normalizer = _normalized_geo if kind == "geo" else _normalized
     if not exact:
-        key = _normalized(raw)
+        key = normalizer(raw)
         exact = [(record, canonical) for record, canonical in candidates
-                 if _normalized(canonical) == key]
+                 if normalizer(canonical) == key]
         method = "normalized_exact"
     if len(exact) == 1:
         record, canonical = exact[0]
@@ -512,9 +529,9 @@ def _resolve_name(name: Any, records: Iterable[dict], kind: str) -> dict:
         print(f"{LOG_PREFIX} {kind} unresolved raw={raw!r}", flush=True)
         return {"matched": False, "raw_name": raw, "reason": "ambiguous"}
 
-    key = _normalized(raw)
+    key = normalizer(raw)
     scored = sorted((
-        (difflib.SequenceMatcher(None, key, _normalized(canonical)).ratio(), record, canonical)
+        (difflib.SequenceMatcher(None, key, normalizer(canonical)).ratio(), record, canonical)
         for record, canonical in candidates
     ), key=lambda item: item[0], reverse=True)
     best = scored[0] if scored else None
@@ -631,31 +648,54 @@ def verify_development_candidate(raw_name: str, context: dict,
             }},
         )
     except Exception as error:
-        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=not_found "
+        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
               f"reason='web_tool_error' error={type(error).__name__}", flush=True)
-        return {"status": "not_found", "raw_name": raw,
+        return {"status": "error", "raw_name": raw,
                 "canonical_name": None, "geo_name": None,
                 "verification_url": None, "confidence": 0.0,
                 "reason": "web_tool_error"}
     try:
         value = json.loads(str(response.output_text or ""))
     except (TypeError, json.JSONDecodeError):
-        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=not_found "
-              "reason='invalid_model_response'", flush=True)
-        return {"status": "not_found", "raw_name": raw,
-                "canonical_name": None, "geo_name": None,
-                "verification_url": None, "confidence": 0.0,
-                "reason": "invalid_model_response"}
+        return _verification_error(raw, "invalid_json")
+    if not isinstance(value, dict):
+        return _verification_error(raw, "schema_validation_failed")
+    if "status" not in value:
+        return _verification_error(raw, "missing_status", value)
     status = value.get("status")
+    if status not in {"verified", "ambiguous", "not_found"}:
+        return _verification_error(raw, "invalid_status", value)
+    for field in ("canonical_name", "geo_name", "verification_url", "confidence", "reason"):
+        if field not in value:
+            return _verification_error(raw, f"missing_{field}", value)
     confidence = value.get("confidence")
+    if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
+            or not 0 <= confidence <= 1):
+        return _verification_error(raw, "invalid_confidence", value)
     reason = value.get("reason")
+    if reason not in {
+        "credible_match", "multiple_plausible_candidates",
+        "no_credible_property_match",
+    }:
+        return _verification_error(raw, "schema_validation_failed", value)
+    if status == "verified":
+        if not _compact(value.get("canonical_name")):
+            return _verification_error(raw, "missing_canonical_name", value)
+        if not _compact(value.get("geo_name")):
+            return _verification_error(raw, "missing_geo_name", value)
+        if not _compact(value.get("verification_url")):
+            return _verification_error(raw, "missing_verification_url", value)
+        if not str(value["verification_url"]).startswith(("https://", "http://")):
+            return _verification_error(raw, "schema_validation_failed", value)
+        if reason != "credible_match":
+            return _verification_error(raw, "schema_validation_failed", value)
+    elif status == "ambiguous" and reason != "multiple_plausible_candidates":
+        return _verification_error(raw, "schema_validation_failed", value)
+    elif status == "not_found" and reason != "no_credible_property_match":
+        return _verification_error(raw, "schema_validation_failed", value)
     verified = (
         status == "verified"
-        and isinstance(confidence, (int, float)) and confidence >= 0.90
-        and _compact(value.get("canonical_name"))
-        and _compact(value.get("geo_name"))
-        and str(value.get("verification_url") or "").startswith(("https://", "http://"))
-        and reason == "credible_match"
+        and confidence >= 0.90
     )
     if verified:
         result = {
@@ -688,6 +728,19 @@ def verify_development_candidate(raw_name: str, context: dict,
     print(f"[DEVELOPMENT VERIFY] raw={raw!r} status={result_status} "
           f"reason={final_reason!r}", flush=True)
     return result
+
+
+def _verification_error(raw, reason, value=None):
+    keys = sorted(str(key) for key in value) if isinstance(value, dict) else None
+    suffix = f" response_keys={keys!r}" if keys is not None else ""
+    print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
+          f"reason={reason!r}{suffix}", flush=True)
+    return {
+        "status": "error", "raw_name": raw,
+        "canonical_name": None, "geo_name": None,
+        "verification_url": None, "confidence": 0.0,
+        "reason": reason,
+    }
 
 
 def _fresh_development_records(bubble_env):
@@ -759,7 +812,8 @@ def _resolve_or_verify_developments(names, development_records, geo_records,
         try:
             verification = verify_development_candidate(raw_name, context, bubble_env)
         except Exception as error:
-            print(f"[DEVELOPMENT VERIFY] raw={raw_name!r} status=not_found "
+            print(f"[DEVELOPMENT VERIFY] raw={raw_name!r} status=error "
+                  f"reason='unexpected_verifier_error' "
                   f"error={type(error).__name__}", flush=True)
             resolutions.append(resolved)
             continue
@@ -840,7 +894,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
             payload["budgetBuy"] = parsed["budget"]
     _apply_proposing_agent_payload(
         payload, proposing_agent,
-        name_field="proposingAgentNameLead",
+        name_field="ProposedAgentNameLead",
         number_field="ProposedAgentNumberLead",
     )
     return payload
