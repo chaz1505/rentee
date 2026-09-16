@@ -378,7 +378,8 @@ Polygon Properties
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer, "verify_development_candidate", return_value=verification), \
              patch.object(importer, "create_verified_development") as create_development, \
-             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
+             patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
                 "Sefina", geo_records=geos, development_records=records
             )
@@ -397,7 +398,8 @@ Polygon Properties
                  "status": "ambiguous", "raw_name": "Sunshine Residence",
                  "candidates": [{"name": "A"}, {"name": "B"}], "confidence": 0.45,
              }), patch.object(importer, "create_verified_development") as create_dev, \
-             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
+             patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
                 "Sunshine Residence", geo_records=GEOS,
                 development_records=DEVELOPMENTS,
@@ -417,13 +419,18 @@ Polygon Properties
                  "geo_name": "Unknown Area", "verification_url": "https://example.com/sefina",
                  "confidence": 0.97,
              }), patch.object(importer, "create_verified_development") as create_dev, \
-             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
+             patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
                 "Sefina", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         create_dev.assert_not_called()
         self.assertNotIn("development", create.call_args.args[2])
         self.assertEqual(result["unresolved_development_names"], ["Sefina"])
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("verification_status=verified", rendered)
+        self.assertIn("reason=geo_unresolved", rendered)
+        self.assertIn("geo_candidate='Unknown Area'", rendered)
 
     def test_multiple_developments_mix_created_and_unresolved(self):
         parsed = {
@@ -527,7 +534,117 @@ Polygon Properties
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
             result = importer.verify_development_candidate("Sunshine Residence", {})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"], "insufficient_credible_evidence")
+
+    def test_verifier_reports_no_search_results_reason(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "evidence": [], "candidates": [],
+            "confidence": 0.0, "search_result_count": 0, "source_domains": [],
+            "had_usable_evidence": False, "reason": "web_search_no_results",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("Ceriaan Kiara", {})
+        self.assertEqual(result, {
+            "status": "not_found", "raw_name": "Ceriaan Kiara",
+            "reason": "web_search_no_results",
+        })
+
+    def test_verifier_reports_pages_without_property_candidate(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "evidence": [], "candidates": [],
+            "confidence": 0.2, "search_result_count": 4,
+            "source_domains": ["example.com", "directory.test"],
+            "had_usable_evidence": False,
+            "reason": "no_property_development_candidate",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("MK Astana", {})
+        self.assertEqual(result["reason"], "no_property_development_candidate")
+
+    def test_verifier_reports_multiple_plausible_candidate_names(self):
+        output = {
+            "status": "ambiguous", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "evidence": [],
+            "candidates": [
+                {"name": "Sunshine Residence KL", "geo_name": "Kuala Lumpur",
+                 "url": "https://one.test"},
+                {"name": "Sunshine Residence Penang", "geo_name": "Penang",
+                 "url": "https://two.test"},
+            ],
+            "confidence": 0.45, "search_result_count": 5,
+            "source_domains": ["one.test", "two.test"],
+            "had_usable_evidence": True,
+            "reason": "multiple_plausible_candidates",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ), patch("builtins.print") as log:
+            result = importer.verify_development_candidate("Sunshine Residence", {})
         self.assertEqual(result["status"], "ambiguous")
+        self.assertEqual(result["reason"], "multiple_plausible_candidates")
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("Sunshine Residence KL", rendered)
+        self.assertIn("Sunshine Residence Penang", rendered)
+
+    def test_verifier_reports_confidence_below_threshold(self):
+        output = {
+            "status": "verified", "canonical_name": "Inspirasi Mont Kiara",
+            "geo_name": "Mont Kiara", "verification_url": "https://one.test",
+            "evidence": [
+                {"url": "https://one.test", "source": "One", "support": "Name"},
+                {"url": "https://two.test", "source": "Two", "support": "Area"},
+            ],
+            "candidates": [], "confidence": 0.84, "search_result_count": 5,
+            "source_domains": ["one.test", "two.test"],
+            "had_usable_evidence": True,
+            "reason": "verification_confidence_below_threshold",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            result = importer.verify_development_candidate("Inspirasi", {})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"],
+                         "verification_confidence_below_threshold")
+
+    def test_contextual_query_and_summary_are_logged_without_raw_dump(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "evidence": [], "candidates": [],
+            "confidence": 0.1, "search_result_count": 2,
+            "source_domains": ["propertyguru.com.my"],
+            "had_usable_evidence": False,
+            "reason": "no_property_development_candidate",
+        }
+        context = {
+            "geo_names": ["Mont Kiara"], "property_types": ["Condo"],
+            "other_development_names": ["Inspirasi", "MK Astana", "Sefina"],
+            "raw_text": "Daughters study at Garden International School. PRIVATE NOTE",
+        }
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ) as create, patch("builtins.print") as log:
+            importer.verify_development_candidate("Sefina", context)
+        query = importer._development_search_query("Sefina", context)
+        self.assertIn("Sefina Condo Mont Kiara", query)
+        self.assertIn("Garden International School", query)
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn(f"query={query!r}", rendered)
+        self.assertIn("propertyguru.com.my", rendered)
+        self.assertNotIn("PRIVATE NOTE", rendered)
+        self.assertIn(query, create.call_args.kwargs["input"])
 
     def test_development_creation_race_requeries_once_and_reuses(self):
         geo = importer.resolve_geo_name("Bangsar", GEOS)
