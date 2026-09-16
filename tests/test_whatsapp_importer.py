@@ -494,13 +494,7 @@ Polygon Properties
             "status": "verified", "canonical_name": "Sefina Mont Kiara",
             "geo_name": "Mont Kiara",
             "verification_url": "https://developer.example/sefina",
-            "evidence": [
-                {"url": "https://developer.example/sefina", "source": "Developer",
-                 "support": "Official project identity and location"},
-                {"url": "https://portal.example/sefina", "source": "Property portal",
-                 "support": "Corroborates name and Mont Kiara area"},
-            ],
-            "candidates": [], "confidence": 0.97,
+            "confidence": 0.97, "reason": "credible_match",
         }
         response = SimpleNamespace(output_text=json.dumps(output))
         context = {
@@ -516,18 +510,14 @@ Polygon Properties
         prompt = create.call_args.kwargs["input"]
         self.assertIn("Sefina", prompt)
         self.assertIn("Garden International School", prompt)
-        self.assertIn("never the returned residential geo_name", prompt)
+        self.assertIn("must never itself be returned as a development or residential Geo", prompt)
 
-    def test_weak_single_source_verification_is_downgraded(self):
+    def test_verified_result_requires_credible_match_reason(self):
         output = {
             "status": "verified", "canonical_name": "Sunshine Residence",
             "geo_name": "Kuala Lumpur",
             "verification_url": "https://weak.example/sunshine",
-            "evidence": [{
-                "url": "https://weak.example/sunshine", "source": "Unknown",
-                "support": "Mentions the same words",
-            }],
-            "candidates": [], "confidence": 0.96,
+            "confidence": 0.96, "reason": "no_credible_property_match",
         }
         with patch.object(
             importer.rentee_app.client.responses, "create",
@@ -535,79 +525,56 @@ Polygon Properties
         ):
             result = importer.verify_development_candidate("Sunshine Residence", {})
         self.assertEqual(result["status"], "not_found")
-        self.assertEqual(result["reason"], "insufficient_credible_evidence")
+        self.assertEqual(result["reason"], "no_credible_property_match")
 
     def test_verifier_reports_no_search_results_reason(self):
         output = {
             "status": "not_found", "canonical_name": None, "geo_name": None,
-            "verification_url": None, "evidence": [], "candidates": [],
-            "confidence": 0.0, "search_result_count": 0, "source_domains": [],
-            "had_usable_evidence": False, "reason": "web_search_no_results",
+            "verification_url": None, "confidence": 0.0,
+            "reason": "no_credible_property_match",
         }
         with patch.object(
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
             result = importer.verify_development_candidate("Ceriaan Kiara", {})
-        self.assertEqual(result, {
-            "status": "not_found", "raw_name": "Ceriaan Kiara",
-            "reason": "web_search_no_results",
-        })
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["raw_name"], "Ceriaan Kiara")
+        self.assertEqual(result["reason"], "no_credible_property_match")
 
     def test_verifier_reports_pages_without_property_candidate(self):
         output = {
             "status": "not_found", "canonical_name": None, "geo_name": None,
-            "verification_url": None, "evidence": [], "candidates": [],
-            "confidence": 0.2, "search_result_count": 4,
-            "source_domains": ["example.com", "directory.test"],
-            "had_usable_evidence": False,
-            "reason": "no_property_development_candidate",
+            "verification_url": None, "confidence": 0.2,
+            "reason": "no_credible_property_match",
         }
         with patch.object(
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
             result = importer.verify_development_candidate("MK Astana", {})
-        self.assertEqual(result["reason"], "no_property_development_candidate")
+        self.assertEqual(result["reason"], "no_credible_property_match")
 
     def test_verifier_reports_multiple_plausible_candidate_names(self):
         output = {
             "status": "ambiguous", "canonical_name": None, "geo_name": None,
-            "verification_url": None, "evidence": [],
-            "candidates": [
-                {"name": "Sunshine Residence KL", "geo_name": "Kuala Lumpur",
-                 "url": "https://one.test"},
-                {"name": "Sunshine Residence Penang", "geo_name": "Penang",
-                 "url": "https://two.test"},
-            ],
-            "confidence": 0.45, "search_result_count": 5,
-            "source_domains": ["one.test", "two.test"],
-            "had_usable_evidence": True,
+            "verification_url": None,
+            "confidence": 0.45,
             "reason": "multiple_plausible_candidates",
         }
         with patch.object(
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
-        ), patch("builtins.print") as log:
+        ):
             result = importer.verify_development_candidate("Sunshine Residence", {})
         self.assertEqual(result["status"], "ambiguous")
         self.assertEqual(result["reason"], "multiple_plausible_candidates")
-        rendered = " ".join(str(call) for call in log.call_args_list)
-        self.assertIn("Sunshine Residence KL", rendered)
-        self.assertIn("Sunshine Residence Penang", rendered)
 
     def test_verifier_reports_confidence_below_threshold(self):
         output = {
             "status": "verified", "canonical_name": "Inspirasi Mont Kiara",
             "geo_name": "Mont Kiara", "verification_url": "https://one.test",
-            "evidence": [
-                {"url": "https://one.test", "source": "One", "support": "Name"},
-                {"url": "https://two.test", "source": "Two", "support": "Area"},
-            ],
-            "candidates": [], "confidence": 0.84, "search_result_count": 5,
-            "source_domains": ["one.test", "two.test"],
-            "had_usable_evidence": True,
-            "reason": "verification_confidence_below_threshold",
+            "confidence": 0.84, "reason": "credible_match",
         }
         with patch.object(
             importer.rentee_app.client.responses, "create",
@@ -618,14 +585,11 @@ Polygon Properties
         self.assertEqual(result["reason"],
                          "verification_confidence_below_threshold")
 
-    def test_contextual_query_and_summary_are_logged_without_raw_dump(self):
+    def test_context_is_passed_to_web_model_without_raw_log_dump(self):
         output = {
             "status": "not_found", "canonical_name": None, "geo_name": None,
-            "verification_url": None, "evidence": [], "candidates": [],
-            "confidence": 0.1, "search_result_count": 2,
-            "source_domains": ["propertyguru.com.my"],
-            "had_usable_evidence": False,
-            "reason": "no_property_development_candidate",
+            "verification_url": None, "confidence": 0.1,
+            "reason": "no_credible_property_match",
         }
         context = {
             "geo_names": ["Mont Kiara"], "property_types": ["Condo"],
@@ -637,14 +601,15 @@ Polygon Properties
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ) as create, patch("builtins.print") as log:
             importer.verify_development_candidate("Sefina", context)
-        query = importer._development_search_query("Sefina", context)
-        self.assertIn("Sefina Condo Mont Kiara", query)
-        self.assertIn("Garden International School", query)
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("Sefina", prompt)
+        self.assertIn("Mont Kiara", prompt)
+        self.assertIn("Inspirasi", prompt)
+        self.assertIn("Garden International School", prompt)
         rendered = " ".join(str(call) for call in log.call_args_list)
-        self.assertIn(f"query={query!r}", rendered)
-        self.assertIn("propertyguru.com.my", rendered)
+        self.assertIn("action=web_model_check", rendered)
+        self.assertIn("status=not_found", rendered)
         self.assertNotIn("PRIVATE NOTE", rendered)
-        self.assertIn(query, create.call_args.kwargs["input"])
 
     def test_development_creation_race_requeries_once_and_reuses(self):
         geo = importer.resolve_geo_name("Bangsar", GEOS)
@@ -724,7 +689,7 @@ Polygon Properties
         create.assert_not_called()
         payload = importer.build_lead_payload(
             {"transaction_types": ["Rent/Let"], "property_types": []}, [], [], result)
-        self.assertNotIn("ProposingAgentNumber", payload)
+        self.assertNotIn("ProposedAgentNumberLead", payload)
 
     def test_existing_user_missing_ren_is_patched_without_email_change(self):
         user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
@@ -779,8 +744,10 @@ Polygon Properties
         user_payload = create.call_args_list[0].args[2]
         lead_payload = create.call_args_list[1].args[2]
         self.assertEqual(user_payload["REN"], "E2265")
-        self.assertEqual(lead_payload["ProposingAgentName"], "Alex Goh")
-        self.assertEqual(lead_payload["ProposingAgentNumber"], "60164697992")
+        self.assertEqual(lead_payload["proposingAgentNameLead"], "Alex Goh")
+        self.assertEqual(lead_payload["ProposedAgentNumberLead"], "60164697992")
+        self.assertNotIn("ProposingAgentName", lead_payload)
+        self.assertNotIn("ProposingAgentNumber", lead_payload)
         self.assertEqual(result["proposing_agent_user_id"], "user-agent")
 
     def test_multiple_numbers_parser_selects_signature_agent_only(self):
@@ -837,6 +804,26 @@ Polygon Properties
         payload = create.call_args.args[2]
         self.assertEqual(payload["ProposingAgentName"], "Alex Goh")
         self.assertEqual(payload["ProposingAgentNumber"], "60164697992")
+
+    def test_bubble_create_error_logs_status_body_and_sanitized_payload(self):
+        response = SimpleNamespace(status_code=400, text="Bubble invalid field")
+        error = RuntimeError("request failed")
+        error.response = response
+        payload = {
+            "proposingAgentNameLead": "Alex Goh",
+            "token": "must-not-appear",
+        }
+        with patch.object(importer.rentee_app, "_bubble_create", side_effect=error), \
+             patch("builtins.print") as log, self.assertRaises(RuntimeError):
+            importer._create_import_record("lead", payload, "live")
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("[WHATSAPP IMPORT BUBBLE ERROR]", rendered)
+        self.assertIn("type=lead", rendered)
+        self.assertIn("status=400", rendered)
+        self.assertIn("Bubble invalid field", rendered)
+        self.assertIn("proposingAgentNameLead", rendered)
+        self.assertIn("[REDACTED]", rendered)
+        self.assertNotIn("must-not-appear", rendered)
 
 
 if __name__ == "__main__":
