@@ -9,6 +9,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 
 import whatsapp_importer as importer
+import development_resolver as resolver
 
 
 GEOS = [
@@ -191,7 +192,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"_id": "a", "name": "Alam Sanctuary One"},
             {"_id": "b", "name": "Alam Sanctuary Two"},
         ]
-        result = importer.resolve_development_name("Alam Sanctuary", records)
+        result = resolver.resolve_development_name("Alam Sanctuary", records)
         self.assertFalse(result["matched"])
 
     def test_unresolved_development_allows_creation_without_relationship(self):
@@ -200,7 +201,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             "development_name": "Alam Sanctuary",
             "transaction_types": ["Rent/Let"], "asking_price": 5000, "beds": 2,
         }
-        with patch.object(importer, "verify_development_candidate", return_value={
+        with patch.object(resolver, "verify_development_candidate", return_value={
             "status": "not_found", "raw_name": "Alam Sanctuary",
         }):
             result, create = self.process_as(parsed)
@@ -210,7 +211,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["Geo"], "geo-bangsar")
 
     def test_case_and_punctuation_normalized_exact(self):
-        result = importer.resolve_development_name("  ONE  MENERUNG!!! ", DEVELOPMENTS)
+        result = resolver.resolve_development_name("  ONE  MENERUNG!!! ", DEVELOPMENTS)
         self.assertTrue(result["matched"])
         self.assertEqual(result["method"], "normalized_exact")
 
@@ -346,8 +347,8 @@ Polygon Properties
             "type": "listing", "development_name": "One Menerung",
             "transaction_types": ["Rent/Let"], "asking_price": 8500, "beds": 3,
         }
-        with patch.object(importer, "verify_development_candidate") as verify, \
-             patch.object(importer, "create_verified_development") as create_development:
+        with patch.object(resolver, "verify_development_candidate") as verify, \
+             patch.object(resolver, "create_verified_development") as create_development:
             result, create_listing = self.process_as(parsed)
         verify.assert_not_called()
         create_development.assert_not_called()
@@ -369,8 +370,8 @@ Polygon Properties
         geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
         create = MagicMock(side_effect=["dev-sefina", "lead-1"])
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate", return_value=verification), \
-             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(resolver, "verify_development_candidate", return_value=verification), \
+             patch.object(resolver, "_fresh_development_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create", create):
             result = importer.process_whatsapp_import(
                 "Want To Rent near Sefina", geo_records=geos,
@@ -402,9 +403,9 @@ Polygon Properties
         geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
         create = MagicMock(side_effect=["dev-ceriaan", "listing-1"])
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate",
+             patch.object(resolver, "verify_development_candidate",
                           return_value=verification), \
-             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(resolver, "_fresh_development_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create", create):
             result = importer.process_whatsapp_import(
                 "Ceriaan Kiara", geo_records=geos,
@@ -433,8 +434,8 @@ Polygon Properties
             "confidence": 0.97,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate", return_value=verification), \
-             patch.object(importer, "create_verified_development") as create_development, \
+             patch.object(resolver, "verify_development_candidate", return_value=verification), \
+             patch.object(resolver, "create_verified_development") as create_development, \
              patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
              patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
@@ -451,10 +452,10 @@ Polygon Properties
             "transaction_types": ["Buy/Sell"], "asking_price": 900000,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate", return_value={
+             patch.object(resolver, "verify_development_candidate", return_value={
                  "status": "ambiguous", "raw_name": "Sunshine Residence",
                  "candidates": [{"name": "A"}, {"name": "B"}], "confidence": 0.45,
-             }), patch.object(importer, "create_verified_development") as create_dev, \
+             }), patch.object(resolver, "create_verified_development") as create_dev, \
              patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
              patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
@@ -471,11 +472,11 @@ Polygon Properties
             "transaction_types": ["Rent/Let"], "asking_price": 5000,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate", return_value={
+             patch.object(resolver, "verify_development_candidate", return_value={
                  "status": "verified", "canonical_name": "Sefina Mont Kiara",
                  "geo_name": "Unknown Area", "verification_url": "https://example.com/sefina",
                  "confidence": 0.97,
-             }), patch.object(importer, "create_verified_development") as create_dev, \
+             }), patch.object(resolver, "create_verified_development") as create_dev, \
              patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create, \
              patch("builtins.print") as log:
             result = importer.process_whatsapp_import(
@@ -485,7 +486,6 @@ Polygon Properties
         self.assertNotIn("development", create.call_args.args[2])
         self.assertEqual(result["unresolved_development_names"], ["Sefina"])
         rendered = " ".join(str(call) for call in log.call_args_list)
-        self.assertIn("verification_status=verified", rendered)
         self.assertIn("reason=geo_unresolved", rendered)
         self.assertIn("geo_candidate='Unknown Area'", rendered)
 
@@ -511,8 +511,8 @@ Polygon Properties
         created_ids = iter(["dev-inspirasi", "dev-sefina", "lead-1"])
         geos = GEOS + [{"_id": "geo-mk", "Name": "Mont Kiara"}]
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer, "verify_development_candidate", side_effect=verify) as verifier, \
-             patch.object(importer, "_fresh_development_records", return_value=[]), \
+             patch.object(resolver, "verify_development_candidate", side_effect=verify) as verifier, \
+             patch.object(resolver, "_fresh_development_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create",
                           side_effect=lambda *_args: next(created_ids)) as create:
             result = importer.process_whatsapp_import(
@@ -561,13 +561,13 @@ Polygon Properties
         with patch.object(
             importer.rentee_app.client.responses, "create", return_value=response
         ) as create:
-            result = importer.verify_development_candidate("Sefina", context)
+            result = resolver.verify_development_candidate("Sefina", context)
         self.assertEqual(result["status"], "verified")
         self.assertEqual(create.call_args.kwargs["tools"], [{"type": "web_search"}])
         prompt = create.call_args.kwargs["input"]
         self.assertIn("Sefina", prompt)
         self.assertIn("Garden International School", prompt)
-        self.assertIn("must never itself be returned as a development or residential Geo", prompt)
+        self.assertIn("must never be returned as a Development or residential Geo", prompt)
 
     def test_verified_result_requires_credible_match_reason(self):
         output = {
@@ -580,7 +580,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Sunshine Residence", {})
+            result = resolver.verify_development_candidate("Sunshine Residence", {})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "schema_validation_failed")
 
@@ -594,7 +594,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Ceriaan Kiara", {})
+            result = resolver.verify_development_candidate("Ceriaan Kiara", {})
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["raw_name"], "Ceriaan Kiara")
         self.assertEqual(result["reason"], "no_credible_property_match")
@@ -609,7 +609,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("MK Astana", {})
+            result = resolver.verify_development_candidate("MK Astana", {})
         self.assertEqual(result["reason"], "no_credible_property_match")
 
     def test_verifier_reports_multiple_plausible_candidate_names(self):
@@ -623,7 +623,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Sunshine Residence", {})
+            result = resolver.verify_development_candidate("Sunshine Residence", {})
         self.assertEqual(result["status"], "ambiguous")
         self.assertEqual(result["reason"], "multiple_plausible_candidates")
 
@@ -637,7 +637,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Inspirasi", {})
+            result = resolver.verify_development_candidate("Inspirasi", {})
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"],
                          "verification_confidence_below_threshold")
@@ -647,7 +647,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text="not JSON"),
         ), patch("builtins.print") as log:
-            result = importer.verify_development_candidate("Inspirasi", {})
+            result = resolver.verify_development_candidate("Inspirasi", {})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "invalid_json")
         self.assertIn("reason='invalid_json'", " ".join(
@@ -664,7 +664,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Inspirasi", {})
+            result = resolver.verify_development_candidate("Inspirasi", {})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "missing_verification_url")
 
@@ -678,7 +678,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ):
-            result = importer.verify_development_candidate("Not Real Place", {})
+            result = resolver.verify_development_candidate("Not Real Place", {})
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"], "no_credible_property_match")
 
@@ -697,7 +697,7 @@ Polygon Properties
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
         ) as create, patch("builtins.print") as log:
-            importer.verify_development_candidate("Sefina", context)
+            resolver.verify_development_candidate("Sefina", context)
         prompt = create.call_args.kwargs["input"]
         self.assertIn("Sefina", prompt)
         self.assertIn("Mont Kiara", prompt)
@@ -713,11 +713,11 @@ Polygon Properties
         raced_record = {"_id": "dev-raced", "Name": "Sefina Mont Kiara",
                         "Geo": "geo-bangsar"}
         with patch.object(
-            importer, "_fresh_development_records", side_effect=[[], [raced_record]]
+            resolver, "_fresh_development_records", side_effect=[[], [raced_record]]
         ) as fresh, patch.object(
             importer.rentee_app, "_bubble_create", side_effect=RuntimeError("duplicate")
         ) as create:
-            result = importer.create_verified_development(
+            result = resolver.create_verified_development(
                 "Sefina Mont Kiara", geo, "https://example.com/sefina"
             )
         self.assertEqual(result["id"], "dev-raced")

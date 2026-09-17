@@ -7,19 +7,17 @@ client and Bubble Data API helpers, but is not wired into the webhook yet.
 
 from __future__ import annotations
 
-import difflib
 import json
 import re
 from typing import Any, Iterable
 
 import app as rentee_app
+import development_resolver
 
 
 LOG_PREFIX = "[WHATSAPP IMPORT]"
 TRANSACTION_TYPES = ("Rent/Let", "Buy/Sell")
 PROPERTY_TYPES = ("Condo", "Landed", "Apartment", "House")
-FUZZY_THRESHOLD = 0.90
-FUZZY_MARGIN = 0.08
 IMPORT_ROUTING_THRESHOLD = 0.90
 
 STRONG_IMPORT_MARKERS = (
@@ -92,27 +90,6 @@ PARSER_SCHEMA = {
 
 def _compact(value: Any) -> str:
     return " ".join(str(value or "").split())
-
-
-def _normalized(value: Any) -> str:
-    text = _compact(value).casefold().replace("&", " and ")
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
-
-
-def _normalized_geo(value: Any) -> str:
-    """Normalize harmless Geo formatting without erasing meaningful area words."""
-    text = _compact(value).casefold()
-    text = re.sub(r"\s*\([^)]*\)\s*", " ", text)
-    # These broad suffixes add no useful identity when matching Rentee's local Geos.
-    previous = None
-    while text != previous:
-        previous = text
-        text = re.sub(
-            r"\s*,\s*(?:kuala\s+lumpur|malaysia)\s*$", "", text,
-            flags=re.IGNORECASE,
-        )
-    text = text.replace("’", "'").replace("'", " ")
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
 
 
 def _record_name(record: dict) -> str:
@@ -498,69 +475,12 @@ def detect_import_intent(raw_text: str) -> dict:
     return _detector_result(intent, confidence, signals, "model_classifier")
 
 
-def _resolve_name(name: Any, records: Iterable[dict], kind: str) -> dict:
-    raw = _compact(name)
-    if not raw:
-        return {"matched": False, "raw_name": raw}
-    candidates = [(record, _record_name(record)) for record in records or []]
-    candidates = [(record, canonical) for record, canonical in candidates
-                  if record.get("_id") and canonical]
-
-    exact = [(record, canonical) for record, canonical in candidates if canonical == raw]
-    method = "exact"
-    if not exact:
-        exact = [(record, canonical) for record, canonical in candidates
-                 if canonical.casefold() == raw.casefold()]
-        method = "case_insensitive_exact"
-    normalizer = _normalized_geo if kind == "geo" else _normalized
-    if not exact:
-        key = normalizer(raw)
-        exact = [(record, canonical) for record, canonical in candidates
-                 if normalizer(canonical) == key]
-        method = "normalized_exact"
-    if len(exact) == 1:
-        record, canonical = exact[0]
-        result = {"matched": True, "id": str(record["_id"]), "name": canonical,
-                  "method": method, "record": record}
-        print(f"{LOG_PREFIX} {kind} {method} raw={raw!r} canonical={canonical!r} "
-              f"id={record['_id']}", flush=True)
-        return result
-    if len(exact) > 1:
-        print(f"{LOG_PREFIX} {kind} unresolved raw={raw!r}", flush=True)
-        return {"matched": False, "raw_name": raw, "reason": "ambiguous"}
-
-    key = normalizer(raw)
-    scored = sorted((
-        (difflib.SequenceMatcher(None, key, normalizer(canonical)).ratio(), record, canonical)
-        for record, canonical in candidates
-    ), key=lambda item: item[0], reverse=True)
-    best = scored[0] if scored else None
-    second_score = scored[1][0] if len(scored) > 1 else 0.0
-    if best and best[0] >= FUZZY_THRESHOLD and best[0] - second_score >= FUZZY_MARGIN:
-        score, record, canonical = best
-        print(f"{LOG_PREFIX} {kind} fuzzy raw={raw!r} canonical={canonical!r} "
-              f"id={record['_id']} score={score:.3f}", flush=True)
-        return {"matched": True, "id": str(record["_id"]), "name": canonical,
-                "method": "fuzzy", "score": score, "record": record}
-    print(f"{LOG_PREFIX} {kind} unresolved raw={raw!r}", flush=True)
-    return {"matched": False, "raw_name": raw,
-            **({"reason": "ambiguous"} if best and best[0] >= FUZZY_THRESHOLD else {})}
-
-
 def resolve_geo_name(name, geo_records):
-    return _resolve_name(name, geo_records, "geo")
+    return development_resolver.resolve_geo_name(name, geo_records)
 
 
 def resolve_geo_names(names, geo_records):
     return [resolve_geo_name(name, geo_records) for name in names or []]
-
-
-def resolve_development_name(name, development_records):
-    return _resolve_name(name, development_records, "development")
-
-
-def resolve_development_names(names, development_records):
-    return [resolve_development_name(name, development_records) for name in names or []]
 
 
 def _verification_context(parsed, raw_text):
@@ -582,279 +502,45 @@ def _verification_context(parsed, raw_text):
     }
 
 
-def verify_development_candidate(raw_name: str, context: dict,
-                                 bubble_env: str = "live") -> dict:
-    """Ask one web-enabled model call for the final Development identity decision."""
-    raw = _compact(raw_name)
-    if not raw:
-        return {"status": "not_found", "raw_name": raw,
-                "canonical_name": None, "geo_name": None,
-                "verification_url": None, "confidence": 0.0,
-                "reason": "no_credible_property_match"}
-    focused_context = {
-        key: value for key, value in (context or {}).items()
-        if value not in (None, "", [], {})
-    }
-    print(f"[DEVELOPMENT VERIFY] raw={raw!r} action=web_model_check", flush=True)
-    try:
-        response = rentee_app.client.responses.create(
-            model="gpt-5-mini",
-            tools=[{"type": "web_search"}],
-            input=(
-                "You are verifying a residential property-development name extracted from a "
-                "Malaysian real-estate WhatsApp message. Use web search to answer the actual "
-                "identity question directly, not to return or classify raw search results. "
-                "Determine whether the candidate is a genuine Malaysian residential property "
-                "development. Use explicit residential areas, other named developments, property "
-                "type, transaction context, and schools/workplaces/landmarks in the message only "
-                "to disambiguate. A school, workplace, mall, landmark, office, or station is "
-                "context and must never itself be returned as a development or residential Geo. "
-                "If confidently real and unambiguous, return its canonical/current name, its "
-                "residential area, and one strong supporting source URL with status verified and "
-                "reason credible_match. If multiple developments remain plausible, return "
-                "ambiguous with reason multiple_plausible_candidates. If credible evidence is "
-                "insufficient, return not_found with reason no_credible_property_match. Do not "
-                "invent a development.\n\n"
-                f"CANDIDATE NAME:\n{raw}\n\n"
-                f"WHATSAPP IMPORT CONTEXT:\n"
-                f"{json.dumps(focused_context, ensure_ascii=False)}"
-            ),
-            reasoning={"effort": "low"},
-            max_output_tokens=400,
-            timeout=20,
-            text={"format": {
-            "type": "json_schema", "name": "development_web_verification",
-            "strict": True, "schema": {
-                "type": "object",
-                "properties": {
-                    "status": {"type": "string", "enum": [
-                        "verified", "ambiguous", "not_found",
-                    ]},
-                    "canonical_name": {"type": ["string", "null"]},
-                    "geo_name": {"type": ["string", "null"]},
-                    "verification_url": {"type": ["string", "null"]},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "reason": {"type": "string", "enum": [
-                        "credible_match", "multiple_plausible_candidates",
-                        "no_credible_property_match",
-                    ]},
-                },
-                "required": [
-                    "status", "canonical_name", "geo_name", "verification_url",
-                    "confidence", "reason",
-                ],
-                "additionalProperties": False,
-            },
-            }},
-        )
-    except Exception as error:
-        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
-              f"reason='web_tool_error' error={type(error).__name__}", flush=True)
-        return {"status": "error", "raw_name": raw,
-                "canonical_name": None, "geo_name": None,
-                "verification_url": None, "confidence": 0.0,
-                "reason": "web_tool_error"}
-    try:
-        value = json.loads(str(response.output_text or ""))
-    except (TypeError, json.JSONDecodeError):
-        return _verification_error(raw, "invalid_json")
-    if not isinstance(value, dict):
-        return _verification_error(raw, "schema_validation_failed")
-    if "status" not in value:
-        return _verification_error(raw, "missing_status", value)
-    status = value.get("status")
-    if status not in {"verified", "ambiguous", "not_found"}:
-        return _verification_error(raw, "invalid_status", value)
-    for field in ("canonical_name", "geo_name", "verification_url", "confidence", "reason"):
-        if field not in value:
-            return _verification_error(raw, f"missing_{field}", value)
-    confidence = value.get("confidence")
-    if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
-            or not 0 <= confidence <= 1):
-        return _verification_error(raw, "invalid_confidence", value)
-    reason = value.get("reason")
-    if reason not in {
-        "credible_match", "multiple_plausible_candidates",
-        "no_credible_property_match",
-    }:
-        return _verification_error(raw, "schema_validation_failed", value)
-    if status == "verified":
-        if not _compact(value.get("canonical_name")):
-            return _verification_error(raw, "missing_canonical_name", value)
-        if not _compact(value.get("geo_name")):
-            return _verification_error(raw, "missing_geo_name", value)
-        if not _compact(value.get("verification_url")):
-            return _verification_error(raw, "missing_verification_url", value)
-        if not str(value["verification_url"]).startswith(("https://", "http://")):
-            return _verification_error(raw, "schema_validation_failed", value)
-        if reason != "credible_match":
-            return _verification_error(raw, "schema_validation_failed", value)
-    elif status == "ambiguous" and reason != "multiple_plausible_candidates":
-        return _verification_error(raw, "schema_validation_failed", value)
-    elif status == "not_found" and reason != "no_credible_property_match":
-        return _verification_error(raw, "schema_validation_failed", value)
-    verified = (
-        status == "verified"
-        and confidence >= 0.90
-    )
-    if verified:
-        result = {
-            "status": "verified", "raw_name": raw,
-            "canonical_name": _compact(value["canonical_name"]),
-            "geo_name": _compact(value["geo_name"]),
-            "verification_url": value["verification_url"],
-            "confidence": float(confidence), "reason": "credible_match",
-        }
-        print(
-            f"[DEVELOPMENT VERIFY] raw={raw!r} status=verified "
-            f"canonical={result['canonical_name']!r} geo={result['geo_name']!r} "
-            f"confidence={result['confidence']:.2f}", flush=True,
-        )
-        return result
-    if status == "ambiguous" and reason == "multiple_plausible_candidates":
-        result_status, final_reason = "ambiguous", reason
-    else:
-        result_status, final_reason = "not_found", (
-            "verification_confidence_below_threshold"
-            if status == "verified" and isinstance(confidence, (int, float))
-            and confidence < 0.90 else "no_credible_property_match"
-        )
-    result = {
-        "status": result_status, "raw_name": raw,
-        "canonical_name": None, "geo_name": None, "verification_url": None,
-        "confidence": float(confidence) if isinstance(confidence, (int, float)) else 0.0,
-        "reason": final_reason,
-    }
-    print(f"[DEVELOPMENT VERIFY] raw={raw!r} status={result_status} "
-          f"reason={final_reason!r}", flush=True)
-    return result
-
-
-def _verification_error(raw, reason, value=None):
-    keys = sorted(str(key) for key in value) if isinstance(value, dict) else None
-    suffix = f" response_keys={keys!r}" if keys is not None else ""
-    print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
-          f"reason={reason!r}{suffix}", flush=True)
-    return {
-        "status": "error", "raw_name": raw,
-        "canonical_name": None, "geo_name": None,
-        "verification_url": None, "confidence": 0.0,
-        "reason": reason,
-    }
-
-
-def _fresh_development_records(bubble_env):
-    return list(rentee_app._bubble_records(
-        rentee_app.get_bubble_base_url(bubble_env), "condo"
-    ))
-
-
-def create_verified_development(canonical_name, resolved_geo, verification_url,
-                                bubble_env="live", *, development_records=None):
-    """Reuse or create one verified Development, with one race recovery lookup."""
-    canonical = _compact(canonical_name)
-    if not canonical or not resolved_geo or not resolved_geo.get("matched"):
-        print(f"[DEVELOPMENT CREATE] canonical={canonical!r} action=skipped "
-              "reason=geo_unresolved", flush=True)
-        return None
-    records = (list(development_records) if development_records is not None
-               else _fresh_development_records(bubble_env))
-    existing = resolve_development_name(canonical, records)
-    if existing.get("matched"):
-        print(f"[DEVELOPMENT CREATE] canonical={canonical!r} "
-              f"action=existing_reused id={existing['id']}", flush=True)
-        return existing
-    payload = {
-        "Name": canonical,
-        "Geo": resolved_geo["id"],
-        "verification_status": "Verified",
-        "source": "WhatsApp Import",
-        "verification_url": verification_url,
-    }
-    try:
-        development_id = rentee_app._bubble_create(
-            rentee_app.get_bubble_base_url(bubble_env), "condo", payload
-        )
-    except Exception as error:
-        try:
-            raced = resolve_development_name(
-                canonical, _fresh_development_records(bubble_env)
-            )
-        except Exception:
-            raced = {"matched": False}
-        if raced.get("matched"):
-            print(f"[DEVELOPMENT CREATE] canonical={canonical!r} "
-                  f"action=existing_reused id={raced['id']}", flush=True)
-            return raced
-        print(f"[DEVELOPMENT CREATE] canonical={canonical!r} action=failed "
-              f"error={type(error).__name__}", flush=True)
-        return None
-    record = {"_id": development_id, "Name": canonical, "Geo": resolved_geo["id"],
-              **{key: payload[key] for key in (
-                  "verification_status", "source", "verification_url",
-              )}}
-    print(f"[DEVELOPMENT CREATE] canonical={canonical!r} "
-          f"action=created id={development_id}", flush=True)
-    return {"matched": True, "id": str(development_id), "name": canonical,
-            "method": "web_verified_created", "record": record, "created": True}
-
-
 def _resolve_or_verify_developments(names, development_records, geo_records,
                                     context, bubble_env):
     resolutions, created = [], []
     for raw_name in _unique_strings(names):
-        resolved = resolve_development_name(raw_name, development_records)
-        if resolved.get("matched"):
-            resolutions.append(resolved)
-            continue
-        print(f"{LOG_PREFIX} development unresolved raw={raw_name!r} action=verify_web",
-              flush=True)
         try:
-            verification = verify_development_candidate(raw_name, context, bubble_env)
+            outcome = development_resolver.resolve_or_create_development(
+                raw_name, context, bubble_env,
+                development_records=development_records,
+                geo_records=geo_records,
+            )
         except Exception as error:
             print(f"[DEVELOPMENT VERIFY] raw={raw_name!r} status=error "
-                  f"reason='unexpected_verifier_error' "
+                  f"reason='unexpected_resolver_error' "
                   f"error={type(error).__name__}", flush=True)
-            resolutions.append(resolved)
+            outcome = {"status": "error", "action": "none",
+                       "raw_name": raw_name, "reason": "unexpected_resolver_error"}
+        if outcome.get("status") != "resolved":
+            resolutions.append({
+                "matched": False, "raw_name": raw_name,
+                "reason": outcome.get("reason"),
+                "resolver_status": outcome.get("status"),
+            })
             continue
-        if verification.get("status") != "verified":
-            resolutions.append(resolved)
-            continue
-        print(f"[DEVELOPMENT VERIFY] raw={raw_name!r} "
-              f"canonical={verification.get('canonical_name')!r} "
-              f"geo_candidate={verification.get('geo_name')!r} "
-              "verification_status=verified", flush=True)
-        resolved_geo = resolve_geo_name(verification.get("geo_name"), geo_records)
-        if not resolved_geo.get("matched"):
-            print(f"[DEVELOPMENT CREATE] canonical={verification.get('canonical_name')!r} "
-                  "action=skipped reason=geo_unresolved "
-                  f"geo_candidate={verification.get('geo_name')!r}", flush=True)
-            resolutions.append(resolved)
-            continue
-        # Check the caller's latest view first, then force a fresh Bubble check in
-        # create_verified_development before any POST.
-        canonical = resolve_development_name(
-            verification["canonical_name"], development_records
-        )
-        if canonical.get("matched"):
-            print(f"[DEVELOPMENT CREATE] canonical={verification['canonical_name']!r} "
-                  f"action=existing_reused id={canonical['id']}", flush=True)
-            resolutions.append(canonical)
-            continue
-        created_or_reused = create_verified_development(
-            verification["canonical_name"], resolved_geo,
-            verification["verification_url"], bubble_env,
-        )
-        if created_or_reused and created_or_reused.get("matched"):
-            resolutions.append(created_or_reused)
-            development_records.append(created_or_reused["record"])
-            if created_or_reused.get("created"):
-                created.append(created_or_reused)
-        else:
-            resolutions.append(resolved)
+        resolution = {
+            "matched": True,
+            "id": str(outcome["development_id"]),
+            "name": outcome["canonical_name"],
+            "method": outcome.get("method") or (
+                "web_verified_created" if outcome.get("action") == "created"
+                else "existing"
+            ),
+            "record": outcome["record"],
+        }
+        if outcome.get("action") == "created":
+            resolution["created"] = True
+            created.append(resolution)
+            development_records.append(outcome["record"])
+        resolutions.append(resolution)
     return resolutions, created
-
-
 def _matched_ids(resolutions: Iterable[dict]) -> list[str]:
     return list(dict.fromkeys(item["id"] for item in resolutions or [] if item.get("matched")))
 
