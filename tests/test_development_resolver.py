@@ -52,10 +52,11 @@ class DevelopmentResolverTests(unittest.TestCase):
         self.assertEqual(result["action"], "created")
         self.assertEqual(result["geo_id"], "geo-mk")
         self.assertEqual(create.call_args.args[2], {
-            "Name": "Ceriaan Kiara", "Geo": "geo-mk",
+            "name": "Ceriaan Kiara", "Geo": "geo-mk",
             "verification_status": "Verified", "source": "WhatsApp Import",
             "verification_url": "https://example.com/ceriaan",
         })
+        self.assertNotIn("Name", create.call_args.args[2])
 
     def test_geo_variants_normalize_and_duplicate_keys_are_ambiguous(self):
         variants = [

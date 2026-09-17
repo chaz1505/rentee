@@ -231,7 +231,7 @@ def create_verified_development(canonical_name, resolved_geo, verification_url,
     existing = resolve_development_name(canonical, records)
     if existing.get("matched"):
         return existing
-    payload = {"Name": canonical, "Geo": resolved_geo["id"],
+    payload = {"name": canonical, "Geo": resolved_geo["id"],
                "verification_status": "Verified", "source": "WhatsApp Import",
                "verification_url": verification_url}
     try:
