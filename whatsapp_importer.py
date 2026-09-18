@@ -7,6 +7,7 @@ client and Bubble Data API helpers, but is not wired into the webhook yet.
 
 from __future__ import annotations
 
+import datetime
 import json
 import re
 from typing import Any, Iterable
@@ -72,6 +73,32 @@ PARSER_SCHEMA = {
         "budget": {"type": ["number", "null"], "minimum": 0},
         "asking_price": {"type": ["number", "null"], "minimum": 0},
         "bedrooms_min": {"type": ["integer", "null"], "minimum": 0},
+        "adults": {"type": ["integer", "null"], "minimum": 0},
+        "children": {"type": ["integer", "null"], "minimum": 0},
+        "nationality": {"type": ["string", "null"]},
+        "occupation": {"type": ["string", "null"]},
+        "move_in_date": {
+            "type": ["string", "null"],
+            "description": "Exact date as YYYY-MM-DD, otherwise null.",
+        },
+        "pets": {"type": ["string", "null"]},
+        "furnishing_preference": {
+            "type": ["string", "null"],
+            "enum": ["Fully Furnished", "Partially Furnished", "Unfurnished", None],
+        },
+        "bathrooms_min": {"type": ["integer", "null"], "minimum": 0},
+        "start_date": {
+            "type": ["string", "null"],
+            "description": "Exact date as YYYY-MM-DD, otherwise null.",
+        },
+        "helpers": {"type": ["integer", "null"], "minimum": 0},
+        "notes": {
+            "type": ["string", "null"],
+            "description": (
+                "Concise useful requirements not represented by another structured field; "
+                "do not duplicate structured facts."
+            ),
+        },
         "beds": {"type": ["integer", "null"], "minimum": 0},
         "proposing_agent": {
             "type": "object",
@@ -88,6 +115,9 @@ PARSER_SCHEMA = {
         "type", "geo_names", "geo_name", "preferred_development_names",
         "development_name", "transaction_types", "property_types",
         "property_type", "budget", "asking_price", "bedrooms_min", "beds",
+        "adults", "children", "nationality", "occupation", "move_in_date",
+        "pets", "furnishing_preference", "bathrooms_min", "start_date",
+        "helpers", "notes",
         "proposing_agent",
     ],
     "additionalProperties": False,
@@ -162,6 +192,21 @@ def _validate_parsed(value: Any) -> dict:
         for key in ("budget", "bedrooms_min"):
             if isinstance(value.get(key), (int, float)) and value[key] >= 0:
                 result[key] = int(value[key]) if float(value[key]).is_integer() else value[key]
+        for key in ("adults", "children", "bathrooms_min", "helpers"):
+            if (not isinstance(value.get(key), bool)
+                    and isinstance(value.get(key), int) and value[key] >= 0):
+                result[key] = value[key]
+        for key in ("nationality", "occupation", "pets", "notes"):
+            if _compact(value.get(key)):
+                result[key] = _compact(value[key])
+        furnishing = value.get("furnishing_preference")
+        if furnishing in {"Fully Furnished", "Partially Furnished", "Unfurnished"}:
+            result["furnishing_preference"] = furnishing
+        for key in ("move_in_date", "start_date"):
+            try:
+                result[key] = datetime.date.fromisoformat(str(value.get(key))).isoformat()
+            except (TypeError, ValueError):
+                pass
         return result
 
     result = {
@@ -226,7 +271,14 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "ambiguous, leave the agent phone null. Do not mistake tenant or owner contacts for "
             "the proposing agent. Never invent agent fields. Return "
             "null/empty values when evidence is weak; do not invent facts. For unknown, leave "
-            "all other fields empty/null.\n\nMESSAGE:\n" + text
+            "all other fields empty/null. For leads, extract adults, children, nationality, "
+            "occupation, pets, furnishing preference, minimum bathrooms, helpers, and exact "
+            "move-in/start dates only when explicitly and clearly stated. Absence never means "
+            "zero. Dates must be YYYY-MM-DD and must be null when approximate or not responsibly "
+            "resolvable. Put concise useful requirements that have no structured Lead field "
+            "(such as desired sqft, tenancy length, employer/work details, school, family context, "
+            "or unusual requirements) in notes. Never repeat in notes anything captured in a "
+            "structured field.\n\nMESSAGE:\n" + text
         ),
         reasoning={"effort": "low"},
         max_output_tokens=700,
@@ -587,6 +639,26 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
             payload["budgetRent"] = parsed["budget"]
         if "Buy/Sell" in transactions:
             payload["budgetBuy"] = parsed["budget"]
+    field_mapping = {
+        "adults": "adults",
+        "children": "children",
+        "nationality": "nationality",
+        "occupation": "occupation",
+        "pets": "pets",
+        "furnishing_preference": "furnishingPreference",
+        "bathrooms_min": "bathroomsMin",
+        "helpers": "helpers",
+        "notes": "Notes",
+    }
+    for parsed_field, bubble_field in field_mapping.items():
+        value = parsed.get(parsed_field)
+        if value is not None:
+            payload[bubble_field] = value
+    for parsed_field, bubble_field in (
+        ("move_in_date", "moveInDate"), ("start_date", "startDate")
+    ):
+        if parsed.get(parsed_field):
+            payload[bubble_field] = f"{parsed[parsed_field]}T00:00:00.000Z"
     _apply_proposing_agent_payload(
         payload, proposing_agent,
         name_field="ProposedAgentNameLead",

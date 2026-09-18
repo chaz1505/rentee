@@ -32,6 +32,10 @@ def full_model_output(**updates):
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
         "budget": None, "asking_price": None, "bedrooms_min": None, "beds": None,
+        "adults": None, "children": None, "nationality": None,
+        "occupation": None, "move_in_date": None, "pets": None,
+        "furnishing_preference": None, "bathrooms_min": None,
+        "start_date": None, "helpers": None, "notes": None,
         "proposing_agent": {"name": None, "phone": None, "ren": None},
     }
     value.update(updates)
@@ -86,6 +90,38 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(parsed["bedrooms_min"], 4)
         self.assertEqual(payload["budgetBuy"], 3500000)
         self.assertNotIn("budgetRent", payload)
+
+    def test_explicit_lead_details_and_notes_map_to_existing_fields(self):
+        parsed = self.parse_as({
+            "type": "lead", "transaction_types": ["Rent/Let"],
+            "adults": 2, "children": 1, "nationality": "British",
+            "occupation": "Engineer", "move_in_date": "2026-11-01",
+            "pets": "1 small dog", "furnishing_preference": "Fully Furnished",
+            "bathrooms_min": 2, "start_date": "2026-11-15", "helpers": 1,
+            "notes": "Prefers at least 1,500 sqft; two-year tenancy.",
+        })
+        payload = importer.build_lead_payload(parsed, [], [])
+        self.assertEqual(payload, {
+            "TransactionType": ["Rent/Let"],
+            "adults": 2, "children": 1, "nationality": "British",
+            "occupation": "Engineer", "moveInDate": "2026-11-01T00:00:00.000Z",
+            "pets": "1 small dog", "furnishingPreference": "Fully Furnished",
+            "bathroomsMin": 2, "startDate": "2026-11-15T00:00:00.000Z",
+            "helpers": 1, "Notes": "Prefers at least 1,500 sqft; two-year tenancy.",
+        })
+
+    def test_absent_or_invalid_lead_details_are_not_mapped(self):
+        parsed = self.parse_as({
+            "type": "lead", "adults": None, "children": None,
+            "move_in_date": "mid November", "start_date": "soon",
+            "furnishing_preference": "Anything is fine", "notes": "  ",
+        })
+        payload = importer.build_lead_payload(parsed, [], [])
+        for field in (
+            "adults", "children", "moveInDate", "startDate",
+            "furnishingPreference", "Notes",
+        ):
+            self.assertNotIn(field, payload)
 
     def test_multiple_geo_lead_survives_parse_and_resolution(self):
         parsed = self.parse_as({
