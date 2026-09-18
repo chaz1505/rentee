@@ -253,9 +253,10 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
         if import_type else
         "Classify it as lead (a seeker requirement), listing (a property offered), or unknown. "
     )
-    response = rentee_app.client.responses.create(
-        model="gpt-5-mini",
-        input=(
+    try:
+        response = rentee_app.client.responses.create(
+            model="gpt-5-mini",
+            input=(
             "Parse one forwarded Malaysian property WhatsApp message. " + task +
             "Lead evidence: "
             "WTR, WTB, looking for, seeking, wanted, requirement, tenant requirement, buyer "
@@ -288,16 +289,24 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "(such as desired sqft, tenancy length, employer/work details, school, family context, "
             "or unusual requirements) in notes. Never repeat in notes anything captured in a "
             "structured field.\n\nMESSAGE:\n" + text
-        ),
-        reasoning={"effort": "low"},
-        max_output_tokens=700,
-        timeout=20,
-        text={"format": {
-            "type": "json_schema", "name": "whatsapp_property_import",
-            "strict": True, "schema": _parser_schema(import_type),
-        }},
-    )
-    if str(getattr(response, "status", "completed") or "completed").lower() != "completed":
+            ),
+            reasoning={"effort": "low"},
+            max_output_tokens=700,
+            timeout=20,
+            text={"format": {
+                "type": "json_schema", "name": "whatsapp_property_import",
+                "strict": True, "schema": _parser_schema(import_type),
+            }},
+        )
+    except Exception as error:
+        print(f"[WHATSAPP IMPORT PARSER ERROR] type={type(error).__name__} "
+              f"error={error}", flush=True)
+        raise
+    response_status = str(getattr(response, "status", "completed") or "completed")
+    if response_status.lower() != "completed":
+        print(f"[WHATSAPP IMPORT PARSER ERROR] status={response_status}", flush=True)
+        print("[WHATSAPP IMPORT PARSER ERROR] type=ValueError "
+              "error=WhatsApp parser did not complete.", flush=True)
         raise ValueError("WhatsApp parser did not complete.")
     try:
         parsed = json.loads(str(response.output_text or ""))
