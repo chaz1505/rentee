@@ -864,12 +864,38 @@ def _confirmation(parsed, geos, developments) -> str:
         if development_names:
             confirmation += f" Developments: {', '.join(development_names)}."
         return confirmation
-    name = next((item["name"] for item in developments if item.get("matched")), None)
-    if not name:
-        name = next((item["name"] for item in geos if item.get("matched")), "Property")
+    development_name = next(
+        (item["name"] for item in developments if item.get("matched")), None
+    )
+    geo_name = next((item["name"] for item in geos if item.get("matched")), None)
+    place = ", ".join(dict.fromkeys(
+        item for item in (development_name, geo_name) if item
+    )) or "Property"
+    details = []
+    if isinstance(parsed.get("beds"), (int, float)):
+        details.append(f"{parsed['beds']:g} bed")
+    if isinstance(parsed.get("baths"), (int, float)):
+        details.append(f"{parsed['baths']:g} bath")
+    if isinstance(parsed.get("sqft"), (int, float)):
+        details.append(f"{parsed['sqft']:,.0f} sqft")
+    elif isinstance(parsed.get("land_sqft"), (int, float)):
+        details.append(f"{parsed['land_sqft']:,.0f} land sqft")
+    if parsed.get("furnishing"):
+        details.append(parsed["furnishing"].lower())
+    elif parsed.get("furnished") == "Yes":
+        details.append("furnished")
+    elif parsed.get("furnished") == "No":
+        details.append("not furnished")
     period = "/month" if "Rent/Let" in parsed.get("transaction_types", []) else ""
-    price = f", {_money(parsed.get('asking_price'))}{period}" if parsed.get("asking_price") is not None else ""
-    return f"Added listing: {name}{bed_text}{price}."
+    if parsed.get("asking_price") is not None:
+        details.append(f"{_money(parsed['asking_price'])}{period}")
+    parsed_agent = parsed.get("proposing_agent") or {}
+    agent_name = _compact(parsed_agent.get("name"))
+    agent_phone = normalize_phone_number(parsed_agent.get("phone"))
+    prefix = (f"Added listing to {agent_name}: {agent_phone}:"
+              if agent_name and agent_phone else "Added listing:")
+    detail_text = f" — {', '.join(details)}" if details else ""
+    return f"{prefix} {place}{detail_text}."
 
 
 def _sanitized_payload(payload):
@@ -896,6 +922,106 @@ def _create_import_record(object_type, payload, bubble_env):
             flush=True,
         )
         raise
+
+
+def lead_matches_listing(lead: dict, listing: dict) -> bool:
+    """Return whether one Bubble Lead and Listing satisfy deterministic match rules."""
+    lead_transactions = {
+        value for value in lead.get("TransactionType") or [] if value in TRANSACTION_TYPES
+    }
+    listing_transactions = {
+        value for value in listing.get("TransactionType") or [] if value in TRANSACTION_TYPES
+    }
+    shared_transactions = lead_transactions & listing_transactions
+    if not shared_transactions:
+        return False
+
+    lead_geos = set(_relationship_ids(lead.get("Geo")))
+    lead_developments = set(_relationship_ids(lead.get("preferredDevelopments")))
+    listing_geo = next(iter(_relationship_ids(listing.get("Geo"))), None)
+    listing_development = next(iter(_relationship_ids(listing.get("development"))), None)
+    if not (
+        listing_development in lead_developments
+        or listing_geo in lead_geos
+    ):
+        return False
+
+    bedrooms_min = lead.get("bedroomsMin")
+    applicable_budgets = {
+        "Rent/Let": lead.get("budgetRent"),
+        "Buy/Sell": lead.get("budgetBuy"),
+    }
+    if not any(
+        not isinstance(applicable_budgets[transaction], bool)
+        and isinstance(applicable_budgets[transaction], (int, float))
+        for transaction in lead_transactions
+    ) and not (
+        not isinstance(bedrooms_min, bool)
+        and isinstance(bedrooms_min, (int, float))
+    ):
+        return False
+
+    if not isinstance(bedrooms_min, bool) and isinstance(bedrooms_min, (int, float)):
+        beds = listing.get("beds")
+        if isinstance(beds, bool) or not isinstance(beds, (int, float)) or beds < bedrooms_min:
+            return False
+
+    price_fields = {"Rent/Let": "priceRent", "Buy/Sell": "priceSale"}
+    for transaction in shared_transactions:
+        budget = applicable_budgets[transaction]
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            return True
+        price = listing.get(price_fields[transaction])
+        if (not isinstance(price, bool) and isinstance(price, (int, float))
+                and budget * 0.8 <= price <= budget * 1.2):
+            return True
+    return False
+
+
+def find_import_matches(created_type: str, record: dict, bubble_env: str) -> list[dict]:
+    """Load the opposite Bubble object type and return deterministic matches."""
+    other_type = "listing" if created_type == "lead" else "lead"
+    records = rentee_app._bubble_records(
+        rentee_app.get_bubble_base_url(bubble_env), other_type
+    )
+    if created_type == "lead":
+        return [item for item in records if lead_matches_listing(record, item)]
+    return [item for item in records if lead_matches_listing(item, record)]
+
+
+def format_import_matches(created_type: str, matches: list[dict]) -> str:
+    """Render deterministic matches for WhatsApp without affecting match logic."""
+    lines = []
+    for match in matches:
+        if created_type == "lead":
+            label = _compact(match.get("name") or match.get("unitNumber")
+                             or match.get("development") or match.get("Geo") or "Listing")
+            details = []
+            if isinstance(match.get("beds"), (int, float)):
+                details.append(f"{match['beds']:g} bed")
+            for field in ("priceRent", "priceSale"):
+                if isinstance(match.get(field), (int, float)):
+                    details.append(_money(match[field]))
+            agent_name = _compact(match.get("ProposingAgentName"))
+            agent_phone = _compact(match.get("ProposingAgentNumber"))
+        else:
+            label = _compact(match.get("name") or "Lead")
+            details = []
+            if isinstance(match.get("bedroomsMin"), (int, float)):
+                details.append(f"{match['bedroomsMin']:g}+ bed")
+            for field in ("budgetRent", "budgetBuy"):
+                if isinstance(match.get(field), (int, float)):
+                    details.append(f"budget {_money(match[field])}")
+            agent_name = _compact(match.get("ProposedAgentNameLead"))
+            agent_phone = _compact(match.get("ProposedAgentNumberLead"))
+        if agent_name and agent_phone:
+            details.append(f"agent {agent_name}: {agent_phone}")
+        elif agent_name:
+            details.append(f"agent {agent_name}")
+        elif agent_phone:
+            details.append(f"agent {agent_phone}")
+        lines.append(f"- {label}" + (f" — {', '.join(details)}" if details else ""))
+    return "Matches:\n" + "\n".join(lines)
 
 
 def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
@@ -1025,5 +1151,11 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "confirmation": _confirmation(parsed, geos_for_confirmation,
                                           developments_for_confirmation),
         }
+    matches = find_import_matches(
+        parsed["type"], dict(payload, _id=bubble_id), bubble_env
+    )
+    result["matches"] = matches
+    if matches:
+        result["confirmation"] += "\n\n" + format_import_matches(parsed["type"], matches)
     print(f"{LOG_PREFIX} created type={parsed['type']} id={bubble_id}", flush=True)
     return result

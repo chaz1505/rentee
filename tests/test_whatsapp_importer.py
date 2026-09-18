@@ -12,6 +12,9 @@ import whatsapp_importer as importer
 import development_resolver as resolver
 
 
+FIND_IMPORT_MATCHES = importer.find_import_matches
+
+
 GEOS = [
     {"_id": "geo-bangsar", "Name": "Bangsar"},
     {"_id": "geo-klcc", "Name": "KLCC"},
@@ -50,6 +53,13 @@ def full_model_output(**updates):
 
 
 class WhatsAppImporterTests(unittest.TestCase):
+    def setUp(self):
+        self.match_patcher = patch.object(
+            importer, "find_import_matches", return_value=[]
+        )
+        self.match_patcher.start()
+        self.addCleanup(self.match_patcher.stop)
+
     def parse_as(self, output, raw="forwarded message"):
         response = SimpleNamespace(
             status="completed", output_text=json.dumps(full_model_output(**output))
@@ -79,7 +89,8 @@ class WhatsAppImporterTests(unittest.TestCase):
     def process_as(self, parsed):
         create = MagicMock(return_value="bubble-1")
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
-             patch.object(importer.rentee_app, "_bubble_create", create):
+             patch.object(importer.rentee_app, "_bubble_create", create), \
+             patch.object(importer, "find_import_matches", return_value=[]):
             result = importer.process_whatsapp_import(
                 "forwarded", geo_records=GEOS, development_records=DEVELOPMENTS
             )
@@ -267,6 +278,33 @@ class WhatsAppImporterTests(unittest.TestCase):
             "Added lead: Mont Kiara, Condo, 3 bed, up to RM5,000.",
         )
 
+    def test_listing_confirmation_includes_agent_and_extracted_details(self):
+        parsed = {
+            "type": "listing", "transaction_types": ["Buy/Sell"],
+            "beds": 3, "baths": 2, "sqft": 1000,
+            "furnishing": "Partially Furnished", "asking_price": 850000,
+            "proposing_agent": {"name": "Jane Tee", "phone": "017-3262281"},
+        }
+        geos = [{"matched": True, "name": "Ampang"}]
+        developments = [{"matched": True, "name": "Arte Plus"}]
+        self.assertEqual(
+            importer._confirmation(parsed, geos, developments),
+            "Added listing to Jane Tee: 60173262281: Arte Plus, Ampang — "
+            "3 bed, 2 bath, 1,000 sqft, partially furnished, RM850,000.",
+        )
+
+    def test_listing_confirmation_without_agent_keeps_default_prefix(self):
+        parsed = {
+            "type": "listing", "transaction_types": ["Rent/Let"],
+            "beds": 2, "asking_price": 4500,
+        }
+        self.assertEqual(
+            importer._confirmation(
+                parsed, [{"matched": True, "name": "Bangsar"}], []
+            ),
+            "Added listing: Bangsar — 2 bed, RM4,500/month.",
+        )
+
     def test_rental_listing_and_development_geo_derivation(self):
         parsed = self.parse_as({
             "type": "listing", "development_name": "One Menerung",
@@ -391,6 +429,173 @@ class WhatsAppImporterTests(unittest.TestCase):
             self.assertIn("resend the full forwarded message", result["confirmation"])
             create.assert_not_called()
             resolve_agent.assert_not_called()
+
+    def test_matching_requires_exact_shared_transaction(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "budgetRent": 5000,
+        }
+        listing = {
+            "TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar",
+            "priceSale": 5000,
+        }
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["TransactionType"] = ["rent/let"]
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_requires_development_or_geo_overlap(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "preferredDevelopments": ["dev-one"], "bedroomsMin": 2,
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-klcc",
+            "development": "dev-serai", "beds": 2,
+        }
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["development"] = "dev-one"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        listing["development"] = "dev-serai"
+        listing["Geo"] = "geo-bangsar"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_budget_uses_applicable_price_and_inclusive_range(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "budgetRent": 10000,
+        }
+        listing = {"TransactionType": ["Rent/Let"], "Geo": "geo-bangsar"}
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["priceSale"] = 10000
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        for price in (8000, 12000):
+            with self.subTest(price=price):
+                listing["priceRent"] = price
+                self.assertTrue(importer.lead_matches_listing(lead, listing))
+        listing["priceRent"] = 12001
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_requires_bedroom_minimum_when_present(self):
+        lead = {
+            "TransactionType": ["Buy/Sell"], "Geo": ["geo-bangsar"],
+            "bedroomsMin": 3,
+        }
+        listing = {"TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar"}
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["beds"] = 2
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["beds"] = 3
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_requires_budget_and_bedrooms_to_both_pass(self):
+        lead = {
+            "TransactionType": ["Buy/Sell"], "Geo": ["geo-bangsar"],
+            "budgetBuy": 1000000, "bedroomsMin": 3,
+        }
+        listing = {
+            "TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar",
+            "priceSale": 1000000, "beds": 2,
+        }
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["beds"] = 3
+        listing["priceSale"] = 1300000
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["priceSale"] = 1000000
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_rejects_under_specified_lead(self):
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "priceRent": 5000, "beds": 2,
+        }
+        for lead in (
+            {"Geo": ["geo-bangsar"], "bedroomsMin": 2},
+            {"TransactionType": ["Rent/Let"], "bedroomsMin": 2},
+            {"TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"]},
+        ):
+            with self.subTest(lead=lead):
+                self.assertFalse(importer.lead_matches_listing(lead, listing))
+
+    def test_match_lookup_checks_opposite_bubble_record_type_in_both_directions(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "budgetRent": 5000,
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "priceRent": 5000,
+        }
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[listing]) as records:
+            self.assertEqual(FIND_IMPORT_MATCHES("lead", lead, "live"), [listing])
+        self.assertEqual(records.call_args.args[1], "listing")
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[lead]) as records:
+            self.assertEqual(FIND_IMPORT_MATCHES("listing", listing, "live"), [lead])
+        self.assertEqual(records.call_args.args[1], "lead")
+
+    def test_new_lead_matches_existing_listings_and_appends_confirmation(self):
+        parsed = {
+            "type": "lead", "geo_names": ["Bangsar"],
+            "preferred_development_names": [], "transaction_types": ["Rent/Let"],
+            "property_types": [], "budget": 5000, "bedrooms_min": 2,
+        }
+        match = {
+            "_id": "listing-1", "name": "Bangsar View", "beds": 2,
+            "priceRent": 4800, "ProposingAgentName": "Jane Tee",
+            "ProposingAgentNumber": "60173262281",
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1"), \
+             patch.object(importer, "find_import_matches", return_value=[match]) as find:
+            result = importer.process_whatsapp_import(
+                "lead", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["matches"], [match])
+        self.assertIn("Bangsar View", result["confirmation"])
+        self.assertIn("agent Jane Tee: 60173262281", result["confirmation"])
+        self.assertEqual(find.call_args.args[0], "lead")
+        self.assertEqual(find.call_args.args[1]["_id"], "lead-1")
+
+    def test_new_listing_matches_existing_leads_and_appends_confirmation(self):
+        parsed = {
+            "type": "listing", "development_name": "One Menerung",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000, "beds": 2,
+        }
+        match = {
+            "_id": "lead-1", "name": "Alex WTR One Menerung",
+            "budgetRent": 5200, "bedroomsMin": 2,
+            "ProposedAgentNameLead": "Alex Goh",
+            "ProposedAgentNumberLead": "60164697992",
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1"), \
+             patch.object(importer, "find_import_matches", return_value=[match]) as find:
+            result = importer.process_whatsapp_import(
+                "listing", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["matches"], [match])
+        self.assertIn("Alex WTR One Menerung", result["confirmation"])
+        self.assertIn("agent Alex Goh: 60164697992", result["confirmation"])
+        self.assertEqual(find.call_args.args[0], "listing")
+        self.assertEqual(find.call_args.args[1]["_id"], "listing-1")
+
+    def test_no_matches_leave_confirmation_unchanged(self):
+        parsed = {
+            "type": "lead", "geo_names": ["Bangsar"],
+            "preferred_development_names": [], "transaction_types": ["Rent/Let"],
+            "property_types": [], "budget": 5000,
+        }
+        expected = importer._confirmation(
+            parsed,
+            [{"matched": True, "id": "geo-bangsar", "name": "Bangsar"}],
+            [],
+        )
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1"):
+            result = importer.process_whatsapp_import(
+                "lead", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["confirmation"], expected)
 
     def test_unsupported_property_type_is_removed(self):
         parsed = self.parse_as({
