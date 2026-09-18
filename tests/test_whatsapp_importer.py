@@ -127,7 +127,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             "occupation": "Engineer", "moveInDate": "2026-11-01T00:00:00.000Z",
             "pets": "1 small dog", "furnishingPreference": "Fully Furnished",
             "bathroomsMin": 2, "startDate": "2026-11-15T00:00:00.000Z",
-            "helpers": 1, "Notes": "Prefers at least 1,500 sqft; two-year tenancy.",
+            "helpers": 1, "notes": "Prefers at least 1,500 sqft; two-year tenancy.",
         })
 
     def test_absent_or_invalid_lead_details_are_not_mapped(self):
@@ -139,7 +139,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         payload = importer.build_lead_payload(parsed, [], [])
         for field in (
             "adults", "children", "moveInDate", "startDate",
-            "furnishingPreference", "Notes",
+            "furnishingPreference", "notes",
         ):
             self.assertNotIn(field, payload)
 

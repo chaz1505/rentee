@@ -668,7 +668,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
         "furnishing_preference": "furnishingPreference",
         "bathrooms_min": "bathroomsMin",
         "helpers": "helpers",
-        "notes": "Notes",
+        "notes": "notes",
     }
     for parsed_field, bubble_field in field_mapping.items():
         value = parsed.get(parsed_field)
