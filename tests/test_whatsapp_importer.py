@@ -160,7 +160,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
         self.assertEqual(payload["ProposedAgentNameLead"], "Alex Goh")
-        self.assertEqual(payload["Name"], "Alex Goh (Agent) WTR Inspirasi")
+        self.assertEqual(payload["name"], "Alex Goh (Agent) WTR Inspirasi")
 
     def test_lead_name_uses_geo_and_buy_label_without_development(self):
         payload = importer.build_lead_payload(
@@ -169,7 +169,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             [],
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
-        self.assertEqual(payload["Name"], "Alex Goh (Agent) WTB Bangsar")
+        self.assertEqual(payload["name"], "Alex Goh (Agent) WTB Bangsar")
 
     def test_explicit_lead_name_is_preserved(self):
         parsed = self.parse_as({
@@ -182,7 +182,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             [{"matched": True, "id": "dev-1", "name": "Inspirasi"}],
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
-        self.assertEqual(payload["Name"], "Sarah Lim")
+        self.assertEqual(payload["name"], "Sarah Lim")
 
     def test_multiple_geo_lead_survives_parse_and_resolution(self):
         parsed = self.parse_as({

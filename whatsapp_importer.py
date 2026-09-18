@@ -685,7 +685,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
         number_field="ProposedAgentNumberLead",
     )
     if parsed.get("lead_name"):
-        payload["Name"] = parsed["lead_name"]
+        payload["name"] = parsed["lead_name"]
     elif payload.get("ProposedAgentNameLead"):
         transaction_label = next((
             label for transaction, label in (("Rent/Let", "WTR"), ("Buy/Sell", "WTB"))
@@ -701,7 +701,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
                 if item.get("matched") and _compact(item.get("name"))
             ), None)
         if transaction_label and location:
-            payload["Name"] = (
+            payload["name"] = (
                 f"{payload['ProposedAgentNameLead']} (Agent) "
                 f"{transaction_label} {_compact(location)}"
             )
