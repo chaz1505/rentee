@@ -763,7 +763,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
 
 def build_listing_payload(parsed, resolved_geo, resolved_development,
                           proposing_agent=None) -> dict:
-    payload = {"exposure": "Public"}
+    payload = {"exposure": "public"}
     if resolved_geo and resolved_geo.get("matched"):
         payload["Geo"] = resolved_geo["id"]
     if resolved_development and resolved_development.get("matched"):

@@ -310,7 +310,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"matched": True, "id": "dev-one", "name": "One Menerung"},
         )
         self.assertEqual(payload, {
-            "exposure": "Public", "development": "dev-one",
+            "exposure": "public", "development": "dev-one",
             "TransactionType": ["Rent/Let"], "beds": 3, "priceRent": 12000,
             "baths": 2.5, "Sq Ft": 1800, "Landed_sqft": 2400,
             "furnished": "Yes", "Furnishing": "Fully Furnished",
@@ -330,7 +330,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             "furnished": None, "balcony": None, "outdoor_area": None,
         })
         payload = importer.build_listing_payload(parsed, None, None)
-        self.assertEqual(payload["exposure"], "Public")
+        self.assertEqual(payload["exposure"], "public")
         for field in (
             "availability_date", "furnished", "balcony", "outdoor area", "Notes",
         ):
