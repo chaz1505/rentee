@@ -97,14 +97,67 @@ def resolve_geo_name(name, geo_records):
     return _resolve_name(name, geo_records, "geo", _normalized_geo)
 
 
-def _verification_error(raw, reason, value=None):
+def _verification_error(raw, reason, value=None, output_preview=None):
     keys = sorted(str(key) for key in value) if isinstance(value, dict) else None
     suffix = f" response_keys={keys!r}" if keys is not None else ""
+    if output_preview is not None:
+        suffix += f" output_preview={_compact(output_preview)[:160]!r}"
     print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
           f"reason={reason!r}{suffix}", flush=True)
     return {"status": "error", "raw_name": raw, "canonical_name": None,
             "geo_name": None, "verification_url": None, "confidence": 0.0,
             "reason": reason}
+
+
+def _extract_one_json_object(text):
+    objects = []
+    start = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(str(text or "")):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif character == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    candidate = json.loads(str(text)[start:index + 1])
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                else:
+                    if isinstance(candidate, dict):
+                        objects.append(candidate)
+                start = None
+    return objects[0] if len(objects) == 1 else None
+
+
+def _verifier_response_value(response):
+    parsed = getattr(response, "output_parsed", None)
+    if hasattr(parsed, "model_dump"):
+        parsed = parsed.model_dump()
+    if isinstance(parsed, dict):
+        return parsed
+    output = str(getattr(response, "output_text", "") or "")
+    try:
+        value = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        value = _extract_one_json_object(output)
+    if not isinstance(value, dict):
+        raise ValueError("invalid_json")
+    return value
 
 
 def verify_development_candidate(raw_name: str, context: dict,
@@ -117,8 +170,7 @@ def verify_development_candidate(raw_name: str, context: dict,
     focused_context = {key: value for key, value in (context or {}).items()
                        if value not in (None, "", [], {})}
     print(f"[DEVELOPMENT VERIFY] raw={raw!r} action=web_model_check", flush=True)
-    try:
-        response = rentee_app.client.responses.create(
+    request = dict(
             model="gpt-5-mini", tools=[{"type": "web_search"}],
             input=(
                 "Does this name refer to a real Malaysian residential property development, "
@@ -127,7 +179,11 @@ def verify_development_candidate(raw_name: str, context: dict,
                 "malls, landmarks, offices, and stations are disambiguation context only and "
                 "must never be returned as a Development or residential Geo. Return verified "
                 "with reason credible_match only for a confident, unambiguous real project, its "
-                "canonical name, residential area, and one strong source URL. Return ambiguous "
+                "canonical name, residential area, and one strong source URL. canonical_name must "
+                "be the clean official property name suitable for storage/display, without aliases "
+                "or explanatory text in brackets or parentheses; for example return 'Residensi "
+                "Sefina', not \"Residensi Sefina (Residensi Sefina Mont' Kiara)\", and return "
+                "\"Mont' Kiara Astana\", not \"Mont' Kiara Astana (MK Astana)\". Return ambiguous "
                 "with reason multiple_plausible_candidates when necessary, otherwise not_found "
                 "with reason no_credible_property_match. Do not invent a Development.\n\n"
                 f"CANDIDATE NAME:\n{raw}\n\nWHATSAPP IMPORT CONTEXT:\n"
@@ -153,14 +209,33 @@ def verify_development_candidate(raw_name: str, context: dict,
                     "additionalProperties": False,
                 }},},
         )
+    try:
+        response = rentee_app.client.responses.create(**request)
     except Exception as error:
         print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
               f"reason='web_tool_error' error={type(error).__name__}", flush=True)
         return _verification_error(raw, "web_tool_error")
     try:
-        value = json.loads(str(response.output_text or ""))
-    except (TypeError, json.JSONDecodeError):
-        return _verification_error(raw, "invalid_json")
+        value = _verifier_response_value(response)
+    except ValueError:
+        retry_request = dict(request)
+        retry_request["input"] = (
+            request["input"]
+            + "\n\nReturn only valid JSON matching the required schema. No markdown or prose."
+        )
+        try:
+            response = rentee_app.client.responses.create(**retry_request)
+        except Exception as error:
+            print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=error "
+                  f"reason='web_tool_error' error={type(error).__name__}", flush=True)
+            return _verification_error(raw, "web_tool_error")
+        try:
+            value = _verifier_response_value(response)
+        except ValueError:
+            return _verification_error(
+                raw, "invalid_json",
+                output_preview=getattr(response, "output_text", ""),
+            )
     if not isinstance(value, dict):
         return _verification_error(raw, "schema_validation_failed")
     if "status" not in value:

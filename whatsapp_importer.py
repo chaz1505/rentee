@@ -39,21 +39,27 @@ PARSER_SCHEMA = {
         "geo_names": {
             "type": "array", "items": {"type": "string"},
             "description": (
-                "Residential search areas explicitly preferred by the sender; never "
-                "schools, workplaces, malls, landmarks, offices, or stations."
+                "Actual residential areas/neighbourhoods explicitly preferred by the sender; "
+                "never Development, condo, or project names, nor schools, workplaces, malls, "
+                "landmarks, offices, or stations. Use an empty list when no actual area is stated."
             ),
         },
         "geo_name": {
             "type": ["string", "null"],
             "description": (
-                "Explicit residential area of the listing; never a school, workplace, "
-                "mall, landmark, office, or station."
+                "Explicit actual residential area/neighbourhood of the listing; never a "
+                "Development, condo, project, school, workplace, mall, landmark, office, or "
+                "station. Use null when no actual area is stated."
             ),
         },
         "preferred_development_names": {
             "type": "array", "items": {"type": "string"},
+            "description": "Development, condo, and project names; never place these in geo_names.",
         },
-        "development_name": {"type": ["string", "null"]},
+        "development_name": {
+            "type": ["string", "null"],
+            "description": "Listing Development, condo, or project name; never place it in geo_name.",
+        },
         "transaction_types": {
             "type": "array",
             "items": {"type": "string", "enum": list(TRANSACTION_TYPES)},
@@ -207,7 +213,10 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "Normalize RM8k=8000, RM 8,500=8500, 1.8m=1800000 and RM3.5 million=3500000. "
             "Normalize bedroom forms to an integer. Property types may only be Condo, Landed, "
             "Apartment, House. Map only obvious variants and never infer Condo merely from a "
-            "development name. Put areas and developments in their distinct fields. Geo fields "
+            "development name. Put actual areas/neighbourhoods only in geo_names/geo_name, and "
+            "put Development, condo, or project names only in preferred_development_names/"
+            "development_name. A named Development is not a Geo. If no actual area is stated, "
+            "geo_names must be empty and geo_name must be null; Geo can be derived later. Geo fields "
             "are only residential search areas or listing locations explicitly stated as such. "
             "Never put schools, workplaces, malls, landmarks, offices, or stations in Geo fields; "
             "they remain context only. Extract proposing_agent only from a credible agent/contact "
@@ -653,7 +662,18 @@ def _confirmation(parsed, geos, developments) -> str:
         property_text = ", ".join(parsed.get("property_types") or [])
         bits = ", ".join(item for item in (place, property_text) if item)
         suffix = f", up to {_money(parsed.get('budget'))}" if parsed.get("budget") is not None else ""
-        return f"Added lead: {bits}{bed_text}{suffix}."
+        parsed_agent = parsed.get("proposing_agent") or {}
+        agent_name = _compact(parsed_agent.get("name"))
+        agent_phone = normalize_phone_number(parsed_agent.get("phone"))
+        prefix = (f"Added lead to {agent_name}: {agent_phone}:"
+                  if agent_name and agent_phone else "Added lead:")
+        confirmation = f"{prefix} {bits}{bed_text}{suffix}."
+        development_names = list(dict.fromkeys(
+            item["name"] for item in developments if item.get("matched") and item.get("name")
+        ))
+        if development_names:
+            confirmation += f" Developments: {', '.join(development_names)}."
+        return confirmation
     name = next((item["name"] for item in developments if item.get("matched")), None)
     if not name:
         name = next((item["name"] for item in geos if item.get("matched")), "Property")

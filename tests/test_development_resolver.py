@@ -127,6 +127,56 @@ class DevelopmentResolverTests(unittest.TestCase):
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"], "no_credible_property_match")
 
+    def test_verifier_recovers_fenced_json_without_retry(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "confidence": 0.1,
+            "reason": "no_credible_property_match",
+        }
+        response = SimpleNamespace(
+            output_text=f"Here is the result:\n```json\n{json.dumps(output)}\n```"
+        )
+        with patch.object(
+            resolver.rentee_app.client.responses, "create", return_value=response,
+        ) as create:
+            result = resolver.verify_development_candidate("Not Real", {})
+        self.assertEqual(result["status"], "not_found")
+        create.assert_called_once()
+
+    def test_verifier_retries_invalid_json_once_and_succeeds(self):
+        output = {
+            "status": "not_found", "canonical_name": None, "geo_name": None,
+            "verification_url": None, "confidence": 0.1,
+            "reason": "no_credible_property_match",
+        }
+        with patch.object(
+            resolver.rentee_app.client.responses, "create",
+            side_effect=[
+                SimpleNamespace(output_text="not-json"),
+                SimpleNamespace(output_text=json.dumps(output)),
+            ],
+        ) as create:
+            result = resolver.verify_development_candidate("Not Real", {})
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(create.call_count, 2)
+        self.assertIn(
+            "Return only valid JSON matching the required schema. No markdown or prose.",
+            create.call_args_list[1].kwargs["input"],
+        )
+
+    def test_verifier_returns_invalid_json_after_single_failed_retry(self):
+        with patch.object(
+            resolver.rentee_app.client.responses, "create",
+            side_effect=[SimpleNamespace(output_text="bad first"),
+                         SimpleNamespace(output_text="bad second")],
+        ) as create, patch("builtins.print") as log:
+            result = resolver.verify_development_candidate("Inspirasi", {})
+        self.assertEqual((result["status"], result["reason"]),
+                         ("error", "invalid_json"))
+        self.assertEqual(create.call_count, 2)
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("output_preview='bad second'", rendered)
+
     def test_create_race_requeries_once_and_reuses(self):
         geo = resolver.resolve_geo_name("Mont Kiara", GEOS)
         raced = {"_id": "dev-raced", "Name": "Residensi Sefina", "Geo": "geo-mk"}

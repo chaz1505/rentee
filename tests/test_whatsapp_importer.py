@@ -135,6 +135,35 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["Geo"], ["geo-bangsar", "geo-klcc"])
         self.assertEqual(len(result["resolved_developments"]), 2)
 
+    def test_lead_confirmation_includes_resolved_preferred_developments(self):
+        parsed = {
+            "type": "lead", "property_types": ["Condo"],
+            "budget": 5000, "bedrooms_min": 3,
+            "proposing_agent": {"name": "Alex Goh", "phone": "016-4697992"},
+        }
+        geos = [{"matched": True, "id": "geo-mk", "name": "Mont Kiara"}]
+        developments = [
+            {"matched": True, "id": "dev-1", "name": "Inspirasi Mont Kiara"},
+            {"matched": True, "id": "dev-2", "name": "Mont Kiara Astana"},
+            {"matched": False, "raw_name": "Unknown"},
+        ]
+        self.assertEqual(
+            importer._confirmation(parsed, geos, developments),
+            "Added lead to Alex Goh: 60164697992: Mont Kiara, Condo, 3 bed, up to RM5,000. "
+            "Developments: Inspirasi Mont Kiara, Mont Kiara Astana.",
+        )
+
+    def test_lead_confirmation_is_unchanged_without_resolved_developments(self):
+        parsed = {
+            "type": "lead", "property_types": ["Condo"],
+            "budget": 5000, "bedrooms_min": 3,
+        }
+        geos = [{"matched": True, "id": "geo-mk", "name": "Mont Kiara"}]
+        self.assertEqual(
+            importer._confirmation(parsed, geos, []),
+            "Added lead: Mont Kiara, Condo, 3 bed, up to RM5,000.",
+        )
+
     def test_rental_listing_and_development_geo_derivation(self):
         parsed = self.parse_as({
             "type": "listing", "development_name": "One Menerung",
@@ -546,6 +575,30 @@ Polygon Properties
         context = importer._verification_context(parsed, text)
         self.assertIn("Garden International School", context["raw_text"])
 
+    def test_parser_prompt_keeps_developments_out_of_geo_names(self):
+        output = full_model_output(
+            type="lead", geo_names=[],
+            preferred_development_names=[
+                "Inspirasi", "MK Astana", "Ceriaan Kiara", "Sefina",
+            ],
+            transaction_types=["Rent/Let"], property_types=["Condo"],
+        )
+        response = SimpleNamespace(status="completed", output_text=json.dumps(output))
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create:
+            parsed = importer.parse_forwarded_message(
+                "Looking to rent in Inspirasi, MK Astana, Ceriaan Kiara or Sefina.",
+                import_type="lead",
+            )
+        self.assertEqual(parsed["geo_names"], [])
+        self.assertEqual(parsed["preferred_development_names"], output[
+            "preferred_development_names"
+        ])
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("A named Development is not a Geo", prompt)
+        self.assertIn("geo_names must be empty", prompt)
+
     def test_web_verifier_reuses_responses_web_search_and_context(self):
         output = {
             "status": "verified", "canonical_name": "Sefina Mont Kiara",
@@ -568,6 +621,8 @@ Polygon Properties
         self.assertIn("Sefina", prompt)
         self.assertIn("Garden International School", prompt)
         self.assertIn("must never be returned as a Development or residential Geo", prompt)
+        self.assertIn("clean official property name", prompt)
+        self.assertIn("without aliases or explanatory text in brackets or parentheses", prompt)
 
     def test_verified_result_requires_credible_match_reason(self):
         output = {
