@@ -291,7 +291,7 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "structured field.\n\nMESSAGE:\n" + text
             ),
             reasoning={"effort": "low"},
-            max_output_tokens=700,
+            max_output_tokens=2000,
             timeout=20,
             text={"format": {
                 "type": "json_schema", "name": "whatsapp_property_import",
@@ -304,7 +304,9 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
         raise
     response_status = str(getattr(response, "status", "completed") or "completed")
     if response_status.lower() != "completed":
-        print(f"[WHATSAPP IMPORT PARSER ERROR] status={response_status}", flush=True)
+        print(f"[WHATSAPP IMPORT PARSER ERROR] status={response_status} "
+              f"incomplete_details={getattr(response, 'incomplete_details', None)} "
+              f"usage={getattr(response, 'usage', None)}", flush=True)
         print("[WHATSAPP IMPORT PARSER ERROR] type=ValueError "
               "error=WhatsApp parser did not complete.", flush=True)
         raise ValueError("WhatsApp parser did not complete.")

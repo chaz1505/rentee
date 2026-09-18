@@ -51,6 +51,25 @@ class WhatsAppImporterTests(unittest.TestCase):
         with patch.object(importer.rentee_app.client.responses, "create", return_value=response):
             return importer.parse_forwarded_message(raw)
 
+    def test_incomplete_parser_response_logs_diagnostics_and_raises(self):
+        response = SimpleNamespace(
+            status="incomplete",
+            incomplete_details={"reason": "max_output_tokens"},
+            usage={"input_tokens": 100, "output_tokens": 2000},
+        )
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create, patch("builtins.print") as log:
+            with self.assertRaisesRegex(
+                ValueError, "WhatsApp parser did not complete."
+            ):
+                importer.parse_forwarded_message("WTR Bangsar")
+        self.assertEqual(create.call_args.kwargs["max_output_tokens"], 2000)
+        rendered = "\n".join(str(call) for call in log.call_args_list)
+        self.assertIn("status=incomplete", rendered)
+        self.assertIn("incomplete_details={'reason': 'max_output_tokens'}", rendered)
+        self.assertIn("usage={'input_tokens': 100, 'output_tokens': 2000}", rendered)
+
     def process_as(self, parsed):
         create = MagicMock(return_value="bubble-1")
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
