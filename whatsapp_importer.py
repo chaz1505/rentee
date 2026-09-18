@@ -73,6 +73,10 @@ PARSER_SCHEMA = {
         "budget": {"type": ["number", "null"], "minimum": 0},
         "asking_price": {"type": ["number", "null"], "minimum": 0},
         "bedrooms_min": {"type": ["integer", "null"], "minimum": 0},
+        "lead_name": {
+            "type": ["string", "null"],
+            "description": "Explicit Lead/client name; never the forwarding or proposing agent.",
+        },
         "adults": {"type": ["integer", "null"], "minimum": 0},
         "children": {"type": ["integer", "null"], "minimum": 0},
         "nationality": {"type": ["string", "null"]},
@@ -115,6 +119,7 @@ PARSER_SCHEMA = {
         "type", "geo_names", "geo_name", "preferred_development_names",
         "development_name", "transaction_types", "property_types",
         "property_type", "budget", "asking_price", "bedrooms_min", "beds",
+        "lead_name",
         "adults", "children", "nationality", "occupation", "move_in_date",
         "pets", "furnishing_preference", "bathrooms_min", "start_date",
         "helpers", "notes",
@@ -199,6 +204,8 @@ def _validate_parsed(value: Any) -> dict:
         for key in ("nationality", "occupation", "pets", "notes"):
             if _compact(value.get(key)):
                 result[key] = _compact(value[key])
+        if _compact(value.get("lead_name")):
+            result["lead_name"] = _compact(value["lead_name"])
         furnishing = value.get("furnishing_preference")
         if furnishing in {"Fully Furnished", "Partially Furnished", "Unfurnished"}:
             result["furnishing_preference"] = furnishing
@@ -275,7 +282,9 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "occupation, pets, furnishing preference, minimum bathrooms, helpers, and exact "
             "move-in/start dates only when explicitly and clearly stated. Absence never means "
             "zero. Dates must be YYYY-MM-DD and must be null when approximate or not responsibly "
-            "resolvable. Put concise useful requirements that have no structured Lead field "
+            "resolvable. Extract lead_name only when an actual Lead/client name is explicitly "
+            "provided; never use the proposing agent or the Rentee user who forwarded the message. "
+            "Put concise useful requirements that have no structured Lead field "
             "(such as desired sqft, tenancy length, employer/work details, school, family context, "
             "or unusual requirements) in notes. Never repeat in notes anything captured in a "
             "structured field.\n\nMESSAGE:\n" + text
@@ -664,6 +673,27 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
         name_field="ProposedAgentNameLead",
         number_field="ProposedAgentNumberLead",
     )
+    if parsed.get("lead_name"):
+        payload["Name"] = parsed["lead_name"]
+    elif payload.get("ProposedAgentNameLead"):
+        transaction_label = next((
+            label for transaction, label in (("Rent/Let", "WTR"), ("Buy/Sell", "WTB"))
+            if transaction in transactions
+        ), None)
+        location = next((
+            item.get("name") for item in resolved_developments or []
+            if item.get("matched") and _compact(item.get("name"))
+        ), None)
+        if not location:
+            location = next((
+                item.get("name") for item in resolved_geos or []
+                if item.get("matched") and _compact(item.get("name"))
+            ), None)
+        if transaction_label and location:
+            payload["Name"] = (
+                f"{payload['ProposedAgentNameLead']} (Agent) "
+                f"{transaction_label} {_compact(location)}"
+            )
     return payload
 
 

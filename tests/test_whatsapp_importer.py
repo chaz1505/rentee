@@ -32,6 +32,7 @@ def full_model_output(**updates):
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
         "budget": None, "asking_price": None, "bedrooms_min": None, "beds": None,
+        "lead_name": None,
         "adults": None, "children": None, "nationality": None,
         "occupation": None, "move_in_date": None, "pets": None,
         "furnishing_preference": None, "bathrooms_min": None,
@@ -122,6 +123,47 @@ class WhatsAppImporterTests(unittest.TestCase):
             "furnishingPreference", "Notes",
         ):
             self.assertNotIn(field, payload)
+
+    def test_lead_name_defaults_from_stored_agent_transaction_and_first_development(self):
+        parsed = self.parse_as({
+            "type": "lead", "transaction_types": ["Rent/Let"],
+            "proposing_agent": {
+                "name": "Alex Goh", "phone": "016-4697992", "ren": None,
+            },
+        })
+        payload = importer.build_lead_payload(
+            parsed,
+            [{"matched": True, "id": "geo-bangsar", "name": "Bangsar"}],
+            [
+                {"matched": True, "id": "dev-1", "name": "Inspirasi"},
+                {"matched": True, "id": "dev-2", "name": "Sefina"},
+            ],
+            {"name": "Alex Goh", "normalized_phone": "60164697992"},
+        )
+        self.assertEqual(payload["ProposedAgentNameLead"], "Alex Goh")
+        self.assertEqual(payload["Name"], "Alex Goh (Agent) WTR Inspirasi")
+
+    def test_lead_name_uses_geo_and_buy_label_without_development(self):
+        payload = importer.build_lead_payload(
+            {"type": "lead", "transaction_types": ["Buy/Sell"]},
+            [{"matched": True, "id": "geo-bangsar", "name": "Bangsar"}],
+            [],
+            {"name": "Alex Goh", "normalized_phone": "60164697992"},
+        )
+        self.assertEqual(payload["Name"], "Alex Goh (Agent) WTB Bangsar")
+
+    def test_explicit_lead_name_is_preserved(self):
+        parsed = self.parse_as({
+            "type": "lead", "lead_name": "Sarah Lim",
+            "transaction_types": ["Rent/Let"],
+        })
+        payload = importer.build_lead_payload(
+            parsed,
+            [{"matched": True, "id": "geo-bangsar", "name": "Bangsar"}],
+            [{"matched": True, "id": "dev-1", "name": "Inspirasi"}],
+            {"name": "Alex Goh", "normalized_phone": "60164697992"},
+        )
+        self.assertEqual(payload["Name"], "Sarah Lim")
 
     def test_multiple_geo_lead_survives_parse_and_resolution(self):
         parsed = self.parse_as({
