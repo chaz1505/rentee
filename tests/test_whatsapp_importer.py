@@ -37,6 +37,12 @@ def full_model_output(**updates):
         "occupation": None, "move_in_date": None, "pets": None,
         "furnishing_preference": None, "bathrooms_min": None,
         "start_date": None, "helpers": None, "notes": None,
+        "baths": None, "sqft": None, "land_sqft": None,
+        "furnished": None, "furnishing": None, "available": None,
+        "availability_date": None, "balcony": None, "study": None,
+        "family_room": None, "maid_room": None, "outdoor_area": None,
+        "unit_number": None, "owner_name": None, "owner_contact": None,
+        "source_agency_name": None,
         "proposing_agent": {"name": None, "phone": None, "ren": None},
     }
     value.update(updates)
@@ -286,6 +292,51 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["priceSale"], 1800000)
         self.assertNotIn("priceRent", payload)
 
+    def test_listing_details_parse_and_map_to_existing_bubble_fields(self):
+        parsed = self.parse_as({
+            "type": "listing", "development_name": "One Menerung",
+            "transaction_types": ["Rent/Let"], "asking_price": 12000, "beds": 3,
+            "baths": 2.5, "sqft": 1800, "land_sqft": 2400,
+            "furnished": "Yes", "furnishing": "Fully Furnished",
+            "available": True, "availability_date": "2026-11-01",
+            "balcony": "Yes", "study": 1, "family_room": 1,
+            "maid_room": 1, "outdoor_area": "No", "unit_number": "A-12-3",
+            "owner_name": "Sarah Lim", "owner_contact": "+60 12-345 6789",
+            "source_agency_name": "RVT Realty",
+            "notes": "Private lift; view of the park.",
+        })
+        payload = importer.build_listing_payload(
+            parsed, None,
+            {"matched": True, "id": "dev-one", "name": "One Menerung"},
+        )
+        self.assertEqual(payload, {
+            "exposure": "Public", "development": "dev-one",
+            "TransactionType": ["Rent/Let"], "beds": 3, "priceRent": 12000,
+            "baths": 2.5, "Sq Ft": 1800, "Landed_sqft": 2400,
+            "furnished": "Yes", "Furnishing": "Fully Furnished",
+            "availability": True,
+            "availability_date": "2026-11-01",
+            "balcony": "Yes", "study": 1, "family room": 1,
+            "maid room": 1, "outdoor area": "No", "unitNumber": "A-12-3",
+            "ownerName": "Sarah Lim", "ownerContact": "+60 12-345 6789",
+            "sourceAgencyName": "RVT Realty",
+            "Notes": "Private lift; view of the park.",
+        })
+
+    def test_listing_omits_unsupported_details_and_always_sets_public_exposure(self):
+        parsed = self.parse_as({
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Buy/Sell"], "availability_date": "soon",
+            "furnished": None, "balcony": None, "outdoor_area": None,
+        })
+        payload = importer.build_listing_payload(parsed, None, None)
+        self.assertEqual(payload["exposure"], "Public")
+        for field in (
+            "availability_date", "furnished", "balcony", "outdoor area", "Notes",
+        ):
+            self.assertNotIn(field, payload)
+        self.assertNotIn("exposure", importer.PARSER_SCHEMA["properties"])
+
     def test_explicit_geo_wins_and_conflict_is_logged(self):
         parsed = {
             "type": "listing", "geo_name": "KLCC", "development_name": "One Menerung",
@@ -304,6 +355,42 @@ class WhatsAppImporterTests(unittest.TestCase):
             result = importer.process_whatsapp_import("Thanks")
         self.assertEqual(result, {"status": "unknown", "type": "unknown"})
         create.assert_not_called()
+
+    def test_invalid_lead_does_not_write_to_bubble_and_requests_full_message(self):
+        parsed = {
+            "type": "lead", "geo_names": [], "preferred_development_names": [],
+            "transaction_types": [], "property_types": [],
+            "proposing_agent": {"name": "Alex Goh", "phone": "016-4697992"},
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer, "resolve_or_create_proposing_agent") as resolve_agent:
+            result = importer.process_whatsapp_import(
+                "WTR", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["status"], "invalid")
+        self.assertIn("resend the full forwarded message", result["confirmation"])
+        create.assert_not_called()
+        resolve_agent.assert_not_called()
+
+    def test_invalid_listing_does_not_write_to_bubble_and_requests_full_message(self):
+        invalid_listings = (
+            {"type": "listing", "transaction_types": ["Rent/Let"]},
+            {"type": "listing", "development_name": "One Menerung"},
+        )
+        for parsed in invalid_listings:
+            with self.subTest(parsed=parsed), \
+                 patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+                 patch.object(importer.rentee_app, "_bubble_create") as create, \
+                 patch.object(importer, "resolve_or_create_proposing_agent") as resolve_agent:
+                result = importer.process_whatsapp_import(
+                    "partial listing", geo_records=GEOS,
+                    development_records=DEVELOPMENTS,
+                )
+            self.assertEqual(result["status"], "invalid")
+            self.assertIn("resend the full forwarded message", result["confirmation"])
+            create.assert_not_called()
+            resolve_agent.assert_not_called()
 
     def test_unsupported_property_type_is_removed(self):
         parsed = self.parse_as({

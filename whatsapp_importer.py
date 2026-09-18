@@ -104,6 +104,28 @@ PARSER_SCHEMA = {
             ),
         },
         "beds": {"type": ["integer", "null"], "minimum": 0},
+        "baths": {"type": ["number", "null"], "minimum": 0},
+        "sqft": {"type": ["number", "null"], "minimum": 0},
+        "land_sqft": {"type": ["number", "null"], "minimum": 0},
+        "furnished": {"type": ["string", "null"], "enum": ["Yes", "No", None]},
+        "furnishing": {
+            "type": ["string", "null"],
+            "enum": ["Fully Furnished", "Partially Furnished", "Unfurnished", None],
+        },
+        "available": {"type": ["boolean", "null"]},
+        "availability_date": {
+            "type": ["string", "null"],
+            "description": "Exact date as YYYY-MM-DD, otherwise null.",
+        },
+        "balcony": {"type": ["string", "null"], "enum": ["Yes", "No", None]},
+        "study": {"type": ["number", "null"], "minimum": 0},
+        "family_room": {"type": ["number", "null"], "minimum": 0},
+        "maid_room": {"type": ["number", "null"], "minimum": 0},
+        "outdoor_area": {"type": ["string", "null"], "enum": ["Yes", "No", None]},
+        "unit_number": {"type": ["string", "null"]},
+        "owner_name": {"type": ["string", "null"]},
+        "owner_contact": {"type": ["string", "null"]},
+        "source_agency_name": {"type": ["string", "null"]},
         "proposing_agent": {
             "type": "object",
             "properties": {
@@ -123,6 +145,10 @@ PARSER_SCHEMA = {
         "adults", "children", "nationality", "occupation", "move_in_date",
         "pets", "furnishing_preference", "bathrooms_min", "start_date",
         "helpers", "notes",
+        "baths", "sqft", "land_sqft", "furnished", "furnishing", "available",
+        "availability_date", "balcony", "study", "family_room", "maid_room",
+        "outdoor_area", "unit_number", "owner_name", "owner_contact",
+        "source_agency_name",
         "proposing_agent",
     ],
     "additionalProperties": False,
@@ -230,6 +256,28 @@ def _validate_parsed(value: Any) -> dict:
     for key in ("asking_price", "beds"):
         if isinstance(value.get(key), (int, float)) and value[key] >= 0:
             result[key] = int(value[key]) if float(value[key]).is_integer() else value[key]
+    for key in ("baths", "sqft", "land_sqft", "study", "family_room", "maid_room"):
+        if (not isinstance(value.get(key), bool)
+                and isinstance(value.get(key), (int, float)) and value[key] >= 0):
+            result[key] = int(value[key]) if float(value[key]).is_integer() else value[key]
+    for key in ("furnished", "balcony", "outdoor_area"):
+        if value.get(key) in {"Yes", "No"}:
+            result[key] = value[key]
+    if value.get("furnishing") in {
+        "Fully Furnished", "Partially Furnished", "Unfurnished",
+    }:
+        result["furnishing"] = value["furnishing"]
+    if isinstance(value.get("available"), bool):
+        result["available"] = value["available"]
+    try:
+        result["availability_date"] = datetime.date.fromisoformat(
+            str(value.get("availability_date"))
+        ).isoformat()
+    except (TypeError, ValueError):
+        pass
+    for key in ("unit_number", "owner_name", "owner_contact", "source_agency_name", "notes"):
+        if _compact(value.get(key)):
+            result[key] = _compact(value[key])
     return result
 
 
@@ -288,7 +336,12 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "Put concise useful requirements that have no structured Lead field "
             "(such as desired sqft, tenancy length, employer/work details, school, family context, "
             "or unusual requirements) in notes. Never repeat in notes anything captured in a "
-            "structured field.\n\nMESSAGE:\n" + text
+            "structured field. For listings, extract baths, built-up sqft, land sqft, furnished "
+            "Yes/No, canonical furnishing status, availability, exact availability date, balcony, "
+            "study/family/maid room counts, outdoor area, unit number, owner name/contact, and "
+            "source agency only when explicitly stated. Put useful listing details not captured "
+            "by another structured field in notes, without duplicating structured facts. Never "
+            "extract or infer exposure.\n\nMESSAGE:\n" + text
             ),
             reasoning={"effort": "low"},
             max_output_tokens=2000,
@@ -710,7 +763,7 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
 
 def build_listing_payload(parsed, resolved_geo, resolved_development,
                           proposing_agent=None) -> dict:
-    payload = {}
+    payload = {"exposure": "Public"}
     if resolved_geo and resolved_geo.get("matched"):
         payload["Geo"] = resolved_geo["id"]
     if resolved_development and resolved_development.get("matched"):
@@ -727,6 +780,30 @@ def build_listing_payload(parsed, resolved_geo, resolved_development,
             payload["priceRent"] = parsed["asking_price"]
         if "Buy/Sell" in transactions:
             payload["priceSale"] = parsed["asking_price"]
+    field_mapping = {
+        "baths": "baths",
+        "sqft": "Sq Ft",
+        "land_sqft": "Landed_sqft",
+        "furnished": "furnished",
+        "furnishing": "Furnishing",
+        "available": "availability",
+        "balcony": "balcony",
+        "study": "study",
+        "family_room": "family room",
+        "maid_room": "maid room",
+        "outdoor_area": "outdoor area",
+        "unit_number": "unitNumber",
+        "owner_name": "ownerName",
+        "owner_contact": "ownerContact",
+        "source_agency_name": "sourceAgencyName",
+        "notes": "Notes",
+    }
+    for parsed_field, bubble_field in field_mapping.items():
+        value = parsed.get(parsed_field)
+        if value is not None:
+            payload[bubble_field] = value
+    if parsed.get("availability_date"):
+        payload["availability_date"] = parsed["availability_date"]
     _apply_proposing_agent_payload(
         payload, proposing_agent,
         name_field="ProposingAgentName",
@@ -830,6 +907,29 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         return {"status": "unknown", "type": "unknown"}
     if bubble_env not in {"live", "development"}:
         raise ValueError("bubble_env must be 'live' or 'development'.")
+    valid_import = (
+        any(parsed.get(field) for field in (
+            "geo_names", "preferred_development_names", "transaction_types",
+            "property_types",
+        ))
+        or parsed.get("budget") is not None
+        or parsed.get("bedrooms_min") is not None
+    ) if parsed["type"] == "lead" else (
+        bool(parsed.get("development_name") or parsed.get("geo_name"))
+        and (
+            bool(parsed.get("transaction_types") or parsed.get("property_type"))
+            or parsed.get("asking_price") is not None
+            or parsed.get("beds") is not None
+        )
+    )
+    if not valid_import:
+        return {
+            "status": "invalid", "type": parsed["type"], "parsed": parsed,
+            "confirmation": (
+                "I couldn't add that property record because it did not contain enough "
+                "details. Please resend the full forwarded message."
+            ),
+        }
     parsed_agent = parsed.get("proposing_agent")
     parsed_agent = parsed_agent if isinstance(parsed_agent, dict) else {}
     try:
