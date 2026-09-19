@@ -1533,6 +1533,43 @@ Polygon Properties
             "name": "Alex Goh", "phone": "016-4697992", "ren": "E2265",
         })
 
+    def test_malaysian_agent_signature_prefers_mobile_over_office_number(self):
+        message = """WTB
+landed house (TTDI or others suitable one)
+
+Singaporean buyer
+Individual title
+Must have garden
+Budget follow market value
+
+Kindly propose to me if there’s any suitable listing🙏
+
+Marcus Yeoh | J+Team
+Real Estate Negotiator (REN50605)
++6017-4081131
+Kommons Realty Sdn Bhd
+E(1)2150
++603-64130178"""
+        output = full_model_output(
+            type="lead", geo_names=["TTDI"], location_references=["TTDI"],
+            transaction_types=["Buy/Sell"], property_types=["Landed", "House"],
+            proposing_agent={
+                "name": "Marcus Yeoh", "phone": "+6017-4081131", "ren": "REN50605",
+            },
+        )
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(status="completed", output_text=json.dumps(output)),
+        ) as create:
+            parsed = importer.parse_forwarded_message(message, import_type="lead")
+        self.assertEqual(parsed["proposing_agent"]["name"], "Marcus Yeoh")
+        self.assertEqual(parsed["proposing_agent"]["phone"], "+6017-4081131")
+        self.assertEqual(parsed["proposing_agent"]["ren"], "REN50605")
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("individual Malaysian mobile (+601/01)", prompt)
+        self.assertIn("office or landline (+603/03)", prompt)
+        self.assertIn("Use the individual person's name", prompt)
+
     def test_duplicate_phone_users_do_not_create_another_user(self):
         duplicates = [
             {"_id": "user-1", "phone": "60164697992"},
