@@ -130,6 +130,39 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["budgetBuy"], 3500000)
         self.assertNotIn("budgetRent", payload)
 
+    def test_new_imports_canonicalize_apartment_and_house(self):
+        apartment = self.parse_as({
+            "type": "lead", "property_types": ["Apartment"],
+            "transaction_types": ["Rent/Let"],
+        })
+        house = self.parse_as({
+            "type": "listing", "property_type": "House",
+            "transaction_types": ["Buy/Sell"],
+        })
+        self.assertEqual(
+            importer.build_lead_payload(apartment, [], [])["propertyTypes"], ["Condo"]
+        )
+        self.assertEqual(
+            importer.build_listing_payload(house, None, None)["propertyType"], "Landed"
+        )
+
+    def test_new_listing_types_are_canonical_and_lead_may_request_both(self):
+        expected = {
+            "Apartment": "Condo", "Condo": "Condo",
+            "House": "Landed", "Landed": "Landed",
+        }
+        for incoming, canonical in expected.items():
+            with self.subTest(incoming=incoming):
+                payload = importer.build_listing_payload(
+                    {"property_type": incoming}, None, None
+                )
+                self.assertEqual(payload["propertyType"], canonical)
+                self.assertIn(payload["propertyType"], {"Condo", "Landed"})
+        lead = importer.build_lead_payload(
+            {"property_types": ["Condo", "Landed"]}, [], []
+        )
+        self.assertEqual(lead["propertyTypes"], ["Condo", "Landed"])
+
     def test_explicit_lead_details_and_notes_map_to_existing_fields(self):
         parsed = self.parse_as({
             "type": "lead", "transaction_types": ["Rent/Let"],
@@ -659,6 +692,67 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["priceSale"] = 1000000
         self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_property_type_only_and_legacy_values(self):
+        lead = {
+            "TransactionType": ["Buy/Sell"], "Geo": ["geo-ttdi"],
+            "propertyTypes": ["Landed"],
+        }
+        listing = {
+            "TransactionType": ["Buy/Sell"], "Geo": "geo-ttdi",
+            "propertyType": "Landed",
+        }
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        listing["propertyType"] = "Condo"
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["propertyType"] = "House"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+        lead["propertyTypes"] = ["Condo"]
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["propertyType"] = "Apartment"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        listing["propertyType"] = "Landed"
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+
+        lead["propertyTypes"] = ["Condo", "Landed"]
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        listing["propertyType"] = "Condo"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_applies_property_bedrooms_and_budget_together(self):
+        lead = {
+            "TransactionType": ["Buy/Sell"], "Geo": ["geo-ttdi"],
+            "propertyTypes": ["Landed"], "bedroomsMin": 4,
+            "budgetBuy": 1000000,
+        }
+        listing = {
+            "TransactionType": ["Buy/Sell"], "Geo": "geo-ttdi",
+            "propertyType": "House", "beds": 4, "priceSale": 1000000,
+        }
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        for field, bad_value in (
+            ("propertyType", "Condo"), ("beds", 3), ("priceSale", 1300000),
+        ):
+            candidate = dict(listing, **{field: bad_value})
+            self.assertFalse(importer.lead_matches_listing(lead, candidate))
+
+    def test_legacy_matching_is_read_only(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "propertyType": "Apartment",
+        }
+        original = dict(listing)
+        with patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            self.assertTrue(importer.lead_matches_listing(lead, listing))
+        self.assertEqual(listing, original)
+        create.assert_not_called()
+        update.assert_not_called()
 
     def test_matching_rejects_under_specified_lead(self):
         listing = {
@@ -1565,6 +1659,11 @@ E(1)2150
         self.assertEqual(parsed["proposing_agent"]["name"], "Marcus Yeoh")
         self.assertEqual(parsed["proposing_agent"]["phone"], "+6017-4081131")
         self.assertEqual(parsed["proposing_agent"]["ren"], "REN50605")
+        self.assertEqual(parsed["transaction_types"], ["Buy/Sell"])
+        self.assertEqual(parsed["geo_names"], ["TTDI"])
+        self.assertEqual(parsed["property_types"], ["Landed"])
+        self.assertNotIn("budget", parsed)
+        self.assertNotIn("bedrooms_min", parsed)
         prompt = create.call_args.kwargs["input"]
         self.assertIn("individual Malaysian mobile (+601/01)", prompt)
         self.assertIn("office or landline (+603/03)", prompt)

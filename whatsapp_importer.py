@@ -18,7 +18,7 @@ import development_resolver
 
 LOG_PREFIX = "[WHATSAPP IMPORT]"
 TRANSACTION_TYPES = ("Rent/Let", "Buy/Sell")
-PROPERTY_TYPES = ("Condo", "Landed", "Apartment", "House")
+PROPERTY_TYPES = ("Condo", "Landed")
 IMPORT_ROUTING_THRESHOLD = 0.90
 
 STRONG_IMPORT_MARKERS = (
@@ -83,7 +83,7 @@ PARSER_SCHEMA = {
             "type": "array",
             "items": {"type": "string", "enum": list(PROPERTY_TYPES)},
         },
-        "property_type": {"type": ["string", "null"]},
+        "property_type": {"type": ["string", "null"], "enum": [*PROPERTY_TYPES, None]},
         "budget": {"type": ["number", "null"], "minimum": 0},
         "asking_price": {"type": ["number", "null"], "minimum": 0},
         "bedrooms_min": {"type": ["integer", "null"], "minimum": 0},
@@ -221,6 +221,13 @@ def _location_references(values: Iterable[Any]) -> list[str]:
     return _unique_strings(result)
 
 
+def _canonical_property_type(value: Any) -> str | None:
+    return {
+        "condo": "Condo", "apartment": "Condo",
+        "landed": "Landed", "house": "Landed",
+    }.get(_compact(value).casefold())
+
+
 def _validate_parsed(value: Any) -> dict:
     if not isinstance(value, dict) or value.get("type") not in {"lead", "listing", "unknown"}:
         return {"type": "unknown"}
@@ -229,11 +236,10 @@ def _validate_parsed(value: Any) -> dict:
 
     transactions = _unique_strings(value.get("transaction_types") or [])
     transactions = [item for item in transactions if item in TRANSACTION_TYPES]
-    property_types = _unique_strings(value.get("property_types") or [])
-    property_types = [item for item in property_types if item in PROPERTY_TYPES]
-    property_type = value.get("property_type")
-    if property_type not in PROPERTY_TYPES:
-        property_type = None
+    property_types = _unique_strings(
+        _canonical_property_type(item) for item in value.get("property_types") or []
+    )
+    property_type = _canonical_property_type(value.get("property_type"))
     raw_agent = value.get("proposing_agent")
     raw_agent = raw_agent if isinstance(raw_agent, dict) else {}
     proposing_agent = {
@@ -352,9 +358,12 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "asking, asking RM, unit available. Map renter/for rent/WTR/WTL to Rent/Let and "
             "buyer/for sale/WTB/WTS to Buy/Sell; classification determines which side. "
             "Normalize RM8k=8000, RM 8,500=8500, 1.8m=1800000 and RM3.5 million=3500000. "
-            "Normalize bedroom forms to an integer. Property types may only be Condo, Landed, "
-            "Apartment, House. Map only obvious variants and never infer Condo merely from a "
-            "development name. Put actual areas/neighbourhoods only in geo_names/geo_name, and "
+            "Normalize bedroom forms to an integer. Property types may only be the canonical "
+            "values Condo or Landed. Map apartment/condominium/condo to Condo. Map house, "
+            "bungalow, semi-D, terrace, link house, detached house, and landed house to Landed. "
+            "A Listing has exactly one property_type when one is stated; a Lead may have neither, "
+            "one, or both canonical property_types. Never infer Condo merely from a development "
+            "name. Put actual areas/neighbourhoods only in geo_names/geo_name, and "
             "put Development, condo, or project names only in preferred_development_names/"
             "development_name. A named Development is not a Geo. If no actual area is stated, "
             "geo_names must be empty and geo_name must be null; Geo can be derived later. Geo fields "
@@ -769,9 +778,9 @@ def _verification_context(parsed, raw_text):
         "location_references": _unique_strings(parsed.get("location_references") or []),
         "location_reference": _compact(parsed.get("location_reference")) or None,
         "property_type": parsed.get("property_type"),
-        "property_types": [
-            item for item in parsed.get("property_types", []) if item in PROPERTY_TYPES
-        ],
+        "property_types": _unique_strings(
+            _canonical_property_type(item) for item in parsed.get("property_types", [])
+        ),
         "transaction_types": [
             item for item in parsed.get("transaction_types", []) if item in TRANSACTION_TYPES
         ],
@@ -845,7 +854,9 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
     geo_ids = _matched_ids(resolved_geos)
     development_ids = _matched_ids(resolved_developments)
     transactions = [v for v in parsed.get("transaction_types", []) if v in TRANSACTION_TYPES]
-    property_types = [v for v in parsed.get("property_types", []) if v in PROPERTY_TYPES]
+    property_types = _unique_strings(
+        _canonical_property_type(v) for v in parsed.get("property_types", [])
+    )
     if geo_ids:
         payload["Geo"] = geo_ids
     location_references = _unique_strings(
@@ -932,8 +943,9 @@ def build_listing_payload(parsed, resolved_geo, resolved_development,
     transactions = [v for v in parsed.get("transaction_types", []) if v in TRANSACTION_TYPES]
     if transactions:
         payload["TransactionType"] = list(dict.fromkeys(transactions))
-    if parsed.get("property_type") in PROPERTY_TYPES:
-        payload["propertyType"] = parsed["property_type"]
+    property_type = _canonical_property_type(parsed.get("property_type"))
+    if property_type:
+        payload["propertyType"] = property_type
     if isinstance(parsed.get("beds"), (int, float)):
         payload["beds"] = parsed["beds"]
     if isinstance(parsed.get("asking_price"), (int, float)):
@@ -1112,17 +1124,32 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
         "Rent/Let": lead.get("budgetRent"),
         "Buy/Sell": lead.get("budgetBuy"),
     }
-    if not any(
+    lead_property_value = lead.get("propertyTypes") or []
+    if not isinstance(lead_property_value, list):
+        lead_property_value = [lead_property_value]
+    lead_property_types = {
+        canonical for canonical in (
+            _canonical_property_type(value) for value in lead_property_value
+        ) if canonical
+    }
+    has_budget = any(
         not isinstance(applicable_budgets[transaction], bool)
         and isinstance(applicable_budgets[transaction], (int, float))
         for transaction in lead_transactions
-    ) and not (
+    )
+    has_bedrooms = (
         not isinstance(bedrooms_min, bool)
         and isinstance(bedrooms_min, (int, float))
-    ):
+    )
+    if not (lead_property_types or has_bedrooms or has_budget):
         return False
 
-    if not isinstance(bedrooms_min, bool) and isinstance(bedrooms_min, (int, float)):
+    if lead_property_types:
+        listing_property_type = _canonical_property_type(listing.get("propertyType"))
+        if listing_property_type not in lead_property_types:
+            return False
+
+    if has_bedrooms:
         beds = listing.get("beds")
         if isinstance(beds, bool) or not isinstance(beds, (int, float)) or beds < bedrooms_min:
             return False
@@ -1130,13 +1157,12 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
     price_fields = {"Rent/Let": "priceRent", "Buy/Sell": "priceSale"}
     for transaction in shared_transactions:
         budget = applicable_budgets[transaction]
-        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
-            return True
-        price = listing.get(price_fields[transaction])
-        if (not isinstance(price, bool) and isinstance(price, (int, float))
-                and budget * 0.8 <= price <= budget * 1.2):
-            return True
-    return False
+        if not isinstance(budget, bool) and isinstance(budget, (int, float)):
+            price = listing.get(price_fields[transaction])
+            if (isinstance(price, bool) or not isinstance(price, (int, float))
+                    or not budget * 0.8 <= price <= budget * 1.2):
+                return False
+    return True
 
 
 def find_import_matches(created_type: str, record: dict, bubble_env: str) -> list[dict]:
