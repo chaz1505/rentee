@@ -139,6 +139,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         })
         payload = importer.build_lead_payload(parsed, [], [])
         self.assertEqual(payload, {
+            "source": "whatsapp", "exposure": "public",
             "TransactionType": ["Rent/Let"],
             "adults": 2, "children": 1, "nationality": "British",
             "occupation": "Engineer", "moveInDate": "2026-11-01T00:00:00.000Z",
@@ -200,6 +201,38 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
         self.assertEqual(payload["name"], "Sarah Lim")
+
+    def test_import_payloads_use_proposing_agent_as_owner_and_whatsapp_source(self):
+        proposing_agent = {
+            "user_id": "user-agent", "name": "Alex Goh",
+            "normalized_phone": "60164697992",
+        }
+        lead_payload = importer.build_lead_payload(
+            {"type": "lead", "transaction_types": ["Rent/Let"]},
+            [], [], proposing_agent,
+        )
+        listing_payload = importer.build_listing_payload(
+            {"type": "listing", "transaction_types": ["Rent/Let"]},
+            None, None, proposing_agent,
+        )
+        for payload in (lead_payload, listing_payload):
+            self.assertEqual(payload["owner"], "user-agent")
+            self.assertEqual(payload["source"], "whatsapp")
+
+    def test_import_payloads_leave_owner_unset_without_proposing_agent_user(self):
+        unresolved_agent = {
+            "user_id": None, "name": "Alex Goh",
+            "normalized_phone": "60164697992",
+        }
+        lead_payload = importer.build_lead_payload(
+            {"type": "lead"}, [], [], unresolved_agent,
+        )
+        listing_payload = importer.build_listing_payload(
+            {"type": "listing"}, None, None, unresolved_agent,
+        )
+        for payload in (lead_payload, listing_payload):
+            self.assertNotIn("owner", payload)
+            self.assertEqual(payload["source"], "whatsapp")
 
     def test_multiple_geo_lead_survives_parse_and_resolution(self):
         parsed = self.parse_as({
@@ -348,7 +381,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"matched": True, "id": "dev-one", "name": "One Menerung"},
         )
         self.assertEqual(payload, {
-            "exposure": "public", "development": "dev-one",
+            "exposure": "public", "source": "whatsapp", "development": "dev-one",
             "TransactionType": ["Rent/Let"], "beds": 3, "priceRent": 12000,
             "baths": 2.5, "Sq Ft": 1800, "Landed_sqft": 2400,
             "furnished": "Yes", "Furnishing": "Fully Furnished",
@@ -1327,6 +1360,8 @@ Polygon Properties
         self.assertEqual(user_payload["REN"], "E2265")
         self.assertEqual(lead_payload["ProposedAgentNameLead"], "Alex Goh")
         self.assertEqual(lead_payload["ProposedAgentNumberLead"], "60164697992")
+        self.assertEqual(lead_payload["owner"], "user-agent")
+        self.assertEqual(lead_payload["source"], "whatsapp")
         self.assertNotIn("proposingAgentNameLead", lead_payload)
         self.assertNotIn("ProposingAgentName", lead_payload)
         self.assertNotIn("ProposingAgentNumber", lead_payload)

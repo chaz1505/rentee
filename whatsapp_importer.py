@@ -692,7 +692,9 @@ def _apply_proposing_agent_payload(payload, proposing_agent, name_field, number_
 
 def build_lead_payload(parsed, resolved_geos, resolved_developments,
                        proposing_agent=None) -> dict:
-    payload = {}
+    payload = {"source": "whatsapp", "exposure": "public"}
+    if proposing_agent and proposing_agent.get("user_id"):
+        payload["owner"] = proposing_agent["user_id"]
     geo_ids = _matched_ids(resolved_geos)
     development_ids = _matched_ids(resolved_developments)
     transactions = [v for v in parsed.get("transaction_types", []) if v in TRANSACTION_TYPES]
@@ -763,7 +765,9 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
 
 def build_listing_payload(parsed, resolved_geo, resolved_development,
                           proposing_agent=None) -> dict:
-    payload = {"exposure": "public"}
+    payload = {"exposure": "public", "source": "whatsapp"}
+    if proposing_agent and proposing_agent.get("user_id"):
+        payload["owner"] = proposing_agent["user_id"]
     if resolved_geo and resolved_geo.get("matched"):
         payload["Geo"] = resolved_geo["id"]
     if resolved_development and resolved_development.get("matched"):
