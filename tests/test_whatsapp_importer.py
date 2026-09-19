@@ -32,6 +32,7 @@ DEVELOPMENTS = [
 def full_model_output(**updates):
     value = {
         "type": "unknown", "geo_names": [], "geo_name": None,
+        "location_references": [], "location_reference": None,
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
         "budget": None, "asking_price": None, "bedrooms_min": None, "beds": None,
@@ -104,6 +105,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }, "WTR\nBangsar\nCondo\n3 bedrooms\nBudget RM8k")
         self.assertEqual(parsed, {
             "type": "lead", "geo_names": ["Bangsar"],
+            "location_references": ["Bangsar"],
             "preferred_development_names": [],
             "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
             "proposing_agent": {"name": None, "phone": None, "ren": None},
@@ -242,6 +244,55 @@ class WhatsAppImporterTests(unittest.TestCase):
         }, "Looking to rent in Brickfields or PJ. Apartment, 2 bed, max RM2,500.")
         resolved = importer.resolve_geo_names(parsed["geo_names"], GEOS)
         self.assertEqual([item["id"] for item in resolved], ["geo-brickfields", "geo-pj"])
+
+    def test_location_references_are_preserved_in_payloads(self):
+        lead = importer.build_lead_payload({
+            "type": "lead", "location_references": ["Sultan Ismail", "Setia Alam"],
+        }, [], [])
+        listing = importer.build_listing_payload({
+            "type": "listing", "location_reference": "Near Sultan Ismail",
+        }, None, None)
+        self.assertEqual(lead["locationReferences"], ["Sultan Ismail", "Setia Alam"])
+        self.assertEqual(listing["locationReference"], "Near Sultan Ismail")
+
+    def test_lead_fallback_combines_and_deduplicates_existing_geos(self):
+        parsed = {
+            "type": "lead", "location_references": ["Sultan Ismail", "KLCC"],
+            "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        fallback = [
+            {"matched": True, "id": "geo-klcc", "name": "KLCC"},
+            {"matched": True, "id": "geo-brickfields", "name": "Brickfields"},
+        ]
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference", return_value=fallback) as verify, \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1") as create:
+            importer.process_whatsapp_import(
+                "WTR near Sultan Ismail or KLCC", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        self.assertEqual(create.call_args.args[2]["locationReferences"],
+                         ["Sultan Ismail", "KLCC"])
+        self.assertEqual(create.call_args.args[2]["Geo"],
+                         ["geo-klcc", "geo-brickfields"])
+        verify.assert_called_once()
+
+    def test_listing_uses_fallback_only_when_direct_and_development_geo_fail(self):
+        parsed = {
+            "type": "listing", "location_reference": "Sultan Ismail",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        fallback = [{"matched": True, "id": "geo-klcc", "name": "KLCC"}]
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference", return_value=fallback), \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1") as create:
+            importer.process_whatsapp_import(
+                "WTL near Sultan Ismail", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        self.assertEqual(create.call_args.args[2]["locationReference"], "Sultan Ismail")
+        self.assertEqual(create.call_args.args[2]["Geo"], "geo-klcc")
 
     def test_mont_kiara_geo_format_variants_resolve_canonically(self):
         geos = [{"_id": "geo-mk", "Name": "Mont Kiara"}]
