@@ -1165,12 +1165,14 @@ def _matched_transaction(lead: dict, listing: dict) -> str | None:
 
 
 def format_import_matches(created_type: str, created_record: dict,
-                          matches: list[dict], development_records=None) -> str:
+                          matches: list[dict], development_records=None,
+                          bubble_env=None) -> str:
     """Render deterministic matches for WhatsApp without affecting match logic."""
     development_names = {
         str(item["_id"]): _record_name(item)
         for item in development_records or [] if item.get("_id")
     }
+    owners = {}
     blocks = []
     for match in matches:
         if created_type == "lead":
@@ -1207,11 +1209,31 @@ def format_import_matches(created_type: str, created_record: dict,
                 details.append(f"budget {_money(budget)}")
             record_id = _compact(match.get("_id"))
             path = "lead"
+        owner = match.get("owner")
+        if isinstance(owner, dict):
+            owner_record = owner
+        else:
+            owner_id = _compact(owner)
+            if owner_id and owner_id not in owners and bubble_env:
+                try:
+                    owners[owner_id] = rentee_app.bubble(
+                        f"{rentee_app.get_bubble_base_url(bubble_env)}/obj/user/{owner_id}"
+                    )
+                except Exception:
+                    owners[owner_id] = {}
+            owner_record = owners.get(owner_id, {})
+        agent_name = _compact(owner_record.get("name"))
+        agent_phone = _compact(owner_record.get("phone"))
         summary = label + (f" — {', '.join(details)}" if label and details else "")
         if not label:
             summary = ", ".join(details)
         url = f"https://www.rentee.asia/{path}/{record_id}" if record_id else ""
-        blocks.append("\n".join(item for item in (summary, url) if item))
+        blocks.append("\n".join(item for item in (
+            summary,
+            f"Agent: {agent_name}" if agent_name else "",
+            f"Phone: {agent_phone}" if agent_phone else "",
+            url,
+        ) if item))
     count = len(matches)
     noun = "listing" if created_type == "lead" else "lead"
     if count != 1:
@@ -1379,7 +1401,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     if matches:
         result["confirmation"] += "\n\n" + format_import_matches(
             parsed["type"], dict(payload, _id=bubble_id), matches,
-            development_records,
+            development_records, bubble_env,
         )
     print(f"{LOG_PREFIX} created type={parsed['type']} id={bubble_id}", flush=True)
     return result

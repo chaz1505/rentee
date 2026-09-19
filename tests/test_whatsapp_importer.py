@@ -725,6 +725,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         match = {
             "_id": "lead-1", "name": "Alex WTR One Menerung",
+            "owner": "user-alex",
             "TransactionType": ["Rent/Let"],
             "budgetRent": 5200, "bedroomsMin": 2,
             "ProposedAgentNameLead": "Alex Goh",
@@ -732,6 +733,9 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1"), \
+             patch.object(importer.rentee_app, "bubble", return_value={
+                 "name": "Alex Goh", "phone": "+60164697992",
+             }) as get_owner, \
              patch.object(importer, "find_import_matches", return_value=[match]) as find:
             result = importer.process_whatsapp_import(
                 "listing", geo_records=GEOS, development_records=DEVELOPMENTS
@@ -740,10 +744,14 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertIn(
             "Found 1 matching lead:\n\n"
             "Alex WTR One Menerung — 2+ bed, budget RM5,200\n"
+            "Agent: Alex Goh\n"
+            "Phone: +60164697992\n"
             "https://www.rentee.asia/lead/lead-1",
             result["confirmation"],
         )
-        self.assertNotIn("agent Alex Goh", result["confirmation"])
+        get_owner.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/user-alex"
+        )
         self.assertEqual(find.call_args.args[0], "listing")
         self.assertEqual(find.call_args.args[1]["_id"], "listing-1")
 
@@ -774,6 +782,21 @@ class WhatsAppImporterTests(unittest.TestCase):
             "https://www.rentee.asia/listing/listing-empty"
         ))
         self.assertNotIn("900,000", rendered)
+
+    def test_matching_listing_includes_owner_name_and_omits_empty_phone(self):
+        lead = {"TransactionType": ["Rent/Let"], "budgetRent": 5000}
+        listing = {
+            "_id": "listing-1", "development": "dev-one", "owner": "user-james",
+            "TransactionType": ["Rent/Let"], "beds": 2, "priceRent": 5000,
+        }
+        with patch.object(importer.rentee_app, "bubble", return_value={
+            "name": "James", "phone": "",
+        }):
+            rendered = importer.format_import_matches(
+                "lead", lead, [listing], DEVELOPMENTS, "live"
+            )
+        self.assertIn("Agent: James", rendered)
+        self.assertNotIn("Phone:", rendered)
 
     def test_no_matches_leave_confirmation_unchanged(self):
         parsed = {
