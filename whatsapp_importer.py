@@ -667,7 +667,9 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
                     "from its Development/location/context; otherwise return an empty list."
                     if single else
                     "This is a Lead: return every canonical Geo that reasonably represents a "
-                    "property search near/in the reference. Do not add merely adjacent areas."
+                    "property search near/in the reference, including a broader canonical Geo "
+                    "when the reference is a specific place within or around it and that mapping "
+                    "is geographically defensible. Do not add merely adjacent areas."
                 ) +
                 f"\n\nLOCATION REFERENCE:\n{raw}\n\nCANONICAL GEOS:\n"
                 f"{json.dumps(canonical_names, ensure_ascii=False)}\n\nCONTEXT:\n"
@@ -1244,14 +1246,19 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         location_references = _unique_strings(
             parsed.get("location_references") or parsed.get("geo_names") or []
         )
-        geos = resolve_location_references(
-            location_references, geo_records, verification_context
-        )
+        geos = resolve_geo_names(location_references, geo_records)
         developments, created_developments = _resolve_or_verify_developments(
             parsed.get("preferred_development_names", []), development_records,
             geo_records, verification_context, bubble_env,
         )
-        if not any(item.get("matched") for item in geos):
+        has_geo = any(item.get("matched") for item in geos)
+        has_development = any(item.get("matched") for item in developments)
+        if not has_geo and not has_development:
+            geos = resolve_location_references(
+                location_references, geo_records, verification_context
+            )
+            has_geo = any(item.get("matched") for item in geos)
+        if not has_geo:
             geos.extend(_derived_geos(developments, geo_records))
         payload = build_lead_payload(
             parsed, geos, developments, proposing_agent
@@ -1277,6 +1284,10 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                                              if not item.get("matched")],
             "confirmation": _confirmation(parsed, geos, developments),
         }
+        if not has_geo and not has_development and location_references:
+            result["confirmation"] += (
+                f" Couldn't resolve Geo: {', '.join(location_references)}."
+            )
     else:
         explicit = resolve_geo_name(parsed.get("geo_name"), geo_records) \
             if parsed.get("geo_name") else None

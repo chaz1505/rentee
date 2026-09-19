@@ -257,7 +257,7 @@ class WhatsAppImporterTests(unittest.TestCase):
 
     def test_lead_fallback_combines_and_deduplicates_existing_geos(self):
         parsed = {
-            "type": "lead", "location_references": ["Sultan Ismail", "KLCC"],
+            "type": "lead", "location_references": ["Sultan Ismail"],
             "geo_names": [], "preferred_development_names": [],
             "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
         }
@@ -267,16 +267,53 @@ class WhatsAppImporterTests(unittest.TestCase):
         ]
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer, "verify_geo_reference", return_value=fallback) as verify, \
-             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1") as create:
+            patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1") as create:
             importer.process_whatsapp_import(
-                "WTR near Sultan Ismail or KLCC", geo_records=GEOS,
+                "WTR near Sultan Ismail", geo_records=GEOS,
                 development_records=DEVELOPMENTS,
             )
         self.assertEqual(create.call_args.args[2]["locationReferences"],
-                         ["Sultan Ismail", "KLCC"])
+                         ["Sultan Ismail"])
         self.assertEqual(create.call_args.args[2]["Geo"],
                          ["geo-klcc", "geo-brickfields"])
         verify.assert_called_once()
+
+    def test_lead_resolved_development_skips_geo_fallback(self):
+        parsed = {
+            "type": "lead", "location_references": ["Near One Menerung"],
+            "geo_names": [], "preferred_development_names": ["One Menerung"],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference") as verify, \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1") as create:
+            importer.process_whatsapp_import(
+                "WTR near One Menerung", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        verify.assert_not_called()
+        self.assertEqual(create.call_args.args[2]["preferredDevelopments"], ["dev-one"])
+        self.assertEqual(create.call_args.args[2]["locationReferences"],
+                         ["Near One Menerung"])
+
+    def test_unresolved_lead_is_created_with_clear_confirmation(self):
+        parsed = {
+            "type": "lead", "location_references": ["Unknown Place"],
+            "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1") as create:
+            result = importer.process_whatsapp_import(
+                "WTR Unknown Place", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        self.assertNotIn("Geo", create.call_args.args[2])
+        self.assertEqual(create.call_args.args[2]["locationReferences"], ["Unknown Place"])
+        self.assertTrue(result["confirmation"].endswith(
+            "Couldn't resolve Geo: Unknown Place."
+        ))
 
     def test_listing_uses_fallback_only_when_direct_and_development_geo_fail(self):
         parsed = {
