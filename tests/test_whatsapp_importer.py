@@ -633,6 +633,67 @@ class WhatsAppImporterTests(unittest.TestCase):
         listing["TransactionType"] = ["rent/let"]
         self.assertFalse(importer.lead_matches_listing(lead, listing))
 
+    def test_cancelled_and_availability_boolean_eligibility_gates(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "propertyType": "Condo",
+        }
+        for cancelled, expected in (
+            (True, False), (False, True), (None, True), ("true", True),
+        ):
+            with self.subTest(cancelled=cancelled):
+                candidate = dict(lead)
+                if cancelled is not None:
+                    candidate["cancelled"] = cancelled
+                self.assertEqual(
+                    importer.lead_matches_listing(candidate, listing), expected
+                )
+        self.assertTrue(importer.lead_matches_listing(
+            dict(lead, cancelled=None), listing
+        ))
+        for availability, expected in (
+            (False, False), (True, True), (None, True), ("false", True),
+        ):
+            with self.subTest(availability=availability):
+                candidate = dict(listing)
+                if availability is not None:
+                    candidate["availability"] = availability
+                self.assertEqual(
+                    importer.lead_matches_listing(lead, candidate), expected
+                )
+        self.assertTrue(importer.lead_matches_listing(
+            lead, dict(listing, availability=None)
+        ))
+
+    def test_ineligible_pairs_do_not_create_match_records(self):
+        lead = {
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "Geo": ["geo-bangsar"], "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "_id": "listing-1", "TransactionType": ["Rent/Let"],
+            "Geo": "geo-bangsar", "propertyType": "Condo",
+        }
+        cases = (
+            ("lead", dict(lead, cancelled=True), listing),
+            ("listing", dict(listing, availability=False), lead),
+        )
+        for created_type, created, existing in cases:
+            with self.subTest(created_type=created_type), \
+                 patch.object(importer.rentee_app, "_bubble_records",
+                              return_value=[existing]), \
+                 patch.object(importer.rentee_app, "_bubble_create") as create:
+                matches = importer.find_import_matches(created_type, created, "live")
+                importer.create_missing_match_records(
+                    created_type, created["_id"], matches, "live"
+                )
+            self.assertEqual(matches, [])
+            create.assert_not_called()
+
     def test_matching_requires_development_or_geo_overlap(self):
         lead = {
             "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
@@ -783,6 +844,50 @@ class WhatsAppImporterTests(unittest.TestCase):
             self.assertEqual(FIND_IMPORT_MATCHES("listing", listing, "live"), [lead])
         self.assertEqual(records.call_args.args[1], "lead")
 
+    def test_new_lead_match_creates_match_record(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]) as records, \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records(
+                "lead", "lead-new", [{"_id": "listing-existing"}], "live"
+            )
+        self.assertEqual(records.call_args.args[1], "match")
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match",
+            {"lead": "lead-new", "listing": "listing-existing"},
+        )
+
+    def test_existing_match_is_not_duplicated(self):
+        with patch.object(
+            importer.rentee_app, "_bubble_records", return_value=[{"_id": "match-1"}]
+        ), patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records(
+                "lead", "lead-1", [{"_id": "listing-1"}], "live"
+            )
+        create.assert_not_called()
+
+    def test_multiple_matches_create_one_record_per_unique_pair(self):
+        matches = [
+            {"_id": "listing-1"}, {"_id": "listing-1"}, {"_id": "listing-2"},
+        ]
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records("lead", "lead-1", matches, "live")
+        self.assertEqual([call.args[2] for call in create.call_args_list], [
+            {"lead": "lead-1", "listing": "listing-1"},
+            {"lead": "lead-1", "listing": "listing-2"},
+        ])
+
+    def test_new_listing_match_creates_match_with_correct_direction(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records(
+                "listing", "listing-new", [{"_id": "lead-existing"}], "live"
+            )
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match",
+            {"lead": "lead-existing", "listing": "listing-new"},
+        )
+
     def test_new_lead_matches_existing_listings_and_appends_confirmation(self):
         parsed = {
             "type": "lead", "geo_names": ["Bangsar"],
@@ -797,6 +902,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "_bubble_create", return_value="lead-1"), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer, "find_import_matches", return_value=[match]) as find:
             result = importer.process_whatsapp_import(
                 "lead", geo_records=GEOS, development_records=DEVELOPMENTS
@@ -827,6 +933,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "_bubble_create", return_value="listing-1"), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "bubble", return_value={
                  "name": "Alex Goh", "phone": "+60164697992",
              }) as get_owner, \

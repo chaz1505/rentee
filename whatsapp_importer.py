@@ -1099,6 +1099,10 @@ def _create_import_record(object_type, payload, bubble_env):
 
 def lead_matches_listing(lead: dict, listing: dict) -> bool:
     """Return whether one Bubble Lead and Listing satisfy deterministic match rules."""
+    if lead.get("cancelled") is True:
+        return False
+    if listing.get("availability") is False:
+        return False
     lead_transactions = {
         value for value in lead.get("TransactionType") or [] if value in TRANSACTION_TYPES
     }
@@ -1174,6 +1178,32 @@ def find_import_matches(created_type: str, record: dict, bubble_env: str) -> lis
     if created_type == "lead":
         return [item for item in records if lead_matches_listing(record, item)]
     return [item for item in records if lead_matches_listing(item, record)]
+
+
+def create_missing_match_records(created_type, created_id, matches, bubble_env):
+    """Persist each unique deterministic Lead/Listing pair once."""
+    base_url = rentee_app.get_bubble_base_url(bubble_env)
+    seen = set()
+    for matched in matches or []:
+        matched_id = _compact(matched.get("_id"))
+        lead_id, listing_id = (
+            (created_id, matched_id) if created_type == "lead"
+            else (matched_id, created_id)
+        )
+        pair = (_compact(lead_id), _compact(listing_id))
+        if not all(pair) or pair in seen:
+            continue
+        seen.add(pair)
+        constraints = [
+            {"key": "lead", "constraint_type": "equals", "value": pair[0]},
+            {"key": "listing", "constraint_type": "equals", "value": pair[1]},
+        ]
+        if next(iter(rentee_app._bubble_records(
+                base_url, "match", constraints)), None):
+            continue
+        rentee_app._bubble_create(
+            base_url, "match", {"lead": pair[0], "listing": pair[1]}
+        )
 
 
 def _matched_transaction(lead: dict, listing: dict) -> str | None:
@@ -1430,6 +1460,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     matches = find_import_matches(
         parsed["type"], dict(payload, _id=bubble_id), bubble_env
     )
+    create_missing_match_records(parsed["type"], bubble_id, matches, bubble_env)
     result["matches"] = matches
     if matches:
         result["confirmation"] += "\n\n" + format_import_matches(
