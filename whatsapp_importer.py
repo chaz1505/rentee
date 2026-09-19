@@ -989,39 +989,80 @@ def find_import_matches(created_type: str, record: dict, bubble_env: str) -> lis
     return [item for item in records if lead_matches_listing(item, record)]
 
 
-def format_import_matches(created_type: str, matches: list[dict]) -> str:
+def _matched_transaction(lead: dict, listing: dict) -> str | None:
+    lead_transactions = lead.get("TransactionType") or []
+    listing_transactions = listing.get("TransactionType") or []
+    fields = {
+        "Rent/Let": ("budgetRent", "priceRent"),
+        "Buy/Sell": ("budgetBuy", "priceSale"),
+    }
+    for transaction in TRANSACTION_TYPES:
+        if transaction not in lead_transactions or transaction not in listing_transactions:
+            continue
+        budget_field, price_field = fields[transaction]
+        budget = lead.get(budget_field)
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            return transaction
+        price = listing.get(price_field)
+        if (not isinstance(price, bool) and isinstance(price, (int, float))
+                and budget * 0.8 <= price <= budget * 1.2):
+            return transaction
+    return None
+
+
+def format_import_matches(created_type: str, created_record: dict,
+                          matches: list[dict], development_records=None) -> str:
     """Render deterministic matches for WhatsApp without affecting match logic."""
-    lines = []
+    development_names = {
+        str(item["_id"]): _record_name(item)
+        for item in development_records or [] if item.get("_id")
+    }
+    blocks = []
     for match in matches:
         if created_type == "lead":
-            label = _compact(match.get("name") or match.get("unitNumber")
-                             or match.get("development") or match.get("Geo") or "Listing")
+            lead, listing = created_record, match
+            development = match.get("development")
+            if isinstance(development, dict):
+                label = _record_name(development)
+            else:
+                label = development_names.get(str(development or ""), "")
             details = []
-            if isinstance(match.get("beds"), (int, float)):
+            if (not isinstance(match.get("beds"), bool)
+                    and isinstance(match.get("beds"), (int, float)) and match["beds"] > 0):
                 details.append(f"{match['beds']:g} bed")
-            for field in ("priceRent", "priceSale"):
-                if isinstance(match.get(field), (int, float)):
-                    details.append(_money(match[field]))
-            agent_name = _compact(match.get("ProposingAgentName"))
-            agent_phone = _compact(match.get("ProposingAgentNumber"))
+            transaction = _matched_transaction(lead, listing)
+            price_field = "priceRent" if transaction == "Rent/Let" else "priceSale"
+            price = match.get(price_field) if transaction else None
+            if not isinstance(price, bool) and isinstance(price, (int, float)) and price > 0:
+                period = "/month" if transaction == "Rent/Let" else ""
+                details.append(f"{_money(price)}{period}")
+            record_id = _compact(match.get("_id"))
+            path = "listing"
         else:
-            label = _compact(match.get("name") or "Lead")
+            lead, listing = match, created_record
+            label = _compact(match.get("name"))
             details = []
-            if isinstance(match.get("bedroomsMin"), (int, float)):
+            if (not isinstance(match.get("bedroomsMin"), bool)
+                    and isinstance(match.get("bedroomsMin"), (int, float))
+                    and match["bedroomsMin"] > 0):
                 details.append(f"{match['bedroomsMin']:g}+ bed")
-            for field in ("budgetRent", "budgetBuy"):
-                if isinstance(match.get(field), (int, float)):
-                    details.append(f"budget {_money(match[field])}")
-            agent_name = _compact(match.get("ProposedAgentNameLead"))
-            agent_phone = _compact(match.get("ProposedAgentNumberLead"))
-        if agent_name and agent_phone:
-            details.append(f"agent {agent_name}: {agent_phone}")
-        elif agent_name:
-            details.append(f"agent {agent_name}")
-        elif agent_phone:
-            details.append(f"agent {agent_phone}")
-        lines.append(f"- {label}" + (f" — {', '.join(details)}" if details else ""))
-    return "Matches:\n" + "\n".join(lines)
+            transaction = _matched_transaction(lead, listing)
+            budget_field = "budgetRent" if transaction == "Rent/Let" else "budgetBuy"
+            budget = match.get(budget_field) if transaction else None
+            if not isinstance(budget, bool) and isinstance(budget, (int, float)) and budget > 0:
+                details.append(f"budget {_money(budget)}")
+            record_id = _compact(match.get("_id"))
+            path = "lead"
+        summary = label + (f" — {', '.join(details)}" if label and details else "")
+        if not label:
+            summary = ", ".join(details)
+        url = f"https://www.rentee.asia/{path}/{record_id}" if record_id else ""
+        blocks.append("\n".join(item for item in (summary, url) if item))
+    count = len(matches)
+    noun = "listing" if created_type == "lead" else "lead"
+    if count != 1:
+        noun += "s"
+    return f"Found {count} matching {noun}:\n\n" + "\n\n".join(blocks)
 
 
 def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
@@ -1156,6 +1197,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     )
     result["matches"] = matches
     if matches:
-        result["confirmation"] += "\n\n" + format_import_matches(parsed["type"], matches)
+        result["confirmation"] += "\n\n" + format_import_matches(
+            parsed["type"], dict(payload, _id=bubble_id), matches,
+            development_records,
+        )
     print(f"{LOG_PREFIX} created type={parsed['type']} id={bubble_id}", flush=True)
     return result

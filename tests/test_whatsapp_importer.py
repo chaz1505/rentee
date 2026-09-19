@@ -539,7 +539,8 @@ class WhatsAppImporterTests(unittest.TestCase):
             "property_types": [], "budget": 5000, "bedrooms_min": 2,
         }
         match = {
-            "_id": "listing-1", "name": "Bangsar View", "beds": 2,
+            "_id": "listing-1", "development": "dev-one", "beds": 2,
+            "TransactionType": ["Rent/Let"],
             "priceRent": 4800, "ProposingAgentName": "Jane Tee",
             "ProposingAgentNumber": "60173262281",
         }
@@ -550,8 +551,13 @@ class WhatsAppImporterTests(unittest.TestCase):
                 "lead", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         self.assertEqual(result["matches"], [match])
-        self.assertIn("Bangsar View", result["confirmation"])
-        self.assertIn("agent Jane Tee: 60173262281", result["confirmation"])
+        self.assertIn(
+            "Found 1 matching listing:\n\n"
+            "One Menerung — 2 bed, RM4,800/month\n"
+            "https://www.rentee.asia/listing/listing-1",
+            result["confirmation"],
+        )
+        self.assertNotIn("Jane Tee", result["confirmation"])
         self.assertEqual(find.call_args.args[0], "lead")
         self.assertEqual(find.call_args.args[1]["_id"], "lead-1")
 
@@ -562,6 +568,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         match = {
             "_id": "lead-1", "name": "Alex WTR One Menerung",
+            "TransactionType": ["Rent/Let"],
             "budgetRent": 5200, "bedroomsMin": 2,
             "ProposedAgentNameLead": "Alex Goh",
             "ProposedAgentNumberLead": "60164697992",
@@ -573,10 +580,43 @@ class WhatsAppImporterTests(unittest.TestCase):
                 "listing", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         self.assertEqual(result["matches"], [match])
-        self.assertIn("Alex WTR One Menerung", result["confirmation"])
-        self.assertIn("agent Alex Goh: 60164697992", result["confirmation"])
+        self.assertIn(
+            "Found 1 matching lead:\n\n"
+            "Alex WTR One Menerung — 2+ bed, budget RM5,200\n"
+            "https://www.rentee.asia/lead/lead-1",
+            result["confirmation"],
+        )
+        self.assertNotIn("agent Alex Goh", result["confirmation"])
         self.assertEqual(find.call_args.args[0], "listing")
         self.assertEqual(find.call_args.args[1]["_id"], "listing-1")
+
+    def test_match_notification_plural_spacing_transaction_and_zero_omission(self):
+        lead = {
+            "TransactionType": ["Rent/Let", "Buy/Sell"],
+            "budgetRent": 5000, "budgetBuy": 900000,
+        }
+        listings = [
+            {
+                "_id": "listing-rent", "development": "dev-one",
+                "TransactionType": ["Rent/Let"], "beds": 3,
+                "priceRent": 5500, "priceSale": 900000,
+            },
+            {
+                "_id": "listing-empty", "development": "dev-serai",
+                "TransactionType": ["Rent/Let"], "beds": 0, "priceRent": 0,
+            },
+        ]
+        rendered = importer.format_import_matches(
+            "lead", lead, listings, DEVELOPMENTS
+        )
+        self.assertEqual(rendered, (
+            "Found 2 matching listings:\n\n"
+            "One Menerung — 3 bed, RM5,500/month\n"
+            "https://www.rentee.asia/listing/listing-rent\n\n"
+            "Serai\n"
+            "https://www.rentee.asia/listing/listing-empty"
+        ))
+        self.assertNotIn("900,000", rendered)
 
     def test_no_matches_leave_confirmation_unchanged(self):
         parsed = {
