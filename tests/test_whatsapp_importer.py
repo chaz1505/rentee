@@ -856,6 +856,168 @@ class WhatsAppImporterTests(unittest.TestCase):
             {"lead": "lead-new", "listing": "listing-existing"},
         )
 
+    def test_source_message_hash_normalizes_only_harmless_whitespace(self):
+        original = "WTB\r\nTTDI   landed  \r\n\r\nBudget RM1,000 "
+        harmless = "  WTB\nTTDI landed\n\n\nBudget RM1,000\n"
+        changed = "WTB\nTTDI landed\n\nBudget RM1,100"
+        self.assertEqual(
+            importer.source_message_hash(original),
+            importer.source_message_hash(harmless),
+        )
+        self.assertNotEqual(
+            importer.source_message_hash(original),
+            importer.source_message_hash(changed),
+        )
+
+    def test_new_import_stores_source_message_hash(self):
+        parsed = {
+            "type": "lead", "geo_names": ["Bangsar"],
+            "preferred_development_names": [], "transaction_types": ["Rent/Let"],
+            "property_types": ["Condo"],
+        }
+        _result, create = self.process_as(parsed)
+        self.assertEqual(
+            create.call_args.args[2]["sourceMessageHash"],
+            importer.source_message_hash("forwarded"),
+        )
+
+    def test_duplicate_lookup_is_scoped_by_type_owner_and_hash(self):
+        existing = {"_id": "lead-existing", "owner": "user-1",
+                    "sourceMessageHash": "hash-1"}
+
+        def records(_base, object_type, constraints):
+            values = {item["key"]: item["value"] for item in constraints}
+            if (object_type == "lead" and values == {
+                    "owner": "user-1", "sourceMessageHash": "hash-1"}):
+                return [existing]
+            return []
+
+        with patch.object(importer.rentee_app, "_bubble_records", side_effect=records):
+            self.assertEqual(
+                importer._find_duplicate_import("lead", "user-1", "hash-1", "live"),
+                existing,
+            )
+            self.assertIsNone(importer._find_duplicate_import(
+                "lead", "user-2", "hash-1", "live"
+            ))
+            self.assertIsNone(importer._find_duplicate_import(
+                "lead", "user-1", "changed", "live"
+            ))
+            self.assertIsNone(importer._find_duplicate_import(
+                "listing", "user-1", "hash-1", "live"
+            ))
+
+    def test_historical_record_without_hash_is_not_duplicate_or_modified(self):
+        historical = {"_id": "lead-old", "owner": "user-1", "name": "Keep Me"}
+        with patch.object(
+            importer.rentee_app, "_bubble_records", return_value=[historical]
+        ), patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer._find_duplicate_import(
+                "lead", "user-1", "incoming-hash", "live"
+            )
+        self.assertIsNone(result)
+        self.assertEqual(historical, {
+            "_id": "lead-old", "owner": "user-1", "name": "Keep Me",
+        })
+        update.assert_not_called()
+
+    def test_duplicate_lead_reuses_existing_record_and_reruns_matching(self):
+        raw = "WTB TTDI landed"
+        existing_lead = {
+            "_id": "lead-existing", "owner": "user-1",
+            "sourceMessageHash": importer.source_message_hash(raw),
+            "TransactionType": ["Buy/Sell"], "Geo": ["geo-ttdi"],
+            "propertyTypes": ["Landed"], "unchanged": "keep",
+        }
+        listings = [
+            {"_id": "listing-old", "TransactionType": ["Buy/Sell"],
+             "Geo": "geo-ttdi", "propertyType": "Landed"},
+            {"_id": "listing-new", "TransactionType": ["Buy/Sell"],
+             "Geo": "geo-ttdi", "propertyType": "Landed"},
+        ]
+
+        def records(_base, object_type, constraints=None, **_kwargs):
+            if object_type == "lead":
+                return [existing_lead]
+            if object_type == "listing":
+                return listings
+            if object_type == "match":
+                values = {item["key"]: item["value"] for item in constraints}
+                return ([{"_id": "match-old"}]
+                        if values["listing"] == "listing-old" else [])
+            return []
+
+        parsed = {
+            "type": "lead", "geo_names": ["TTDI"],
+            "location_references": ["TTDI"], "preferred_development_names": [],
+            "transaction_types": ["Buy/Sell"], "property_types": ["Landed"],
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "resolve_or_create_proposing_agent", return_value={
+                 "status": "existing", "user_id": "user-1",
+             }), patch.object(importer, "find_import_matches",
+                              side_effect=FIND_IMPORT_MATCHES), \
+             patch.object(importer.rentee_app, "_bubble_records",
+                              side_effect=records), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-new") as create, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer.process_whatsapp_import(
+                raw, geo_records=[{"_id": "geo-ttdi", "Name": "TTDI"}],
+                development_records=[],
+            )
+        self.assertEqual(result["status"], "duplicate")
+        self.assertEqual(result["bubble_id"], "lead-existing")
+        self.assertTrue(result["confirmation"].startswith(
+            "This lead already exists.\n\nFound 2 matching listings:"
+        ), result["confirmation"])
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(create.call_args.args[1:], (
+            "match", {"lead": "lead-existing", "listing": "listing-new"}
+        ))
+        self.assertEqual(existing_lead["unchanged"], "keep")
+        update.assert_not_called()
+
+    def test_duplicate_listing_reuses_existing_record_and_reruns_matching(self):
+        raw = "WTL One Menerung RM5,000"
+        existing = {
+            "_id": "listing-existing", "owner": "user-1",
+            "sourceMessageHash": importer.source_message_hash(raw),
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "beds": 2, "priceRent": 5000,
+        }
+        lead = {"_id": "lead-1", "TransactionType": ["Rent/Let"],
+                "Geo": ["geo-bangsar"], "bedroomsMin": 2}
+
+        def records(_base, object_type, constraints=None, **_kwargs):
+            return {"listing": [existing], "lead": [lead], "match": []}.get(
+                object_type, []
+            )
+
+        parsed = {"type": "listing", "geo_name": "Bangsar",
+                  "transaction_types": ["Rent/Let"], "asking_price": 5000,
+                  "beds": 2}
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "resolve_or_create_proposing_agent", return_value={
+                 "status": "existing", "user_id": "user-1",
+             }), patch.object(importer, "find_import_matches",
+                              side_effect=FIND_IMPORT_MATCHES), \
+             patch.object(importer.rentee_app, "_bubble_records",
+                              side_effect=records), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create:
+            result = importer.process_whatsapp_import(
+                raw, geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["status"], "duplicate")
+        self.assertTrue(result["confirmation"].startswith(
+            "This listing already exists.\n\nFound 1 matching lead:"
+        ), result["confirmation"])
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match",
+            {"lead": "lead-1", "listing": "listing-existing"},
+        )
+
     def test_existing_match_is_not_duplicated(self):
         with patch.object(
             importer.rentee_app, "_bubble_records", return_value=[{"_id": "match-1"}]
@@ -1700,6 +1862,7 @@ Polygon Properties
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "find_bubble_users_by_phone",
                           return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create", create):
             result = importer.process_whatsapp_import(
                 text, import_type="lead", geo_records=[], development_records=[])

@@ -8,6 +8,7 @@ client and Bubble Data API helpers, but is not wired into the webhook yet.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 from typing import Any, Iterable
@@ -202,6 +203,16 @@ def _unique_strings(values: Iterable[Any]) -> list[str]:
             result.append(clean)
             seen.add(key)
     return result
+
+
+def normalize_source_message(value: Any) -> str:
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip())
+
+
+def source_message_hash(value: Any) -> str:
+    return hashlib.sha256(normalize_source_message(value).encode("utf-8")).hexdigest()
 
 
 def _location_references(values: Iterable[Any]) -> list[str]:
@@ -1097,6 +1108,23 @@ def _create_import_record(object_type, payload, bubble_env):
         raise
 
 
+def _find_duplicate_import(object_type, owner_id, message_hash, bubble_env):
+    if not owner_id:
+        return None
+    constraints = [
+        {"key": "owner", "constraint_type": "equals", "value": owner_id},
+        {"key": "sourceMessageHash", "constraint_type": "equals",
+         "value": message_hash},
+    ]
+    for existing in rentee_app._bubble_records(
+            rentee_app.get_bubble_base_url(bubble_env), object_type, constraints):
+        if (existing.get("_id")
+                and owner_id in _relationship_ids(existing.get("owner"))
+                and existing.get("sourceMessageHash") == message_hash):
+            return existing
+    return None
+
+
 def lead_matches_listing(lead: dict, listing: dict) -> bool:
     """Return whether one Bubble Lead and Listing satisfy deterministic match rules."""
     if lead.get("cancelled") is True:
@@ -1354,6 +1382,31 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "name": _agent_value(parsed_agent.get("name")),
             "ren": _agent_value(parsed_agent.get("ren")),
         }
+    message_hash = source_message_hash(raw_text)
+    duplicate = _find_duplicate_import(
+        parsed["type"], proposing_agent.get("user_id"), message_hash, bubble_env
+    )
+    if duplicate:
+        bubble_id = str(duplicate["_id"])
+        matches = find_import_matches(parsed["type"], duplicate, bubble_env)
+        create_missing_match_records(parsed["type"], bubble_id, matches, bubble_env)
+        duplicate_developments = development_records
+        if duplicate_developments is None:
+            duplicate_developments = rentee_app._property_entity_records(
+                bubble_env
+            )["condo"]
+        confirmation = f"This {parsed['type']} already exists."
+        if matches:
+            confirmation += "\n\n" + format_import_matches(
+                parsed["type"], duplicate, matches, duplicate_developments,
+                bubble_env,
+            )
+        print(f"{LOG_PREFIX} duplicate type={parsed['type']} id={bubble_id}", flush=True)
+        return {
+            "status": "duplicate", "type": parsed["type"], "bubble_id": bubble_id,
+            "parsed": parsed, "proposing_agent_user_id": proposing_agent.get("user_id"),
+            "matches": matches, "confirmation": confirmation,
+        }
     if geo_records is None or development_records is None:
         records = rentee_app._property_entity_records(bubble_env)
         geo_records = records["geo"] if geo_records is None else geo_records
@@ -1382,7 +1435,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         payload = build_lead_payload(
             parsed, geos, developments, proposing_agent
         )
+        payload["sourceMessageHash"] = message_hash
         bubble_id = _create_import_record("lead", payload, bubble_env)
+        created_record = dict(payload, _id=bubble_id)
         result = {
             "status": "processed", "type": "lead", "bubble_id": bubble_id,
             "parsed": parsed,
@@ -1434,7 +1489,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         payload = build_listing_payload(
             parsed, resolved_geo, development, proposing_agent
         )
+        payload["sourceMessageHash"] = message_hash
         bubble_id = _create_import_record("listing", payload, bubble_env)
+        created_record = dict(payload, _id=bubble_id)
         geos_for_confirmation = [resolved_geo] if resolved_geo else []
         developments_for_confirmation = [development] if development else []
         result = {
@@ -1458,13 +1515,13 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                                           developments_for_confirmation),
         }
     matches = find_import_matches(
-        parsed["type"], dict(payload, _id=bubble_id), bubble_env
+        parsed["type"], created_record, bubble_env
     )
     create_missing_match_records(parsed["type"], bubble_id, matches, bubble_env)
     result["matches"] = matches
     if matches:
         result["confirmation"] += "\n\n" + format_import_matches(
-            parsed["type"], dict(payload, _id=bubble_id), matches,
+            parsed["type"], created_record, matches,
             development_records, bubble_env,
         )
     print(f"{LOG_PREFIX} created type={parsed['type']} id={bubble_id}", flush=True)
