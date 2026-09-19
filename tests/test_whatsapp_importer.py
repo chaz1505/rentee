@@ -255,6 +255,42 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(lead["locationReferences"], ["Sultan Ismail", "Setia Alam"])
         self.assertEqual(listing["locationReference"], "Near Sultan Ismail")
 
+    def test_location_reference_extraction_keeps_named_place_not_generic_proximity(self):
+        parsed = self.parse_as({
+            "type": "lead",
+            "location_references": [
+                "Near to Sultan Ismail",
+                "near to working place. Walking distance",
+            ],
+            "transaction_types": ["Rent/Let"],
+        })
+        self.assertEqual(parsed["location_references"], ["Sultan Ismail"])
+
+    def test_geo_verifier_retries_invalid_structured_output(self):
+        responses = [
+            SimpleNamespace(output_text=""),
+            SimpleNamespace(output_text=json.dumps({"geo_names": ["KLCC"]})),
+        ]
+        with patch.object(
+            importer.rentee_app.client.responses, "create", side_effect=responses
+        ) as create:
+            result = importer.verify_geo_reference(
+                "Near to Sultan Ismail", GEOS, {"raw_text": "WTR near Sultan Ismail"}
+            )
+        self.assertEqual([item["id"] for item in result], ["geo-klcc"])
+        self.assertEqual(create.call_count, 2)
+
+    def test_geo_verifier_error_log_includes_exception_message(self):
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            side_effect=ValueError("bad structured response"),
+        ), patch("builtins.print") as log:
+            result = importer.verify_geo_reference("Sultan Ismail", GEOS, {})
+        self.assertEqual(result, [])
+        self.assertIn("ValueError: bad structured response", " ".join(
+            str(call) for call in log.call_args_list
+        ))
+
     def test_lead_fallback_combines_and_deduplicates_existing_geos(self):
         parsed = {
             "type": "lead", "location_references": ["Sultan Ismail"],

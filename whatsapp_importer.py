@@ -204,6 +204,23 @@ def _unique_strings(values: Iterable[Any]) -> list[str]:
     return result
 
 
+def _location_references(values: Iterable[Any]) -> list[str]:
+    result = []
+    for value in _unique_strings(values):
+        clean = re.sub(r"^(?:near(?:\s+to)?|close\s+to)\s+", "", value,
+                       flags=re.IGNORECASE).strip(" .,;:-")
+        generic = re.sub(r"[^a-z]+", " ", clean.casefold()).strip()
+        if generic in {
+            "work place", "working place", "workplace", "walking distance",
+            "work place walking distance", "working place walking distance",
+            "workplace walking distance",
+        }:
+            continue
+        if clean:
+            result.append(clean)
+    return _unique_strings(result)
+
+
 def _validate_parsed(value: Any) -> dict:
     if not isinstance(value, dict) or value.get("type") not in {"lead", "listing", "unknown"}:
         return {"type": "unknown"}
@@ -228,7 +245,7 @@ def _validate_parsed(value: Any) -> dict:
         result = {
             "type": "lead",
             "geo_names": _unique_strings(value.get("geo_names") or []),
-            "location_references": _unique_strings(
+            "location_references": _location_references(
                 value.get("location_references") or value.get("geo_names") or []
             ),
             "preferred_development_names": _unique_strings(
@@ -265,10 +282,11 @@ def _validate_parsed(value: Any) -> dict:
         "transaction_types": transactions,
         "proposing_agent": proposing_agent,
     }
-    if _compact(value.get("location_reference") or value.get("geo_name")):
-        result["location_reference"] = _compact(
-            value.get("location_reference") or value.get("geo_name")
-        )
+    location_references = _location_references([
+        value.get("location_reference") or value.get("geo_name")
+    ])
+    if location_references:
+        result["location_reference"] = location_references[0]
     if _compact(value.get("geo_name")):
         result["geo_name"] = _compact(value["geo_name"])
     if _compact(value.get("development_name")):
@@ -345,7 +363,10 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "they remain context only. Separately preserve the original meaningful location "
             "wording in location_references for Leads and location_reference for Listings. These "
             "location reference fields may include roads, landmarks, and other real-world location "
-            "descriptions even when they are not residential Geo names. Extract proposing_agent "
+            "descriptions even when they are not residential Geo names. Store only the named or "
+            "geographically identifiable place itself (for example 'Sultan Ismail', not 'Near to "
+            "Sultan Ismail'). Generic phrases such as 'near to working place' or 'walking distance' "
+            "are context, not standalone location references. Extract proposing_agent "
             "only from a credible agent/contact "
             "signature, such as a final name + registration/REN + agency + phone block, or an "
             "explicit agent/negotiator/contact/PIC association. Registration forms include REN "
@@ -654,8 +675,7 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
         key: value for key, value in (context or {}).items()
         if value not in (None, "", [], {})
     }
-    try:
-        response = rentee_app.client.responses.create(
+    request = dict(
             model="gpt-5-mini", tools=[{"type": "web_search"}],
             input=(
                 "Map this Malaysian property location reference to Rentee's existing canonical "
@@ -684,10 +704,24 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
                     "required": ["geo_names"], "additionalProperties": False,
                 }}},
         )
+    try:
+        response = rentee_app.client.responses.create(**request)
         value = development_resolver._verifier_response_value(response)
+    except ValueError as error:
+        retry_request = dict(request)
+        retry_request["input"] += (
+            "\n\nReturn only valid JSON matching the required schema. No markdown or prose."
+        )
+        try:
+            response = rentee_app.client.responses.create(**retry_request)
+            value = development_resolver._verifier_response_value(response)
+        except Exception as retry_error:
+            print(f"[GEO VERIFY] raw={raw!r} status=unresolved "
+                  f"error={type(retry_error).__name__}: {retry_error}", flush=True)
+            return []
     except Exception as error:
         print(f"[GEO VERIFY] raw={raw!r} status=unresolved "
-              f"error={type(error).__name__}", flush=True)
+              f"error={type(error).__name__}: {error}", flush=True)
         return []
     requested = _unique_strings(value.get("geo_names") or [])
     if single and len(requested) > 1:
