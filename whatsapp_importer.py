@@ -1511,6 +1511,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         payload = build_lead_payload(
             parsed, geos, developments, proposing_agent
         )
+        payload["waMessage"] = raw_text
         payload["sourceMessageHash"] = message_hash
         bubble_id = _create_import_record("lead", payload, bubble_env)
         created_record = dict(payload, _id=bubble_id)
@@ -1565,6 +1566,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         payload = build_listing_payload(
             parsed, resolved_geo, development, proposing_agent
         )
+        payload["waMessage"] = raw_text
         payload["sourceMessageHash"] = message_hash
         bubble_id = _create_import_record("listing", payload, bubble_env)
         created_record = dict(payload, _id=bubble_id)

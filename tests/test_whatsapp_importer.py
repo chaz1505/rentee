@@ -880,6 +880,21 @@ class WhatsAppImporterTests(unittest.TestCase):
             create.call_args.args[2]["sourceMessageHash"],
             importer.source_message_hash("forwarded"),
         )
+        self.assertEqual(create.call_args.args[2]["waMessage"], "forwarded")
+
+    def test_new_listing_stores_original_whatsapp_message_verbatim(self):
+        raw = "WTL\r\nCondo 🏠\nAgent: Gwen\n+6017-4156107  "
+        parsed = {
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="listing-1") as create:
+            importer.process_whatsapp_import(
+                raw, geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(create.call_args.args[2]["waMessage"], raw)
 
     def test_duplicate_lookup_is_scoped_by_type_owner_and_hash(self):
         existing = {"_id": "lead-existing", "owner": "user-1",
