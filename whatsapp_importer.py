@@ -88,7 +88,14 @@ PARSER_SCHEMA = {
         },
         "property_type": {"type": ["string", "null"], "enum": [*PROPERTY_TYPES, None]},
         "budget": {"type": ["number", "null"], "minimum": 0},
-        "asking_price": {"type": ["number", "null"], "minimum": 0},
+        "price_rent": {
+            "type": ["number", "null"], "minimum": 0,
+            "description": "Listing monthly rent price only; null when no rent price is stated.",
+        },
+        "price_sale": {
+            "type": ["number", "null"], "minimum": 0,
+            "description": "Listing sale price only; null when no sale price is stated.",
+        },
         "bedrooms_min": {"type": ["integer", "null"], "minimum": 0},
         "lead_name": {
             "type": ["string", "null"],
@@ -158,7 +165,8 @@ PARSER_SCHEMA = {
         "type", "geo_names", "geo_name", "location_references", "location_reference",
         "preferred_development_names",
         "development_name", "transaction_types", "property_types",
-        "property_type", "budget", "asking_price", "bedrooms_min", "beds",
+        "property_type", "budget", "price_rent", "price_sale",
+        "bedrooms_min", "beds",
         "lead_name",
         "adults", "children", "nationality", "occupation", "move_in_date",
         "pets", "furnishing_preference", "bathrooms_min", "start_date",
@@ -314,7 +322,7 @@ def _validate_parsed(value: Any) -> dict:
         result["development_name"] = _compact(value["development_name"])
     if property_type:
         result["property_type"] = property_type
-    for key in ("asking_price", "beds"):
+    for key in ("price_rent", "price_sale", "beds"):
         if isinstance(value.get(key), (int, float)) and value[key] >= 0:
             result[key] = int(value[key]) if float(value[key]).is_integer() else value[key]
     for key in ("baths", "sqft", "land_sqft", "study", "family_room", "maid_room"):
@@ -373,6 +381,9 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "asking, asking RM, unit available. Map renter/for rent/WTR/WTL to Rent/Let and "
             "buyer/for sale/WTB/WTS to Buy/Sell; classification determines which side. "
             "Normalize RM8k=8000, RM 8,500=8500, 1.8m=1800000 and RM3.5 million=3500000. "
+            "For Listings, extract a stated rent amount only into price_rent and a stated sale "
+            "amount only into price_sale. A combined WTL/WTS Listing may have both. Never copy "
+            "or infer one transaction's price from the other; leave the unstated price null. "
             "Normalize bedroom forms to an integer. Property types may only be the canonical "
             "values Condo or Landed. Map apartment/condominium/condo to Condo. Map house, "
             "bungalow, semi-D, terrace, link house, detached house, and landed house to Landed. "
@@ -1037,11 +1048,12 @@ def build_listing_payload(parsed, resolved_geo, resolved_development,
         payload["propertyType"] = property_type
     if isinstance(parsed.get("beds"), (int, float)):
         payload["beds"] = parsed["beds"]
-    if isinstance(parsed.get("asking_price"), (int, float)):
-        if "Rent/Let" in transactions:
-            payload["priceRent"] = parsed["asking_price"]
-        if "Buy/Sell" in transactions:
-            payload["priceSale"] = parsed["asking_price"]
+    if ("Rent/Let" in transactions
+            and isinstance(parsed.get("price_rent"), (int, float))):
+        payload["priceRent"] = parsed["price_rent"]
+    if ("Buy/Sell" in transactions
+            and isinstance(parsed.get("price_sale"), (int, float))):
+        payload["priceSale"] = parsed["price_sale"]
     field_mapping = {
         "baths": "baths",
         "sqft": "Sq Ft",
@@ -1148,9 +1160,11 @@ def _confirmation(parsed, geos, developments) -> str:
         details.append("furnished")
     elif parsed.get("furnished") == "No":
         details.append("not furnished")
-    period = "/month" if "Rent/Let" in parsed.get("transaction_types", []) else ""
-    if parsed.get("asking_price") is not None:
-        details.append(f"{_money(parsed['asking_price'])}{period}")
+    transactions = parsed.get("transaction_types", [])
+    if "Rent/Let" in transactions and parsed.get("price_rent") is not None:
+        details.append(f"{_money(parsed['price_rent'])}/month")
+    if "Buy/Sell" in transactions and parsed.get("price_sale") is not None:
+        details.append(_money(parsed["price_sale"]))
     parsed_agent = parsed.get("proposing_agent") or {}
     agent_name = _compact(parsed_agent.get("name"))
     agent_phone = normalize_phone_number(parsed_agent.get("phone"))
@@ -1460,7 +1474,8 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
              or parsed.get("location_reference"))
         and (
             bool(parsed.get("transaction_types") or parsed.get("property_type"))
-            or parsed.get("asking_price") is not None
+            or parsed.get("price_rent") is not None
+            or parsed.get("price_sale") is not None
             or parsed.get("beds") is not None
         )
     )

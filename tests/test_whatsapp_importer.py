@@ -35,7 +35,8 @@ def full_model_output(**updates):
         "location_references": [], "location_reference": None,
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
-        "budget": None, "asking_price": None, "bedrooms_min": None, "beds": None,
+        "budget": None, "price_rent": None, "price_sale": None,
+        "bedrooms_min": None, "beds": None,
         "lead_name": None,
         "adults": None, "children": None, "nationality": None,
         "occupation": None, "move_in_date": None, "pets": None,
@@ -387,7 +388,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_listing_uses_fallback_only_when_direct_and_development_geo_fail(self):
         parsed = {
             "type": "listing", "location_reference": "Sultan Ismail",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         fallback = [{"matched": True, "id": "geo-klcc", "name": "KLCC"}]
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
@@ -472,7 +473,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         parsed = {
             "type": "listing", "transaction_types": ["Buy/Sell"],
             "beds": 3, "baths": 2, "sqft": 1000,
-            "furnishing": "Partially Furnished", "asking_price": 850000,
+            "furnishing": "Partially Furnished", "price_sale": 850000,
             "proposing_agent": {"name": "Jane Tee", "phone": "017-3262281"},
         }
         geos = [{"matched": True, "name": "Ampang"}]
@@ -486,7 +487,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_listing_confirmation_without_agent_keeps_default_prefix(self):
         parsed = {
             "type": "listing", "transaction_types": ["Rent/Let"],
-            "beds": 2, "asking_price": 4500,
+            "beds": 2, "price_rent": 4500,
         }
         self.assertEqual(
             importer._confirmation(
@@ -498,7 +499,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_rental_listing_and_development_geo_derivation(self):
         parsed = self.parse_as({
             "type": "listing", "development_name": "One Menerung",
-            "transaction_types": ["Rent/Let"], "asking_price": 8500, "beds": 3,
+            "transaction_types": ["Rent/Let"], "price_rent": 8500, "beds": 3,
         }, "One Menerung\n3 bed\nFor rent RM8,500")
         result, create = self.process_as(parsed)
         payload = create.call_args.args[2]
@@ -512,7 +513,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         parsed = self.parse_as({
             "type": "listing", "geo_name": "Bangsar",
             "transaction_types": ["Buy/Sell"], "property_type": "Condo",
-            "asking_price": 1800000, "beds": 3,
+            "price_sale": 1800000, "beds": 3,
         }, "WTS\n3 bedroom condo\nRM1.8m\nBangsar")
         payload = importer.build_listing_payload(
             parsed, importer.resolve_geo_name("Bangsar", GEOS), None
@@ -520,10 +521,39 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["priceSale"], 1800000)
         self.assertNotIn("priceRent", payload)
 
+    def test_combined_rent_and_sale_listing_keeps_distinct_prices(self):
+        parsed = self.parse_as({
+            "type": "listing", "development_name": "Lakeview Residences",
+            "geo_name": "Lakeview Township",
+            "transaction_types": ["Rent/Let", "Buy/Sell"],
+            "price_rent": 4800, "price_sale": 1100000,
+        }, (
+            "WTS/WTL\nLakeview Residences, Lakeview Township\n\n"
+            "for rent at RM4,800 per month.\nfor sell at RM1.1Mil"
+        ))
+        payload = importer.build_listing_payload(parsed, None, None)
+        self.assertEqual(payload["TransactionType"], ["Rent/Let", "Buy/Sell"])
+        self.assertEqual(payload["priceRent"], 4800)
+        self.assertEqual(payload["priceSale"], 1100000)
+        schema = importer._parser_schema("listing")
+        self.assertIn("price_rent", schema["properties"])
+        self.assertIn("price_sale", schema["properties"])
+        self.assertNotIn("asking_price", schema["properties"])
+
+    def test_combined_listing_does_not_copy_an_unstated_transaction_price(self):
+        parsed = self.parse_as({
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Rent/Let", "Buy/Sell"],
+            "price_rent": 4800, "price_sale": None,
+        })
+        payload = importer.build_listing_payload(parsed, None, None)
+        self.assertEqual(payload["priceRent"], 4800)
+        self.assertNotIn("priceSale", payload)
+
     def test_listing_details_parse_and_map_to_existing_bubble_fields(self):
         parsed = self.parse_as({
             "type": "listing", "development_name": "One Menerung",
-            "transaction_types": ["Rent/Let"], "asking_price": 12000, "beds": 3,
+            "transaction_types": ["Rent/Let"], "price_rent": 12000, "beds": 3,
             "baths": 2.5, "sqft": 1800, "land_sqft": 2400,
             "furnished": "Yes", "furnishing": "Fully Furnished",
             "available": True, "availability_date": "2026-11-01",
@@ -568,7 +598,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_explicit_geo_wins_and_conflict_is_logged(self):
         parsed = {
             "type": "listing", "geo_name": "KLCC", "development_name": "One Menerung",
-            "transaction_types": ["Rent/Let"], "asking_price": 8500, "beds": 3,
+            "transaction_types": ["Rent/Let"], "price_rent": 8500, "beds": 3,
         }
         with patch("builtins.print") as log:
             _result, create = self.process_as(parsed)
@@ -957,7 +987,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         raw = "WTL\r\nCondo 🏠\nAgent: Gwen\n+6017-4156107  "
         parsed = {
             "type": "listing", "geo_name": "Bangsar",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "_bubble_create",
@@ -1083,7 +1113,7 @@ class WhatsAppImporterTests(unittest.TestCase):
             )
 
         parsed = {"type": "listing", "geo_name": "Bangsar",
-                  "transaction_types": ["Rent/Let"], "asking_price": 5000,
+                  "transaction_types": ["Rent/Let"], "price_rent": 5000,
                   "beds": 2}
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer, "resolve_or_create_proposing_agent", return_value={
@@ -1171,7 +1201,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_new_listing_matches_existing_leads_and_appends_confirmation(self):
         parsed = {
             "type": "listing", "development_name": "One Menerung",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000, "beds": 2,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000, "beds": 2,
         }
         match = {
             "_id": "lead-1", "name": "Alex WTR One Menerung",
@@ -1271,7 +1301,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_unsupported_property_type_is_removed(self):
         parsed = self.parse_as({
             "type": "listing", "transaction_types": ["Buy/Sell"],
-            "property_type": "Villa", "asking_price": 1000000,
+            "property_type": "Villa", "price_sale": 1000000,
         })
         self.assertNotIn("property_type", parsed)
         self.assertNotIn("propertyType", importer.build_listing_payload(parsed, None, None))
@@ -1288,7 +1318,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         parsed = {
             "type": "listing", "geo_name": "Bangsar",
             "development_name": "Alam Sanctuary",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000, "beds": 2,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000, "beds": 2,
         }
         with patch.object(resolver, "verify_development_candidate", return_value={
             "status": "not_found", "raw_name": "Alam Sanctuary",
@@ -1434,7 +1464,7 @@ Polygon Properties
     def test_existing_development_skips_web_and_creation(self):
         parsed = {
             "type": "listing", "development_name": "One Menerung",
-            "transaction_types": ["Rent/Let"], "asking_price": 8500, "beds": 3,
+            "transaction_types": ["Rent/Let"], "price_rent": 8500, "beds": 3,
         }
         with patch.object(resolver, "verify_development_candidate") as verify, \
              patch.object(resolver, "create_verified_development") as create_development:
@@ -1480,7 +1510,7 @@ Polygon Properties
     def test_verified_development_verbose_geo_uses_existing_canonical_geo(self):
         parsed = {
             "type": "listing", "development_name": "Ceriaan Kiara",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         verification = {
             "status": "verified", "raw_name": "Ceriaan Kiara",
@@ -1511,7 +1541,7 @@ Polygon Properties
     def test_verified_development_geo_fallback_creates_and_attaches_to_listing(self):
         parsed = {
             "type": "listing", "development_name": "Lakeview Residences",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         verification = {
             "status": "verified", "raw_name": "Lakeview Residences",
@@ -1549,7 +1579,7 @@ Polygon Properties
     def test_verified_canonical_development_is_reused_without_post(self):
         parsed = {
             "type": "listing", "development_name": "Sefina",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         records = DEVELOPMENTS + [
             {"_id": "dev-sefina", "Name": "Sefina Mont Kiara", "Geo": "geo-mk"}
@@ -1576,7 +1606,7 @@ Polygon Properties
     def test_ambiguous_verification_leaves_development_unresolved(self):
         parsed = {
             "type": "listing", "development_name": "Sunshine Residence",
-            "transaction_types": ["Buy/Sell"], "asking_price": 900000,
+            "transaction_types": ["Buy/Sell"], "price_sale": 900000,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(resolver, "verify_development_candidate", return_value={
@@ -1596,7 +1626,7 @@ Polygon Properties
     def test_verified_development_with_unresolved_geo_is_not_created(self):
         parsed = {
             "type": "listing", "development_name": "Sefina",
-            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+            "transaction_types": ["Rent/Let"], "price_rent": 5000,
         }
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(resolver, "verify_development_candidate", return_value={
@@ -2192,7 +2222,7 @@ Polygon Properties
     def test_multiple_numbers_parser_selects_signature_agent_only(self):
         output = full_model_output(
             type="listing", development_name="One Menerung",
-            transaction_types=["Rent/Let"], asking_price=8500,
+            transaction_types=["Rent/Let"], price_rent=8500,
             proposing_agent={
                 "name": "Alex Goh", "phone": "016-4697992", "ren": "E2265",
             },
@@ -2271,7 +2301,7 @@ E(1)2150
     def test_agent_lookup_failure_does_not_stop_listing_import(self):
         parsed = {
             "type": "listing", "geo_name": "Bangsar",
-            "transaction_types": ["Rent/Let"], "asking_price": 8500,
+            "transaction_types": ["Rent/Let"], "price_rent": 8500,
             "proposing_agent": {
                 "name": "Alex Goh", "phone": "0164697992", "ren": "E2265",
             },
