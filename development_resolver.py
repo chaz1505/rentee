@@ -364,7 +364,8 @@ def _geo_details(record, geo_records):
 def resolve_or_create_development(raw_name: str, context: dict,
                                   bubble_env: str = "live", *,
                                   development_records=None,
-                                  geo_records=None) -> dict:
+                                  geo_records=None,
+                                  geo_verifier=None) -> dict:
     """Resolve an existing Development or safely verify and create it."""
     if development_records is None or geo_records is None:
         records = rentee_app._property_entity_records(bubble_env)
@@ -387,6 +388,18 @@ def resolve_or_create_development(raw_name: str, context: dict,
                 "raw_name": raw,
                 "reason": verification.get("reason", "schema_validation_failed")}
     resolved_geo = resolve_geo_name(verification["geo_name"], geo_records)
+    if not resolved_geo.get("matched") and geo_verifier is not None:
+        try:
+            verified_geos = geo_verifier(
+                verification["geo_name"], geo_records, context, single=True,
+            )
+        except Exception as error:
+            print(f"[DEVELOPMENT CREATE] canonical={verification['canonical_name']!r} "
+                  f"action=geo_fallback_failed error={type(error).__name__}",
+                  flush=True)
+            verified_geos = []
+        if len(verified_geos) == 1 and verified_geos[0].get("matched"):
+            resolved_geo = verified_geos[0]
     if not resolved_geo.get("matched"):
         print(f"[DEVELOPMENT CREATE] canonical={verification['canonical_name']!r} "
               f"action=skipped reason=geo_unresolved "

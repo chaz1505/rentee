@@ -889,6 +889,7 @@ def _resolve_or_verify_developments(names, development_records, geo_records,
                 raw_name, context, bubble_env,
                 development_records=development_records,
                 geo_records=geo_records,
+                geo_verifier=verify_geo_reference,
             )
         except Exception as error:
             print(f"[DEVELOPMENT VERIFY] raw={raw_name!r} status=error "

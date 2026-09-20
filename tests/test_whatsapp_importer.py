@@ -1508,6 +1508,44 @@ Polygon Properties
         self.assertEqual(listing_payload["Geo"], "geo-mk")
         self.assertEqual(result["created_developments"][0]["id"], "dev-ceriaan")
 
+    def test_verified_development_geo_fallback_creates_and_attaches_to_listing(self):
+        parsed = {
+            "type": "listing", "development_name": "Lakeview Residences",
+            "transaction_types": ["Rent/Let"], "asking_price": 5000,
+        }
+        verification = {
+            "status": "verified", "raw_name": "Lakeview Residences",
+            "canonical_name": "Lakeview Residences",
+            "geo_name": "Bangsar Township",
+            "verification_url": "https://example.com/lakeview",
+            "confidence": 0.96, "reason": "credible_match",
+        }
+        fallback = [{
+            "matched": True, "id": "geo-bangsar", "name": "Bangsar",
+            "record": GEOS[0], "method": "normalized_exact",
+        }]
+        create = MagicMock(side_effect=["dev-lakeview", "listing-1"])
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(resolver, "verify_development_candidate",
+                          return_value=verification), \
+             patch.object(importer, "verify_geo_reference",
+                          return_value=fallback) as verify_geo, \
+             patch.object(resolver, "_fresh_development_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create", create):
+            result = importer.process_whatsapp_import(
+                "Lakeview listing", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+        verify_geo.assert_called_once_with(
+            "Bangsar Township", GEOS, unittest.mock.ANY, single=True,
+        )
+        development_payload = create.call_args_list[0].args[2]
+        listing_payload = create.call_args_list[1].args[2]
+        self.assertEqual(development_payload["Geo"], "geo-bangsar")
+        self.assertEqual(listing_payload["development"], "dev-lakeview")
+        self.assertEqual(listing_payload["Geo"], "geo-bangsar")
+        self.assertEqual(result["resolved_development"]["id"], "dev-lakeview")
+
     def test_verified_canonical_development_is_reused_without_post(self):
         parsed = {
             "type": "listing", "development_name": "Sefina",

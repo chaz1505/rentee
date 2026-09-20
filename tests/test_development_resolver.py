@@ -58,6 +58,56 @@ class DevelopmentResolverTests(unittest.TestCase):
         })
         self.assertNotIn("Name", create.call_args.args[2])
 
+    def test_verified_development_uses_single_geo_fallback_match(self):
+        verification = {
+            "status": "verified", "canonical_name": "Lakeview Residences",
+            "geo_name": "Lakeview Township",
+            "verification_url": "https://example.com/lakeview",
+            "confidence": 0.96, "reason": "credible_match",
+        }
+        fallback_geo = {
+            "matched": True, "id": "geo-bangsar", "name": "Bangsar",
+            "record": GEOS[0], "method": "normalized_exact",
+        }
+        geo_verifier = unittest.mock.Mock(return_value=[fallback_geo])
+        with patch.object(resolver, "verify_development_candidate",
+                          return_value=verification), \
+             patch.object(resolver, "_fresh_development_records", return_value=[]), \
+             patch.object(resolver.rentee_app, "_bubble_create",
+                          return_value="dev-lakeview") as create:
+            result = resolver.resolve_or_create_development(
+                "Lakeview", {"raw_text": "Lakeview listing"},
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+                geo_verifier=geo_verifier,
+            )
+        geo_verifier.assert_called_once_with(
+            "Lakeview Township", GEOS, {"raw_text": "Lakeview listing"},
+            single=True,
+        )
+        self.assertEqual(result["status"], "resolved")
+        self.assertEqual(result["action"], "created")
+        self.assertEqual(result["geo_id"], "geo-bangsar")
+        self.assertEqual(create.call_args.args[2]["Geo"], "geo-bangsar")
+
+    def test_verified_development_stays_geo_unresolved_without_one_fallback(self):
+        verification = {
+            "status": "verified", "canonical_name": "Lakeview Residences",
+            "geo_name": "Unknown Township",
+            "verification_url": "https://example.com/lakeview",
+            "confidence": 0.96, "reason": "credible_match",
+        }
+        geo_verifier = unittest.mock.Mock(return_value=[])
+        with patch.object(resolver, "verify_development_candidate",
+                          return_value=verification), \
+             patch.object(resolver.rentee_app, "_bubble_create") as create:
+            result = resolver.resolve_or_create_development(
+                "Lakeview", {}, development_records=DEVELOPMENTS,
+                geo_records=GEOS, geo_verifier=geo_verifier,
+            )
+        self.assertEqual((result["status"], result["reason"]),
+                         ("not_found", "geo_unresolved"))
+        create.assert_not_called()
+
     def test_geo_variants_normalize_and_duplicate_keys_are_ambiguous(self):
         variants = [
             "Mont Kiara", "Mont'Kiara", "Mont' Kiara", "Mont’ Kiara",
