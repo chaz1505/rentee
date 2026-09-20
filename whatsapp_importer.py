@@ -282,6 +282,8 @@ def _validate_parsed(value: Any) -> dict:
         for key in ("nationality", "occupation", "pets", "notes"):
             if _compact(value.get(key)):
                 result[key] = _compact(value[key])
+        if _compact(value.get("source_agency_name")):
+            result["source_agency_name"] = _compact(value["source_agency_name"])
         if _compact(value.get("lead_name")):
             result["lead_name"] = _compact(value["lead_name"])
         furnishing = value.get("furnishing_preference")
@@ -399,7 +401,8 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "office number as ambiguous. Leave phone null only when multiple plausible individual "
             "mobile numbers remain ambiguous. Do not mistake the buyer, tenant, client, owner, "
             "team, agency, or agency registration number for "
-            "the proposing agent. Never invent agent fields. Return "
+            "the proposing agent. For both Leads and Listings, put the agent signature's agency "
+            "or company name in source_agency_name. Never invent agent fields. Return "
             "null/empty values when evidence is weak; do not invent facts. For unknown, leave "
             "all other fields empty/null. For leads, extract adults, children, nationality, "
             "occupation, pets, furnishing preference, minimum bathrooms, helpers, and exact "
@@ -412,8 +415,8 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "or unusual requirements) in notes. Never repeat in notes anything captured in a "
             "structured field. For listings, extract baths, built-up sqft, land sqft, furnished "
             "Yes/No, canonical furnishing status, availability, exact availability date, balcony, "
-            "study/family/maid room counts, outdoor area, unit number, owner name/contact, and "
-            "source agency only when explicitly stated. Put useful listing details not captured "
+            "study/family/maid room counts, outdoor area, unit number, and owner name/contact "
+            "only when explicitly stated. Put useful listing details not captured "
             "by another structured field in notes, without duplicating structured facts. Never "
             "extract or infer exposure.\n\nMESSAGE:\n" + text
             ),
@@ -465,7 +468,40 @@ def _agent_value(value):
     return _compact(value) or None
 
 
-def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env):
+def _normalized_agency_name(value):
+    return " ".join(re.sub(
+        r"[^a-z0-9]+", " ", _compact(value).casefold()
+    ).split())
+
+
+def _resolve_or_create_agency(source_agency_name, bubble_env):
+    clean_name = _agent_value(source_agency_name)
+    if not clean_name:
+        return None
+    base_url = rentee_app.get_bubble_base_url(bubble_env)
+    key = _normalized_agency_name(clean_name)
+    matches = [
+        record for record in rentee_app._bubble_records(base_url, "agency")
+        if record.get("_id") and _normalized_agency_name(
+            record.get("name") or record.get("Name")
+        ) == key
+    ]
+    if len(matches) == 1:
+        return str(matches[0]["_id"])
+    if len(matches) > 1:
+        print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
+              f"status=ambiguous count={len(matches)}", flush=True)
+        return None
+    agency_id = rentee_app._bubble_create(
+        base_url, "agency", {"name": clean_name}
+    )
+    print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
+          f"action=created id={agency_id}", flush=True)
+    return str(agency_id)
+
+
+def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
+                           agency_id=None, agency_name=None):
     updates = {}
     existing_name = _agent_value(user.get("name"))
     existing_ren = _agent_value(user.get("REN"))
@@ -479,6 +515,12 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env):
     elif ren and existing_ren and ren.casefold() != existing_ren.casefold():
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=REN "
               f"existing={existing_ren!r} incoming={ren!r}", flush=True)
+    existing_agencies = _relationship_ids(user.get("Agency"))
+    if agency_id and not existing_agencies:
+        updates["Agency"] = agency_id
+    elif agency_id and agency_id not in existing_agencies:
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=Agency "
+              f"existing={existing_agencies!r} incoming={agency_name!r}", flush=True)
     if updates:
         try:
             rentee_app._bubble_patch(
@@ -498,7 +540,8 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env):
 
 def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
                                       ren: str | None,
-                                      bubble_env: str = "live") -> dict:
+                                      bubble_env: str = "live", *,
+                                      source_agency_name: str | None = None) -> dict:
     """Resolve one proposing agent by canonical phone, creating conservatively."""
     clean_name, clean_ren = _agent_value(name), _agent_value(ren)
     normalized = normalize_phone_number(phone)
@@ -520,8 +563,10 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
         return {"status": "duplicate_existing", "user_id": None,
                 "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
     if len(matches) == 1:
+        agency_id = _resolve_or_create_agency(source_agency_name, bubble_env)
         user = _enrich_existing_agent(
-            dict(matches[0]), clean_name, clean_ren, normalized, bubble_env
+            dict(matches[0]), clean_name, clean_ren, normalized, bubble_env,
+            agency_id, _agent_value(source_agency_name),
         )
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
               f"user_id={user['_id']}", flush=True)
@@ -538,6 +583,9 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
         payload["name"] = clean_name
     if clean_ren:
         payload["REN"] = clean_ren
+    agency_id = _resolve_or_create_agency(source_agency_name, bubble_env)
+    if agency_id:
+        payload["Agency"] = agency_id
     try:
         user_id = rentee_app._bubble_create(
             rentee_app.get_bubble_base_url(bubble_env), "user", payload
@@ -551,7 +599,8 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
             raced = []
         if len(raced) == 1:
             user = _enrich_existing_agent(
-                dict(raced[0]), clean_name, clean_ren, normalized, bubble_env
+                dict(raced[0]), clean_name, clean_ren, normalized, bubble_env,
+                agency_id, _agent_value(source_agency_name),
             )
             print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
                   f"user_id={user['_id']}", flush=True)
@@ -1371,6 +1420,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         proposing_agent = resolve_or_create_proposing_agent(
             parsed_agent.get("name"), parsed_agent.get("phone"),
             parsed_agent.get("ren"), bubble_env,
+            source_agency_name=parsed.get("source_agency_name"),
         )
     except Exception as error:
         normalized = normalize_phone_number(parsed_agent.get("phone"))

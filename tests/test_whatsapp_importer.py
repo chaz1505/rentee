@@ -1787,6 +1787,96 @@ Polygon Properties
         ))
         self.assertEqual(result["user_id"], "user-new")
 
+    def test_existing_agency_resolves_with_case_and_punctuation_variation(self):
+        agencies = [{"_id": "agency-propnex", "name": "PropNex Realty Sdn Bhd"}]
+        with patch.object(importer.rentee_app, "_bubble_records",
+                          return_value=agencies), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            exact = importer._resolve_or_create_agency(
+                "PropNex Realty Sdn Bhd", "live"
+            )
+            variation = importer._resolve_or_create_agency(
+                "PROPNEX REALTY SDN. BHD.", "live"
+            )
+        self.assertEqual(exact, "agency-propnex")
+        self.assertEqual(variation, "agency-propnex")
+        create.assert_not_called()
+
+    def test_new_agency_is_created_and_assigned_to_new_user(self):
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["agency-kommons", "user-marcus"]) as create:
+            result = importer.resolve_or_create_proposing_agent(
+                "Marcus Yeoh", "+6017-4081131", "REN50605",
+                source_agency_name="Kommons Realty Sdn Bhd",
+            )
+        self.assertEqual(create.call_args_list[0].args, (
+            "https://www.rentee.asia/api/1.1", "agency",
+            {"name": "Kommons Realty Sdn Bhd"},
+        ))
+        self.assertEqual(create.call_args_list[1].args[2]["Agency"], "agency-kommons")
+        self.assertNotIn("agency", create.call_args_list[1].args[2])
+        self.assertEqual(result["user"]["Agency"], "agency-kommons")
+
+    def test_existing_user_empty_agency_is_enriched_without_touching_text_field(self):
+        user = {"_id": "user-jasmine", "phone": "60123456789",
+                "name": "Jasmine", "REN": "REN12345", "agency": "Legacy Text"}
+        agencies = [{"_id": "agency-1", "name": "Kommons Realty Sdn Bhd"}]
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_records",
+                          return_value=agencies), \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer.resolve_or_create_proposing_agent(
+                "Jasmine", "0123456789", "REN12345",
+                source_agency_name="Kommons Realty Sdn Bhd",
+            )
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/user-jasmine",
+            {"Agency": "agency-1"},
+        )
+        self.assertEqual(result["user"]["agency"], "Legacy Text")
+        self.assertEqual(result["user"]["Agency"], "agency-1")
+
+    def test_existing_same_agency_is_unchanged_and_different_agency_conflicts(self):
+        agencies = [{"_id": "agency-new", "name": "Kommons Realty Sdn Bhd"}]
+        for existing_agency, conflict in (
+            ("agency-new", False), ("agency-old", True),
+        ):
+            user = {"_id": "user-1", "phone": "60123456789",
+                    "name": "Jasmine", "REN": "REN12345",
+                    "Agency": existing_agency, "agency": "Legacy Text"}
+            with self.subTest(existing_agency=existing_agency), \
+                 patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                              return_value=[user]), \
+                 patch.object(importer.rentee_app, "_bubble_records",
+                              return_value=agencies), \
+                 patch.object(importer.rentee_app, "_bubble_patch") as update, \
+                 patch("builtins.print") as log:
+                result = importer.resolve_or_create_proposing_agent(
+                    "Jasmine", "0123456789", "REN12345",
+                    source_agency_name="Kommons Realty Sdn Bhd",
+                )
+            update.assert_not_called()
+            self.assertEqual(result["user"]["Agency"], existing_agency)
+            self.assertEqual(result["user"]["agency"], "Legacy Text")
+            rendered = " ".join(str(call) for call in log.call_args_list)
+            self.assertEqual("conflict=Agency" in rendered, conflict)
+
+    def test_missing_source_agency_name_makes_no_agency_change(self):
+        user = {"_id": "user-1", "phone": "60123456789", "name": "Jasmine"}
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_records") as agencies, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            importer.resolve_or_create_proposing_agent(
+                "Jasmine", "0123456789", None
+            )
+        agencies.assert_not_called()
+        update.assert_not_called()
+
     def test_missing_ren_or_name_still_allows_user_creation(self):
         for index, name in enumerate(("Alex Goh", None)):
             with self.subTest(name=name), \
@@ -1917,6 +2007,7 @@ E(1)2150
         output = full_model_output(
             type="lead", geo_names=["TTDI"], location_references=["TTDI"],
             transaction_types=["Buy/Sell"], property_types=["Landed", "House"],
+            source_agency_name="Kommons Realty Sdn Bhd",
             proposing_agent={
                 "name": "Marcus Yeoh", "phone": "+6017-4081131", "ren": "REN50605",
             },
@@ -1932,12 +2023,15 @@ E(1)2150
         self.assertEqual(parsed["transaction_types"], ["Buy/Sell"])
         self.assertEqual(parsed["geo_names"], ["TTDI"])
         self.assertEqual(parsed["property_types"], ["Landed"])
+        self.assertEqual(parsed["source_agency_name"], "Kommons Realty Sdn Bhd")
         self.assertNotIn("budget", parsed)
         self.assertNotIn("bedrooms_min", parsed)
         prompt = create.call_args.kwargs["input"]
         self.assertIn("individual Malaysian mobile (+601/01)", prompt)
         self.assertIn("office or landline (+603/03)", prompt)
         self.assertIn("Use the individual person's name", prompt)
+        self.assertIn("both Leads and Listings", prompt)
+        self.assertIn("source_agency_name", prompt)
 
     def test_duplicate_phone_users_do_not_create_another_user(self):
         duplicates = [
