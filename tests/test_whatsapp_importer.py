@@ -1877,6 +1877,93 @@ Polygon Properties
         agencies.assert_not_called()
         update.assert_not_called()
 
+    def test_existing_user_survives_agency_lookup_and_creation_failures(self):
+        user = {"_id": "user-gwen", "phone": "60174156107", "name": "Gwen"}
+        cases = (
+            (RuntimeError("lookup down"), None, "lookup_failed"),
+            ([], RuntimeError("create down"), "create_failed"),
+        )
+        for agency_records, create_error, action in cases:
+            with self.subTest(action=action), \
+                 patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                              return_value=[user]), \
+                 patch.object(importer.rentee_app, "_bubble_records",
+                              side_effect=agency_records if isinstance(
+                                  agency_records, Exception) else None,
+                              return_value=agency_records if isinstance(
+                                  agency_records, list) else None), \
+                 patch.object(importer.rentee_app, "_bubble_create",
+                              side_effect=create_error) as create, \
+                 patch("builtins.print") as log:
+                result = importer.resolve_or_create_proposing_agent(
+                    "Gwen", "017-4156107", None,
+                    source_agency_name="Prestige Realty",
+                )
+            self.assertEqual(result["status"], "existing")
+            self.assertEqual(result["user_id"], "user-gwen")
+            self.assertEqual(result["user"], user)
+            self.assertIn(action, " ".join(str(call) for call in log.call_args_list))
+            if action == "lookup_failed":
+                create.assert_not_called()
+
+    def test_existing_user_survives_agency_assignment_failure(self):
+        user = {"_id": "user-gwen", "phone": "60174156107", "name": "Gwen"}
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[{
+                 "_id": "agency-1", "name": "Prestige Realty",
+             }]), patch.object(importer.rentee_app, "_bubble_patch",
+                              side_effect=RuntimeError("assignment down")), \
+             patch("builtins.print") as log:
+            result = importer.resolve_or_create_proposing_agent(
+                "Gwen", "017-4156107", None,
+                source_agency_name="Prestige Realty",
+            )
+        self.assertEqual(result["status"], "existing")
+        self.assertEqual(result["user_id"], "user-gwen")
+        self.assertEqual(result["user"], user)
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("action=assign_failed", rendered)
+        self.assertNotIn("WHATSAPP IMPORT AGENT] phone='60174156107' action=failed", rendered)
+
+    def test_new_user_survives_agency_lookup_failure(self):
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_records",
+                          side_effect=RuntimeError("agency down")), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="user-new") as create:
+            result = importer.resolve_or_create_proposing_agent(
+                "Gwen", "017-4156107", None,
+                source_agency_name="Prestige Realty",
+            )
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(result["user_id"], "user-new")
+        self.assertNotIn("Agency", create.call_args.args[2])
+
+    def test_agency_failure_keeps_owner_and_duplicate_identity_downstream(self):
+        parsed = {
+            "type": "lead", "geo_names": ["Bangsar"],
+            "preferred_development_names": [], "transaction_types": ["Rent/Let"],
+            "property_types": ["Condo"], "source_agency_name": "Prestige Realty",
+            "proposing_agent": {"name": "Gwen", "phone": "017-4156107", "ren": None},
+        }
+        user = {"_id": "user-gwen", "phone": "60174156107", "name": "Gwen"}
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_records",
+                          side_effect=RuntimeError("agency down")), \
+             patch.object(importer, "_find_duplicate_import", return_value=None) as duplicate, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            result = importer.process_whatsapp_import(
+                "WTR Bangsar", geo_records=GEOS, development_records=DEVELOPMENTS
+            )
+        self.assertEqual(result["proposing_agent_user_id"], "user-gwen")
+        self.assertEqual(create.call_args.args[2]["owner"], "user-gwen")
+        self.assertEqual(duplicate.call_args.args[1], "user-gwen")
+
     def test_missing_ren_or_name_still_allows_user_creation(self):
         for index, name in enumerate(("Alex Goh", None)):
             with self.subTest(name=name), \

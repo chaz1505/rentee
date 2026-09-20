@@ -480,21 +480,31 @@ def _resolve_or_create_agency(source_agency_name, bubble_env):
         return None
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     key = _normalized_agency_name(clean_name)
-    matches = [
-        record for record in rentee_app._bubble_records(base_url, "agency")
-        if record.get("_id") and _normalized_agency_name(
-            record.get("name") or record.get("Name")
-        ) == key
-    ]
+    try:
+        matches = [
+            record for record in rentee_app._bubble_records(base_url, "agency")
+            if record.get("_id") and _normalized_agency_name(
+                record.get("name") or record.get("Name")
+            ) == key
+        ]
+    except Exception as error:
+        print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
+              f"action=lookup_failed error={type(error).__name__}", flush=True)
+        return None
     if len(matches) == 1:
         return str(matches[0]["_id"])
     if len(matches) > 1:
         print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
               f"status=ambiguous count={len(matches)}", flush=True)
         return None
-    agency_id = rentee_app._bubble_create(
-        base_url, "agency", {"name": clean_name}
-    )
+    try:
+        agency_id = rentee_app._bubble_create(
+            base_url, "agency", {"name": clean_name}
+        )
+    except Exception as error:
+        print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
+              f"action=create_failed error={type(error).__name__}", flush=True)
+        return None
     print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
           f"action=created id={agency_id}", flush=True)
     return str(agency_id)
@@ -515,12 +525,6 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
     elif ren and existing_ren and ren.casefold() != existing_ren.casefold():
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=REN "
               f"existing={existing_ren!r} incoming={ren!r}", flush=True)
-    existing_agencies = _relationship_ids(user.get("Agency"))
-    if agency_id and not existing_agencies:
-        updates["Agency"] = agency_id
-    elif agency_id and agency_id not in existing_agencies:
-        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=Agency "
-              f"existing={existing_agencies!r} incoming={agency_name!r}", flush=True)
     if updates:
         try:
             rentee_app._bubble_patch(
@@ -535,6 +539,23 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
             for field in updates:
                 print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} "
                       f"action=updated field={field}", flush=True)
+    existing_agencies = _relationship_ids(user.get("Agency"))
+    if agency_id and not existing_agencies:
+        try:
+            rentee_app._bubble_patch(
+                f"{rentee_app.get_bubble_base_url(bubble_env)}/obj/user/{user['_id']}",
+                {"Agency": agency_id},
+            )
+        except Exception as error:
+            print(f"[WHATSAPP IMPORT AGENCY] name={agency_name!r} "
+                  f"action=assign_failed error={type(error).__name__}", flush=True)
+        else:
+            user = {**user, "Agency": agency_id}
+            print(f"[WHATSAPP IMPORT AGENCY] name={agency_name!r} "
+                  f"action=assigned user_id={user['_id']}", flush=True)
+    elif agency_id and agency_id not in existing_agencies:
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=Agency "
+              f"existing={existing_agencies!r} incoming={agency_name!r}", flush=True)
     return user
 
 
