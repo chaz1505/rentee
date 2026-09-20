@@ -13,6 +13,7 @@ import app as rentee_app
 FUZZY_THRESHOLD = 0.90
 FUZZY_MARGIN = 0.08
 VERIFICATION_CONFIDENCE = 0.90
+DEVELOPMENT_VERIFIER_MAX_OUTPUT_TOKENS = 800
 
 
 def _compact(value: Any) -> str:
@@ -160,6 +161,15 @@ def _verifier_response_value(response):
     return value
 
 
+def _verifier_response_log_details(response):
+    status = getattr(response, "status", None)
+    incomplete_details = getattr(response, "incomplete_details", None)
+    if hasattr(incomplete_details, "model_dump"):
+        incomplete_details = incomplete_details.model_dump()
+    return (f" response_status={status!r} incomplete_details={incomplete_details!r}"
+            f" output_preview={_compact(getattr(response, 'output_text', ''))[:160]!r}")
+
+
 def verify_development_candidate(raw_name: str, context: dict,
                                  bubble_env: str = "live") -> dict:
     raw = _compact(raw_name)
@@ -189,7 +199,8 @@ def verify_development_candidate(raw_name: str, context: dict,
                 f"CANDIDATE NAME:\n{raw}\n\nWHATSAPP IMPORT CONTEXT:\n"
                 f"{json.dumps(focused_context, ensure_ascii=False)}"
             ),
-            reasoning={"effort": "low"}, max_output_tokens=400, timeout=20,
+            reasoning={"effort": "low"},
+            max_output_tokens=DEVELOPMENT_VERIFIER_MAX_OUTPUT_TOKENS, timeout=20,
             text={"format": {"type": "json_schema",
                 "name": "development_web_verification", "strict": True,
                 "schema": {
@@ -218,10 +229,14 @@ def verify_development_candidate(raw_name: str, context: dict,
     try:
         value = _verifier_response_value(response)
     except ValueError:
+        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=retry "
+              f"reason='invalid_json'"
+              f"{_verifier_response_log_details(response)}", flush=True)
         retry_request = dict(request)
         retry_request["input"] = (
             request["input"]
-            + "\n\nReturn only valid JSON matching the required schema. No markdown or prose."
+            + "\n\nRetry after invalid JSON. Return ONLY one complete JSON object matching "
+              "the required schema, with no prose or markdown."
         )
         try:
             response = rentee_app.client.responses.create(**retry_request)
@@ -232,10 +247,15 @@ def verify_development_candidate(raw_name: str, context: dict,
         try:
             value = _verifier_response_value(response)
         except ValueError:
+            print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=retry_failed "
+                  f"reason='invalid_json'"
+                  f"{_verifier_response_log_details(response)}", flush=True)
             return _verification_error(
                 raw, "invalid_json",
                 output_preview=getattr(response, "output_text", ""),
             )
+        print(f"[DEVELOPMENT VERIFY] raw={raw!r} status=retry_succeeded "
+              f"result='valid_json'", flush=True)
     if not isinstance(value, dict):
         return _verification_error(raw, "schema_validation_failed")
     if "status" not in value:

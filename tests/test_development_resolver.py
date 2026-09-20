@@ -122,10 +122,11 @@ class DevelopmentResolverTests(unittest.TestCase):
         with patch.object(
             resolver.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
-        ):
+        ) as create:
             result = resolver.verify_development_candidate("Not Real", {})
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"], "no_credible_property_match")
+        create.assert_called_once()
 
     def test_verifier_recovers_fenced_json_without_retry(self):
         output = {
@@ -145,24 +146,39 @@ class DevelopmentResolverTests(unittest.TestCase):
 
     def test_verifier_retries_invalid_json_once_and_succeeds(self):
         output = {
-            "status": "not_found", "canonical_name": None, "geo_name": None,
-            "verification_url": None, "confidence": 0.1,
-            "reason": "no_credible_property_match",
+            "status": "verified", "canonical_name": "Ceriaan Kiara",
+            "geo_name": "Mont Kiara",
+            "verification_url": "https://example.com/ceriaan",
+            "confidence": 0.96, "reason": "credible_match",
         }
         with patch.object(
             resolver.rentee_app.client.responses, "create",
             side_effect=[
-                SimpleNamespace(output_text="not-json"),
+                SimpleNamespace(
+                    output_text='{"status":"verified","canonical_name":"Ceriaan',
+                    status="incomplete",
+                    incomplete_details={"reason": "max_output_tokens"},
+                ),
                 SimpleNamespace(output_text=json.dumps(output)),
             ],
-        ) as create:
+        ) as create, patch("builtins.print") as log:
             result = resolver.verify_development_candidate("Not Real", {})
-        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["canonical_name"], "Ceriaan Kiara")
         self.assertEqual(create.call_count, 2)
         self.assertIn(
-            "Return only valid JSON matching the required schema. No markdown or prose.",
+            "Return ONLY one complete JSON object matching the required schema, "
+            "with no prose or markdown.",
             create.call_args_list[1].kwargs["input"],
         )
+        self.assertEqual(
+            create.call_args_list[0].kwargs["max_output_tokens"],
+            resolver.DEVELOPMENT_VERIFIER_MAX_OUTPUT_TOKENS,
+        )
+        rendered = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("status=retry", rendered)
+        self.assertIn("incomplete_details={'reason': 'max_output_tokens'}", rendered)
+        self.assertIn("status=retry_succeeded", rendered)
 
     def test_verifier_returns_invalid_json_after_single_failed_retry(self):
         with patch.object(
@@ -174,7 +190,9 @@ class DevelopmentResolverTests(unittest.TestCase):
         self.assertEqual((result["status"], result["reason"]),
                          ("error", "invalid_json"))
         self.assertEqual(create.call_count, 2)
-        rendered = " ".join(str(call) for call in log.call_args_list)
+        rendered = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("status=retry reason='invalid_json'", rendered)
+        self.assertIn("status=retry_failed reason='invalid_json'", rendered)
         self.assertIn("output_preview='bad second'", rendered)
 
     def test_create_race_requeries_once_and_reuses(self):
