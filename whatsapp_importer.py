@@ -1231,6 +1231,8 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
     """Return whether one Bubble Lead and Listing satisfy deterministic match rules."""
     if lead.get("cancelled") is True:
         return False
+    if not _relationship_ids(listing.get("owner")):
+        return False
     if listing.get("availability") is False:
         return False
     if not _listing_date_eligible(listing):

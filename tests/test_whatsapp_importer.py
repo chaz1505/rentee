@@ -627,7 +627,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar",
-            "priceSale": 5000,
+            "priceSale": 5000, "owner": "user-agent",
         }
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["TransactionType"] = ["rent/let"]
@@ -640,7 +640,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
-            "propertyType": "Condo",
+            "propertyType": "Condo", "owner": "user-agent",
         }
         for cancelled, expected in (
             (True, False), (False, True), (None, True), ("true", True),
@@ -667,6 +667,25 @@ class WhatsAppImporterTests(unittest.TestCase):
                 )
         self.assertTrue(importer.lead_matches_listing(
             lead, dict(listing, availability=None)
+        ))
+
+    def test_listing_owner_is_required_for_matching(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "propertyType": "Condo",
+            "owner": "user-agent",
+        }
+        for owner in (None, "", []):
+            with self.subTest(owner=owner):
+                self.assertFalse(importer.lead_matches_listing(
+                    lead, dict(listing, owner=owner)
+                ))
+        self.assertTrue(importer.lead_matches_listing(
+            lead, dict(listing, owner="user-agent")
         ))
 
     def test_listing_date_eligibility_uses_calendar_month_window_and_priority(self):
@@ -701,7 +720,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
-            "propertyType": "Condo",
+            "propertyType": "Condo", "owner": "user-agent",
             "availability_date": (
                 importer.datetime.date.today() + importer.datetime.timedelta(days=200)
             ).isoformat(),
@@ -720,6 +739,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         listing = {
             "_id": "listing-1", "TransactionType": ["Rent/Let"],
             "Geo": "geo-bangsar", "propertyType": "Condo",
+            "owner": "user-agent",
         }
         cases = (
             ("lead", dict(lead, cancelled=True), listing),
@@ -745,6 +765,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-klcc",
             "development": "dev-serai", "beds": 2,
+            "owner": "user-agent",
         }
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["development"] = "dev-one"
@@ -758,7 +779,10 @@ class WhatsAppImporterTests(unittest.TestCase):
             "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
             "budgetRent": 10000,
         }
-        listing = {"TransactionType": ["Rent/Let"], "Geo": "geo-bangsar"}
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "owner": "user-agent",
+        }
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["priceSale"] = 10000
         self.assertFalse(importer.lead_matches_listing(lead, listing))
@@ -774,7 +798,10 @@ class WhatsAppImporterTests(unittest.TestCase):
             "TransactionType": ["Buy/Sell"], "Geo": ["geo-bangsar"],
             "bedroomsMin": 3,
         }
-        listing = {"TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar"}
+        listing = {
+            "TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar",
+            "owner": "user-agent",
+        }
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["beds"] = 2
         self.assertFalse(importer.lead_matches_listing(lead, listing))
@@ -788,7 +815,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar",
-            "priceSale": 1000000, "beds": 2,
+            "priceSale": 1000000, "beds": 2, "owner": "user-agent",
         }
         self.assertFalse(importer.lead_matches_listing(lead, listing))
         listing["beds"] = 3
@@ -804,7 +831,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Buy/Sell"], "Geo": "geo-ttdi",
-            "propertyType": "Landed",
+            "propertyType": "Landed", "owner": "user-agent",
         }
         self.assertTrue(importer.lead_matches_listing(lead, listing))
         listing["propertyType"] = "Condo"
@@ -833,6 +860,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         listing = {
             "TransactionType": ["Buy/Sell"], "Geo": "geo-ttdi",
             "propertyType": "House", "beds": 4, "priceSale": 1000000,
+            "owner": "user-agent",
         }
         self.assertTrue(importer.lead_matches_listing(lead, listing))
         for field, bad_value in (
@@ -848,7 +876,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
-            "propertyType": "Apartment",
+            "propertyType": "Apartment", "owner": "user-agent",
         }
         original = dict(listing)
         with patch.object(importer.rentee_app, "_bubble_create") as create, \
@@ -861,7 +889,7 @@ class WhatsAppImporterTests(unittest.TestCase):
     def test_matching_rejects_under_specified_lead(self):
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
-            "priceRent": 5000, "beds": 2,
+            "priceRent": 5000, "beds": 2, "owner": "user-agent",
         }
         for lead in (
             {"Geo": ["geo-bangsar"], "bedroomsMin": 2},
@@ -878,7 +906,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
-            "priceRent": 5000,
+            "priceRent": 5000, "owner": "user-agent",
         }
         with patch.object(importer.rentee_app, "_bubble_records", return_value=[listing]) as records:
             self.assertEqual(FIND_IMPORT_MATCHES("lead", lead, "live"), [listing])
@@ -989,9 +1017,11 @@ class WhatsAppImporterTests(unittest.TestCase):
         }
         listings = [
             {"_id": "listing-old", "TransactionType": ["Buy/Sell"],
-             "Geo": "geo-ttdi", "propertyType": "Landed"},
+             "Geo": "geo-ttdi", "propertyType": "Landed",
+             "owner": "user-agent"},
             {"_id": "listing-new", "TransactionType": ["Buy/Sell"],
-             "Geo": "geo-ttdi", "propertyType": "Landed"},
+             "Geo": "geo-ttdi", "propertyType": "Landed",
+             "owner": "user-agent"},
         ]
 
         def records(_base, object_type, constraints=None, **_kwargs):
