@@ -1189,6 +1189,11 @@ class WhatsAppImporterTests(unittest.TestCase):
             )
         self.assertEqual(result["matches"], [match])
         self.assertIn(
+            "See here: https://www.rentee.asia/lead/lead-1\n\n"
+            "Found 1 matching listing:",
+            result["confirmation"],
+        )
+        self.assertIn(
             "Found 1 matching listing:\n\n"
             "One Menerung — 2 bed, RM4,800/month\n"
             "https://www.rentee.asia/listing/listing-1",
@@ -1222,6 +1227,11 @@ class WhatsAppImporterTests(unittest.TestCase):
                 "listing", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         self.assertEqual(result["matches"], [match])
+        self.assertIn(
+            "See here: https://www.rentee.asia/listing/listing-1\n\n"
+            "Found 1 matching lead:",
+            result["confirmation"],
+        )
         self.assertIn(
             "Found 1 matching lead:\n\n"
             "Alex WTR One Menerung — 2+ bed, budget RM5,200\n"
@@ -1279,7 +1289,7 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertIn("Agent: James", rendered)
         self.assertNotIn("Phone:", rendered)
 
-    def test_no_matches_leave_confirmation_unchanged(self):
+    def test_no_matches_append_created_lead_link_to_confirmation(self):
         parsed = {
             "type": "lead", "geo_names": ["Bangsar"],
             "preferred_development_names": [], "transaction_types": ["Rent/Let"],
@@ -1296,7 +1306,10 @@ class WhatsAppImporterTests(unittest.TestCase):
                 "lead", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         self.assertEqual(result["matches"], [])
-        self.assertEqual(result["confirmation"], expected)
+        self.assertEqual(
+            result["confirmation"],
+            expected + "\n\nSee here: https://www.rentee.asia/lead/lead-1",
+        )
 
     def test_unsupported_property_type_is_removed(self):
         parsed = self.parse_as({

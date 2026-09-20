@@ -1582,6 +1582,10 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                                              if not item.get("matched")],
             "confirmation": _confirmation(parsed, geos, developments),
         }
+        path = "lead" if parsed["type"] == "lead" else "listing"
+        result["confirmation"] += (
+            f"\n\nSee here: https://www.rentee.asia/{path}/{bubble_id}"
+        )
         if not has_geo and not has_development and location_references:
             result["confirmation"] += (
                 f" Couldn't resolve Geo: {', '.join(location_references)}."
@@ -1639,6 +1643,10 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "confirmation": _confirmation(parsed, geos_for_confirmation,
                                           developments_for_confirmation),
         }
+        path = "lead" if parsed["type"] == "lead" else "listing"
+        result["confirmation"] += (
+            f"\n\nSee here: https://www.rentee.asia/{path}/{bubble_id}"
+        )
     matches = find_import_matches(
         parsed["type"], created_record, bubble_env
     )
