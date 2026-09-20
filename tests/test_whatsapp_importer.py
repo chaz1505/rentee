@@ -1813,7 +1813,7 @@ Polygon Properties
                 source_agency_name="Kommons Realty Sdn Bhd",
             )
         self.assertEqual(create.call_args_list[0].args, (
-            "https://www.rentee.asia/api/1.1", "agency",
+            "https://www.rentee.asia/api/1.1", "Agency",
             {"name": "Kommons Realty Sdn Bhd"},
         ))
         self.assertEqual(create.call_args_list[1].args[2]["Agency"], "agency-kommons")

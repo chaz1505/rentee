@@ -482,7 +482,7 @@ def _resolve_or_create_agency(source_agency_name, bubble_env):
     key = _normalized_agency_name(clean_name)
     try:
         matches = [
-            record for record in rentee_app._bubble_records(base_url, "agency")
+            record for record in rentee_app._bubble_records(base_url, "Agency")
             if record.get("_id") and _normalized_agency_name(
                 record.get("name") or record.get("Name")
             ) == key
@@ -499,7 +499,7 @@ def _resolve_or_create_agency(source_agency_name, bubble_env):
         return None
     try:
         agency_id = rentee_app._bubble_create(
-            base_url, "agency", {"name": clean_name}
+            base_url, "Agency", {"name": clean_name}
         )
     except Exception as error:
         print(f"[WHATSAPP IMPORT AGENCY] name={clean_name!r} "
