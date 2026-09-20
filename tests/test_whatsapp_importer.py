@@ -669,6 +669,49 @@ class WhatsAppImporterTests(unittest.TestCase):
             lead, dict(listing, availability=None)
         ))
 
+    def test_listing_date_eligibility_uses_calendar_month_window_and_priority(self):
+        today = importer.datetime.date(2026, 1, 31)
+        self.assertTrue(importer._listing_date_eligible(
+            {"availability_date": "2026-04-30T00:00:00.000Z"}, today
+        ))
+        self.assertFalse(importer._listing_date_eligible(
+            {"availability_date": "2026-05-01"}, today
+        ))
+        self.assertTrue(importer._listing_date_eligible(
+            {"availability_date": "2025-01-01"}, today
+        ))
+        self.assertTrue(importer._listing_date_eligible(
+            {"tenantExpiry": "2026-04-30"}, today
+        ))
+        self.assertFalse(importer._listing_date_eligible(
+            {"tenantExpiry": "2026-05-01"}, today
+        ))
+        self.assertFalse(importer._listing_date_eligible({
+            "availability_date": "2026-05-01", "tenantExpiry": "2026-02-01",
+        }, today))
+        self.assertTrue(importer._listing_date_eligible({
+            "availability_date": "2026-02-01", "tenantExpiry": "2027-01-01",
+        }, today))
+        self.assertTrue(importer._listing_date_eligible({}, today))
+
+    def test_future_listing_date_blocks_otherwise_perfect_match(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "propertyType": "Condo",
+            "availability_date": (
+                importer.datetime.date.today() + importer.datetime.timedelta(days=200)
+            ).isoformat(),
+        }
+        self.assertFalse(importer.lead_matches_listing(lead, listing))
+        listing["availability_date"] = (
+            importer.datetime.date.today() - importer.datetime.timedelta(days=1)
+        ).isoformat()
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
     def test_ineligible_pairs_do_not_create_match_records(self):
         lead = {
             "_id": "lead-1", "TransactionType": ["Rent/Let"],

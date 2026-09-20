@@ -8,6 +8,7 @@ client and Bubble Data API helpers, but is not wired into the webhook yet.
 from __future__ import annotations
 
 import datetime
+import calendar
 import hashlib
 import json
 import re
@@ -21,6 +22,7 @@ LOG_PREFIX = "[WHATSAPP IMPORT]"
 TRANSACTION_TYPES = ("Rent/Let", "Buy/Sell")
 PROPERTY_TYPES = ("Condo", "Landed")
 IMPORT_ROUTING_THRESHOLD = 0.90
+MATCH_AVAILABILITY_MONTHS = 3
 
 STRONG_IMPORT_MARKERS = (
     ("lead_import", "WTR", r"(?<![A-Z0-9])WTR(?![A-Z0-9])"),
@@ -1183,6 +1185,31 @@ def _create_import_record(object_type, payload, bubble_env):
         raise
 
 
+def _listing_date_eligible(listing, today=None):
+    raw_date = listing.get("availability_date")
+    if raw_date in (None, ""):
+        raw_date = listing.get("tenantExpiry")
+    if raw_date in (None, ""):
+        return True
+    try:
+        if isinstance(raw_date, datetime.datetime):
+            available_date = raw_date.date()
+        elif isinstance(raw_date, datetime.date):
+            available_date = raw_date
+        else:
+            available_date = datetime.date.fromisoformat(str(raw_date)[:10])
+    except (TypeError, ValueError):
+        return False
+    current = today or datetime.date.today()
+    month_index = current.month - 1 + MATCH_AVAILABILITY_MONTHS
+    year = current.year + month_index // 12
+    month = month_index % 12 + 1
+    window_end = datetime.date(
+        year, month, min(current.day, calendar.monthrange(year, month)[1])
+    )
+    return available_date <= window_end
+
+
 def _find_duplicate_import(object_type, owner_id, message_hash, bubble_env):
     if not owner_id:
         return None
@@ -1205,6 +1232,8 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
     if lead.get("cancelled") is True:
         return False
     if listing.get("availability") is False:
+        return False
+    if not _listing_date_eligible(listing):
         return False
     lead_transactions = {
         value for value in lead.get("TransactionType") or [] if value in TRANSACTION_TYPES
