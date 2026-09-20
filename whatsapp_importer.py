@@ -468,6 +468,11 @@ def _agent_value(value):
     return _compact(value) or None
 
 
+def _normalized_ren(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits or None
+
+
 def _normalized_agency_name(value):
     return " ".join(re.sub(
         r"[^a-z0-9]+", " ", _compact(value).casefold()
@@ -514,7 +519,7 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
                            agency_id=None, agency_name=None):
     updates = {}
     existing_name = _agent_value(user.get("name"))
-    existing_ren = _agent_value(user.get("REN"))
+    existing_ren = _normalized_ren(user.get("REN"))
     if name and not existing_name:
         updates["name"] = name
     elif name and existing_name and name.casefold() != existing_name.casefold():
@@ -522,7 +527,7 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
               f"existing={existing_name!r} incoming={name!r}", flush=True)
     if ren and not existing_ren:
         updates["REN"] = ren
-    elif ren and existing_ren and ren.casefold() != existing_ren.casefold():
+    elif ren and existing_ren and ren != existing_ren:
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=REN "
               f"existing={existing_ren!r} incoming={ren!r}", flush=True)
     if updates:
@@ -564,7 +569,7 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
                                       bubble_env: str = "live", *,
                                       source_agency_name: str | None = None) -> dict:
     """Resolve one proposing agent by canonical phone, creating conservatively."""
-    clean_name, clean_ren = _agent_value(name), _agent_value(ren)
+    clean_name, clean_ren = _agent_value(name), _normalized_ren(ren)
     normalized = normalize_phone_number(phone)
     print(f"[WHATSAPP IMPORT AGENT] raw_phone={_compact(phone)!r} "
           f"normalized={normalized!r}", flush=True)
@@ -594,7 +599,7 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
         return {"status": "existing", "user_id": str(user["_id"]),
                 "normalized_phone": normalized,
                 "name": _agent_value(user.get("name")) or clean_name,
-                "ren": _agent_value(user.get("REN")) or clean_ren,
+                "ren": _normalized_ren(user.get("REN")) or clean_ren,
                 "user": user}
     payload = {
         "phone": normalized,
@@ -628,7 +633,7 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
             return {"status": "existing", "user_id": str(user["_id"]),
                     "normalized_phone": normalized,
                     "name": _agent_value(user.get("name")) or clean_name,
-                    "ren": _agent_value(user.get("REN")) or clean_ren,
+                    "ren": _normalized_ren(user.get("REN")) or clean_ren,
                     "user": user}
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=create_failed "
               f"error={type(create_error).__name__}", flush=True)

@@ -1759,6 +1759,14 @@ Polygon Properties
         self.assertEqual(importer.build_internal_user_email("60164697992"), expected)
         self.assertEqual(importer.build_internal_user_email("60164697992"), expected)
 
+    def test_ren_normalization_uses_digits_only(self):
+        self.assertEqual(
+            [importer._normalized_ren(value) for value in (
+                "REN74405", "REN 74405", "74405",
+            )],
+            ["74405", "74405", "74405"],
+        )
+
     def test_existing_proposing_agent_is_reused_without_create(self):
         user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
                 "REN": "E2265", "email": "alex@example.com"}
@@ -1781,7 +1789,7 @@ Polygon Properties
                 "Alex Goh", "016-4697992", "E2265")
         self.assertEqual(create.call_args.args, (
             "https://www.rentee.asia/api/1.1", "user", {
-                "phone": "60164697992", "name": "Alex Goh", "REN": "E2265",
+                "phone": "60164697992", "name": "Alex Goh", "REN": "2265",
                 "email": "whatsapp-60164697992@users.rentee.internal",
             },
         ))
@@ -2001,8 +2009,8 @@ Polygon Properties
             result = importer.resolve_or_create_proposing_agent(
                 "Alex Goh", "0164697992", "E2265")
         patch_user.assert_called_once_with(
-            "https://www.rentee.asia/api/1.1/obj/user/user-agent", {"REN": "E2265"})
-        self.assertEqual(result["ren"], "E2265")
+            "https://www.rentee.asia/api/1.1/obj/user/user-agent", {"REN": "2265"})
+        self.assertEqual(result["ren"], "2265")
         self.assertEqual(result["user"]["email"], "alex.real@example.com")
 
     def test_conflicting_identity_values_are_preserved_and_logged(self):
@@ -2015,7 +2023,7 @@ Polygon Properties
             result = importer.resolve_or_create_proposing_agent(
                 "Alex", "0164697992", "E2266")
         patch_user.assert_not_called()
-        self.assertEqual((result["name"], result["ren"]), ("Alex Goh", "E2265"))
+        self.assertEqual((result["name"], result["ren"]), ("Alex Goh", "2265"))
         self.assertTrue(any("conflict=REN" in str(call) for call in log.call_args_list))
 
     def test_real_agent_block_flows_to_user_and_lead_payload(self):
@@ -2045,7 +2053,7 @@ Polygon Properties
                 text, import_type="lead", geo_records=[], development_records=[])
         user_payload = create.call_args_list[0].args[2]
         lead_payload = create.call_args_list[1].args[2]
-        self.assertEqual(user_payload["REN"], "E2265")
+        self.assertEqual(user_payload["REN"], "2265")
         self.assertEqual(lead_payload["ProposedAgentNameLead"], "Alex Goh")
         self.assertEqual(lead_payload["ProposedAgentNumberLead"], "60164697992")
         self.assertEqual(lead_payload["owner"], "user-agent")
