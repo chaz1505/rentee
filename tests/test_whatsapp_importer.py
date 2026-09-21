@@ -131,6 +131,32 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["budgetBuy"], 3500000)
         self.assertNotIn("budgetRent", payload)
 
+    def test_wtb_budget_range_uses_upper_value_as_maximum_budget(self):
+        message = """WTB Client looking to buy bungalow...
+Budget between 5m to 6m"""
+        response = SimpleNamespace(
+            status="completed",
+            output_text=json.dumps(full_model_output(
+                type="lead",
+                transaction_types=["Buy/Sell"],
+                property_types=["Landed"],
+                budget=6000000,
+            )),
+        )
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create:
+            parsed = importer.parse_forwarded_message(message, import_type="lead")
+
+        self.assertEqual(parsed["budget"], 6000000)
+        payload = importer.build_lead_payload(parsed, [], [])
+        self.assertEqual(payload["budgetBuy"], 6000000)
+        self.assertNotIn("budgetRent", payload)
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn("upper value as the single maximum budget", prompt)
+        self.assertIn("'Budget between 5m to 6m' means budget=6000000", prompt)
+        self.assertIn("RM3.5 mil/RM3.5 million=3500000", prompt)
+
     def test_new_imports_canonicalize_apartment_and_house(self):
         apartment = self.parse_as({
             "type": "lead", "property_types": ["Apartment"],
