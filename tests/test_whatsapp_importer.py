@@ -413,7 +413,7 @@ Tech subang"""
         self.assertIn("must not map to Petaling Jaya", prompt)
         self.assertNotIn("defensible broader area", prompt)
         self.assertNotIn("property search near/in", prompt)
-        self.assertIn("Never create a Geo for a road, street", prompt)
+        self.assertIn("applies to canonical_name being created", prompt)
         create.assert_not_called()
 
     def test_road_within_existing_geo_matches_that_same_area(self):
@@ -431,26 +431,32 @@ Tech subang"""
         create.assert_not_called()
 
     def test_missing_major_area_creates_proposed_geo(self):
-        response = SimpleNamespace(output_text=json.dumps({
-            "outcome": "create_geo", "geo_names": [],
-            "canonical_name": "Subang Jaya",
-        }))
-        geos = list(GEOS)
-        with patch.object(
-            importer.rentee_app.client.responses, "create", return_value=response
-        ), patch.object(
-            importer.rentee_app, "_bubble_create", return_value="geo-subang"
-        ) as create:
-            result = importer.verify_geo_reference(
-                "SS12, Subang Jaya", geos, {}, single=True
+        for reference in (
+            "Wangsa Baiduri (SS12), Subang Jaya", "SS12, Subang Jaya",
+        ):
+            response = SimpleNamespace(output_text=json.dumps({
+                "outcome": "create_geo", "geo_names": [],
+                "canonical_name": "Subang Jaya",
+            }))
+            geos = list(GEOS)
+            with self.subTest(reference=reference), patch.object(
+                importer.rentee_app.client.responses, "create", return_value=response
+            ) as verify, patch.object(
+                importer.rentee_app, "_bubble_create", return_value="geo-subang"
+            ) as create:
+                result = importer.verify_geo_reference(
+                    reference, geos, {}, single=True
+                )
+            create.assert_called_once_with(
+                importer.rentee_app.get_bubble_base_url("live"), "geo",
+                {"Name": "Subang Jaya", "status": "proposed"},
             )
-        create.assert_called_once_with(
-            importer.rentee_app.get_bubble_base_url("live"), "geo",
-            {"Name": "Subang Jaya", "status": "proposed"},
-        )
-        self.assertEqual(result[0]["outcome"], "create_geo")
-        self.assertEqual(result[0]["id"], "geo-subang")
-        self.assertEqual(geos[-1]["Name"], "Subang Jaya")
+            self.assertEqual(result[0]["outcome"], "create_geo")
+            self.assertEqual(result[0]["id"], "geo-subang")
+            self.assertEqual(geos[-1]["Name"], "Subang Jaya")
+            prompt = verify.call_args.kwargs["input"]
+            self.assertIn("not to the raw reference", prompt)
+            self.assertIn("Return unresolved only when no suitable recognised major parent", prompt)
 
     def test_road_or_tiny_area_remains_unresolved(self):
         response = SimpleNamespace(output_text=json.dumps({

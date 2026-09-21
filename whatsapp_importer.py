@@ -897,10 +897,16 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
                 "names exactly from CANONICAL GEOS. Propose "
                 "create_geo only when no appropriate existing Geo exists and canonical_name is "
                 "a meaningful recognised property-search area such as a city, township, or "
-                "established major neighbourhood. Canonicalise a specific location to that major "
-                "area when appropriate; for example Wangsa Baiduri, Subang Jaya becomes Subang "
-                "Jaya. Never create a Geo for a road, street, Development/condo, landmark, small "
-                "precinct or taman, or another overly granular location; return unresolved. " + (
+                "established major neighbourhood. A raw reference may itself be a road, taman, "
+                "small precinct, landmark, or other granular place: canonicalise it to its "
+                "recognised major parent property-search area when that parent can be confidently "
+                "established. For example, Wangsa Baiduri (SS12), Subang Jaya and SS12, Subang "
+                "Jaya both become create_geo with canonical_name Subang Jaya. The granularity "
+                "restriction applies to canonical_name being created, not to the raw reference. "
+                "Never create Wangsa Baiduri, SS12, a road, taman, small precinct, landmark, "
+                "Development/condo, or another overly granular place as a Geo. Return unresolved "
+                "only when no suitable recognised major parent property-search area can be "
+                "confidently established. " + (
                     "This is a Listing: match at most one existing Geo, and only with sufficient "
                     "evidence from its Development/location/context."
                     if single else
