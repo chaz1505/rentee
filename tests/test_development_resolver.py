@@ -178,6 +178,74 @@ class DevelopmentResolverTests(unittest.TestCase):
         self.assertEqual(result["reason"], "no_credible_property_match")
         create.assert_called_once()
 
+    def test_verifier_applies_geographic_context_before_ambiguity(self):
+        output = {
+            "status": "verified", "canonical_name": "Harbour Residences",
+            "geo_name": "George Town, Penang",
+            "verification_url": "https://example.com/harbour-residences",
+            "confidence": 0.96, "reason": "credible_match",
+        }
+        context = {"location_references": ["George Town, Penang"]}
+        with patch.object(
+            resolver.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ) as create, patch("builtins.print") as log:
+            result = resolver.verify_development_candidate(
+                "Harbour Residences Penang", context
+            )
+        self.assertEqual(result["status"], "verified")
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn(
+            "Apply geographic and contextual evidence before deciding", prompt
+        )
+        self.assertIn(
+            "geographic qualifiers in the candidate name as strong disambiguating evidence",
+            prompt,
+        )
+        self.assertIn(
+            "after applying all available geographic and contextual evidence", prompt
+        )
+        self.assertIn("George Town, Penang", prompt)
+        rendered = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("status=verified", rendered)
+        self.assertIn("reason='credible_match'", rendered)
+        self.assertIn("confidence=0.96", rendered)
+        self.assertIn("canonical='Harbour Residences'", rendered)
+        self.assertIn("geo='George Town, Penang'", rendered)
+        self.assertIn(
+            "verification_url='https://example.com/harbour-residences'", rendered
+        )
+
+    def test_ambiguous_and_not_found_logs_include_returned_details(self):
+        cases = (
+            {
+                "status": "ambiguous", "canonical_name": "Possible Residence",
+                "geo_name": "Kuala Lumpur",
+                "verification_url": "https://example.com/possible",
+                "confidence": 0.55, "reason": "multiple_plausible_candidates",
+            },
+            {
+                "status": "not_found", "canonical_name": None,
+                "geo_name": None, "verification_url": None,
+                "confidence": 0.12, "reason": "no_credible_property_match",
+            },
+        )
+        for output in cases:
+            with self.subTest(status=output["status"]), patch.object(
+                resolver.rentee_app.client.responses, "create",
+                return_value=SimpleNamespace(output_text=json.dumps(output)),
+            ), patch("builtins.print") as log:
+                resolver.verify_development_candidate("Candidate", {})
+            rendered = " ".join(str(call.args[0]) for call in log.call_args_list)
+            self.assertIn(f"status={output['status']}", rendered)
+            self.assertIn(f"reason={output['reason']!r}", rendered)
+            self.assertIn(f"confidence={output['confidence']!r}", rendered)
+            self.assertIn(f"canonical={output['canonical_name']!r}", rendered)
+            self.assertIn(f"geo={output['geo_name']!r}", rendered)
+            self.assertIn(
+                f"verification_url={output['verification_url']!r}", rendered
+            )
+
     def test_verifier_recovers_fenced_json_without_retry(self):
         output = {
             "status": "not_found", "canonical_name": None, "geo_name": None,

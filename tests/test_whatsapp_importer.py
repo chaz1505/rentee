@@ -456,7 +456,10 @@ Tech subang"""
             self.assertEqual(geos[-1]["Name"], "Subang Jaya")
             prompt = verify.call_args.kwargs["input"]
             self.assertIn("not to the raw reference", prompt)
-            self.assertIn("Return unresolved only when no suitable recognised major parent", prompt)
+            self.assertIn(
+                "no suitable recognised parent at appropriate property-search granularity",
+                prompt,
+            )
 
     def test_road_or_tiny_area_remains_unresolved(self):
         response = SimpleNamespace(output_text=json.dumps({
@@ -468,6 +471,25 @@ Tech subang"""
             result = importer.verify_geo_reference("Jalan SS 12/1", GEOS, {})
         self.assertEqual(result, [])
         create.assert_not_called()
+
+    def test_overly_broad_areas_remain_unresolved_without_geo_creation(self):
+        for reference in ("KL City Area", "Kuala Lumpur", "Selangor"):
+            response = SimpleNamespace(output_text=json.dumps({
+                "outcome": "unresolved", "geo_names": [], "canonical_name": None,
+            }))
+            with self.subTest(reference=reference), patch.object(
+                importer.rentee_app.client.responses, "create", return_value=response
+            ) as verify, patch.object(
+                importer.rentee_app, "_bubble_create"
+            ) as create:
+                result = importer.verify_geo_reference(reference, GEOS, {})
+            self.assertEqual(result, [])
+            create.assert_not_called()
+            prompt = verify.call_args.kwargs["input"]
+            self.assertIn("entire city or metropolitan region", prompt)
+            self.assertIn("a state, a country", prompt)
+            self.assertIn("too granular or too broad", prompt)
+            self.assertIn("SS12, Subang Jaya", prompt)
 
     def test_created_geo_is_immediately_used_by_development_and_current_import(self):
         verification = {

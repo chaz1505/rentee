@@ -904,9 +904,18 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
                 "Jaya both become create_geo with canonical_name Subang Jaya. The granularity "
                 "restriction applies to canonical_name being created, not to the raw reference. "
                 "Never create Wangsa Baiduri, SS12, a road, taman, small precinct, landmark, "
-                "Development/condo, or another overly granular place as a Geo. Return unresolved "
-                "only when no suitable recognised major parent property-search area can be "
-                "confidently established. " + (
+                "Development/condo, or another overly granular place as a Geo. Equally, never "
+                "create a Geo that is too broad: an entire city or metropolitan region normally "
+                "divided into multiple distinct property-search areas, a state, a country, or a "
+                "vague broad region. create_geo is only appropriate for a recognised property-"
+                "search area at useful Rentee search granularity. For example, KL City Area or "
+                "Kuala Lumpur must not create Kuala Lumpur, and Selangor must not create Selangor. "
+                "If a meaningful input identifies only an overly broad area, return unresolved "
+                "so the original location reference can be preserved. Apply this symmetrically: "
+                "do not create a Geo that is too granular or too broad; create only an appropriate "
+                "intermediate-granularity property-search area. Return unresolved "
+                "only when no suitable recognised parent at appropriate property-search "
+                "granularity can be confidently established. " + (
                     "This is a Listing: match at most one existing Geo, and only with sufficient "
                     "evidence from its Development/location/context."
                     if single else

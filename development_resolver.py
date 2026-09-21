@@ -189,7 +189,16 @@ def verify_development_candidate(raw_name: str, context: dict,
                 "malls, landmarks, offices, and stations are disambiguation context only and "
                 "must never be returned as a Development or residential Geo. Return verified "
                 "with reason credible_match only for a confident, unambiguous real project, its "
-                "canonical name, residential area, and one strong source URL. canonical_name must "
+                "canonical name, residential area, and one strong source URL. Apply geographic "
+                "and contextual evidence before deciding that candidates are ambiguous. Treat "
+                "geographic qualifiers in the candidate name as strong disambiguating evidence, "
+                "and also use location information from the WhatsApp import context. A Development "
+                "in a different area is not a competing plausible candidate when the supplied "
+                "geography clearly points elsewhere. Accept normal name variations when credible "
+                "web evidence confirms they refer to the same Development. Return reason "
+                "multiple_plausible_candidates only when two or more distinct residential "
+                "Developments remain plausible after applying all available geographic and "
+                "contextual evidence. canonical_name must "
                 "be the clean official property name suitable for storage/display, without aliases "
                 "or explanatory text in brackets or parentheses; for example return 'Residensi "
                 "Sefina', not \"Residensi Sefina (Residensi Sefina Mont' Kiara)\", and return "
@@ -305,14 +314,12 @@ def verify_development_candidate(raw_name: str, context: dict,
                   "reason": reason}
     else:
         return _verification_error(raw, "schema_validation_failed", value)
-    log_details = ""
-    if result["reason"] == "verification_confidence_below_threshold":
-        log_details = (
-            f" confidence={float(confidence)!r}"
-            f" canonical={_compact(value['canonical_name'])!r}"
-            f" geo={_compact(value['geo_name'])!r}"
-            f" verification_url={value['verification_url']!r}"
-        )
+    log_details = (
+        f" confidence={float(confidence)!r}"
+        f" canonical={_compact(value['canonical_name']) or None!r}"
+        f" geo={_compact(value['geo_name']) or None!r}"
+        f" verification_url={value['verification_url']!r}"
+    )
     print(f"[DEVELOPMENT VERIFY] raw={raw!r} status={result['status']} "
           f"reason={result['reason']!r}{log_details}", flush=True)
     return result
