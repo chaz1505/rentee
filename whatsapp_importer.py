@@ -824,10 +824,14 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
             model="gpt-5-mini", tools=[{"type": "web_search"}],
             input=(
                 "Resolve this Malaysian property location reference for Rentee. Return exactly "
-                "one outcome: match_existing, create_geo, or unresolved. Always prefer an "
-                "appropriate existing canonical Geo, including a defensible broader area; for "
-                "example Bandar Puchong Jaya must map to existing Puchong rather than create a "
-                "new Geo. For match_existing, copy names exactly from CANONICAL GEOS. Propose "
+                "one outcome: match_existing, create_geo, or unresolved. Use match_existing only "
+                "when the requested location is actually within that canonical Geo, or is an "
+                "alternative or more-specific name for the same geographic area. Do not match "
+                "an existing Geo merely because it is nearby, in the same metropolitan area, or "
+                "would be a reasonable alternative property-search area. For example, Bandar "
+                "Puchong Jaya maps to existing Puchong and Jalan Maarof maps to existing Bangsar, "
+                "but SS12, Subang Jaya must not map to Petaling Jaya. For match_existing, copy "
+                "names exactly from CANONICAL GEOS. Propose "
                 "create_geo only when no appropriate existing Geo exists and canonical_name is "
                 "a meaningful recognised property-search area such as a city, township, or "
                 "established major neighbourhood. Canonicalise a specific location to that major "
@@ -837,10 +841,8 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
                     "This is a Listing: match at most one existing Geo, and only with sufficient "
                     "evidence from its Development/location/context."
                     if single else
-                    "This is a Lead: return every canonical Geo that reasonably represents a "
-                    "property search near/in the reference, including a broader canonical Geo "
-                    "when the reference is a specific place within or around it and that mapping "
-                    "is geographically defensible. Do not add merely adjacent areas."
+                    "This is a Lead: return every canonical Geo that satisfies the same strict "
+                    "same-area rule. Do not add adjacent or nearby areas."
                 ) +
                 f"\n\nLOCATION REFERENCE:\n{raw}\n\nCANONICAL GEOS:\n"
                 f"{json.dumps(canonical_names, ensure_ascii=False)}\n\nCONTEXT:\n"

@@ -366,8 +366,25 @@ Budget between 5m to 6m"""
         self.assertEqual([item["id"] for item in result], ["geo-puchong"])
         self.assertEqual(result[0]["outcome"], "match_existing")
         prompt = verify.call_args.kwargs["input"]
-        self.assertIn("Always prefer an appropriate existing canonical Geo", prompt)
+        self.assertIn("actually within that canonical Geo", prompt)
+        self.assertIn("must not map to Petaling Jaya", prompt)
+        self.assertNotIn("defensible broader area", prompt)
+        self.assertNotIn("property search near/in", prompt)
         self.assertIn("Never create a Geo for a road, street", prompt)
+        create.assert_not_called()
+
+    def test_road_within_existing_geo_matches_that_same_area(self):
+        response = SimpleNamespace(output_text=json.dumps({
+            "outcome": "match_existing", "geo_names": ["Bangsar"],
+            "canonical_name": None,
+        }))
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ), patch.object(importer.rentee_app, "_bubble_create") as create:
+            result = importer.verify_geo_reference(
+                "Jalan Maarof", GEOS, {}, single=True
+            )
+        self.assertEqual([item["id"] for item in result], ["geo-bangsar"])
         create.assert_not_called()
 
     def test_missing_major_area_creates_proposed_geo(self):
@@ -382,7 +399,7 @@ Budget between 5m to 6m"""
             importer.rentee_app, "_bubble_create", return_value="geo-subang"
         ) as create:
             result = importer.verify_geo_reference(
-                "Wangsa Baiduri, Subang Jaya", geos, {}, single=True
+                "SS12, Subang Jaya", geos, {}, single=True
             )
         create.assert_called_once_with(
             importer.rentee_app.get_bubble_base_url("live"), "geo",
