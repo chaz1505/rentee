@@ -157,6 +157,49 @@ Budget between 5m to 6m"""
         self.assertIn("'Budget between 5m to 6m' means budget=6000000", prompt)
         self.assertIn("RM3.5 mil/RM3.5 million=3500000", prompt)
 
+    def test_agent_and_agency_metadata_are_not_location_references(self):
+        message = """WTB
+
+Boulevard Subang Jaya
+Budget 500k
+Viewing next week
+
+Stephanie
+0122017185
+Ren29187
+Tech subang"""
+        response = SimpleNamespace(
+            status="completed",
+            output_text=json.dumps(full_model_output(
+                type="lead",
+                location_references=[
+                    "Boulevard Subang Jaya", "Subang Jaya",
+                    "Stephanie", "Tech subang",
+                ],
+                preferred_development_names=["Boulevard Subang Jaya"],
+                transaction_types=["Buy/Sell"],
+                budget=500000,
+                source_agency_name="Tech subang",
+                proposing_agent={
+                    "name": "Stephanie", "phone": "0122017185", "ren": "Ren29187",
+                },
+            )),
+        )
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as create:
+            parsed = importer.parse_forwarded_message(message, import_type="lead")
+
+        self.assertEqual(parsed["location_references"], [
+            "Boulevard Subang Jaya", "Subang Jaya",
+        ])
+        self.assertEqual(parsed["source_agency_name"], "Tech subang")
+        self.assertEqual(parsed["proposing_agent"]["name"], "Stephanie")
+        prompt = create.call_args.kwargs["input"]
+        self.assertIn(
+            "must not also be extracted as a location or Development", prompt
+        )
+
     def test_new_imports_canonicalize_apartment_and_house(self):
         apartment = self.parse_as({
             "type": "lead", "property_types": ["Apartment"],

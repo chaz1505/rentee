@@ -242,6 +242,19 @@ def _location_references(values: Iterable[Any]) -> list[str]:
     return _unique_strings(result)
 
 
+def _without_agent_metadata_locations(values, proposing_agent, source_agency_name):
+    metadata_keys = {
+        " ".join(re.sub(r"[^a-z0-9]+", " ", _compact(value).casefold()).split())
+        for value in (
+            (proposing_agent or {}).get("name"), source_agency_name,
+        )
+        if _compact(value)
+    }
+    return [value for value in values or [] if " ".join(re.sub(
+        r"[^a-z0-9]+", " ", _compact(value).casefold()
+    ).split()) not in metadata_keys]
+
+
 def _canonical_property_type(value: Any) -> str | None:
     return {
         "condo": "Condo", "apartment": "Condo",
@@ -294,6 +307,10 @@ def _validate_parsed(value: Any) -> dict:
                 result[key] = _compact(value[key])
         if _compact(value.get("source_agency_name")):
             result["source_agency_name"] = _compact(value["source_agency_name"])
+        result["location_references"] = _without_agent_metadata_locations(
+            result["location_references"], proposing_agent,
+            result.get("source_agency_name"),
+        )
         if _compact(value.get("lead_name")):
             result["lead_name"] = _compact(value["lead_name"])
         furnishing = value.get("furnishing_preference")
@@ -347,6 +364,12 @@ def _validate_parsed(value: Any) -> dict:
     for key in ("unit_number", "owner_name", "owner_contact", "source_agency_name", "notes"):
         if _compact(value.get(key)):
             result[key] = _compact(value[key])
+    filtered_location_references = _without_agent_metadata_locations(
+        [result.get("location_reference")], proposing_agent,
+        result.get("source_agency_name"),
+    )
+    if not filtered_location_references:
+        result.pop("location_reference", None)
     return result
 
 
@@ -419,8 +442,11 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "mobile numbers remain ambiguous. Do not mistake the buyer, tenant, client, owner, "
             "team, agency, or agency registration number for "
             "the proposing agent. For both Leads and Listings, put the agent signature's agency "
-            "or company name in source_agency_name. Never invent agent fields. Return "
-            "null/empty values when evidence is weak; do not invent facts. For unknown, leave "
+            "or company name in source_agency_name. Never invent agent fields. "
+            "Text identified as an agent name, agency/company name, phone number, or REN number "
+            "must not also be extracted as a location or Development unless the message "
+            "explicitly uses that text as part of the property requirement. Return null/empty "
+            "values when evidence is weak; do not invent facts. For unknown, leave "
             "all other fields empty/null. For leads, extract adults, children, nationality, "
             "occupation, pets, furnishing preference, minimum bathrooms, helpers, and exact "
             "move-in/start dates only when explicitly and clearly stated. Absence never means "
@@ -848,7 +874,7 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
                 f"{json.dumps(canonical_names, ensure_ascii=False)}\n\nCONTEXT:\n"
                 f"{json.dumps(focused_context, ensure_ascii=False)}"
             ),
-            reasoning={"effort": "low"}, max_output_tokens=300, timeout=20,
+            reasoning={"effort": "low"}, max_output_tokens=800, timeout=20,
             text={"format": {"type": "json_schema", "name": "geo_verification",
                 "strict": True, "schema": {
                     "type": "object", "properties": {
