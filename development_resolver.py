@@ -392,6 +392,7 @@ def resolve_or_create_development(raw_name: str, context: dict,
         try:
             verified_geos = geo_verifier(
                 verification["geo_name"], geo_records, context, single=True,
+                bubble_env=bubble_env,
             )
         except Exception as error:
             print(f"[DEVELOPMENT CREATE] canonical={verification['canonical_name']!r} "
@@ -414,6 +415,7 @@ def resolve_or_create_development(raw_name: str, context: dict,
                 "canonical_name": canonical["name"],
                 "development_id": canonical["id"], "geo_id": resolved_geo["id"],
                 "geo_name": resolved_geo["name"], "record": canonical["record"],
+                "geo_record": resolved_geo.get("record"),
                 "method": canonical["method"],
                 "verification_url": verification["verification_url"]}
     created = create_verified_development(
@@ -428,5 +430,6 @@ def resolve_or_create_development(raw_name: str, context: dict,
             "raw_name": raw, "canonical_name": created["name"],
             "development_id": created["id"], "geo_id": resolved_geo["id"],
             "geo_name": resolved_geo["name"], "record": created["record"],
+            "geo_record": resolved_geo.get("record"),
             "method": created.get("method"),
             "verification_url": verification["verification_url"]}

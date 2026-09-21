@@ -351,6 +351,103 @@ Budget between 5m to 6m"""
             str(call) for call in log.call_args_list
         ))
 
+    def test_unknown_subarea_prefers_existing_broader_geo_without_creation(self):
+        geos = GEOS + [{"_id": "geo-puchong", "Name": "Puchong"}]
+        response = SimpleNamespace(output_text=json.dumps({
+            "outcome": "match_existing", "geo_names": ["Puchong"],
+            "canonical_name": None,
+        }))
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ) as verify, patch.object(importer.rentee_app, "_bubble_create") as create:
+            result = importer.verify_geo_reference(
+                "Bandar Puchong Jaya", geos, {}, single=True
+            )
+        self.assertEqual([item["id"] for item in result], ["geo-puchong"])
+        self.assertEqual(result[0]["outcome"], "match_existing")
+        prompt = verify.call_args.kwargs["input"]
+        self.assertIn("Always prefer an appropriate existing canonical Geo", prompt)
+        self.assertIn("Never create a Geo for a road, street", prompt)
+        create.assert_not_called()
+
+    def test_missing_major_area_creates_proposed_geo(self):
+        response = SimpleNamespace(output_text=json.dumps({
+            "outcome": "create_geo", "geo_names": [],
+            "canonical_name": "Subang Jaya",
+        }))
+        geos = list(GEOS)
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ), patch.object(
+            importer.rentee_app, "_bubble_create", return_value="geo-subang"
+        ) as create:
+            result = importer.verify_geo_reference(
+                "Wangsa Baiduri, Subang Jaya", geos, {}, single=True
+            )
+        create.assert_called_once_with(
+            importer.rentee_app.get_bubble_base_url("live"), "geo",
+            {"Name": "Subang Jaya", "status": "proposed"},
+        )
+        self.assertEqual(result[0]["outcome"], "create_geo")
+        self.assertEqual(result[0]["id"], "geo-subang")
+        self.assertEqual(geos[-1]["Name"], "Subang Jaya")
+
+    def test_road_or_tiny_area_remains_unresolved(self):
+        response = SimpleNamespace(output_text=json.dumps({
+            "outcome": "unresolved", "geo_names": [], "canonical_name": None,
+        }))
+        with patch.object(
+            importer.rentee_app.client.responses, "create", return_value=response
+        ), patch.object(importer.rentee_app, "_bubble_create") as create:
+            result = importer.verify_geo_reference("Jalan SS 12/1", GEOS, {})
+        self.assertEqual(result, [])
+        create.assert_not_called()
+
+    def test_created_geo_is_immediately_used_by_development_and_current_import(self):
+        verification = {
+            "status": "verified", "canonical_name": "The Boulevard",
+            "geo_name": "Wangsa Baiduri, Subang Jaya",
+            "verification_url": "https://example.com/the-boulevard",
+            "confidence": 0.97, "reason": "credible_match",
+        }
+        geo_response = SimpleNamespace(output_text=json.dumps({
+            "outcome": "create_geo", "geo_names": [],
+            "canonical_name": "Subang Jaya",
+        }))
+        cases = (
+            ("lead", {
+                "type": "lead", "geo_names": [], "location_references": [],
+                "preferred_development_names": ["The Boulevard"],
+                "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            }),
+            ("listing", {
+                "type": "listing", "development_name": "The Boulevard",
+                "transaction_types": ["Rent/Let"], "price_rent": 5000,
+            }),
+        )
+        for import_type, parsed in cases:
+            with self.subTest(import_type=import_type), \
+                 patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+                 patch.object(importer.development_resolver, "verify_development_candidate",
+                              return_value=verification), \
+                 patch.object(importer.development_resolver,
+                              "_fresh_development_records", return_value=[]), \
+                 patch.object(importer.rentee_app.client.responses, "create",
+                              return_value=geo_response), \
+                 patch.object(importer.rentee_app, "_bubble_create",
+                              side_effect=["geo-subang", "dev-boulevard", "import-1"]) as create:
+                importer.process_whatsapp_import(
+                    "The Boulevard", import_type=import_type,
+                    geo_records=list(GEOS), development_records=[],
+                )
+            geo_call, development_call, import_call = create.call_args_list
+            self.assertEqual(geo_call.args[2], {
+                "Name": "Subang Jaya", "status": "proposed",
+            })
+            self.assertEqual(development_call.args[2]["Geo"], "geo-subang")
+            expected_geo = ["geo-subang"] if import_type == "lead" else "geo-subang"
+            self.assertEqual(import_call.args[2]["Geo"], expected_geo)
+
     def test_lead_fallback_combines_and_deduplicates_existing_geos(self):
         parsed = {
             "type": "lead", "location_references": ["Sultan Ismail"],
@@ -1607,6 +1704,7 @@ Polygon Properties
             )
         verify_geo.assert_called_once_with(
             "Bangsar Township", GEOS, unittest.mock.ANY, single=True,
+            bubble_env="live",
         )
         development_payload = create.call_args_list[0].args[2]
         listing_payload = create.call_args_list[1].args[2]

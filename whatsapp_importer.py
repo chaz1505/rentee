@@ -783,11 +783,37 @@ def resolve_geo_names(names, geo_records):
     return [resolve_geo_name(name, geo_records) for name in names or []]
 
 
-def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
-    """Map one unresolved location reference only to existing Bubble Geos."""
+def _create_proposed_geo(canonical_name, geo_records, bubble_env="live"):
+    canonical = _compact(canonical_name)
+    if not canonical:
+        return None
+    existing = resolve_geo_name(canonical, geo_records)
+    if existing.get("matched"):
+        existing["outcome"] = "match_existing"
+        return existing
+    payload = {"Name": canonical, "status": "proposed"}
+    try:
+        geo_id = rentee_app._bubble_create(
+            rentee_app.get_bubble_base_url(bubble_env), "geo", payload
+        )
+    except Exception as error:
+        print(f"[GEO CREATE] canonical={canonical!r} action=failed "
+              f"error={type(error).__name__}", flush=True)
+        return None
+    record = {"_id": geo_id, **payload}
+    geo_records.append(record)
+    print(f"[GEO CREATE] canonical={canonical!r} action=created id={geo_id}", flush=True)
+    return {"matched": True, "id": str(geo_id), "name": canonical,
+            "method": "verified_created", "record": record, "created": True,
+            "outcome": "create_geo"}
+
+
+def verify_geo_reference(raw_reference, geo_records, context, *, single=False,
+                         bubble_env="live"):
+    """Resolve a location to existing Geos or create one verified major area."""
     raw = _compact(raw_reference)
     canonical_names = _unique_strings(_record_name(item) for item in geo_records or [])
-    if not raw or not canonical_names:
+    if not raw:
         print(f"[GEO VERIFY] raw={raw!r} status=unresolved", flush=True)
         return []
     focused_context = {
@@ -797,13 +823,19 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
     request = dict(
             model="gpt-5-mini", tools=[{"type": "web_search"}],
             input=(
-                "Map this Malaysian property location reference to Rentee's existing canonical "
-                "Geo records. It may be a road, landmark, neighbourhood, or other real-world "
-                "location description. Return only names copied exactly from CANONICAL GEOS; "
-                "never invent or create a Geo. Return an empty list if there is no reasonable "
-                "mapping. " + (
-                    "This is a Listing: return at most one Geo, and only with sufficient evidence "
-                    "from its Development/location/context; otherwise return an empty list."
+                "Resolve this Malaysian property location reference for Rentee. Return exactly "
+                "one outcome: match_existing, create_geo, or unresolved. Always prefer an "
+                "appropriate existing canonical Geo, including a defensible broader area; for "
+                "example Bandar Puchong Jaya must map to existing Puchong rather than create a "
+                "new Geo. For match_existing, copy names exactly from CANONICAL GEOS. Propose "
+                "create_geo only when no appropriate existing Geo exists and canonical_name is "
+                "a meaningful recognised property-search area such as a city, township, or "
+                "established major neighbourhood. Canonicalise a specific location to that major "
+                "area when appropriate; for example Wangsa Baiduri, Subang Jaya becomes Subang "
+                "Jaya. Never create a Geo for a road, street, Development/condo, landmark, small "
+                "precinct or taman, or another overly granular location; return unresolved. " + (
+                    "This is a Listing: match at most one existing Geo, and only with sufficient "
+                    "evidence from its Development/location/context."
                     if single else
                     "This is a Lead: return every canonical Geo that reasonably represents a "
                     "property search near/in the reference, including a broader canonical Geo "
@@ -818,9 +850,13 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
             text={"format": {"type": "json_schema", "name": "geo_verification",
                 "strict": True, "schema": {
                     "type": "object", "properties": {
+                        "outcome": {"type": "string", "enum": [
+                            "match_existing", "create_geo", "unresolved"]},
                         "geo_names": {"type": "array", "items": {"type": "string"}},
+                        "canonical_name": {"type": ["string", "null"]},
                     },
-                    "required": ["geo_names"], "additionalProperties": False,
+                    "required": ["outcome", "geo_names", "canonical_name"],
+                    "additionalProperties": False,
                 }}},
         )
     try:
@@ -842,7 +878,20 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
         print(f"[GEO VERIFY] raw={raw!r} status=unresolved "
               f"error={type(error).__name__}: {error}", flush=True)
         return []
+    # Accept the former response shape for compatibility with an in-flight retry.
+    outcome = value.get("outcome") or (
+        "match_existing" if value.get("geo_names") else "unresolved"
+    )
     requested = _unique_strings(value.get("geo_names") or [])
+    if outcome == "create_geo":
+        created = _create_proposed_geo(
+            value.get("canonical_name"), geo_records, bubble_env
+        )
+        if created:
+            return [created]
+        outcome = "unresolved"
+    if outcome != "match_existing":
+        requested = []
     if single and len(requested) > 1:
         requested = []
     resolved = resolve_geo_names(requested, geo_records)
@@ -850,6 +899,8 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
     if len(matches) != len(requested):
         matches = []
     if matches:
+        for match in matches:
+            match["outcome"] = "match_existing"
         print(f"[GEO VERIFY] raw={raw!r} resolved="
               f"{[item['name'] for item in matches]!r}", flush=True)
     else:
@@ -857,7 +908,8 @@ def verify_geo_reference(raw_reference, geo_records, context, *, single=False):
     return matches
 
 
-def resolve_location_references(references, geo_records, context, *, single=False):
+def resolve_location_references(references, geo_records, context, *, single=False,
+                                bubble_env="live"):
     resolutions = []
     for reference in _unique_strings(references):
         direct = resolve_geo_name(reference, geo_records)
@@ -865,7 +917,7 @@ def resolve_location_references(references, geo_records, context, *, single=Fals
             resolutions.append(direct)
             continue
         fallback = verify_geo_reference(
-            reference, geo_records, context, single=single
+            reference, geo_records, context, single=single, bubble_env=bubble_env
         )
         if fallback:
             resolutions.extend(fallback)
@@ -919,6 +971,12 @@ def _resolve_or_verify_developments(names, development_records, geo_records,
                 "resolver_status": outcome.get("status"),
             })
             continue
+        created_geo = outcome.get("geo_record")
+        if created_geo and not any(
+            str(item.get("_id")) == str(created_geo.get("_id"))
+            for item in geo_records
+        ):
+            geo_records.append(created_geo)
         resolution = {
             "matched": True,
             "id": str(outcome["development_id"]),
@@ -1554,7 +1612,8 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         has_development = any(item.get("matched") for item in developments)
         if not has_geo and not has_development:
             geos = resolve_location_references(
-                location_references, geo_records, verification_context
+                location_references, geo_records, verification_context,
+                bubble_env=bubble_env,
             )
             has_geo = any(item.get("matched") for item in geos)
         if not has_geo:
@@ -1613,7 +1672,8 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         )
         if not resolved_geo and location_reference:
             fallback = resolve_location_references(
-                [location_reference], geo_records, verification_context, single=True
+                [location_reference], geo_records, verification_context, single=True,
+                bubble_env=bubble_env,
             )
             resolved_geo = next(
                 (item for item in fallback if item.get("matched")), None

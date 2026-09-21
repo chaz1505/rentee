@@ -82,7 +82,7 @@ class DevelopmentResolverTests(unittest.TestCase):
             )
         geo_verifier.assert_called_once_with(
             "Lakeview Township", GEOS, {"raw_text": "Lakeview listing"},
-            single=True,
+            single=True, bubble_env="live",
         )
         self.assertEqual(result["status"], "resolved")
         self.assertEqual(result["action"], "created")
