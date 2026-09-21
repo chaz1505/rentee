@@ -48,7 +48,7 @@ def full_model_output(**updates):
         "family_room": None, "maid_room": None, "outdoor_area": None,
         "unit_number": None, "owner_name": None, "owner_contact": None,
         "source_agency_name": None,
-        "proposing_agent": {"name": None, "phone": None, "ren": None},
+        "proposing_agent": {"name": None, "phone": None, "ren": None, "pea": None},
     }
     value.update(updates)
     return value
@@ -2120,6 +2120,16 @@ Polygon Properties
             ["74405", "74405", "74405"],
         )
 
+    def test_pea_normalization_uses_digits_only_and_types_do_not_cross(self):
+        self.assertEqual(
+            [importer._normalized_pea(value) for value in (
+                "PEA2495", "PEA 2495", "PEA-2495",
+            )],
+            ["2495", "2495", "2495"],
+        )
+        self.assertIsNone(importer._normalized_ren("PEA2495"))
+        self.assertIsNone(importer._normalized_pea("REN29187"))
+
     def test_existing_proposing_agent_is_reused_without_create(self):
         user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
                 "REN": "E2265", "email": "alex@example.com"}
@@ -2147,6 +2157,89 @@ Polygon Properties
             },
         ))
         self.assertEqual(result["user_id"], "user-new")
+        self.assertNotIn("PEA", create.call_args.args[2])
+
+    def test_new_pea_agent_creation_never_populates_ren(self):
+        for registration in ("PEA2495", "PEA 2495", "PEA-2495"):
+            with self.subTest(registration=registration), \
+                 patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                              return_value=[]), \
+                 patch.object(importer.rentee_app, "_bubble_create",
+                              return_value="user-new") as create:
+                result = importer.resolve_or_create_proposing_agent(
+                    "Samantha", "0123777823", None, pea=registration
+                )
+            payload = create.call_args.args[2]
+            self.assertEqual(payload["PEA"], "2495")
+            self.assertNotIn("REN", payload)
+            self.assertEqual(result["pea"], "2495")
+            self.assertIsNone(result["ren"])
+
+    def test_existing_user_gets_pea_without_overwriting_ren(self):
+        user = {
+            "_id": "user-samantha", "phone": "60123777823",
+            "name": "Samantha", "REN": "29187", "PEA": "",
+        }
+        with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[user]), \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer.resolve_or_create_proposing_agent(
+                "Samantha", "0123777823", None, pea="PEA-2495"
+            )
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/user-samantha",
+            {"PEA": "2495"},
+        )
+        self.assertEqual(result["user"]["REN"], "29187")
+        self.assertEqual(result["user"]["PEA"], "2495")
+
+    def test_wtr_pea_signature_creates_separate_pea_agent_and_agency(self):
+        message = """WTR
+
+Samantha PEA2495
+0123777823
+Knight World Realty"""
+        output = full_model_output(
+            type="lead", transaction_types=["Rent/Let"],
+            location_references=["PEA2495"],
+            source_agency_name="Knight World Realty",
+            proposing_agent={
+                "name": "Samantha", "phone": "0123777823",
+                "ren": None, "pea": "PEA2495",
+            },
+        )
+        with patch.object(
+            importer.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(
+                status="completed", output_text=json.dumps(output)
+            ),
+        ) as parse:
+            parsed = importer.parse_forwarded_message(message, import_type="lead")
+        self.assertEqual(parsed["proposing_agent"], {
+            "name": "Samantha", "phone": "0123777823",
+            "ren": None, "pea": "PEA2495",
+        })
+        self.assertEqual(parsed["location_references"], [])
+        prompt = parse.call_args.kwargs["input"]
+        self.assertIn("PEA2495, PEA 2495, and PEA-2495", prompt)
+
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "find_bubble_users_by_phone",
+                          return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["agency-knight", "user-samantha", "lead-1"]) as create:
+            importer.process_whatsapp_import(
+                message, import_type="lead", geo_records=[], development_records=[]
+            )
+        agency_payload = create.call_args_list[0].args[2]
+        user_payload = create.call_args_list[1].args[2]
+        self.assertEqual(agency_payload, {"name": "Knight World Realty"})
+        self.assertEqual(user_payload["name"], "Samantha")
+        self.assertEqual(user_payload["phone"], "60123777823")
+        self.assertEqual(user_payload["PEA"], "2495")
+        self.assertNotIn("REN", user_payload)
+        self.assertEqual(user_payload["Agency"], "agency-knight")
 
     def test_existing_agency_resolves_with_case_and_punctuation_variation(self):
         agencies = [{"_id": "agency-propnex", "name": "PropNex Realty Sdn Bhd"}]

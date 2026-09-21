@@ -156,8 +156,9 @@ PARSER_SCHEMA = {
                 "name": {"type": ["string", "null"]},
                 "phone": {"type": ["string", "null"]},
                 "ren": {"type": ["string", "null"]},
+                "pea": {"type": ["string", "null"]},
             },
-            "required": ["name", "phone", "ren"],
+            "required": ["name", "phone", "ren", "pea"],
             "additionalProperties": False,
         },
     },
@@ -246,7 +247,10 @@ def _without_agent_metadata_locations(values, proposing_agent, source_agency_nam
     metadata_keys = {
         " ".join(re.sub(r"[^a-z0-9]+", " ", _compact(value).casefold()).split())
         for value in (
-            (proposing_agent or {}).get("name"), source_agency_name,
+            (proposing_agent or {}).get("name"),
+            (proposing_agent or {}).get("ren"),
+            (proposing_agent or {}).get("pea"),
+            source_agency_name,
         )
         if _compact(value)
     }
@@ -280,6 +284,8 @@ def _validate_parsed(value: Any) -> dict:
         key: (_compact(raw_agent.get(key)) or None)
         for key in ("name", "phone", "ren")
     }
+    if _compact(raw_agent.get("pea")):
+        proposing_agent["pea"] = _compact(raw_agent["pea"])
 
     if value["type"] == "lead":
         result = {
@@ -435,7 +441,9 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "end the message and contain an individual's name, team name, 'Real Estate "
             "Negotiator', REN number, mobile number, agency/company name, agency registration, "
             "and office number. Use the individual person's name, not the team or agency. "
-            "Registration forms include REN 12345, REN12345, E2265, and PEA 1234. When both an "
+            "Registration forms include REN 12345, REN12345, E2265, PEA2495, PEA 2495, and "
+            "PEA-2495. Put REN/E registrations only in proposing_agent.ren and PEA registrations "
+            "only in proposing_agent.pea; never copy one registration type into the other. When both an "
             "individual Malaysian mobile (+601/01) and an office or landline (+603/03) appear in "
             "that signature, select the mobile as proposing_agent.phone and do not treat the "
             "office number as ambiguous. Leave phone null only when multiple plausible individual "
@@ -443,7 +451,7 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "team, agency, or agency registration number for "
             "the proposing agent. For both Leads and Listings, put the agent signature's agency "
             "or company name in source_agency_name. Never invent agent fields. "
-            "Text identified as an agent name, agency/company name, phone number, or REN number "
+            "Text identified as an agent name, agency/company name, phone number, REN number, or PEA number "
             "must not also be extracted as a location or Development unless the message "
             "explicitly uses that text as part of the property requirement. Return null/empty "
             "values when evidence is weak; do not invent facts. For unknown, leave "
@@ -511,9 +519,21 @@ def _agent_value(value):
     return _compact(value) or None
 
 
-def _normalized_ren(value):
-    digits = re.sub(r"\D", "", str(value or ""))
+def _normalized_registration(value, registration_type):
+    text = _compact(value).upper()
+    prefix = r"(?:REN|E)" if registration_type == "REN" else r"PEA"
+    if not re.fullmatch(rf"(?:{prefix}(?:\s|-)*)?\d+", text):
+        return None
+    digits = re.sub(r"\D", "", text)
     return digits or None
+
+
+def _normalized_ren(value):
+    return _normalized_registration(value, "REN")
+
+
+def _normalized_pea(value):
+    return _normalized_registration(value, "PEA")
 
 
 def _normalized_agency_name(value):
@@ -558,11 +578,12 @@ def _resolve_or_create_agency(source_agency_name, bubble_env):
     return str(agency_id)
 
 
-def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
+def _enrich_existing_agent(user, name, ren, pea, normalized_phone, bubble_env,
                            agency_id=None, agency_name=None):
     updates = {}
     existing_name = _agent_value(user.get("name"))
     existing_ren = _normalized_ren(user.get("REN"))
+    existing_pea = _normalized_pea(user.get("PEA"))
     if name and not existing_name:
         updates["name"] = name
     elif name and existing_name and name.casefold() != existing_name.casefold():
@@ -573,6 +594,11 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
     elif ren and existing_ren and ren != existing_ren:
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=REN "
               f"existing={existing_ren!r} incoming={ren!r}", flush=True)
+    if pea and not existing_pea:
+        updates["PEA"] = pea
+    elif pea and existing_pea and pea != existing_pea:
+        print(f"[WHATSAPP IMPORT AGENT] phone={normalized_phone!r} conflict=PEA "
+              f"existing={existing_pea!r} incoming={pea!r}", flush=True)
     if updates:
         try:
             rentee_app._bubble_patch(
@@ -610,31 +636,36 @@ def _enrich_existing_agent(user, name, ren, normalized_phone, bubble_env,
 def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
                                       ren: str | None,
                                       bubble_env: str = "live", *,
+                                      pea: str | None = None,
                                       source_agency_name: str | None = None) -> dict:
     """Resolve one proposing agent by canonical phone, creating conservatively."""
-    clean_name, clean_ren = _agent_value(name), _normalized_ren(ren)
+    clean_name = _agent_value(name)
+    clean_ren, clean_pea = _normalized_ren(ren), _normalized_pea(pea)
     normalized = normalize_phone_number(phone)
     print(f"[WHATSAPP IMPORT AGENT] raw_phone={_compact(phone)!r} "
           f"normalized={normalized!r}", flush=True)
     if not normalized:
         return {"status": "no_phone", "user_id": None,
-                "normalized_phone": None, "name": clean_name, "ren": clean_ren}
+                "normalized_phone": None, "name": clean_name,
+                "ren": clean_ren, "pea": clean_pea}
     try:
         matches = rentee_app.find_bubble_users_by_phone(normalized, bubble_env)
     except Exception as error:
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=lookup_failed "
               f"error={type(error).__name__}", flush=True)
         return {"status": "error", "user_id": None,
-                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+                "normalized_phone": normalized, "name": clean_name,
+                "ren": clean_ren, "pea": clean_pea}
     if len(matches) > 1:
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} "
               f"action=duplicate_existing count={len(matches)}", flush=True)
         return {"status": "duplicate_existing", "user_id": None,
-                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+                "normalized_phone": normalized, "name": clean_name,
+                "ren": clean_ren, "pea": clean_pea}
     if len(matches) == 1:
         agency_id = _resolve_or_create_agency(source_agency_name, bubble_env)
         user = _enrich_existing_agent(
-            dict(matches[0]), clean_name, clean_ren, normalized, bubble_env,
+            dict(matches[0]), clean_name, clean_ren, clean_pea, normalized, bubble_env,
             agency_id, _agent_value(source_agency_name),
         )
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
@@ -643,6 +674,7 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
                 "normalized_phone": normalized,
                 "name": _agent_value(user.get("name")) or clean_name,
                 "ren": _normalized_ren(user.get("REN")) or clean_ren,
+                "pea": _normalized_pea(user.get("PEA")) or clean_pea,
                 "user": user}
     payload = {
         "phone": normalized,
@@ -652,6 +684,8 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
         payload["name"] = clean_name
     if clean_ren:
         payload["REN"] = clean_ren
+    if clean_pea:
+        payload["PEA"] = clean_pea
     agency_id = _resolve_or_create_agency(source_agency_name, bubble_env)
     if agency_id:
         payload["Agency"] = agency_id
@@ -668,7 +702,7 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
             raced = []
         if len(raced) == 1:
             user = _enrich_existing_agent(
-                dict(raced[0]), clean_name, clean_ren, normalized, bubble_env,
+                dict(raced[0]), clean_name, clean_ren, clean_pea, normalized, bubble_env,
                 agency_id, _agent_value(source_agency_name),
             )
             print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=existing "
@@ -677,16 +711,19 @@ def resolve_or_create_proposing_agent(name: str | None, phone: str | None,
                     "normalized_phone": normalized,
                     "name": _agent_value(user.get("name")) or clean_name,
                     "ren": _normalized_ren(user.get("REN")) or clean_ren,
+                    "pea": _normalized_pea(user.get("PEA")) or clean_pea,
                     "user": user}
         print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=create_failed "
               f"error={type(create_error).__name__}", flush=True)
         return {"status": "error", "user_id": None,
-                "normalized_phone": normalized, "name": clean_name, "ren": clean_ren}
+                "normalized_phone": normalized, "name": clean_name,
+                "ren": clean_ren, "pea": clean_pea}
     user = {"_id": user_id, **payload}
     print(f"[WHATSAPP IMPORT AGENT] phone={normalized!r} action=created "
           f"user_id={user_id}", flush=True)
     return {"status": "created", "user_id": str(user_id),
             "normalized_phone": normalized, "name": clean_name, "ren": clean_ren,
+            "pea": clean_pea,
             "user": user}
 
 
@@ -1583,6 +1620,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         proposing_agent = resolve_or_create_proposing_agent(
             parsed_agent.get("name"), parsed_agent.get("phone"),
             parsed_agent.get("ren"), bubble_env,
+            pea=parsed_agent.get("pea"),
             source_agency_name=parsed.get("source_agency_name"),
         )
     except Exception as error:
@@ -1594,6 +1632,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "normalized_phone": normalized,
             "name": _agent_value(parsed_agent.get("name")),
             "ren": _agent_value(parsed_agent.get("ren")),
+            "pea": _agent_value(parsed_agent.get("pea")),
         }
     message_hash = source_message_hash(raw_text)
     duplicate = _find_duplicate_import(
@@ -1659,7 +1698,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "proposing_agent_user_id": proposing_agent.get("user_id"),
             "proposing_agent": {
                 key: proposing_agent.get(key) for key in (
-                    "status", "user_id", "normalized_phone", "name", "ren",
+                    "status", "user_id", "normalized_phone", "name", "ren", "pea",
                 )
             },
             "resolved_geos": [_public_resolution(item) for item in geos if item.get("matched")],
@@ -1721,7 +1760,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             "proposing_agent_user_id": proposing_agent.get("user_id"),
             "proposing_agent": {
                 key: proposing_agent.get(key) for key in (
-                    "status", "user_id", "normalized_phone", "name", "ren",
+                    "status", "user_id", "normalized_phone", "name", "ren", "pea",
                 )
             },
             "resolved_geo": _public_resolution(resolved_geo),
