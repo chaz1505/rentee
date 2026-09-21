@@ -2016,11 +2016,16 @@ Polygon Properties
         with patch.object(
             importer.rentee_app.client.responses, "create",
             return_value=SimpleNamespace(output_text=json.dumps(output)),
-        ):
+        ), patch("builtins.print") as log:
             result = resolver.verify_development_candidate("Inspirasi", {})
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["reason"],
                          "verification_confidence_below_threshold")
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertIn("confidence=0.84", rendered)
+        self.assertIn("canonical='Inspirasi Mont Kiara'", rendered)
+        self.assertIn("geo='Mont Kiara'", rendered)
+        self.assertIn("verification_url='https://one.test'", rendered)
 
     def test_verifier_invalid_json_is_error(self):
         with patch.object(

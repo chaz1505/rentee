@@ -305,8 +305,16 @@ def verify_development_candidate(raw_name: str, context: dict,
                   "reason": reason}
     else:
         return _verification_error(raw, "schema_validation_failed", value)
+    log_details = ""
+    if result["reason"] == "verification_confidence_below_threshold":
+        log_details = (
+            f" confidence={float(confidence)!r}"
+            f" canonical={_compact(value['canonical_name'])!r}"
+            f" geo={_compact(value['geo_name'])!r}"
+            f" verification_url={value['verification_url']!r}"
+        )
     print(f"[DEVELOPMENT VERIFY] raw={raw!r} status={result['status']} "
-          f"reason={result['reason']!r}", flush=True)
+          f"reason={result['reason']!r}{log_details}", flush=True)
     return result
 
 
