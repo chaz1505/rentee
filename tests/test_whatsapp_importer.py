@@ -1670,20 +1670,99 @@ Polygon Properties
             "status": "processed", "type": "lead", "bubble_id": "lead-1",
             "confirmation": "Added lead.",
         }
-        with patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent", return_value={"intent": "lead_import"}), \
              patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
              patch.object(app, "send_whatsapp_text") as send, \
-             patch.object(app, "find_active_conversation_by_phone") as conversations, \
-             patch.object(app, "find_nearby_places") as nearby, \
-             patch.object(app, "advance_property_search") as advance:
+             patch.object(app, "get_bubble_base_url") as base_url, \
+             patch.object(app, "find_reply_context") as reply_context:
             app._process_whatsapp_message(message)
         process.assert_called_once_with(text, import_type="lead", bubble_env="live")
         send.assert_called_once_with("60123456789", "Added lead.")
-        conversations.assert_not_called()
-        nearby.assert_not_called()
-        advance.assert_not_called()
+        base_url.assert_not_called()
+        reply_context.assert_not_called()
+
+    def test_whatsapp_simple_mode_listing_import_returns_before_conversation_routing(self):
+        app = importer.rentee_app
+        text = "WTR listing at One Menerung, 3 bedrooms, RM8,500"
+        message = {
+            "id": "wamid.import-listing", "from": "60123456789", "type": "text",
+            "text": {"body": text},
+        }
+        imported = {
+            "status": "processed", "type": "listing", "bubble_id": "listing-1",
+            "confirmation": "Added listing.",
+        }
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+             patch.object(app, "_stop_whatsapp_typing"), \
+             patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent", return_value={"intent": "listing_import"}), \
+             patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
+             patch.object(app, "send_whatsapp_text") as send, \
+             patch.object(app, "get_bubble_base_url") as base_url, \
+             patch.object(app, "find_reply_context") as reply_context:
+            app._process_whatsapp_message(message)
+        process.assert_called_once_with(text, import_type="listing", bubble_env="live")
+        send.assert_called_once_with("60123456789", "Added listing.")
+        base_url.assert_not_called()
+        reply_context.assert_not_called()
+
+    def test_whatsapp_simple_mode_ordinary_text_returns_before_conversation_routing(self):
+        app = importer.rentee_app
+        message = {
+            "id": "wamid.simple-text", "from": "60123456789", "type": "text",
+            "text": {"body": "Hello there"},
+        }
+        expected = (
+            "Rentee currently helps you add and match property leads and listings. "
+            "Forward me a lead or listing and I'll add it for you."
+        )
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+             patch.object(app, "_stop_whatsapp_typing"), \
+             patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent", return_value={"intent": "normal_chat"}), \
+             patch.object(importer, "process_whatsapp_import") as process, \
+             patch.object(app, "send_whatsapp_text") as send, \
+             patch.object(app, "get_bubble_base_url") as base_url, \
+             patch.object(app, "find_reply_context") as reply_context:
+            app._process_whatsapp_message(message)
+        process.assert_not_called()
+        send.assert_called_once_with("60123456789", expected)
+        base_url.assert_not_called()
+        reply_context.assert_not_called()
+
+    def test_whatsapp_simple_mode_image_returns_before_listing_and_conversation_routing(self):
+        app = importer.rentee_app
+        message = {
+            "id": "wamid.simple-image", "from": "60123456789", "type": "image",
+            "image": {"id": "media-1"},
+        }
+        expected = (
+            "Rentee currently helps you add and match property leads and listings. "
+            "Forward me a lead or listing and I'll add it for you."
+        )
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+             patch.object(app, "_stop_whatsapp_typing"), \
+             patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent") as detect, \
+             patch.object(importer, "process_whatsapp_import") as process, \
+             patch.object(app, "send_whatsapp_text") as send, \
+             patch.object(app, "get_bubble_base_url") as base_url, \
+             patch.object(app, "find_reply_context") as reply_context, \
+             patch.object(app, "handle_listing_creation") as listing_creation:
+            app._process_whatsapp_message(message)
+        detect.assert_not_called()
+        process.assert_not_called()
+        send.assert_called_once_with("60123456789", expected)
+        base_url.assert_not_called()
+        reply_context.assert_not_called()
+        listing_creation.assert_not_called()
 
     def test_existing_development_skips_web_and_creation(self):
         parsed = {

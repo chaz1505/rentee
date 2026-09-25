@@ -18,6 +18,7 @@ os.environ.setdefault("WHATSAPP_ACCESS_TOKEN", "wa-token")
 os.environ.setdefault("WHATSAPP_PHONE_NUMBER_ID", "phone-number-id")
 os.environ.setdefault("WHATSAPP_BUSINESS_PHONE_NUMBER", "60115551234")
 os.environ.setdefault("RENTEE_WHATSAPP_NUMBER", "601112032754")
+os.environ["RENTEE_MODE"] = "full"
 
 import app as app_module
 

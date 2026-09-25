@@ -70,6 +70,8 @@ CORS(
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 BUBBLE_API_TOKEN = os.environ["BUBBLE_API_TOKEN"]
 
+RENTEE_MODE = os.getenv("RENTEE_MODE", "simple").strip().casefold()
+
 # Keep the qualitative reranker small after deterministic factual pre-ranking.
 RANKING_CANDIDATE_LIMIT = 12
 RANKING_RECOMMENDATION_MAX = 6
@@ -7959,10 +7961,27 @@ def _process_whatsapp_message(message):
                     send_whatsapp_text(phone, confirmation)
                     reply_sent = True
                     return
+
+            if RENTEE_MODE == "simple":
                 print(
-                    "[WHATSAPP IMPORT ROUTING] action=continue_normal_chat",
+                    "[WHATSAPP SIMPLE ROUTING] "
+                    f"action=unsupported_message type={message_type}",
                     flush=True,
                 )
+                response_text = (
+                    "Rentee currently helps you add and match property leads "
+                    "and listings. Forward me a lead or listing and I'll add it for you."
+                )
+                _stop_whatsapp_typing(typing_keepalive)
+                send_whatsapp_text(phone, response_text)
+                reply_sent = True
+                return
+
+            print(
+                "[WHATSAPP IMPORT ROUTING] action=continue_normal_chat",
+                flush=True,
+            )
+
             base_url = get_bubble_base_url("live")
             inbound_message_id = None
             inbound_message_created = False
