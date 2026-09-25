@@ -1471,7 +1471,8 @@ def find_import_matches(created_type: str, record: dict, bubble_env: str) -> lis
     return [item for item in records if lead_matches_listing(item, record)]
 
 
-def create_missing_match_records(created_type, created_id, matches, bubble_env):
+def create_missing_match_records(
+        created_type, created_id, matches, bubble_env, created_record=None):
     """Persist each unique deterministic Lead/Listing pair once."""
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     seen = set()
@@ -1492,8 +1493,29 @@ def create_missing_match_records(created_type, created_id, matches, bubble_env):
         if next(iter(rentee_app._bubble_records(
                 base_url, "match", constraints)), None):
             continue
+        lead_record, listing_record = (
+            (created_record, matched) if created_type == "lead"
+            else (matched, created_record)
+        )
+        lead_owner = next(
+            iter(_relationship_ids((lead_record or {}).get("owner"))),
+            None,
+        )
+        listing_owner = next(
+            iter(_relationship_ids((listing_record or {}).get("owner"))),
+            None,
+        )
+        payload = {
+            "lead": pair[0],
+            "listing": pair[1],
+            "match_source": "whatsapp",
+        }
+        if lead_owner:
+            payload["lead_owner"] = lead_owner
+        if listing_owner:
+            payload["listing_owner"] = listing_owner
         rentee_app._bubble_create(
-            base_url, "match", {"lead": pair[0], "listing": pair[1]}
+            base_url, "match", payload
         )
 
 
@@ -1656,7 +1678,10 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     if duplicate:
         bubble_id = str(duplicate["_id"])
         matches = find_import_matches(parsed["type"], duplicate, bubble_env)
-        create_missing_match_records(parsed["type"], bubble_id, matches, bubble_env)
+        create_missing_match_records(
+            parsed["type"], bubble_id, matches, bubble_env,
+            created_record=duplicate,
+        )
         duplicate_developments = development_records
         if duplicate_developments is None:
             duplicate_developments = rentee_app._property_entity_records(
@@ -1796,7 +1821,10 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     matches = find_import_matches(
         parsed["type"], created_record, bubble_env
     )
-    create_missing_match_records(parsed["type"], bubble_id, matches, bubble_env)
+    create_missing_match_records(
+        parsed["type"], bubble_id, matches, bubble_env,
+        created_record=created_record,
+    )
     result["matches"] = matches
     if matches:
         result["confirmation"] += "\n\n" + format_import_matches(

@@ -1165,7 +1165,10 @@ Tech subang"""
         self.assertEqual(records.call_args.args[1], "match")
         create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "match",
-            {"lead": "lead-new", "listing": "listing-existing"},
+            {
+                "lead": "lead-new", "listing": "listing-existing",
+                "match_source": "whatsapp",
+            },
         )
 
     def test_source_message_hash_normalizes_only_harmless_whitespace(self):
@@ -1302,7 +1305,12 @@ Tech subang"""
         ), result["confirmation"])
         self.assertEqual(create.call_count, 1)
         self.assertEqual(create.call_args.args[1:], (
-            "match", {"lead": "lead-existing", "listing": "listing-new"}
+            "match", {
+                "lead": "lead-existing", "listing": "listing-new",
+                "match_source": "whatsapp",
+                "lead_owner": "user-1",
+                "listing_owner": "user-agent",
+            }
         ))
         self.assertEqual(existing_lead["unchanged"], "keep")
         update.assert_not_called()
@@ -1344,7 +1352,11 @@ Tech subang"""
         ), result["confirmation"])
         create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "match",
-            {"lead": "lead-1", "listing": "listing-existing"},
+            {
+                "lead": "lead-1", "listing": "listing-existing",
+                "match_source": "whatsapp",
+                "listing_owner": "user-1",
+            },
         )
 
     def test_existing_match_is_not_duplicated(self):
@@ -1364,19 +1376,63 @@ Tech subang"""
              patch.object(importer.rentee_app, "_bubble_create") as create:
             importer.create_missing_match_records("lead", "lead-1", matches, "live")
         self.assertEqual([call.args[2] for call in create.call_args_list], [
-            {"lead": "lead-1", "listing": "listing-1"},
-            {"lead": "lead-1", "listing": "listing-2"},
+            {"lead": "lead-1", "listing": "listing-1",
+             "match_source": "whatsapp"},
+            {"lead": "lead-1", "listing": "listing-2",
+             "match_source": "whatsapp"},
         ])
 
-    def test_new_listing_match_creates_match_with_correct_direction(self):
+    def test_new_listing_match_creates_match_with_owners_and_correct_direction(self):
         with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create") as create:
             importer.create_missing_match_records(
-                "listing", "listing-new", [{"_id": "lead-existing"}], "live"
+                "listing", "listing-new",
+                [{"_id": "lead-existing", "owner": {"_id": "lead-owner"}}],
+                "live", created_record={"owner": ["listing-owner"]},
             )
         create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "match",
-            {"lead": "lead-existing", "listing": "listing-new"},
+            {
+                "lead": "lead-existing", "listing": "listing-new",
+                "match_source": "whatsapp",
+                "lead_owner": "lead-owner",
+                "listing_owner": "listing-owner",
+            },
+        )
+
+    def test_new_lead_match_creates_match_with_owners(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records(
+                "lead", "lead-new",
+                [{"_id": "listing-existing", "owner": "listing-owner"}],
+                "live", created_record={"owner": {"_id": "lead-owner"}},
+            )
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match",
+            {
+                "lead": "lead-new", "listing": "listing-existing",
+                "match_source": "whatsapp",
+                "lead_owner": "lead-owner",
+                "listing_owner": "listing-owner",
+            },
+        )
+
+    def test_match_creation_omits_an_unavailable_owner(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create:
+            importer.create_missing_match_records(
+                "lead", "lead-new",
+                [{"_id": "listing-existing", "owner": "listing-owner"}],
+                "live", created_record={},
+            )
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match",
+            {
+                "lead": "lead-new", "listing": "listing-existing",
+                "match_source": "whatsapp",
+                "listing_owner": "listing-owner",
+            },
         )
 
     def test_new_lead_matches_existing_listings_and_appends_confirmation(self):
