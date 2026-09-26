@@ -1769,7 +1769,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         )
         development = developments[0] if developments else None
         derived = _derived_geos([development] if development else [], geo_records)
-        resolved_geo = explicit if explicit and explicit.get("matched") else (derived[0] if derived else None)
+        resolved_geo = derived[0] if derived else (
+            explicit if explicit and explicit.get("matched") else None
+        )
         if explicit and explicit.get("matched") and derived and explicit["id"] != derived[0]["id"]:
             print(f"{LOG_PREFIX} geo conflict explicit={explicit['name']!r} "
                   f"development_geo={derived[0]['name']!r}", flush=True)

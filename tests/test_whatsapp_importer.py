@@ -806,14 +806,15 @@ Tech subang"""
             self.assertNotIn(field, payload)
         self.assertNotIn("exposure", importer.PARSER_SCHEMA["properties"])
 
-    def test_explicit_geo_wins_and_conflict_is_logged(self):
+    def test_development_geo_wins_over_conflicting_explicit_geo(self):
         parsed = {
             "type": "listing", "geo_name": "KLCC", "development_name": "One Menerung",
             "transaction_types": ["Rent/Let"], "price_rent": 8500, "beds": 3,
         }
         with patch("builtins.print") as log:
-            _result, create = self.process_as(parsed)
-        self.assertEqual(create.call_args.args[2]["Geo"], "geo-klcc")
+            result, create = self.process_as(parsed)
+        self.assertEqual(create.call_args.args[2]["Geo"], "geo-bangsar")
+        self.assertEqual(result["resolved_geo"]["method"], "development_geo")
         self.assertTrue(any("geo conflict" in str(call) for call in log.call_args_list))
 
     def test_unknown_does_not_write_to_bubble(self):
