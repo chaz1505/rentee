@@ -1088,6 +1088,43 @@ def _apply_proposing_agent_payload(payload, proposing_agent, name_field, number_
             payload[name_field] = name
 
 
+def _build_lead_display_name(parsed, resolved_geos, resolved_developments):
+    transactions = [
+        value for value in parsed.get("transaction_types", [])
+        if value in TRANSACTION_TYPES
+    ]
+    role = next((
+        {"Buy/Sell": "Buyer", "Rent/Let": "Tenant"}[value]
+        for value in transactions
+    ), None)
+    if not role:
+        return None
+
+    property_type = next((
+        _compact(value).casefold()
+        for value in parsed.get("property_types", [])
+        if _compact(value)
+    ), "property")
+    bedrooms = parsed.get("bedrooms_min")
+    if (not isinstance(bedrooms, bool)
+            and isinstance(bedrooms, (int, float)) and bedrooms > 0):
+        bedroom_label = f"{bedrooms:g}" if isinstance(bedrooms, float) else str(bedrooms)
+        property_type = f"{bedroom_label}-bed {property_type}"
+
+    location = next((
+        _compact(item.get("name")) for item in resolved_developments or []
+        if item.get("matched") and _compact(item.get("name"))
+    ), None)
+    if not location:
+        location = next((
+            _compact(item.get("name")) for item in resolved_geos or []
+            if item.get("matched") and _compact(item.get("name"))
+        ), None)
+
+    name = f"{role} looking for {property_type}"
+    return f"{name} in {location}" if location else name
+
+
 def build_lead_payload(parsed, resolved_geos, resolved_developments,
                        proposing_agent=None) -> dict:
     payload = {"source": "whatsapp", "exposure": "public"}
@@ -1144,27 +1181,11 @@ def build_lead_payload(parsed, resolved_geos, resolved_developments,
         name_field="ProposedAgentNameLead",
         number_field="ProposedAgentNumberLead",
     )
-    if parsed.get("lead_name"):
-        payload["name"] = parsed["lead_name"]
-    elif payload.get("ProposedAgentNameLead"):
-        transaction_label = next((
-            label for transaction, label in (("Rent/Let", "WTR"), ("Buy/Sell", "WTB"))
-            if transaction in transactions
-        ), None)
-        location = next((
-            item.get("name") for item in resolved_developments or []
-            if item.get("matched") and _compact(item.get("name"))
-        ), None)
-        if not location:
-            location = next((
-                item.get("name") for item in resolved_geos or []
-                if item.get("matched") and _compact(item.get("name"))
-            ), None)
-        if transaction_label and location:
-            payload["name"] = (
-                f"{payload['ProposedAgentNameLead']} (Agent) "
-                f"{transaction_label} {_compact(location)}"
-            )
+    display_name = _build_lead_display_name(
+        parsed, resolved_geos, resolved_developments
+    )
+    if display_name:
+        payload["name"] = display_name
     return payload
 
 
@@ -1514,9 +1535,18 @@ def create_missing_match_records(
             payload["lead_owner"] = lead_owner
         if listing_owner:
             payload["listing_owner"] = listing_owner
-        rentee_app._bubble_create(
-            base_url, "match", payload
-        )
+        try:
+            rentee_app._bubble_create(base_url, "match", payload)
+        except Exception as error:
+            # Matching is downstream of a completed import. Keep each pair
+            # isolated so one rejected Match cannot fail the import or prevent
+            # later candidates from being attempted.
+            print(
+                "[MATCH CREATE CONTINUE] "
+                f"lead_id={pair[0]} listing_id={pair[1]} "
+                f"error={type(error).__name__}",
+                flush=True,
+            )
 
 
 def _matched_transaction(lead: dict, listing: dict) -> str | None:

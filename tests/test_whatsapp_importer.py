@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import requests
+
 
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
@@ -246,6 +248,7 @@ Tech subang"""
         self.assertEqual(payload, {
             "source": "whatsapp", "exposure": "public",
             "TransactionType": ["Rent/Let"],
+            "name": "Tenant looking for property",
             "adults": 2, "children": 1, "nationality": "British",
             "occupation": "Engineer", "moveInDate": "2026-11-01T00:00:00.000Z",
             "pets": "1 small dog", "furnishingPreference": "Fully Furnished",
@@ -266,7 +269,7 @@ Tech subang"""
         ):
             self.assertNotIn(field, payload)
 
-    def test_lead_name_defaults_from_stored_agent_transaction_and_first_development(self):
+    def test_lead_name_uses_requirement_and_first_development(self):
         parsed = self.parse_as({
             "type": "lead", "transaction_types": ["Rent/Let"],
             "proposing_agent": {
@@ -283,18 +286,18 @@ Tech subang"""
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
         self.assertEqual(payload["ProposedAgentNameLead"], "Alex Goh")
-        self.assertEqual(payload["name"], "Alex Goh (Agent) WTR Inspirasi")
+        self.assertEqual(payload["name"], "Tenant looking for property in Inspirasi")
 
-    def test_lead_name_uses_geo_and_buy_label_without_development(self):
+    def test_lead_name_uses_geo_and_buyer_wording_without_development(self):
         payload = importer.build_lead_payload(
             {"type": "lead", "transaction_types": ["Buy/Sell"]},
             [{"matched": True, "id": "geo-bangsar", "name": "Bangsar"}],
             [],
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
-        self.assertEqual(payload["name"], "Alex Goh (Agent) WTB Bangsar")
+        self.assertEqual(payload["name"], "Buyer looking for property in Bangsar")
 
-    def test_explicit_lead_name_is_preserved(self):
+    def test_explicit_client_name_is_not_used_as_public_lead_name(self):
         parsed = self.parse_as({
             "type": "lead", "lead_name": "Sarah Lim",
             "transaction_types": ["Rent/Let"],
@@ -305,7 +308,57 @@ Tech subang"""
             [{"matched": True, "id": "dev-1", "name": "Inspirasi"}],
             {"name": "Alex Goh", "normalized_phone": "60164697992"},
         )
-        self.assertEqual(payload["name"], "Sarah Lim")
+        self.assertEqual(payload["name"], "Tenant looking for property in Inspirasi")
+
+    def test_lead_display_name_variants(self):
+        geo_bangsar = [{"matched": True, "id": "geo-1", "name": "Bangsar"}]
+        development_mont_kiara = [
+            {"matched": True, "id": "dev-1", "name": "Mont Kiara"}
+        ]
+        cases = (
+            (
+                {"transaction_types": ["Buy/Sell"],
+                 "property_types": ["bungalow"]},
+                geo_bangsar, [], "Buyer looking for bungalow in Bangsar",
+            ),
+            (
+                {"transaction_types": ["Rent/Let"],
+                 "property_types": ["condo"], "bedrooms_min": 3},
+                geo_bangsar, development_mont_kiara,
+                "Tenant looking for 3-bed condo in Mont Kiara",
+            ),
+            (
+                {"transaction_types": ["Buy/Sell"], "property_types": []},
+                geo_bangsar, [], "Buyer looking for property in Bangsar",
+            ),
+            (
+                {"transaction_types": ["Rent/Let"], "property_types": []},
+                [], [], "Tenant looking for property",
+            ),
+            (
+                {"transaction_types": ["Buy/Sell"],
+                 "property_types": ["bungalow"]},
+                [], [], "Buyer looking for bungalow",
+            ),
+        )
+        for parsed, geos, developments, expected in cases:
+            with self.subTest(expected=expected):
+                payload = importer.build_lead_payload(parsed, geos, developments)
+                self.assertEqual(payload["name"], expected)
+
+    def test_lead_display_name_excludes_agent_but_preserves_agent_fields_and_owner(self):
+        payload = importer.build_lead_payload(
+            {"transaction_types": ["Buy/Sell"],
+             "property_types": ["bungalow"]},
+            [{"matched": True, "id": "geo-1", "name": "Bangsar"}], [],
+            {"user_id": "user-sylvia", "name": "Sylvia",
+             "normalized_phone": "60143380088"},
+        )
+        self.assertEqual(payload["name"], "Buyer looking for bungalow in Bangsar")
+        self.assertNotIn("Sylvia", payload["name"])
+        self.assertEqual(payload["owner"], "user-sylvia")
+        self.assertEqual(payload["ProposedAgentNameLead"], "Sylvia")
+        self.assertEqual(payload["ProposedAgentNumberLead"], "60143380088")
 
     def test_import_payloads_use_proposing_agent_as_owner_and_whatsapp_source(self):
         proposing_agent = {
@@ -1382,6 +1435,88 @@ Tech subang"""
             {"lead": "lead-1", "listing": "listing-2",
              "match_source": "whatsapp"},
         ])
+
+    def test_failed_match_logs_bubble_body_and_continues_to_next_match(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'{"statusCode":400,"body":"Invalid lead_owner"}'
+        response.url = "https://www.rentee.asia/api/1.1/obj/match"
+        error = requests.HTTPError(response=response)
+
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=[error, "match-2"]) as create, \
+             patch("builtins.print") as log:
+            importer.create_missing_match_records(
+                "lead", "lead-1",
+                [{"_id": "listing-1"}, {"_id": "listing-2"}], "live",
+            )
+
+        self.assertEqual(create.call_count, 2)
+        self.assertIn("[MATCH CREATE CONTINUE]", log.call_args_list[0].args[0])
+        self.assertIn("lead_id=lead-1", log.call_args_list[0].args[0])
+        self.assertIn("listing_id=listing-1", log.call_args_list[0].args[0])
+
+    def test_bubble_match_400_logs_payload_and_response_before_raising(self):
+        response = MagicMock(
+            ok=False, status_code=400,
+            text='{"statusCode":400,"body":"Invalid listing_owner"}',
+        )
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+        payload = {
+            "lead": "lead-1", "listing": "listing-1",
+            "lead_owner": "user-lead", "listing_owner": "user-listing",
+            "match_source": "whatsapp",
+        }
+
+        with patch.object(importer.rentee_app.requests, "post", return_value=response), \
+             patch("builtins.print") as log:
+            with self.assertRaises(requests.HTTPError):
+                importer.rentee_app._bubble_create(
+                    "https://www.rentee.asia/api/1.1", "match", payload
+                )
+
+        message = log.call_args.args[0]
+        self.assertIn("[MATCH CREATE ERROR] status=400", message)
+        self.assertIn("lead_id=lead-1 listing_id=listing-1", message)
+        self.assertIn(repr(payload), message)
+        self.assertIn("Invalid listing_owner", message)
+        self.assertNotIn("test-token", message)
+
+    def test_successful_import_survives_match_400_and_keeps_confirmation(self):
+        parsed = {
+            "type": "lead", "geo_names": ["Bangsar"],
+            "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        match = {
+            "_id": "listing-1", "owner": {"_id": "user-listing"},
+            "development": "dev-one", "TransactionType": ["Rent/Let"],
+        }
+        error = requests.HTTPError("400 Client Error")
+
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "resolve_or_create_proposing_agent", return_value={
+                 "status": "existing", "user_id": "user-lead",
+             }), \
+             patch.object(importer, "find_import_matches", return_value=[match]), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["lead-1", error]) as create:
+            result = importer.process_whatsapp_import(
+                "WTR Bangsar condo", geo_records=GEOS,
+                development_records=DEVELOPMENTS,
+            )
+
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(result["bubble_id"], "lead-1")
+        self.assertIn("See here: https://www.rentee.asia/lead/lead-1",
+                      result["confirmation"])
+        self.assertEqual(create.call_args_list[1].args[2], {
+            "lead": "lead-1", "listing": "listing-1",
+            "match_source": "whatsapp", "lead_owner": "user-lead",
+            "listing_owner": "user-listing",
+        })
 
     def test_new_listing_match_creates_match_with_owners_and_correct_direction(self):
         with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \

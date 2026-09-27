@@ -1527,6 +1527,15 @@ def _bubble_create(base_url, object_type, payload):
         f"{base_url}/obj/{object_type}", headers=_bubble_headers(),
         json=payload, timeout=30,
     )
+    if object_type == "match" and not response.ok:
+        print(
+            "[MATCH CREATE ERROR] "
+            f"status={response.status_code} "
+            f"lead_id={payload.get('lead')} "
+            f"listing_id={payload.get('listing')} "
+            f"payload={payload!r} response={response.text!r}",
+            flush=True,
+        )
     response.raise_for_status()
     object_id = response.json().get("id")
     if not object_id:
