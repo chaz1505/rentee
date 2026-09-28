@@ -133,6 +133,64 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertEqual(payload["budgetBuy"], 3500000)
         self.assertNotIn("budgetRent", payload)
 
+    def test_listing_bedroom_plus_notation_uses_number_before_plus(self):
+        cases = [
+            ("2+1 Bedroom 2 Bathroom", 2, 2),
+            ("3+1 Bedroom", 3, None),
+            ("4 + 2 BR", 4, None),
+            ("3 Bedroom 2 Bathroom", 3, 2),
+        ]
+        for message, expected_beds, expected_baths in cases:
+            with self.subTest(message=message):
+                parsed = self.parse_as({
+                    "type": "listing",
+                    "beds": 3 if message.startswith("2+1") else expected_beds,
+                    "baths": expected_baths,
+                }, message)
+                self.assertEqual(parsed["beds"], expected_beds)
+                if expected_baths is not None:
+                    self.assertEqual(parsed["baths"], expected_baths)
+
+    def test_st_mary_listing_bedroom_plus_regression(self):
+        message = """🔥 WTL 🔥🔥🔥
+St Mary Residences @ KLCC
+1442 sqft
+2+1 Bedroom 2 Bathroom
+Fully Furnished
+Vacant now
+Asking Rental RM6,000 (nego)
+Jimmi Low
+REN 32270
+014-8833519
+Propnex Realty Sdn Bhd"""
+        parsed = self.parse_as({
+            "type": "listing",
+            "development_name": "St Mary Residences",
+            "transaction_types": ["Rent/Let"],
+            "beds": 3,
+            "baths": 2,
+            "sqft": 1442,
+            "price_rent": 6000,
+        }, message)
+        self.assertEqual(parsed["beds"], 2)
+        self.assertEqual(parsed["baths"], 2)
+        self.assertEqual(parsed["sqft"], 1442)
+        self.assertEqual(parsed["price_rent"], 6000)
+
+    def test_bedroom_plus_override_does_not_change_explicit_maid_room(self):
+        parsed = self.parse_as({
+            "type": "listing", "beds": 4, "maid_room": 1,
+        }, "3+1 Bedroom, 1 maid room")
+        self.assertEqual(parsed["beds"], 3)
+        self.assertEqual(parsed["maid_room"], 1)
+
+    def test_bedroom_plus_override_is_listing_only(self):
+        parsed = self.parse_as({
+            "type": "lead", "bedrooms_min": 4,
+        }, "WTR 3+1 Bedroom")
+        self.assertEqual(parsed["bedrooms_min"], 4)
+        self.assertNotIn("beds", parsed)
+
     def test_wtb_budget_range_uses_upper_value_as_maximum_budget(self):
         message = """WTB Client looking to buy bungalow...
 Budget between 5m to 6m"""

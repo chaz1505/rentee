@@ -417,7 +417,11 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "For Listings, extract a stated rent amount only into price_rent and a stated sale "
             "amount only into price_sale. A combined WTL/WTS Listing may have both. Never copy "
             "or infer one transaction's price from the other; leave the unstated price null. "
-            "Normalize bedroom forms to an integer. Property types may only be the canonical "
+            "Normalize bedroom forms to an integer. For N+M bedroom notation, beds is N, the "
+            "number before the plus sign: '2+1 Bedroom' means beds=2, not 3, and '3+1 "
+            "Bedroom' means beds=3, not 4. Do not classify the +M room as a study, maid room, "
+            "family room, or any other room type unless the message explicitly identifies it. "
+            "Property types may only be the canonical "
             "values Condo or Landed. Map apartment/condominium/condo to Condo. Map house, "
             "bungalow, semi-D, terrace, link house, detached house, and landed house to Landed. "
             "A Listing has exactly one property_type when one is stated; a Lead may have neither, "
@@ -496,6 +500,14 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
     except (TypeError, json.JSONDecodeError) as error:
         raise ValueError("WhatsApp parser returned invalid structured output.") from error
     result = _validate_parsed(parsed)
+    if result["type"] == "listing":
+        bedroom_plus_match = re.search(
+            r"\b(\d+)\s*\+\s*\d+\s*(?:bed(?:room)?s?|br)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if bedroom_plus_match:
+            result["beds"] = int(bedroom_plus_match.group(1))
     print(f"{LOG_PREFIX} parsed type={result['type']}", flush=True)
     return result
 
