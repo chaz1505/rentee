@@ -386,6 +386,74 @@ def _parser_schema(import_type=None):
     return schema
 
 
+def _recover_trailing_agent_signature(raw_text: str, parsed: dict) -> dict:
+    """Fill missing agent fields from an obvious, compact signature at the tail."""
+    if not isinstance(parsed, dict):
+        return parsed
+
+    lines = [_compact(line) for line in normalize_source_message(raw_text).splitlines()]
+    tail = [line for line in lines if line][-8:]
+    if not tail:
+        return parsed
+
+    phones = [
+        (index, line) for index, line in enumerate(tail)
+        if re.fullmatch(r"(?:\+?60|0)1[0-9](?:[ -]?\d){7,8}", line)
+        and normalize_phone_number(line)
+    ]
+    registrations = []
+    for index, line in enumerate(tail):
+        match = re.fullmatch(r"(REN|PEA)[\s-]*(\d+)", line, flags=re.IGNORECASE)
+        if match:
+            registrations.append((index, match.group(1).lower(),
+                                  f"{match.group(1).upper()}{match.group(2)}"))
+
+    # A phone or registration alone occurs too often in property/contact details.
+    # Requiring exactly one of each in one compact tail block keeps this a fallback,
+    # rather than a second general-purpose parser.
+    if len(phones) != 1 or len(registrations) != 1:
+        return parsed
+    phone_index, phone = phones[0]
+    registration_index, registration_key, registration = registrations[0]
+    if abs(phone_index - registration_index) > 3:
+        return parsed
+
+    start = max(0, min(phone_index, registration_index) - 1)
+    end = min(len(tail), max(phone_index, registration_index) + 2)
+    if end != len(tail):
+        return parsed
+    metadata_indices = {phone_index, registration_index}
+    text_fields = [
+        tail[index] for index in range(start, end)
+        if index not in metadata_indices
+    ]
+    if not text_fields or any(re.search(r"\d", value) for value in text_fields):
+        return parsed
+
+    recovered_name = text_fields[0]
+    recovered_agency = text_fields[-1] if len(text_fields) > 1 else None
+    agent = parsed.get("proposing_agent")
+    agent = dict(agent) if isinstance(agent, dict) else {}
+    changes = {}
+    for key, value in (
+        ("name", recovered_name), ("phone", phone),
+        (registration_key, registration),
+    ):
+        if value and not _compact(agent.get(key)):
+            agent[key] = value
+            changes[key] = value
+    if recovered_agency and not _compact(parsed.get("source_agency_name")):
+        parsed["source_agency_name"] = recovered_agency
+        changes["agency"] = recovered_agency
+    if changes:
+        parsed["proposing_agent"] = agent
+        print("[WHATSAPP IMPORT AGENT] action=signature_recovered "
+              f"phone={agent.get('phone')!r} ren={agent.get('ren')!r} "
+              f"pea={agent.get('pea')!r} agency={parsed.get('source_agency_name')!r}",
+              flush=True)
+    return parsed
+
+
 def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> dict:
     """Classify and extract only strongly evidenced MVP fields."""
     text = str(raw_text or "").strip()
@@ -445,6 +513,12 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             "end the message and contain an individual's name, team name, 'Real Estate "
             "Negotiator', REN number, mobile number, agency/company name, agency registration, "
             "and office number. Use the individual person's name, not the team or agency. "
+            "Agent signature field order varies and must not be assumed. Common trailing forms "
+            "include name + phone + REN/PEA + agency, name + REN/PEA + phone + agency, and "
+            "name + REN/PEA + agency + phone, as well as other obvious permutations of an "
+            "individual agent name, Malaysian mobile number, REN/PEA registration, and agency "
+            "or company. A trailing block containing both a Malaysian mobile number and a "
+            "REN/PEA registration is strong evidence of an agent signature. "
             "Registration forms include REN 12345, REN12345, E2265, PEA2495, PEA 2495, and "
             "PEA-2495. Put REN/E registrations only in proposing_agent.ren and PEA registrations "
             "only in proposing_agent.pea; never copy one registration type into the other. When both an "
@@ -499,6 +573,7 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
         parsed = json.loads(str(response.output_text or ""))
     except (TypeError, json.JSONDecodeError) as error:
         raise ValueError("WhatsApp parser returned invalid structured output.") from error
+    parsed = _recover_trailing_agent_signature(text, parsed)
     result = _validate_parsed(parsed)
     if result["type"] == "listing":
         bedroom_plus_match = re.search(

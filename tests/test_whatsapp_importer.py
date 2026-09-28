@@ -260,6 +260,82 @@ Tech subang"""
             "must not also be extracted as a location or Development", prompt
         )
 
+    def test_recovers_trailing_name_phone_ren_agency_signature(self):
+        message = """WTR
+
+Bungalow
+15min to klcc
+China tenant
+Fully furnished
+Budget 15+/-
+
+Stephanie
+0122017185
+Ren29187
+Tech subang"""
+        parsed = self.parse_as({
+            "type": "lead",
+            "location_references": ["15min to klcc", "Tech subang"],
+            "transaction_types": ["Rent/Let"],
+            "property_types": ["Landed"],
+        }, message)
+        self.assertEqual(parsed["proposing_agent"], {
+            "name": "Stephanie", "phone": "0122017185", "ren": "REN29187",
+        })
+        self.assertEqual(parsed["source_agency_name"], "Tech subang")
+        self.assertNotIn("Tech subang", parsed["location_references"])
+        self.assertIn("15min to klcc", parsed["location_references"])
+
+    def test_recovers_alternate_trailing_signature_order(self):
+        message = """WTR KLCC
+
+Stephanie
+REN 29187
+Tech subang
+012-2017185"""
+        parsed = self.parse_as({
+            "type": "lead", "location_references": ["KLCC", "Tech subang"],
+        }, message)
+        self.assertEqual(parsed["proposing_agent"]["name"], "Stephanie")
+        self.assertEqual(parsed["proposing_agent"]["phone"], "012-2017185")
+        self.assertEqual(parsed["proposing_agent"]["ren"], "REN29187")
+        self.assertEqual(parsed["source_agency_name"], "Tech subang")
+        self.assertNotIn("Tech subang", parsed["location_references"])
+
+    def test_trailing_signature_recovery_preserves_complete_gpt_values(self):
+        message = "WTR KLCC\n\nStephanie\n0122017185\nRen29187\nTech subang"
+        with patch("builtins.print") as log:
+            parsed = self.parse_as({
+                "type": "lead", "location_references": ["KLCC", "Tech subang"],
+                "source_agency_name": "Tech subang",
+                "proposing_agent": {
+                    "name": "Stephanie", "phone": "+60122017185",
+                    "ren": "REN 29187", "pea": None,
+                },
+            }, message)
+        self.assertEqual(parsed["proposing_agent"]["phone"], "+60122017185")
+        self.assertEqual(parsed["proposing_agent"]["ren"], "REN 29187")
+        self.assertFalse(any("signature_recovered" in str(call)
+                             for call in log.call_args_list))
+
+    def test_trailing_recovery_requires_mobile_and_registration(self):
+        parsed = self.parse_as({
+            "type": "lead", "location_references": ["Bangsar"],
+        }, "WTR Bangsar\nOwner contact 012-2017185\nUnit 29187")
+        self.assertEqual(parsed["proposing_agent"], {
+            "name": None, "phone": None, "ren": None,
+        })
+        self.assertNotIn("source_agency_name", parsed)
+
+    def test_recovered_geo_looking_agency_is_removed_from_locations(self):
+        message = "WTR near KLCC\n\nStephanie\nREN-29187\n012 2017185\nTech subang"
+        parsed = self.parse_as({
+            "type": "lead",
+            "location_references": ["KLCC", "Tech subang"],
+        }, message)
+        self.assertEqual(parsed["source_agency_name"], "Tech subang")
+        self.assertEqual(parsed["location_references"], ["KLCC"])
+
     def test_new_imports_canonicalize_apartment_and_house(self):
         apartment = self.parse_as({
             "type": "lead", "property_types": ["Apartment"],
