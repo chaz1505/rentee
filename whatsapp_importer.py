@@ -1093,6 +1093,28 @@ def resolve_location_references(references, geo_records, context, *, single=Fals
     return resolutions
 
 
+def _reconcile_lead_location_references(references, geo_records,
+                                        development_records):
+    """Resolve each lead reference as an existing Geo or Development first."""
+    geos, developments, unresolved = [], [], []
+    for reference in _unique_strings(references):
+        geo = resolve_geo_name(reference, geo_records)
+        if geo.get("matched"):
+            geos.append(geo)
+            continue
+        development = development_resolver.resolve_development_name(
+            reference, development_records
+        )
+        if (development.get("matched") and development.get("method") in {
+                "exact", "case_insensitive_exact", "normalized_exact"}):
+            developments.append(development)
+            print(f"{LOG_PREFIX} location reclassified raw={reference!r} "
+                  f"type=development canonical={development['name']!r}", flush=True)
+            continue
+        unresolved.append(reference)
+    return geos, developments, unresolved
+
+
 def _verification_context(parsed, raw_text):
     return {
         "geo_names": _unique_strings(parsed.get("geo_names") or []),
@@ -1162,6 +1184,19 @@ def _resolve_or_verify_developments(names, development_records, geo_records,
     return resolutions, created
 def _matched_ids(resolutions: Iterable[dict]) -> list[str]:
     return list(dict.fromkeys(item["id"] for item in resolutions or [] if item.get("matched")))
+
+
+def _merge_matched_resolutions(*groups) -> list[dict]:
+    merged, seen = [], set()
+    for group in groups:
+        for item in group or []:
+            key = ("id", str(item["id"])) if item.get("matched") else (
+                "raw", _compact(item.get("raw_name")).casefold()
+            )
+            if key not in seen:
+                merged.append(item)
+                seen.add(key)
+    return merged
 
 
 def _apply_proposing_agent_payload(payload, proposing_agent, name_field, number_field):
@@ -1827,21 +1862,40 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         location_references = _unique_strings(
             parsed.get("location_references") or parsed.get("geo_names") or []
         )
-        geos = resolve_geo_names(location_references, geo_records)
-        developments, created_developments = _resolve_or_verify_developments(
+        geos, reclassified_developments, unresolved_references = (
+            _reconcile_lead_location_references(
+                location_references, geo_records, development_records
+            )
+        )
+        explicit_developments, created_developments = _resolve_or_verify_developments(
             parsed.get("preferred_development_names", []), development_records,
             geo_records, verification_context, bubble_env,
         )
-        has_geo = any(item.get("matched") for item in geos)
-        has_development = any(item.get("matched") for item in developments)
-        if not has_geo and not has_development:
-            geos = resolve_location_references(
-                location_references, geo_records, verification_context,
+        developments = _merge_matched_resolutions(
+            explicit_developments, reclassified_developments
+        )
+        development_keys = [
+            development_resolver._normalized_development(item.get("name"))
+            for item in developments if item.get("matched")
+        ]
+        unresolved_references = [
+            reference for reference in unresolved_references
+            if not any(
+                key and key in development_resolver._normalized_development(reference)
+                for key in development_keys
+            )
+        ]
+        if unresolved_references:
+            fallback_geos = resolve_location_references(
+                unresolved_references, geo_records, verification_context,
                 bubble_env=bubble_env,
             )
-            has_geo = any(item.get("matched") for item in geos)
-        if not has_geo:
-            geos.extend(_derived_geos(developments, geo_records))
+            geos = _merge_matched_resolutions(geos, fallback_geos)
+        geos = _merge_matched_resolutions(
+            geos, _derived_geos(developments, geo_records)
+        )
+        has_geo = any(item.get("matched") for item in geos)
+        has_development = any(item.get("matched") for item in developments)
         payload = build_lead_payload(
             parsed, geos, developments, proposing_agent
         )

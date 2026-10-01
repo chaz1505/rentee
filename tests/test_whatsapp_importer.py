@@ -764,6 +764,115 @@ Tech subang
         self.assertEqual(create.call_args.args[2]["locationReferences"],
                          ["Near One Menerung"])
 
+    def test_lead_reclassifies_existing_development_location_reference(self):
+        parsed = {
+            "type": "lead", "location_references": ["One menerung"],
+            "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "budget": 15000, "bedrooms_min": 3,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference") as verify, \
+             patch("builtins.print") as log, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            result = importer.process_whatsapp_import(
+                "WTR 3 bedroom One menerung RM15k",
+                geo_records=GEOS, development_records=DEVELOPMENTS,
+            )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["preferredDevelopments"], ["dev-one"])
+        self.assertEqual(payload["Geo"], ["geo-bangsar"])
+        self.assertEqual(payload["bedroomsMin"], 3)
+        self.assertEqual(payload["budgetRent"], 15000)
+        self.assertEqual(result["resolved_developments"][0]["name"], "One Menerung")
+        verify.assert_not_called()
+        self.assertTrue(any(
+            "location reclassified raw='One menerung' type=development "
+            "canonical='One Menerung'" in str(call)
+            for call in log.call_args_list
+        ))
+
+    def test_lead_geo_reference_remains_geo_not_development(self):
+        parsed = {
+            "type": "lead", "location_references": ["Bangsar"],
+            "geo_names": ["Bangsar"], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+            "budget": 15000, "bedrooms_min": 3,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.development_resolver,
+                          "resolve_development_name") as resolve_development, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            importer.process_whatsapp_import(
+                "WTR 3 bedroom Bangsar RM15k",
+                geo_records=GEOS, development_records=DEVELOPMENTS,
+            )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["Geo"], ["geo-bangsar"])
+        self.assertNotIn("preferredDevelopments", payload)
+        resolve_development.assert_not_called()
+
+    def test_lead_reconciles_mixed_development_and_geo_references(self):
+        parsed = {
+            "type": "lead",
+            "location_references": ["One Menerung", "Damansara Heights"],
+            "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference") as verify, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            importer.process_whatsapp_import(
+                "WTR One Menerung or Damansara Heights",
+                geo_records=GEOS, development_records=DEVELOPMENTS,
+            )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["preferredDevelopments"], ["dev-one"])
+        self.assertEqual(payload["Geo"], ["geo-dh", "geo-bangsar"])
+        verify.assert_not_called()
+
+    def test_lead_unknown_reference_still_uses_geo_fallback(self):
+        parsed = {
+            "type": "lead", "location_references": ["Sultan Ismail"],
+            "geo_names": [], "preferred_development_names": [],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        fallback = [{"matched": True, "id": "geo-klcc", "name": "KLCC"}]
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "verify_geo_reference",
+                          return_value=fallback) as verify, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            importer.process_whatsapp_import(
+                "WTR near Sultan Ismail",
+                geo_records=GEOS, development_records=DEVELOPMENTS,
+            )
+        self.assertEqual(create.call_args.args[2]["Geo"], ["geo-klcc"])
+        verify.assert_called_once()
+
+    def test_explicit_and_reclassified_development_and_geo_are_deduplicated(self):
+        parsed = {
+            "type": "lead",
+            "location_references": ["One menerung", "Bangsar"],
+            "geo_names": [], "preferred_development_names": ["One Menerung"],
+            "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="lead-1") as create:
+            result = importer.process_whatsapp_import(
+                "WTR One Menerung Bangsar",
+                geo_records=GEOS, development_records=DEVELOPMENTS,
+            )
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["preferredDevelopments"], ["dev-one"])
+        self.assertEqual(payload["Geo"], ["geo-bangsar"])
+        self.assertEqual(len(result["resolved_developments"]), 1)
+        self.assertEqual(len(result["resolved_geos"]), 1)
+
     def test_unresolved_lead_is_created_with_clear_confirmation(self):
         parsed = {
             "type": "lead", "location_references": ["Unknown Place"],
