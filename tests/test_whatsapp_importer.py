@@ -2,7 +2,7 @@ import json
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import requests
 
@@ -1814,6 +1814,207 @@ Tech subang
             },
         )
 
+    @staticmethod
+    def match_alert_records():
+        lead = {
+            "_id": "lead-new", "owner": "user-stephanie",
+            "TransactionType": ["Buy/Sell"], "preferredDevelopments": ["dev-one"],
+            "bedroomsMin": 3, "budgetBuy": 1800000,
+        }
+        listing = {
+            "_id": "listing-existing", "owner": "user-gwen",
+            "TransactionType": ["Buy/Sell"], "development": "dev-one",
+            "beds": 3, "priceSale": 1650000,
+        }
+        return lead, listing
+
+    def test_new_lead_match_alerts_existing_listing_owner_in_open_window(self):
+        lead, listing = self.match_alert_records()
+
+        def user(url):
+            return ({"name": "Gwen", "phone": "0174156107", "alerts": True}
+                    if url.endswith("/user/user-gwen") else {"name": "Stephanie"})
+
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create, \
+             patch.object(importer.rentee_app, "bubble", side_effect=user), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text",
+                          return_value=["wamid.1"]) as send_text, \
+             patch.object(importer.rentee_app, "send_whatsapp_template") as send_template, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            importer.create_missing_match_records(
+                "lead", "lead-new", [listing], "live", created_record=lead,
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+            )
+        self.assertEqual(create.call_args.args[2]["listing_owner"], "user-gwen")
+        message = send_text.call_args.args[1]
+        self.assertIn("Hi Gwen, Stephanie has just added a buyer", message)
+        self.assertIn("https://www.rentee.asia/lead/lead-new", message)
+        self.assertIn("https://www.rentee.asia/listing/listing-existing", message)
+        send_template.assert_not_called()
+        payload = update.call_args.args[1]
+        self.assertIs(payload["alert_sent"], True)
+        self.assertEqual(payload["alert_recipient"], "user-gwen")
+        self.assertIn("alert_sent_at", payload)
+
+    def test_closed_and_unknown_match_alert_windows_use_template(self):
+        lead, listing = self.match_alert_records()
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        for window in ("closed", "unknown"):
+            with self.subTest(window=window), \
+                 patch.object(importer.rentee_app, "bubble",
+                              side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+                 patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                              return_value=window), \
+                 patch.object(importer.rentee_app, "send_whatsapp_text") as text, \
+                 patch.object(importer.rentee_app, "send_whatsapp_template",
+                              return_value=["wamid.template"]) as template, \
+                 patch.object(importer.rentee_app, "_bubble_patch") as update:
+                sent = importer.maybe_send_match_alert(
+                    "match-1", "lead", lead, listing,
+                    "user-stephanie", "user-gwen",
+                    development_records=DEVELOPMENTS, geo_records=GEOS,
+                    match_record={"alert_sent": False},
+                )
+            self.assertTrue(sent)
+            text.assert_not_called()
+            self.assertEqual(template.call_args.args[:2], (
+                "60174156107", "rentee_match_alert",
+            ))
+            self.assertEqual(len(template.call_args.kwargs["parameters"]), 8)
+            self.assertTrue(update.call_args.args[1]["alert_sent"])
+
+    def test_new_listing_alerts_existing_lead_owner(self):
+        lead, listing = self.match_alert_records()
+        listing["_id"] = "listing-new"
+        listing["owner"] = "user-gwen"
+        users = {
+            "user-stephanie": {
+                "name": "Stephanie", "phone": "0122017185", "alerts": True,
+            },
+            "user-gwen": {"name": "Gwen"},
+        }
+        with patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text") as send, \
+             patch.object(importer.rentee_app, "_bubble_patch"):
+            importer.maybe_send_match_alert(
+                "match-2", "listing", lead, listing,
+                "user-stephanie", "user-gwen",
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+                match_record={},
+            )
+        self.assertEqual(send.call_args.args[0], "60122017185")
+        self.assertIn("Hi Stephanie, Gwen has just added a 3-bed listing", send.call_args.args[1])
+
+    def test_match_alert_eligibility_skips_self_disabled_missing_and_sent(self):
+        lead, listing = self.match_alert_records()
+        cases = (
+            ("self", "same", "same", {"alerts": True, "phone": "0174156107"}, {},
+             "self_match"),
+            ("disabled", "lead-owner", "listing-owner",
+             {"alerts": False, "phone": "0174156107"}, {}, "alerts_disabled"),
+            ("absent", "lead-owner", "listing-owner",
+             {"phone": "0174156107"}, {}, "alerts_disabled"),
+            ("phone", "lead-owner", "listing-owner", {"alerts": True}, {},
+             "missing_phone"),
+            ("sent", "lead-owner", "listing-owner",
+             {"alerts": True, "phone": "0174156107"}, {"alert_sent": True},
+             "already_sent"),
+        )
+        for label, lead_owner, listing_owner, recipient, match_record, reason in cases:
+            with self.subTest(label=label), \
+                 patch.object(importer.rentee_app, "bubble", return_value=recipient), \
+                 patch.object(importer.rentee_app, "send_whatsapp_text") as text, \
+                 patch.object(importer.rentee_app, "send_whatsapp_template") as template, \
+                 patch("builtins.print") as log:
+                sent = importer.maybe_send_match_alert(
+                    "match-1", "lead", lead, listing, lead_owner, listing_owner,
+                    match_record=match_record,
+                )
+            self.assertFalse(sent)
+            text.assert_not_called()
+            template.assert_not_called()
+            self.assertIn(f"reason={reason}", " ".join(
+                str(call) for call in log.call_args_list
+            ))
+
+    def test_existing_match_pair_does_not_send_alert(self):
+        with patch.object(importer.rentee_app, "_bubble_records",
+                          return_value=[{"_id": "match-existing"}]), \
+             patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert:
+            importer.create_missing_match_records(
+                "lead", "lead-1", [{"_id": "listing-1"}], "live"
+            )
+        create.assert_not_called()
+        alert.assert_not_called()
+
+    def test_match_alert_send_failure_keeps_created_match_unpatched(self):
+        lead, listing = self.match_alert_records()
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create, \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text",
+                          side_effect=RuntimeError("Meta unavailable")), \
+             patch.object(importer.rentee_app, "_bubble_patch") as update, \
+             patch("builtins.print") as log:
+            importer.create_missing_match_records(
+                "lead", "lead-new", [listing], "live", created_record=lead,
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+            )
+        create.assert_called_once()
+        update.assert_not_called()
+        self.assertIn("[MATCH ALERT ERROR] match_id=match-1", " ".join(
+            str(call) for call in log.call_args_list
+        ))
+
+    def test_match_alert_formatters_cover_sale_rent_and_missing_fields(self):
+        lead, listing = self.match_alert_records()
+        self.assertEqual(importer.format_lead_alert_summary(
+            lead, DEVELOPMENTS, GEOS
+        ), "buyer looking for a 3-bed in One Menerung")
+        self.assertEqual(importer.format_listing_alert_summary(
+            listing, DEVELOPMENTS, GEOS
+        ), "3-bed listing in One Menerung")
+        self.assertEqual(importer.format_match_reason(
+            lead, listing, DEVELOPMENTS, GEOS
+        ), "One Menerung · 3 bedrooms · Budget RM1.8m vs asking RM1.65m")
+
+        rental_lead = dict(lead, TransactionType=["Rent/Let"], budgetRent=15000)
+        rental_listing = dict(listing, TransactionType=["Rent/Let"], priceRent=12000)
+        self.assertEqual(importer.format_lead_alert_summary(
+            rental_lead, DEVELOPMENTS, GEOS
+        ), "tenant looking for a 3-bed in One Menerung")
+        self.assertEqual(importer.format_match_reason(
+            rental_lead, rental_listing, DEVELOPMENTS, GEOS
+        ), "One Menerung · 3 bedrooms · Budget RM15,000/month vs asking RM12,000/month")
+
+        sparse_lead = {"TransactionType": ["Buy/Sell"], "Geo": ["geo-bangsar"]}
+        sparse_listing = {"TransactionType": ["Buy/Sell"], "Geo": "geo-bangsar"}
+        reason = importer.format_match_reason(
+            sparse_lead, sparse_listing, DEVELOPMENTS, GEOS
+        )
+        self.assertEqual(reason, "Bangsar")
+        self.assertNotIn("None", reason)
+        self.assertNotIn("  ·", reason)
+
     def test_new_lead_matches_existing_listings_and_appends_confirmation(self):
         parsed = {
             "type": "lead", "geo_names": ["Bangsar"],
@@ -1886,9 +2087,14 @@ Tech subang
             "https://www.rentee.asia/lead/lead-1",
             result["confirmation"],
         )
-        get_owner.assert_called_once_with(
-            "https://www.rentee.asia/api/1.1/obj/user/user-alex"
-        )
+        self.assertEqual(get_owner.call_args_list, [
+            call(
+                "https://www.rentee.asia/api/1.1/obj/user/user-alex"
+            ),
+            call(
+                "https://www.rentee.asia/api/1.1/obj/user/user-alex"
+            ),
+        ])
         self.assertEqual(find.call_args.args[0], "listing")
         self.assertEqual(find.call_args.args[1]["_id"], "listing-1")
 

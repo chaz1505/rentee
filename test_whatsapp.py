@@ -720,6 +720,25 @@ class OwnerCheckTests(unittest.TestCase):
             },
         })
 
+    @patch("app.requests.post")
+    def test_whatsapp_template_supports_optional_body_parameters(self, post):
+        post.return_value.status_code = 200
+        post.return_value.raise_for_status.return_value = None
+        post.return_value.json.return_value = {
+            "messages": [{"id": "wamid.match-alert"}],
+        }
+        ids = app_module.send_whatsapp_template(
+            "60115551234", "rentee_match_alert", parameters=["Gwen", "Summary"]
+        )
+        self.assertEqual(ids, ["wamid.match-alert"])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["template"]["components"],
+            [{"type": "body", "parameters": [
+                {"type": "text", "text": "Gwen"},
+                {"type": "text", "text": "Summary"},
+            ]}],
+        )
+
     def test_sent_and_replied_owner_checks_do_not_resend(self):
         for status in ("Sent", "Replied"):
             with self.subTest(status=status), \

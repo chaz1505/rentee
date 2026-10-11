@@ -1614,8 +1614,215 @@ def find_import_matches(created_type: str, record: dict, bubble_env: str) -> lis
     return [item for item in records if lead_matches_listing(item, record)]
 
 
+def _record_url(record_type, record_id):
+    record_id = _compact(record_id)
+    return f"https://www.rentee.asia/{record_type}/{record_id}" if record_id else ""
+
+
+def _related_record_name(value, records) -> str:
+    values = value if isinstance(value, list) else [value]
+    by_id = {str(item.get("_id")): item for item in records or [] if item.get("_id")}
+    for item in values:
+        record = item if isinstance(item, dict) else by_id.get(str(item or ""), {})
+        name = _record_name(record)
+        if name:
+            return name
+    return ""
+
+
+def _alert_location(record, development_records=None, geo_records=None) -> str:
+    development = _related_record_name(
+        record.get("preferredDevelopments") or record.get("development"),
+        development_records,
+    )
+    return development or _related_record_name(record.get("Geo"), geo_records)
+
+
+def format_lead_alert_summary(lead, development_records=None, geo_records=None,
+                              transaction=None) -> str:
+    transaction = transaction or next((
+        item for item in TRANSACTION_TYPES
+        if item in (lead.get("TransactionType") or [])
+    ), None)
+    role = {"Buy/Sell": "buyer", "Rent/Let": "tenant"}.get(transaction, "client")
+    beds = lead.get("bedroomsMin")
+    subject = (
+        f"a {beds:g}-bed" if not isinstance(beds, bool)
+        and isinstance(beds, (int, float)) and beds > 0 else "a property"
+    )
+    location = _alert_location(lead, development_records, geo_records)
+    return f"{role} looking for {subject}" + (f" in {location}" if location else "")
+
+
+def format_listing_alert_summary(listing, development_records=None, geo_records=None) -> str:
+    beds = listing.get("beds")
+    subject = (
+        f"{beds:g}-bed listing" if not isinstance(beds, bool)
+        and isinstance(beds, (int, float)) and beds > 0 else "listing"
+    )
+    location = _alert_location(listing, development_records, geo_records)
+    return subject + (f" in {location}" if location else "")
+
+
+def _alert_money(value, *, monthly=False) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return ""
+    if not monthly and value >= 1_000_000:
+        millions = f"{value / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"RM{millions}m"
+    return f"RM{value:,.0f}" + ("/month" if monthly else "")
+
+
+def format_match_reason(lead, listing, development_records=None, geo_records=None) -> str:
+    parts = []
+    location = (
+        _alert_location(listing, development_records, geo_records)
+        or _alert_location(lead, development_records, geo_records)
+    )
+    if location:
+        parts.append(location)
+    lead_beds, listing_beds = lead.get("bedroomsMin"), listing.get("beds")
+    if all(not isinstance(value, bool) and isinstance(value, (int, float))
+           and value > 0 for value in (lead_beds, listing_beds)):
+        parts.append(f"{listing_beds:g} bedrooms")
+    transaction = _matched_transaction(lead, listing)
+    if transaction:
+        budget_field, price_field = {
+            "Rent/Let": ("budgetRent", "priceRent"),
+            "Buy/Sell": ("budgetBuy", "priceSale"),
+        }[transaction]
+        monthly = transaction == "Rent/Let"
+        budget = _alert_money(lead.get(budget_field), monthly=monthly)
+        asking = _alert_money(listing.get(price_field), monthly=monthly)
+        if budget and asking:
+            parts.append(f"Budget {budget} vs asking {asking}")
+    return " · ".join(parts)
+
+
+def build_match_alert(created_type, lead, listing, recipient, other_agent,
+                      development_records=None, geo_records=None) -> dict:
+    transaction = _matched_transaction(lead, listing)
+    lead_summary = format_lead_alert_summary(
+        lead, development_records, geo_records, transaction
+    )
+    listing_summary = format_listing_alert_summary(
+        listing, development_records, geo_records
+    )
+    lead_url = _record_url("lead", lead.get("_id"))
+    listing_url = _record_url("listing", listing.get("_id"))
+    recipient_name = _compact(recipient.get("name")) or "there"
+    other_name = _compact(other_agent.get("name")) or "another Rentee agent"
+    if created_type == "lead":
+        new_summary, new_url = lead_summary, lead_url
+        existing_summary, existing_url = listing_summary, listing_url
+    else:
+        new_summary, new_url = listing_summary, listing_url
+        existing_summary, existing_url = lead_summary, lead_url
+    reason = format_match_reason(
+        lead, listing, development_records, geo_records
+    )
+    reason_line = f"\n\n*Why it matches:* {reason}" if reason else ""
+    text = (
+        "🔔 *Rentee Match Alert*\n\n"
+        f"Hi {recipient_name}, {other_name} has just added a {new_summary} – {new_url}, "
+        f"which might match your {existing_summary} – {existing_url}."
+        f"{reason_line}\n\n"
+        f"Take a look and connect with {other_name} if it’s a good fit."
+    )
+    return {
+        "text": text, "recipient_name": recipient_name, "other_agent_name": other_name,
+        "new_summary": new_summary, "new_url": new_url,
+        "existing_summary": existing_summary, "existing_url": existing_url,
+        "reason": reason,
+    }
+
+
+def _match_alert_template_parameters(alert) -> list[str]:
+    """Body order for rentee_match_alert; keep isolated for template approval changes."""
+    parameters = [alert[key] for key in (
+        "recipient_name", "other_agent_name", "new_summary", "new_url",
+        "existing_summary", "existing_url", "reason", "other_agent_name",
+    )]
+    parameters[6] = parameters[6] or "See the linked records for details"
+    return parameters
+
+
+def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
+                           listing_owner, bubble_env="live", *, match_record=None,
+                           development_records=None, geo_records=None):
+    match_id = _compact(match_id)
+    base_url = rentee_app.get_bubble_base_url(bubble_env)
+    if match_record is None:
+        try:
+            match_record = rentee_app.bubble(
+                f"{base_url}/obj/match/{match_id}"
+            )
+        except Exception:
+            match_record = {}
+    if (match_record or {}).get("alert_sent") is True:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=already_sent", flush=True)
+        return False
+    if lead_owner and lead_owner == listing_owner:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped reason=self_match",
+              flush=True)
+        return False
+    recipient_id = listing_owner if created_type == "lead" else lead_owner
+    other_agent_id = lead_owner if created_type == "lead" else listing_owner
+    if not recipient_id:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=missing_recipient", flush=True)
+        return False
+    try:
+        recipient = rentee_app.bubble(f"{base_url}/obj/user/{recipient_id}")
+    except Exception:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=alerts_disabled", flush=True)
+        return False
+    if recipient.get("alerts") is not True:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=alerts_disabled", flush=True)
+        return False
+    phone = normalize_phone_number(recipient.get("phone"))
+    if not phone:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=missing_phone", flush=True)
+        return False
+    try:
+        other_agent = (
+            rentee_app.bubble(f"{base_url}/obj/user/{other_agent_id}")
+            if other_agent_id else {}
+        )
+    except Exception:
+        other_agent = {}
+    alert = build_match_alert(
+        created_type, lead, listing, recipient, other_agent,
+        development_records, geo_records,
+    )
+    window = rentee_app.owner_check_whatsapp_window(phone, bubble_env)
+    channel = "text" if window == "open" else "template"
+    print(f"[MATCH ALERT] match_id={match_id} recipient_user_id={recipient_id} "
+          f"window={window} channel={channel}", flush=True)
+    if channel == "text":
+        rentee_app.send_whatsapp_text(phone, alert["text"])
+    else:
+        rentee_app.send_whatsapp_template(
+            phone, "rentee_match_alert", parameters=(
+                _match_alert_template_parameters(alert)
+            ),
+        )
+    rentee_app._bubble_patch(f"{base_url}/obj/match/{match_id}", {
+        "alert_sent": True,
+        "alert_sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "alert_recipient": recipient_id,
+    })
+    print(f"[MATCH ALERT] match_id={match_id} action=sent", flush=True)
+    return True
+
+
 def create_missing_match_records(
-        created_type, created_id, matches, bubble_env, created_record=None):
+        created_type, created_id, matches, bubble_env, created_record=None,
+        development_records=None, geo_records=None):
     """Persist each unique deterministic Lead/Listing pair once."""
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     seen = set()
@@ -1658,7 +1865,7 @@ def create_missing_match_records(
         if listing_owner:
             payload["listing_owner"] = listing_owner
         try:
-            rentee_app._bubble_create(base_url, "match", payload)
+            match_id = rentee_app._bubble_create(base_url, "match", payload)
         except Exception as error:
             # Matching is downstream of a completed import. Keep each pair
             # isolated so one rejected Match cannot fail the import or prevent
@@ -1669,6 +1876,17 @@ def create_missing_match_records(
                 f"error={type(error).__name__}",
                 flush=True,
             )
+            continue
+        try:
+            maybe_send_match_alert(
+                match_id, created_type, dict(lead_record or {}, _id=pair[0]),
+                dict(listing_record or {}, _id=pair[1]), lead_owner, listing_owner,
+                bubble_env, match_record=dict(payload, _id=match_id),
+                development_records=development_records, geo_records=geo_records,
+            )
+        except Exception as error:
+            print(f"[MATCH ALERT ERROR] match_id={match_id} "
+                  f"error={type(error).__name__}: {error}", flush=True)
 
 
 def _matched_transaction(lead: dict, listing: dict) -> str | None:
@@ -1755,7 +1973,7 @@ def format_import_matches(created_type: str, created_record: dict,
         summary = label + (f" — {', '.join(details)}" if label and details else "")
         if not label:
             summary = ", ".join(details)
-        url = f"https://www.rentee.asia/{path}/{record_id}" if record_id else ""
+        url = _record_url(path, record_id)
         blocks.append("\n".join(item for item in (
             summary,
             f"Agent: {agent_name}" if agent_name else "",
@@ -1832,7 +2050,8 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         matches = find_import_matches(parsed["type"], duplicate, bubble_env)
         create_missing_match_records(
             parsed["type"], bubble_id, matches, bubble_env,
-            created_record=duplicate,
+            created_record=duplicate, development_records=development_records,
+            geo_records=geo_records,
         )
         duplicate_developments = development_records
         if duplicate_developments is None:
@@ -1996,7 +2215,8 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     )
     create_missing_match_records(
         parsed["type"], bubble_id, matches, bubble_env,
-        created_record=created_record,
+        created_record=created_record, development_records=development_records,
+        geo_records=geo_records,
     )
     result["matches"] = matches
     if matches:

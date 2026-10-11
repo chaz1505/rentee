@@ -2187,10 +2187,22 @@ def owner_check_whatsapp_window(phone, bubble_env="live", now=None):
     return "open" if datetime.timedelta(0) <= age <= datetime.timedelta(hours=24) else "closed"
 
 
-def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
-    """Send one configured Meta WhatsApp template without changing its content."""
+def send_whatsapp_template(to_phone, template_name, language_code="en_US",
+                           parameters=None):
+    """Send one configured Meta template, optionally with text body parameters."""
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
     access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
+    template = {
+        "name": template_name,
+        "language": {"code": language_code},
+    }
+    if parameters is not None:
+        template["components"] = [{
+            "type": "body",
+            "parameters": [
+                {"type": "text", "text": str(value)} for value in parameters
+            ],
+        }]
     response = requests.post(
         f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
         f"{phone_number_id}/messages",
@@ -2202,10 +2214,7 @@ def send_whatsapp_template(to_phone, template_name, language_code="en_US"):
             "messaging_product": "whatsapp",
             "to": normalize_phone(to_phone),
             "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": language_code},
-            },
+            "template": template,
         },
         timeout=30,
     )
