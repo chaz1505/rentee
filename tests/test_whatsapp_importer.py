@@ -1868,6 +1868,7 @@ Tech subang
         }
         for window in ("closed", "unknown"):
             with self.subTest(window=window), \
+                 patch.dict(os.environ, {"MATCH_ALERT_TEMPLATES_ENABLED": "true"}), \
                  patch.object(importer.rentee_app, "bubble",
                               side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
                  patch.object(importer.rentee_app, "owner_check_whatsapp_window",
@@ -1889,6 +1890,111 @@ Tech subang
             ))
             self.assertEqual(len(template.call_args.kwargs["parameters"]), 8)
             self.assertTrue(update.call_args.args[1]["alert_sent"])
+
+    def test_templates_disabled_skips_closed_and_unknown_windows(self):
+        lead, listing = self.match_alert_records()
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        for window in ("closed", "unknown"):
+            with self.subTest(window=window), \
+                 patch.dict(os.environ, {"MATCH_ALERT_TEMPLATES_ENABLED": "false"}), \
+                 patch.object(importer.rentee_app, "bubble",
+                              side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+                 patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                              return_value=window), \
+                 patch.object(importer.rentee_app, "send_whatsapp_text") as text, \
+                 patch.object(importer.rentee_app, "send_whatsapp_template") as template, \
+                 patch.object(importer.rentee_app, "_bubble_patch") as update, \
+                 patch("builtins.print") as logged:
+                sent = importer.maybe_send_match_alert(
+                    "match-1", "lead", lead, listing,
+                    "user-stephanie", "user-gwen", match_record={},
+                )
+            self.assertFalse(sent)
+            text.assert_not_called()
+            template.assert_not_called()
+            update.assert_not_called()
+            self.assertIn(
+                f"reason=templates_disabled window={window}",
+                " ".join(str(call) for call in logged.call_args_list),
+            )
+
+    def test_import_alert_limit_creates_all_matches_but_sends_once(self):
+        lead, listing = self.match_alert_records()
+        listings = [dict(listing, _id=f"listing-{index}") for index in range(20)]
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=[f"match-{index}" for index in range(20)]) as create, \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text",
+                          return_value=["wamid.accepted"]) as send, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            importer.create_missing_match_records(
+                "lead", "lead-new", listings, "live", created_record=lead,
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+            )
+        self.assertEqual(create.call_count, 20)
+        send.assert_called_once()
+        update.assert_called_once()
+
+    def test_failed_alert_allows_later_attempt_but_success_consumes_limit(self):
+        lead, listing = self.match_alert_records()
+        listings = [dict(listing, _id=f"listing-{index}") for index in range(3)]
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["match-0", "match-1", "match-2"]), \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text",
+                          side_effect=[RuntimeError("Meta down"), ["wamid.accepted"]]) as send, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            importer.create_missing_match_records(
+                "lead", "lead-new", listings, "live", created_record=lead,
+            )
+        self.assertEqual(send.call_count, 2)
+        update.assert_called_once()
+        self.assertTrue(update.call_args.args[0].endswith("/match/match-1"))
+
+    def test_match_patch_failure_does_not_allow_second_send(self):
+        lead, listing = self.match_alert_records()
+        listings = [dict(listing, _id=f"listing-{index}") for index in range(2)]
+        users = {
+            "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
+            "user-stephanie": {"name": "Stephanie"},
+        }
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["match-0", "match-1"]), \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="open"), \
+             patch.object(importer.rentee_app, "send_whatsapp_text",
+                          return_value=["wamid.accepted"]) as send, \
+             patch.object(importer.rentee_app, "_bubble_patch",
+                          side_effect=RuntimeError("Bubble down")):
+            importer.create_missing_match_records(
+                "lead", "lead-new", listings, "live", created_record=lead,
+            )
+        send.assert_called_once()
 
     def test_new_listing_alerts_existing_lead_owner(self):
         lead, listing = self.match_alert_records()
@@ -2316,12 +2422,17 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent", return_value={"intent": "lead_import"}), \
+             patch.object(app, "persist_whatsapp_import_message") as persist, \
              patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \
              patch.object(app, "find_reply_context") as reply_context:
             app._process_whatsapp_message(message)
         process.assert_called_once_with(text, import_type="lead", bubble_env="live")
+        persist.assert_called_once_with(
+            "60123456789", "wamid.import-1", text, {"_id": "user-1"},
+            "live", "text",
+        )
         send.assert_called_once_with("60123456789", "Added lead.")
         base_url.assert_not_called()
         reply_context.assert_not_called()
@@ -2342,12 +2453,14 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent", return_value={"intent": "listing_import"}), \
+             patch.object(app, "persist_whatsapp_import_message") as persist, \
              patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \
              patch.object(app, "find_reply_context") as reply_context:
             app._process_whatsapp_message(message)
         process.assert_called_once_with(text, import_type="listing", bubble_env="live")
+        persist.assert_called_once()
         send.assert_called_once_with("60123456789", "Added listing.")
         base_url.assert_not_called()
         reply_context.assert_not_called()

@@ -532,8 +532,9 @@ class OwnerCheckTests(unittest.TestCase):
     def test_owner_window_uses_latest_inbound_created_date(self):
         now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
         with patch("app._bubble_records", return_value=iter([
-            {"Created Date": "2026-08-29T10:00:00Z"},
-            {"Created Date": "2026-08-30T11:00:00Z"},
+            {"direction": "Inbound", "Created Date": "2026-08-29T10:00:00Z"},
+            {"direction": "inbound", "Created Date": "2026-08-30T11:00:00Z"},
+            {"direction": "Outbound", "Created Date": "2026-08-30T11:30:00Z"},
         ])) as records:
             window = app_module.owner_check_whatsapp_window(
                 "+60 11-555 1234", now=now
@@ -542,14 +543,12 @@ class OwnerCheckTests(unittest.TestCase):
         self.assertEqual(records.call_args.args[2], [
             {"key": "phone", "constraint_type": "equals",
              "value": "60115551234"},
-            {"key": "direction", "constraint_type": "equals",
-             "value": "Inbound"},
         ])
 
     def test_owner_window_expired_inbound_is_closed(self):
         now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
         with patch("app._bubble_records", return_value=iter([
-            {"Created Date": "2026-08-29T11:59:59Z"},
+            {"direction": "Inbound", "Created Date": "2026-08-29T11:59:59Z"},
         ])):
             self.assertEqual(
                 app_module.owner_check_whatsapp_window("60115551234", now=now),
@@ -561,25 +560,33 @@ class OwnerCheckTests(unittest.TestCase):
             self.assertEqual(
                 app_module.owner_check_whatsapp_window("60115551234"), "closed"
             )
-        self.assertEqual(
-            records.call_args.args[2][1]["value"], "Inbound"
-        )
+        self.assertEqual(records.call_args.args[2][0]["value"], "60115551234")
 
     def test_recent_outbound_only_history_does_not_open_window(self):
-        with patch("app._bubble_records", return_value=iter([])) as records:
+        with patch("app._bubble_records", return_value=iter([
+            {"direction": "Outbound", "Created Date": "2026-08-30T11:00:00Z"},
+        ])) as records:
             window = app_module.owner_check_whatsapp_window("60115551234")
         self.assertEqual(window, "closed")
-        self.assertEqual(records.call_args.args[2][1], {
-            "key": "direction", "constraint_type": "equals", "value": "Inbound",
-        })
+        self.assertEqual(len(records.call_args.args[2]), 1)
 
     def test_malformed_inbound_created_date_is_unknown(self):
         with patch("app._bubble_records", return_value=iter([
-            {"Created Date": "not-a-date"},
+            {"direction": "Inbound", "Created Date": "not-a-date"},
         ])):
             self.assertEqual(
                 app_module.owner_check_whatsapp_window("60115551234"), "unknown"
             )
+
+    def test_failed_owner_window_lookup_is_unknown(self):
+        with patch("app._bubble_records", side_effect=RuntimeError("Bubble down")), \
+             patch("builtins.print") as logged:
+            result = app_module.owner_check_whatsapp_window("+60 11-555 1234")
+        self.assertEqual(result, "unknown")
+        log_text = " ".join(str(call) for call in logged.call_args_list)
+        self.assertIn("phone=...551234", log_text)
+        self.assertIn("reason=query_failed", log_text)
+        self.assertNotIn("60115551234", log_text)
 
     def test_closed_window_uses_template_and_marks_sent_only_on_success(self):
         enquiry = self.enquiry(

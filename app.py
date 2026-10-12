@@ -2156,35 +2156,59 @@ def _bubble_created_at(value):
 def owner_check_whatsapp_window(phone, bubble_env="live", now=None):
     """Return open/closed/unknown from the latest inbound WhatsApp Message."""
     canonical = normalize_phone(phone)
+    masked_phone = _masked_whatsapp_phone(canonical)
     constraints = [
         {"key": "phone", "constraint_type": "equals", "value": canonical},
-        {"key": "direction", "constraint_type": "equals", "value": "Inbound"},
     ]
     try:
         messages = list(_bubble_records(
             get_bubble_base_url(bubble_env), "message", constraints
         ))
-    except Exception:
+    except Exception as error:
+        print(
+            f"[WHATSAPP WINDOW] phone={masked_phone} result=unknown "
+            f"reason=query_failed error={type(error).__name__}", flush=True,
+        )
         return "unknown"
-    if not messages:
+    inbound = [
+        item for item in messages
+        if str(item.get("direction") or "").strip().casefold() == "inbound"
+    ]
+    if not inbound:
+        print(
+            f"[WHATSAPP WINDOW] phone={masked_phone} records_found=0 "
+            "result=closed reason=no_inbound_records", flush=True,
+        )
         return "closed"
-    messages.sort(
-        key=lambda item: str(
-            item.get("Created Date") or item.get("created_date") or ""
-        ),
-        reverse=True,
-    )
-    created_at = _bubble_created_at(
-        messages[0].get("Created Date") or messages[0].get("created_date")
-    )
-    if created_at is None:
+    timestamps = [
+        _bubble_created_at(item.get("Created Date") or item.get("created_date"))
+        for item in inbound
+    ]
+    valid_timestamps = [value for value in timestamps if value is not None]
+    if not valid_timestamps:
+        print(
+            f"[WHATSAPP WINDOW] phone={masked_phone} "
+            f"records_found={len(inbound)} result=unknown "
+            "reason=invalid_timestamp", flush=True,
+        )
         return "unknown"
+    created_at = max(valid_timestamps)
     current = now or datetime.datetime.now(datetime.timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=datetime.timezone.utc)
     current = current.astimezone(datetime.timezone.utc)
     age = current - created_at
-    return "open" if datetime.timedelta(0) <= age <= datetime.timedelta(hours=24) else "closed"
+    result = (
+        "open" if datetime.timedelta(0) <= age <= datetime.timedelta(hours=24)
+        else "closed"
+    )
+    print(
+        f"[WHATSAPP WINDOW] phone={masked_phone} records_found={len(inbound)} "
+        f"latest_inbound={created_at.isoformat().replace('+00:00', 'Z')} "
+        f"age_hours={age.total_seconds() / 3600:.1f} result={result}",
+        flush=True,
+    )
+    return result
 
 
 def send_whatsapp_template(to_phone, template_name, language_code="en_US",
@@ -3345,6 +3369,40 @@ def persist_inbound_whatsapp_message(
         "action=persisted", flush=True,
     )
     return message_id, True
+
+
+def persist_whatsapp_import_message(
+    phone, whatsapp_message_id, message_content, whatsapp_user=None,
+    bubble_env="live", message_type="text",
+):
+    """Persist an import message before the import route returns early."""
+    user_id = conversation_store.relationship_id(
+        (whatsapp_user or {}).get("_id")
+    )
+    if user_id:
+        conversation = find_general_conversation(
+            user_id, phone, counterparty_user_id=user_id,
+            counterparty_role="Principal", rentee_role="Principal Assistant",
+            bubble_env=bubble_env,
+        )
+    else:
+        conversation = find_existing_general_conversation_by_phone(
+            phone, bubble_env
+        )
+    conversation_id = conversation_store.relationship_id(
+        (conversation or {}).get("_id")
+    )
+    if not conversation_id:
+        print(
+            "[WHATSAPP IMPORT ROUTING] action=inbound_not_persisted "
+            "reason=no_unambiguous_conversation", flush=True,
+        )
+        return None, False
+    return persist_inbound_whatsapp_message(
+        phone, whatsapp_message_id, message_content,
+        conversation_id=conversation_id, bubble_env=bubble_env,
+        message_type=message_type,
+    )
 
 
 def attach_whatsapp_message_lead(message_id, lead_id, bubble_env="live"):
@@ -7968,6 +8026,18 @@ def _process_whatsapp_message(message):
                         "[WHATSAPP IMPORT ROUTING] action=import "
                         f"type={import_type}", flush=True,
                     )
+                    try:
+                        persist_whatsapp_import_message(
+                            phone, message_id, text, whatsapp_user,
+                            "live", message_type,
+                        )
+                    except Exception as error:
+                        # Retention diagnostics must not make a valid import fail.
+                        print(
+                            "[WHATSAPP IMPORT ROUTING] "
+                            "action=inbound_persistence_failed "
+                            f"error={type(error).__name__}", flush=True,
+                        )
                     import_result = process_whatsapp_import(
                         text, import_type=import_type, bubble_env="live"
                     )

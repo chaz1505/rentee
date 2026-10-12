@@ -11,6 +11,7 @@ import datetime
 import calendar
 import hashlib
 import json
+import os
 import re
 from typing import Any, Iterable
 
@@ -1747,9 +1748,25 @@ def _match_alert_template_parameters(alert) -> list[str]:
     return parameters
 
 
+def _match_alert_templates_enabled() -> bool:
+    """Read the rollout switch at send time so Render changes take effect."""
+    return str(os.getenv("MATCH_ALERT_TEMPLATES_ENABLED", "false")).strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _match_alert_max_per_import() -> int:
+    """Return the temporary per-import send cap, safely defaulting to one."""
+    try:
+        return max(0, int(str(os.getenv("MATCH_ALERT_MAX_PER_IMPORT", "1")).strip()))
+    except (TypeError, ValueError):
+        return 1
+
+
 def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
                            listing_owner, bubble_env="live", *, match_record=None,
-                           development_records=None, geo_records=None):
+                           development_records=None, geo_records=None,
+                           import_alert_state=None, import_alert_limit=None):
     match_id = _compact(match_id)
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     if match_record is None:
@@ -1762,6 +1779,14 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
     if (match_record or {}).get("alert_sent") is True:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped "
               "reason=already_sent", flush=True)
+        return False
+    if (
+        import_alert_state is not None
+        and import_alert_limit is not None
+        and import_alert_state.get("accepted", 0) >= import_alert_limit
+    ):
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              "reason=import_alert_limit", flush=True)
         return False
     if lead_owner and lead_owner == listing_owner:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped reason=self_match",
@@ -1800,6 +1825,11 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
         development_records, geo_records,
     )
     window = rentee_app.owner_check_whatsapp_window(phone, bubble_env)
+    templates_enabled = _match_alert_templates_enabled()
+    if window != "open" and not templates_enabled:
+        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
+              f"reason=templates_disabled window={window}", flush=True)
+        return False
     channel = "text" if window == "open" else "template"
     print(f"[MATCH ALERT] match_id={match_id} recipient_user_id={recipient_id} "
           f"window={window} channel={channel}", flush=True)
@@ -1811,6 +1841,10 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
                 _match_alert_template_parameters(alert)
             ),
         )
+    # Meta accepted the send. Consume the import allowance before Bubble state
+    # is updated so a persistence failure cannot cause a second notification.
+    if import_alert_state is not None:
+        import_alert_state["accepted"] = import_alert_state.get("accepted", 0) + 1
     rentee_app._bubble_patch(f"{base_url}/obj/match/{match_id}", {
         "alert_sent": True,
         "alert_sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1826,6 +1860,8 @@ def create_missing_match_records(
     """Persist each unique deterministic Lead/Listing pair once."""
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     seen = set()
+    import_alert_state = {"accepted": 0}
+    import_alert_limit = _match_alert_max_per_import()
     for matched in matches or []:
         matched_id = _compact(matched.get("_id"))
         lead_id, listing_id = (
@@ -1883,6 +1919,8 @@ def create_missing_match_records(
                 dict(listing_record or {}, _id=pair[1]), lead_owner, listing_owner,
                 bubble_env, match_record=dict(payload, _id=match_id),
                 development_records=development_records, geo_records=geo_records,
+                import_alert_state=import_alert_state,
+                import_alert_limit=import_alert_limit,
             )
         except Exception as error:
             print(f"[MATCH ALERT ERROR] match_id={match_id} "
