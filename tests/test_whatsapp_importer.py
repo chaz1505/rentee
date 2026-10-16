@@ -71,6 +71,50 @@ class WhatsAppImporterTests(unittest.TestCase):
         with patch.object(importer.rentee_app.client.responses, "create", return_value=response):
             return importer.parse_forwarded_message(raw)
 
+    def test_save_whatsapp_message_creates_without_conversation(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="message-1") as create:
+            result = importer.save_whatsapp_message(
+                "+60 12-345 6789", "wamid.inbound", "WTR\nBangsar",
+                "Inbound", "text",
+            )
+        self.assertEqual(result, ("message-1", True))
+        payload = create.call_args.args[2]
+        self.assertEqual(payload["phone"], "60123456789")
+        self.assertEqual(payload["messageContent"], "WTR\nBangsar")
+        self.assertEqual(payload["own_Sent?"], "Yes")
+        self.assertNotIn("Conversation", payload)
+
+    def test_save_whatsapp_message_duplicate_is_not_overwritten(self):
+        existing = {
+            "_id": "message-existing", "messageContent": "original",
+            "direction": "Inbound", "lead": "lead-existing",
+        }
+        with patch.object(
+            importer.rentee_app, "_bubble_records", return_value=[existing]
+        ), patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer.save_whatsapp_message(
+                "60123456789", "wamid.duplicate", "replacement", "Outbound",
+                lead_id="lead-conflict",
+            )
+        self.assertEqual(result, ("message-existing", False))
+        create.assert_not_called()
+        update.assert_not_called()
+
+    def test_save_whatsapp_message_can_attach_missing_relationship(self):
+        existing = {"_id": "message-existing"}
+        with patch.object(
+            importer.rentee_app, "_bubble_records", return_value=[existing]
+        ), patch.object(importer.rentee_app, "_bubble_patch") as update:
+            result = importer.save_whatsapp_message(
+                "60123456789", "wamid.duplicate", "original", "Inbound",
+                listing_id="listing-1",
+            )
+        self.assertEqual(result, ("message-existing", False))
+        self.assertEqual(update.call_args.args[1], {"listing": "listing-1"})
+
     def test_incomplete_parser_response_logs_diagnostics_and_raises(self):
         response = SimpleNamespace(
             status="incomplete",
@@ -1843,6 +1887,7 @@ Tech subang
                           return_value="open"), \
              patch.object(importer.rentee_app, "send_whatsapp_text",
                           return_value=["wamid.1"]) as send_text, \
+             patch.object(importer, "save_whatsapp_message") as save_message, \
              patch.object(importer.rentee_app, "send_whatsapp_template") as send_template, \
              patch.object(importer.rentee_app, "_bubble_patch") as update:
             importer.create_missing_match_records(
@@ -1854,6 +1899,10 @@ Tech subang
         self.assertIn("Hi Gwen, Stephanie has just added a buyer", message)
         self.assertIn("https://www.rentee.asia/lead/lead-new", message)
         self.assertIn("https://www.rentee.asia/listing/listing-existing", message)
+        save_message.assert_called_once_with(
+            "60174156107", "wamid.1", message, "Outbound", "text", "live",
+            lead_id="lead-new", listing_id="listing-existing",
+        )
         send_template.assert_not_called()
         payload = update.call_args.args[1]
         self.assertIs(payload["alert_sent"], True)
@@ -1938,6 +1987,7 @@ Tech subang
                           return_value="open"), \
              patch.object(importer.rentee_app, "send_whatsapp_text",
                           return_value=["wamid.accepted"]) as send, \
+             patch.object(importer, "save_whatsapp_message"), \
              patch.object(importer.rentee_app, "_bubble_patch") as update:
             importer.create_missing_match_records(
                 "lead", "lead-new", listings, "live", created_record=lead,
@@ -2422,17 +2472,16 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent", return_value={"intent": "lead_import"}), \
-             patch.object(app, "persist_whatsapp_import_message") as persist, \
+             patch.object(importer, "save_whatsapp_message") as save, \
              patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \
              patch.object(app, "find_reply_context") as reply_context:
             app._process_whatsapp_message(message)
         process.assert_called_once_with(text, import_type="lead", bubble_env="live")
-        persist.assert_called_once_with(
-            "60123456789", "wamid.import-1", text, {"_id": "user-1"},
-            "live", "text",
-        )
+        self.assertEqual(save.call_args_list[0], call(
+            "60123456789", "wamid.import-1", text, "Inbound", "text", "live"
+        ))
         send.assert_called_once_with("60123456789", "Added lead.")
         base_url.assert_not_called()
         reply_context.assert_not_called()
@@ -2453,14 +2502,17 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent", return_value={"intent": "listing_import"}), \
-             patch.object(app, "persist_whatsapp_import_message") as persist, \
+             patch.object(importer, "save_whatsapp_message") as save, \
              patch.object(importer, "process_whatsapp_import", return_value=imported) as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \
              patch.object(app, "find_reply_context") as reply_context:
             app._process_whatsapp_message(message)
         process.assert_called_once_with(text, import_type="listing", bubble_env="live")
-        persist.assert_called_once()
+        self.assertEqual(save.call_args_list[0], call(
+            "60123456789", "wamid.import-listing", text,
+            "Inbound", "text", "live",
+        ))
         send.assert_called_once_with("60123456789", "Added listing.")
         base_url.assert_not_called()
         reply_context.assert_not_called()
@@ -2480,6 +2532,7 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent", return_value={"intent": "normal_chat"}), \
+             patch.object(importer, "save_whatsapp_message"), \
              patch.object(importer, "process_whatsapp_import") as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \
@@ -2505,6 +2558,7 @@ Polygon Properties
              patch.object(app, "_stop_whatsapp_typing"), \
              patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
              patch.object(importer, "detect_import_intent") as detect, \
+             patch.object(importer, "save_whatsapp_message"), \
              patch.object(importer, "process_whatsapp_import") as process, \
              patch.object(app, "send_whatsapp_text") as send, \
              patch.object(app, "get_bubble_base_url") as base_url, \

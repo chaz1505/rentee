@@ -598,6 +598,57 @@ def normalize_phone_number(raw_phone: str | None) -> str | None:
     return digits
 
 
+def save_whatsapp_message(
+    phone, whatsapp_message_id, content, direction, message_type="text",
+    bubble_env="live", lead_id=None, listing_id=None,
+):
+    """Idempotently store a WhatsApp delivery without a Conversation."""
+    meta_id = str(whatsapp_message_id or "").strip()
+    if not meta_id:
+        raise ValueError("WhatsApp message ID is required.")
+    normalized_direction = str(direction or "").strip().casefold()
+    if normalized_direction not in {"inbound", "outbound"}:
+        raise ValueError("WhatsApp message direction must be Inbound or Outbound.")
+    direction_value = normalized_direction.title()
+    base_url = rentee_app.get_bubble_base_url(bubble_env)
+    constraints = [{
+        "key": "whatsappMessageId", "constraint_type": "equals", "value": meta_id,
+    }]
+    existing = next(iter(rentee_app._bubble_records(
+        base_url, "message", constraints
+    )), None)
+    if existing and existing.get("_id"):
+        relationship_patch = {}
+        for field, relationship_id in (("lead", lead_id), ("listing", listing_id)):
+            existing_ids = _relationship_ids(existing.get(field))
+            if relationship_id and not existing_ids:
+                relationship_patch[field] = relationship_id
+            elif relationship_id and str(relationship_id) not in existing_ids:
+                print(
+                    f"[WHATSAPP MESSAGE] action={field}_conflict "
+                    f"message_id={existing['_id']}", flush=True,
+                )
+        if relationship_patch:
+            rentee_app._bubble_patch(
+                f"{base_url}/obj/message/{existing['_id']}", relationship_patch
+            )
+        return existing["_id"], False
+
+    payload = {
+        "phone": rentee_app.normalize_phone(phone),
+        "direction": direction_value,
+        "own_Sent?": "Yes" if direction_value == "Inbound" else "No",
+        "whatsappMessageId": meta_id,
+        "messageContent": str(content or ""),
+        "messageType": str(message_type or "text").strip().casefold() or "text",
+    }
+    if lead_id:
+        payload["lead"] = lead_id
+    if listing_id:
+        payload["listing"] = listing_id
+    return rentee_app._bubble_create(base_url, "message", payload), True
+
+
 def build_internal_user_email(normalized_phone: str) -> str:
     """Use the repository's deterministic WhatsApp-only User email convention."""
     return f"whatsapp-{normalized_phone}@users.rentee.internal"
@@ -1834,17 +1885,40 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
     print(f"[MATCH ALERT] match_id={match_id} recipient_user_id={recipient_id} "
           f"window={window} channel={channel}", flush=True)
     if channel == "text":
-        rentee_app.send_whatsapp_text(phone, alert["text"])
+        sent_ids = rentee_app.send_whatsapp_text(phone, alert["text"])
+        logged_content = alert["text"]
+        logged_type = "text"
     else:
-        rentee_app.send_whatsapp_template(
-            phone, "rentee_match_alert", parameters=(
+        template_name = "rentee_match_alert"
+        sent_ids = rentee_app.send_whatsapp_template(
+            phone, template_name, parameters=(
                 _match_alert_template_parameters(alert)
             ),
         )
+        logged_content = f"Template: {template_name}\n\n{alert['text']}"
+        logged_type = "template"
     # Meta accepted the send. Consume the import allowance before Bubble state
     # is updated so a persistence failure cannot cause a second notification.
     if import_alert_state is not None:
         import_alert_state["accepted"] = import_alert_state.get("accepted", 0) + 1
+    logged_parts = (
+        rentee_app.split_whatsapp_text(logged_content)
+        if logged_type == "text" else [logged_content]
+    )
+    for meta_id, content in zip(sent_ids or [], logged_parts):
+        if not meta_id:
+            continue
+        try:
+            save_whatsapp_message(
+                phone, meta_id, content, "Outbound", logged_type,
+                bubble_env, lead_id=(lead or {}).get("_id"),
+                listing_id=(listing or {}).get("_id"),
+            )
+        except Exception as error:
+            print(
+                "[MATCH ALERT] action=message_logging_failed "
+                f"match_id={match_id} error={type(error).__name__}", flush=True,
+            )
     rentee_app._bubble_patch(f"{base_url}/obj/match/{match_id}", {
         "alert_sent": True,
         "alert_sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

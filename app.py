@@ -7988,19 +7988,6 @@ def _process_whatsapp_message(message):
             identity_error = None
             whatsapp_user = None
             bubble_user_id = None
-            try:
-                whatsapp_user = resolve_whatsapp_user(
-                    phone, message.get("customer_name"), "live"
-                )
-                bubble_user_id = conversation_store.relationship_id(
-                    whatsapp_user.get("_id")
-                )
-                message["bubble_user_id"] = bubble_user_id
-            except WhatsAppIdentityCollision as error:
-                # Do not enter User/Lead processing for an ambiguous identity. We
-                # still perform Conversation routing below so the inbound Message
-                # can be retained safely when an existing context is available.
-                identity_error = error
             if message_type == "audio":
                 media_id = str((message.get("audio") or {}).get("id") or "").strip()
                 print(
@@ -8013,6 +8000,27 @@ def _process_whatsapp_message(message):
                     f"[WHATSAPP AUDIO] message_id={message_id} "
                     "processing_transcript_as_text", flush=True,
                 )
+            from whatsapp_importer import save_whatsapp_message
+            if RENTEE_MODE == "simple":
+                try:
+                    save_whatsapp_message(
+                        phone, message_id, text, "Inbound", message_type, "live"
+                    )
+                except Exception as error:
+                    print(
+                        "[WHATSAPP IMPORT ROUTING] action=inbound_persistence_failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+            try:
+                whatsapp_user = resolve_whatsapp_user(
+                    phone, message.get("customer_name"), "live"
+                )
+                bubble_user_id = conversation_store.relationship_id(
+                    whatsapp_user.get("_id")
+                )
+                message["bubble_user_id"] = bubble_user_id
+            except WhatsAppIdentityCollision as error:
+                identity_error = error
             if message_type in {"text", "audio"}:
                 # Local import avoids coupling app startup to the importer while
                 # keeping this gate ahead of Conversation, Lead and Folio routing.
@@ -8026,18 +8034,18 @@ def _process_whatsapp_message(message):
                         "[WHATSAPP IMPORT ROUTING] action=import "
                         f"type={import_type}", flush=True,
                     )
-                    try:
-                        persist_whatsapp_import_message(
-                            phone, message_id, text, whatsapp_user,
-                            "live", message_type,
-                        )
-                    except Exception as error:
-                        # Retention diagnostics must not make a valid import fail.
-                        print(
-                            "[WHATSAPP IMPORT ROUTING] "
-                            "action=inbound_persistence_failed "
-                            f"error={type(error).__name__}", flush=True,
-                        )
+                    if RENTEE_MODE != "simple":
+                        try:
+                            persist_whatsapp_import_message(
+                                phone, message_id, text, whatsapp_user,
+                                "live", message_type,
+                            )
+                        except Exception as error:
+                            print(
+                                "[WHATSAPP IMPORT ROUTING] "
+                                "action=inbound_persistence_failed "
+                                f"error={type(error).__name__}", flush=True,
+                            )
                     import_result = process_whatsapp_import(
                         text, import_type=import_type, bubble_env="live"
                     )
@@ -8046,7 +8054,25 @@ def _process_whatsapp_message(message):
                         "couldn't be read reliably. Please check the message and resend it."
                     )
                     _stop_whatsapp_typing(typing_keepalive)
-                    send_whatsapp_text(phone, confirmation)
+                    sent_ids = send_whatsapp_text(phone, confirmation)
+                    relationship_id = import_result.get("bubble_id")
+                    for meta_id, segment in zip(
+                        sent_ids or [], split_whatsapp_text(confirmation)
+                    ):
+                        if not meta_id:
+                            continue
+                        try:
+                            save_whatsapp_message(
+                                phone, meta_id, segment, "Outbound", "text", "live",
+                                lead_id=(relationship_id if import_type == "lead" else None),
+                                listing_id=(relationship_id if import_type == "listing" else None),
+                            )
+                        except Exception as error:
+                            print(
+                                "[WHATSAPP IMPORT ROUTING] "
+                                "action=outbound_persistence_failed "
+                                f"error={type(error).__name__}", flush=True,
+                            )
                     reply_sent = True
                     return
 
@@ -8061,7 +8087,22 @@ def _process_whatsapp_message(message):
                     "and listings. Forward me a lead or listing and I'll add it for you."
                 )
                 _stop_whatsapp_typing(typing_keepalive)
-                send_whatsapp_text(phone, response_text)
+                sent_ids = send_whatsapp_text(phone, response_text)
+                for meta_id, segment in zip(
+                    sent_ids or [], split_whatsapp_text(response_text)
+                ):
+                    if not meta_id:
+                        continue
+                    try:
+                        save_whatsapp_message(
+                            phone, meta_id, segment, "Outbound", "text", "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP SIMPLE ROUTING] "
+                            "action=outbound_persistence_failed "
+                            f"error={type(error).__name__}", flush=True,
+                        )
                 reply_sent = True
                 return
 
