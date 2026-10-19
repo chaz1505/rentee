@@ -1890,6 +1890,10 @@ Tech subang
              patch.object(importer, "save_whatsapp_message") as save_message, \
              patch.object(importer.rentee_app, "send_whatsapp_template") as send_template, \
              patch.object(importer.rentee_app, "_bubble_patch") as update:
+            expected_message = importer.build_match_alert(
+                "lead", lead, listing, {"name": "Gwen"}, {"name": "Stephanie"},
+                DEVELOPMENTS, GEOS,
+            )["text"]
             importer.create_missing_match_records(
                 "lead", "lead-new", [listing], "live", created_record=lead,
                 development_records=DEVELOPMENTS, geo_records=GEOS,
@@ -1899,6 +1903,7 @@ Tech subang
         self.assertIn("Hi Gwen, Stephanie has just added a buyer", message)
         self.assertIn("https://www.rentee.asia/lead/lead-new", message)
         self.assertIn("https://www.rentee.asia/listing/listing-existing", message)
+        self.assertEqual(message, expected_message)
         save_message.assert_called_once_with(
             "60174156107", "wamid.1", message, "Outbound", "text", "live",
             lead_id="lead-new", listing_id="listing-existing",
@@ -1937,8 +1942,60 @@ Tech subang
             self.assertEqual(template.call_args.args[:2], (
                 "60174156107", "rentee_match_alert",
             ))
-            self.assertEqual(len(template.call_args.kwargs["parameters"]), 8)
+            self.assertEqual(template.call_args.kwargs["language_code"], "en")
+            parameters = template.call_args.kwargs["parameters"]
+            self.assertEqual(len(parameters), 4)
+            self.assertEqual(parameters[0], "Gwen")
+            self.assertEqual(parameters[1], (
+                "Stephanie has just added a buyer looking for a 3-bed in "
+                "One Menerung – https://www.rentee.asia/lead/lead-new, which "
+                "might match your 3-bed listing in One Menerung – "
+                "https://www.rentee.asia/listing/listing-existing."
+            ))
+            self.assertEqual(parameters[2], (
+                "One Menerung · 3 bedrooms · Budget RM1.8m vs asking RM1.65m"
+            ))
+            self.assertEqual(parameters[3], "Stephanie")
             self.assertTrue(update.call_args.args[1]["alert_sent"])
+
+    def test_new_listing_template_describes_listing_before_existing_lead(self):
+        lead, listing = self.match_alert_records()
+        listing["_id"] = "listing-new"
+        users = {
+            "user-stephanie": {
+                "name": "Stephanie", "phone": "0122017185", "alerts": True,
+            },
+            "user-gwen": {"name": "Gwen"},
+        }
+        with patch.dict(os.environ, {"MATCH_ALERT_TEMPLATES_ENABLED": "true"}), \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=lambda url: users[url.rsplit("/", 1)[-1]]), \
+             patch.object(importer.rentee_app, "owner_check_whatsapp_window",
+                          return_value="closed"), \
+             patch.object(importer.rentee_app, "send_whatsapp_template",
+                          return_value=["wamid.template"]) as template, \
+             patch.object(importer.rentee_app, "_bubble_patch"):
+            sent = importer.maybe_send_match_alert(
+                "match-2", "listing", lead, listing,
+                "user-stephanie", "user-gwen",
+                development_records=DEVELOPMENTS, geo_records=GEOS,
+                match_record={},
+            )
+
+        self.assertTrue(sent)
+        parameters = template.call_args.kwargs["parameters"]
+        self.assertEqual(parameters[0], "Stephanie")
+        self.assertEqual(parameters[1], (
+            "Gwen has just added a 3-bed listing in One Menerung – "
+            "https://www.rentee.asia/listing/listing-new, which might match "
+            "your buyer looking for a 3-bed in One Menerung – "
+            "https://www.rentee.asia/lead/lead-new."
+        ))
+        self.assertEqual(parameters[2], (
+            "One Menerung · 3 bedrooms · Budget RM1.8m vs asking RM1.65m"
+        ))
+        self.assertEqual(parameters[3], "Gwen")
+        self.assertEqual(template.call_args.kwargs["language_code"], "en")
 
     def test_templates_disabled_skips_closed_and_unknown_windows(self):
         lead, listing = self.match_alert_records()

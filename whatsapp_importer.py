@@ -1790,13 +1790,21 @@ def build_match_alert(created_type, lead, listing, recipient, other_agent,
 
 
 def _match_alert_template_parameters(alert) -> list[str]:
-    """Body order for rentee_match_alert; keep isolated for template approval changes."""
-    parameters = [alert[key] for key in (
-        "recipient_name", "other_agent_name", "new_summary", "new_url",
-        "existing_summary", "existing_url", "reason", "other_agent_name",
-    )]
-    parameters[6] = parameters[6] or "See the linked records for details"
-    return parameters
+    """Four body parameters for approved rentee_match_alert."""
+
+    description = (
+        f"{alert['other_agent_name']} has just added a "
+        f"{alert['new_summary']} – {alert['new_url']}, "
+        f"which might match your "
+        f"{alert['existing_summary']} – {alert['existing_url']}."
+    )
+
+    return [
+        alert["recipient_name"],
+        description,
+        alert["reason"] or "See the linked records for details",
+        alert["other_agent_name"],
+    ]
 
 
 def _match_alert_templates_enabled() -> bool:
@@ -1891,9 +1899,10 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
     else:
         template_name = "rentee_match_alert"
         sent_ids = rentee_app.send_whatsapp_template(
-            phone, template_name, parameters=(
-                _match_alert_template_parameters(alert)
-            ),
+            phone,
+            template_name,
+            language_code="en",
+            parameters=_match_alert_template_parameters(alert),
         )
         logged_content = f"Template: {template_name}\n\n{alert['text']}"
         logged_type = "template"
