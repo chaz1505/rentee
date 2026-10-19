@@ -1383,6 +1383,11 @@ def build_listing_payload(parsed, resolved_geo, resolved_development,
     property_type = _canonical_property_type(parsed.get("property_type"))
     if property_type:
         payload["propertyType"] = property_type
+    elif (resolved_development and resolved_development.get("matched")
+          and not resolved_development.get("created")):
+        # Temporary assumption while Development records cannot represent
+        # multiple property types: the current Development database is condos.
+        payload["propertyType"] = "Condo"
     if isinstance(parsed.get("beds"), (int, float)):
         payload["beds"] = parsed["beds"]
     if ("Rent/Let" in transactions
@@ -1636,7 +1641,7 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
 
     if lead_property_types:
         listing_property_type = _canonical_property_type(listing.get("propertyType"))
-        if listing_property_type not in lead_property_types:
+        if listing_property_type and listing_property_type not in lead_property_types:
             return False
 
     if has_bedrooms:

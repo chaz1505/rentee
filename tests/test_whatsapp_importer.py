@@ -413,6 +413,28 @@ Tech subang
         )
         self.assertEqual(lead["propertyTypes"], ["Condo", "Landed"])
 
+    def test_listing_property_type_default_requires_existing_resolved_development(self):
+        existing = {"matched": True, "id": "dev-one", "name": "One Menerung"}
+        created = dict(existing, id="dev-new", created=True)
+
+        self.assertEqual(
+            importer.build_listing_payload({}, None, existing)["propertyType"],
+            "Condo",
+        )
+        self.assertNotIn(
+            "propertyType", importer.build_listing_payload({}, None, None)
+        )
+        self.assertNotIn(
+            "propertyType", importer.build_listing_payload({}, None, created)
+        )
+
+    def test_resolved_development_does_not_overwrite_explicit_landed_type(self):
+        payload = importer.build_listing_payload(
+            {"property_type": "Landed"}, None,
+            {"matched": True, "id": "dev-one", "name": "One Menerung"},
+        )
+        self.assertEqual(payload["propertyType"], "Landed")
+
     def test_explicit_lead_details_and_notes_map_to_existing_fields(self):
         parsed = self.parse_as({
             "type": "lead", "transaction_types": ["Rent/Let"],
@@ -1056,6 +1078,7 @@ Tech subang
         payload = create.call_args.args[2]
         self.assertEqual(payload["development"], "dev-one")
         self.assertEqual(payload["Geo"], "geo-bangsar")
+        self.assertEqual(payload["propertyType"], "Condo")
         self.assertEqual(payload["priceRent"], 8500)
         self.assertNotIn("priceSale", payload)
         self.assertEqual(result["resolved_geo"]["method"], "development_geo")
@@ -1120,7 +1143,8 @@ Tech subang
         )
         self.assertEqual(payload, {
             "exposure": "public", "source": "whatsapp", "development": "dev-one",
-            "TransactionType": ["Rent/Let"], "beds": 3, "priceRent": 12000,
+            "TransactionType": ["Rent/Let"], "propertyType": "Condo",
+            "beds": 3, "priceRent": 12000,
             "baths": 2.5, "Sq Ft": 1800, "Landed_sqft": 2400,
             "furnished": "Yes", "Furnishing": "Fully Furnished",
             "availability": True,
@@ -1431,6 +1455,36 @@ Tech subang
         lead["propertyTypes"] = ["Condo", "Landed"]
         self.assertTrue(importer.lead_matches_listing(lead, listing))
         listing["propertyType"] = "Condo"
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+
+    def test_matching_allows_unknown_listing_type_but_rejects_known_incompatible_type(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "preferredDevelopments": ["dev-one"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "development": "dev-one",
+            "owner": "user-agent",
+        }
+        self.assertTrue(importer.lead_matches_listing(
+            lead, dict(listing, propertyType="Condo")
+        ))
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        self.assertFalse(importer.lead_matches_listing(
+            lead, dict(listing, propertyType="Landed")
+        ))
+
+    def test_one_menerung_rental_matches_when_listing_type_is_missing(self):
+        lead = {
+            "TransactionType": ["Rent/Let"],
+            "preferredDevelopments": ["dev-one"],
+            "propertyTypes": ["Condo"], "bedroomsMin": 3,
+            "budgetRent": 5000,
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "development": "dev-one",
+            "beds": 3, "priceRent": 4800, "owner": "user-agent",
+        }
         self.assertTrue(importer.lead_matches_listing(lead, listing))
 
     def test_matching_applies_property_bedrooms_and_budget_together(self):
