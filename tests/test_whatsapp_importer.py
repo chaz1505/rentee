@@ -1807,7 +1807,9 @@ Tech subang
 
     def test_new_listing_match_creates_match_with_owners_and_correct_direction(self):
         with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
-             patch.object(importer.rentee_app, "_bubble_create") as create:
+             patch.object(importer.rentee_app, "bubble") as get_record, \
+             patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer, "maybe_send_match_alert"):
             importer.create_missing_match_records(
                 "listing", "listing-new",
                 [{"_id": "lead-existing", "owner": {"_id": "lead-owner"}}],
@@ -1822,6 +1824,73 @@ Tech subang
                 "listing_owner": "listing-owner",
             },
         )
+        get_record.assert_not_called()
+
+    def test_new_listing_match_recovers_missing_lead_owner(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "bubble", return_value={
+                 "_id": "lead-existing", "owner": {"_id": "lead-owner"},
+             }) as get_record, \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert:
+            importer.create_missing_match_records(
+                "listing", "listing-new", [{"_id": "lead-existing"}],
+                "live", created_record={"owner": "listing-owner"},
+            )
+
+        get_record.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/lead/lead-existing"
+        )
+        create.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1", "match", {
+                "lead": "lead-existing", "listing": "listing-new",
+                "match_source": "whatsapp", "lead_owner": "lead-owner",
+                "listing_owner": "listing-owner",
+            },
+        )
+        self.assertEqual(alert.call_args.args[4:6], (
+            "lead-owner", "listing-owner",
+        ))
+
+    def test_new_listing_match_continues_when_full_lead_fetch_fails(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "bubble",
+                          side_effect=RuntimeError("Bubble unavailable")), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert, \
+             patch("builtins.print") as log:
+            importer.create_missing_match_records(
+                "listing", "listing-new", [{"_id": "lead-existing"}],
+                "live", created_record={"owner": "listing-owner"},
+            )
+
+        self.assertNotIn("lead_owner", create.call_args.args[2])
+        self.assertIsNone(alert.call_args.args[4])
+        messages = " ".join(str(item) for item in log.call_args_list)
+        self.assertIn("source=full_lead_fetch status=failed", messages)
+        self.assertIn("lead_id=lead-existing status=missing", messages)
+
+    def test_new_listing_match_keeps_missing_owner_when_full_lead_has_none(self):
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "bubble", return_value={
+                 "_id": "lead-existing",
+             }), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-1") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert, \
+             patch("builtins.print") as log:
+            importer.create_missing_match_records(
+                "listing", "listing-new", [{"_id": "lead-existing"}],
+                "live", created_record={"owner": "listing-owner"},
+            )
+
+        self.assertNotIn("lead_owner", create.call_args.args[2])
+        self.assertIsNone(alert.call_args.args[4])
+        self.assertIn("lead_id=lead-existing status=missing", " ".join(
+            str(item) for item in log.call_args_list
+        ))
 
     def test_new_lead_match_creates_match_with_owners(self):
         with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \

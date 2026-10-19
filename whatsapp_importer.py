@@ -1970,6 +1970,39 @@ def create_missing_match_records(
             iter(_relationship_ids((lead_record or {}).get("owner"))),
             None,
         )
+        if lead_owner:
+            print(
+                f"[MATCH OWNER] lead_id={pair[0]} "
+                "source=matched_record status=found",
+                flush=True,
+            )
+        elif created_type == "listing":
+            try:
+                full_lead = rentee_app.bubble(
+                    f"{base_url}/obj/lead/{pair[0]}"
+                )
+                lead_owner = next(
+                    iter(_relationship_ids((full_lead or {}).get("owner"))),
+                    None,
+                )
+                if lead_owner:
+                    print(
+                        f"[MATCH OWNER] lead_id={pair[0]} "
+                        "source=full_lead_fetch status=found",
+                        flush=True,
+                    )
+            except Exception as error:
+                print(
+                    f"[MATCH OWNER] lead_id={pair[0]} "
+                    "source=full_lead_fetch status=failed "
+                    f"error={type(error).__name__}",
+                    flush=True,
+                )
+            if not lead_owner:
+                print(
+                    f"[MATCH OWNER] lead_id={pair[0]} status=missing",
+                    flush=True,
+                )
         listing_owner = next(
             iter(_relationship_ids((listing_record or {}).get("owner"))),
             None,
