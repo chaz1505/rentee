@@ -1660,6 +1660,33 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
     return True
 
 
+def classify_match(lead: dict, listing: dict) -> int:
+    """Classify an eligible match into tier 1, 2 or 3."""
+    lead_developments = set(_relationship_ids(lead.get("preferredDevelopments")))
+    listing_developments = set(_relationship_ids(listing.get("development")))
+    if lead_developments & listing_developments:
+        return 1
+
+    lead_geos = set(_relationship_ids(lead.get("Geo")))
+    listing_geos = set(_relationship_ids(listing.get("Geo")))
+    lead_property_value = lead.get("propertyTypes") or []
+    if not isinstance(lead_property_value, list):
+        lead_property_value = [lead_property_value]
+    lead_property_types = {
+        canonical for canonical in (
+            _canonical_property_type(value) for value in lead_property_value
+        ) if canonical
+    }
+    listing_property_type = _canonical_property_type(listing.get("propertyType"))
+    if (
+        lead_geos & listing_geos
+        and listing_property_type
+        and listing_property_type in lead_property_types
+    ):
+        return 2
+    return 3
+
+
 def find_import_matches(created_type: str, record: dict, bubble_env: str) -> list[dict]:
     """Load the opposite Bubble object type and return deterministic matches."""
     other_type = "listing" if created_type == "lead" else "lead"
@@ -1950,7 +1977,14 @@ def create_missing_match_records(
     seen = set()
     import_alert_state = {"accepted": 0}
     import_alert_limit = _match_alert_max_per_import()
-    for matched in matches or []:
+    def match_tier(matched):
+        lead_record, listing_record = (
+            (created_record, matched) if created_type == "lead"
+            else (matched, created_record)
+        )
+        return classify_match(lead_record or {}, listing_record or {})
+
+    for matched in sorted(matches or [], key=match_tier):
         matched_id = _compact(matched.get("_id"))
         lead_id, listing_id = (
             (created_id, matched_id) if created_type == "lead"
@@ -2016,6 +2050,9 @@ def create_missing_match_records(
             "lead": pair[0],
             "listing": pair[1],
             "match_source": "whatsapp",
+            "match_tier": classify_match(
+                lead_record or {}, listing_record or {}
+            ),
         }
         if lead_owner:
             payload["lead_owner"] = lead_owner

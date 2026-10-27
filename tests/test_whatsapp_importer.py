@@ -1522,6 +1522,50 @@ Tech subang
         create.assert_not_called()
         update.assert_not_called()
 
+    def test_match_classification_tiers_and_precedence(self):
+        tier_one_lead = {
+            "preferredDevelopments": [
+                {"_id": "dev-other"}, {"_id": "dev-target"},
+            ],
+            "Geo": [{"_id": "geo-bangsar"}],
+            "propertyTypes": ["Apartment"],
+        }
+        tier_one_listing = {
+            "development": {"_id": "dev-target"},
+            "Geo": {"_id": "geo-bangsar"},
+            "propertyType": "Condo",
+        }
+        self.assertEqual(importer.classify_match(
+            tier_one_lead, tier_one_listing
+        ), 1)
+
+        tier_two_listing = dict(
+            tier_one_listing, development={"_id": "dev-different"}
+        )
+        self.assertEqual(importer.classify_match(
+            tier_one_lead, tier_two_listing
+        ), 2)
+
+        for lead, listing in (
+            (tier_one_lead, dict(tier_two_listing, propertyType=None)),
+            (dict(tier_one_lead, propertyTypes=[]), tier_two_listing),
+            (tier_one_lead, dict(tier_two_listing, Geo={"_id": "geo-klcc"})),
+        ):
+            with self.subTest(lead=lead, listing=listing):
+                self.assertEqual(importer.classify_match(lead, listing), 3)
+
+    def test_tier_three_pair_can_remain_eligible_with_missing_lead_type(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "bedroomsMin": 2,
+        }
+        listing = {
+            "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
+            "propertyType": "Condo", "beds": 2, "owner": "user-agent",
+        }
+        self.assertTrue(importer.lead_matches_listing(lead, listing))
+        self.assertEqual(importer.classify_match(lead, listing), 3)
+
     def test_matching_rejects_under_specified_lead(self):
         listing = {
             "TransactionType": ["Rent/Let"], "Geo": "geo-bangsar",
@@ -1562,7 +1606,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1", "match",
             {
                 "lead": "lead-new", "listing": "listing-existing",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 3,
             },
         )
 
@@ -1702,7 +1746,7 @@ Tech subang
         self.assertEqual(create.call_args.args[1:], (
             "match", {
                 "lead": "lead-existing", "listing": "listing-new",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 2,
                 "lead_owner": "user-1",
                 "listing_owner": "user-agent",
             }
@@ -1749,7 +1793,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1", "match",
             {
                 "lead": "lead-1", "listing": "listing-existing",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 3,
                 "listing_owner": "user-1",
             },
         )
@@ -1757,11 +1801,74 @@ Tech subang
     def test_existing_match_is_not_duplicated(self):
         with patch.object(
             importer.rentee_app, "_bubble_records", return_value=[{"_id": "match-1"}]
-        ), patch.object(importer.rentee_app, "_bubble_create") as create:
+        ), patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert:
             importer.create_missing_match_records(
                 "lead", "lead-1", [{"_id": "listing-1"}], "live"
             )
         create.assert_not_called()
+        alert.assert_not_called()
+
+    def test_match_creation_is_stably_sorted_by_tier(self):
+        lead = {
+            "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        matches = [
+            {"_id": "tier-3a", "Geo": "geo-bangsar"},
+            {"_id": "tier-2a", "Geo": "geo-bangsar", "propertyType": "Apartment"},
+            {"_id": "tier-1", "development": {"_id": "dev-one"}},
+            {"_id": "tier-3b", "Geo": "geo-klcc", "propertyType": "Condo"},
+            {"_id": "tier-2b", "Geo": {"_id": "geo-bangsar"},
+             "propertyType": "Condo"},
+        ]
+        original_order = [match["_id"] for match in matches]
+        with patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["m1", "m2", "m3", "m4", "m5"]) as create, \
+             patch.object(importer, "maybe_send_match_alert"):
+            importer.create_missing_match_records(
+                "lead", "lead-new", matches, "live", created_record=lead
+            )
+        self.assertEqual(
+            [(call.args[2]["listing"], call.args[2]["match_tier"])
+             for call in create.call_args_list],
+            [("tier-1", 1), ("tier-2a", 2), ("tier-2b", 2),
+             ("tier-3a", 3), ("tier-3b", 3)],
+        )
+        self.assertEqual([match["_id"] for match in matches], original_order)
+
+    def test_alert_limit_reaches_best_recipient_that_can_receive(self):
+        lead = {
+            "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        matches = [
+            {"_id": "tier-3"},
+            {"_id": "tier-2", "Geo": "geo-bangsar", "propertyType": "Condo"},
+            {"_id": "tier-1", "development": "dev-one"},
+        ]
+        attempts = []
+
+        def alert(_match_id, _created_type, _lead, listing, *_args, **kwargs):
+            if kwargs["import_alert_state"]["accepted"] >= kwargs["import_alert_limit"]:
+                return False
+            attempts.append(listing["_id"])
+            if listing["_id"] == "tier-2":
+                kwargs["import_alert_state"]["accepted"] += 1
+                return True
+            return False
+
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+             patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          side_effect=["match-1", "match-2", "match-3"]) as create, \
+             patch.object(importer, "maybe_send_match_alert", side_effect=alert):
+            importer.create_missing_match_records(
+                "lead", "lead-new", matches, "live", created_record=lead
+            )
+        self.assertEqual(attempts, ["tier-1", "tier-2"])
+        self.assertEqual(create.call_count, 3)
 
     def test_multiple_matches_create_one_record_per_unique_pair(self):
         matches = [
@@ -1772,9 +1879,9 @@ Tech subang
             importer.create_missing_match_records("lead", "lead-1", matches, "live")
         self.assertEqual([call.args[2] for call in create.call_args_list], [
             {"lead": "lead-1", "listing": "listing-1",
-             "match_source": "whatsapp"},
+             "match_source": "whatsapp", "match_tier": 3},
             {"lead": "lead-1", "listing": "listing-2",
-             "match_source": "whatsapp"},
+             "match_source": "whatsapp", "match_tier": 3},
         ])
 
     def test_failed_match_logs_bubble_body_and_continues_to_next_match(self):
@@ -1855,7 +1962,8 @@ Tech subang
                       result["confirmation"])
         self.assertEqual(create.call_args_list[1].args[2], {
             "lead": "lead-1", "listing": "listing-1",
-            "match_source": "whatsapp", "lead_owner": "user-lead",
+            "match_source": "whatsapp", "match_tier": 3,
+            "lead_owner": "user-lead",
             "listing_owner": "user-listing",
         })
 
@@ -1873,7 +1981,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1", "match",
             {
                 "lead": "lead-existing", "listing": "listing-new",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 3,
                 "lead_owner": "lead-owner",
                 "listing_owner": "listing-owner",
             },
@@ -1899,7 +2007,8 @@ Tech subang
         create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "match", {
                 "lead": "lead-existing", "listing": "listing-new",
-                "match_source": "whatsapp", "lead_owner": "lead-owner",
+                "match_source": "whatsapp", "match_tier": 3,
+                "lead_owner": "lead-owner",
                 "listing_owner": "listing-owner",
             },
         )
@@ -1958,7 +2067,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1", "match",
             {
                 "lead": "lead-new", "listing": "listing-existing",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 3,
                 "lead_owner": "lead-owner",
                 "listing_owner": "listing-owner",
             },
@@ -1976,7 +2085,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1", "match",
             {
                 "lead": "lead-new", "listing": "listing-existing",
-                "match_source": "whatsapp",
+                "match_source": "whatsapp", "match_tier": 3,
                 "listing_owner": "listing-owner",
             },
         )
