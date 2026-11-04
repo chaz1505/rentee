@@ -1239,7 +1239,7 @@ Tech subang
         listing["TransactionType"] = ["rent/let"]
         self.assertFalse(importer.lead_matches_listing(lead, listing))
 
-    def test_cancelled_and_availability_boolean_eligibility_gates(self):
+    def test_cancelled_and_availability_option_eligibility_gates(self):
         lead = {
             "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
             "propertyTypes": ["Condo"],
@@ -1261,18 +1261,18 @@ Tech subang
         self.assertTrue(importer.lead_matches_listing(
             dict(lead, cancelled=None), listing
         ))
-        for availability, expected in (
-            (False, False), (True, True), (None, True), ("false", True),
+        for availability_option, expected in (
+            ("Yes", True), ("No", False), ("", True), (None, True),
         ):
-            with self.subTest(availability=availability):
+            with self.subTest(availability_option=availability_option):
                 candidate = dict(listing)
-                if availability is not None:
-                    candidate["availability"] = availability
+                if availability_option is not None:
+                    candidate["availability_option"] = availability_option
                 self.assertEqual(
                     importer.lead_matches_listing(lead, candidate), expected
                 )
         self.assertTrue(importer.lead_matches_listing(
-            lead, dict(listing, availability=None)
+            lead, dict(listing, availability_option=None)
         ))
 
     def test_listing_owner_is_required_for_matching(self):

@@ -1590,7 +1590,7 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
         return False
     if not _relationship_ids(listing.get("owner")):
         return False
-    if listing.get("availability") is False:
+    if str(listing.get("availability_option") or "").strip().lower() == "no":
         return False
     if not _listing_date_eligible(listing):
         return False
