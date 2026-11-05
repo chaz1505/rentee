@@ -1522,6 +1522,25 @@ def _bubble_headers():
     }
 
 
+def request_bubble_magic_link(phone):
+    response = requests.post(
+        f"{get_bubble_base_url('live')}/wf/wa_login",
+        headers=_bubble_headers(), json={"phone": phone}, timeout=15,
+    )
+    response.raise_for_status()
+    login_url = response.text.strip()
+    parsed = urlparse(login_url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"www.rentee.asia", "rentee.bubbleapps.io"}
+        or not parsed.path
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("Invalid Bubble magic login URL")
+    return login_url
+
+
 def _bubble_create(base_url, object_type, payload):
     response = requests.post(
         f"{base_url}/obj/{object_type}", headers=_bubble_headers(),
@@ -8011,6 +8030,32 @@ def _process_whatsapp_message(message):
                         "[WHATSAPP IMPORT ROUTING] action=inbound_persistence_failed "
                         f"error={type(error).__name__}", flush=True,
                     )
+            if message_type == "text" and text.casefold() == "/login":
+                try:
+                    login_url = request_bubble_magic_link(phone)
+                    reply = (
+                        "🔐 Here's your Rentee login link:\n\n"
+                        f"{login_url}\n\n"
+                        "Tap the link to log in to Rentee."
+                    )
+                    print(
+                        "[WHATSAPP LOGIN] status=success "
+                        f"phone={_masked_whatsapp_phone(phone)}", flush=True,
+                    )
+                except Exception as error:
+                    reply = (
+                        "Sorry, we couldn't generate your login link right now. "
+                        "Please try again shortly."
+                    )
+                    print(
+                        "[WHATSAPP LOGIN] status=failed "
+                        f"phone={_masked_whatsapp_phone(phone)} "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+                _stop_whatsapp_typing(typing_keepalive)
+                send_whatsapp_text(phone, reply)
+                reply_sent = True
+                return
             try:
                 whatsapp_user = resolve_whatsapp_user(
                     phone, message.get("customer_name"), "live"

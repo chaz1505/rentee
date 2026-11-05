@@ -961,6 +961,96 @@ class WhatsAppUserIdentityTests(unittest.TestCase):
         )
 
 
+class WhatsAppLoginTests(unittest.TestCase):
+    def test_magic_link_request_uses_live_workflow_and_plain_text_response(self):
+        response = MagicMock()
+        response.text = "  https://www.rentee.asia/login/magic-token  \n"
+        with patch("app.requests.post", return_value=response) as post:
+            result = app_module.request_bubble_magic_link("60123456789")
+
+        self.assertEqual(result, "https://www.rentee.asia/login/magic-token")
+        post.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/wf/wa_login",
+            headers=app_module._bubble_headers(),
+            json={"phone": "60123456789"},
+            timeout=15,
+        )
+        response.raise_for_status.assert_called_once_with()
+
+    def test_magic_link_request_rejects_invalid_urls(self):
+        invalid_urls = (
+            "", "not-a-url", "http://www.rentee.asia/login/token",
+            "https://example.com/login/token", "https://www.rentee.asia",
+            "https://user@www.rentee.asia/login/token",
+        )
+        for login_url in invalid_urls:
+            with self.subTest(login_url=login_url):
+                response = MagicMock(text=login_url)
+                with patch("app.requests.post", return_value=response):
+                    with self.assertRaises(ValueError):
+                        app_module.request_bubble_magic_link("60123456789")
+
+    def test_login_variants_bypass_identity_import_and_conversation_routing(self):
+        for index, command in enumerate(("/login", "/LOGIN", "  /login  ")):
+            with self.subTest(command=command), patch(
+                "app.whatsapp_typing_keepalive", return_value=MagicMock()
+            ), patch(
+                "app.request_bubble_magic_link",
+                return_value="https://rentee.bubbleapps.io/login/test-token",
+            ) as magic_link, patch(
+                "app.send_whatsapp_text", return_value=["wamid.reply"]
+            ) as send, patch("app.resolve_whatsapp_user") as resolve, patch(
+                "whatsapp_importer.detect_import_intent"
+            ) as detect, patch("app.find_reply_context") as conversation:
+                item = webhook_payload(
+                    message_id=f"wamid.login-{index}",
+                    phone="+60 12-345 6789", text=command,
+                )["entry"][0]["changes"][0]["value"]["messages"][0]
+                app_module._process_whatsapp_message(item)
+
+            magic_link.assert_called_once_with("60123456789")
+            sent_text = send.call_args.args[1]
+            self.assertIn("https://rentee.bubbleapps.io/login/test-token", sent_text)
+            send.assert_called_once_with("60123456789", sent_text)
+            resolve.assert_not_called()
+            detect.assert_not_called()
+            conversation.assert_not_called()
+
+    def test_login_api_error_sends_friendly_response(self):
+        with patch(
+            "app.whatsapp_typing_keepalive", return_value=MagicMock()
+        ), patch(
+            "app.request_bubble_magic_link", side_effect=requests.HTTPError("down")
+        ), patch("app.send_whatsapp_text", return_value=["wamid.reply"]) as send, \
+             patch("app.resolve_whatsapp_user") as resolve:
+            item = webhook_payload(text="/login")["entry"][0]["changes"][0]["value"]["messages"][0]
+            app_module._process_whatsapp_message(item)
+
+        send.assert_called_once_with(
+            "60123456789",
+            "Sorry, we couldn't generate your login link right now. "
+            "Please try again shortly.",
+        )
+        resolve.assert_not_called()
+
+    def test_non_login_message_continues_existing_simple_routing(self):
+        with patch.object(app_module, "RENTEE_MODE", "simple"), patch(
+            "app.whatsapp_typing_keepalive", return_value=MagicMock()
+        ), patch("app.request_bubble_magic_link") as magic_link, patch(
+            "app.resolve_whatsapp_user", return_value={"_id": "user-1"}
+        ) as resolve, patch(
+            "whatsapp_importer.save_whatsapp_message"
+        ), patch(
+            "whatsapp_importer.detect_import_intent",
+            return_value={"intent": "normal_chat"},
+        ), patch("app.send_whatsapp_text", return_value=["wamid.reply"]):
+            item = webhook_payload(text="/login please")["entry"][0]["changes"][0]["value"]["messages"][0]
+            app_module._process_whatsapp_message(item)
+
+        magic_link.assert_not_called()
+        resolve.assert_called_once_with("60123456789", None, "live")
+
+
 class WhatsAppTests(unittest.TestCase):
     def setUp(self):
         app_module._whatsapp_processing_ids.clear()
