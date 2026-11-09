@@ -1460,7 +1460,18 @@ def _money(value: Any) -> str:
     return f"RM{value:,.0f}" if isinstance(value, (int, float)) else "price not specified"
 
 
-def _confirmation(parsed, geos, developments) -> str:
+def _owner_heading(record_type, owner=None) -> str:
+    owner = owner if isinstance(owner, dict) else {}
+    name = _compact(owner.get("name"))
+    phone = normalize_phone_number(
+        owner.get("normalized_phone") or owner.get("phone")
+    )
+    identity = f"{name} ({phone})" if name and phone else (name or phone)
+    suffix = f" to {identity}" if identity else ""
+    return f"✅ *{record_type.title()} added{suffix}*"
+
+
+def _confirmation(parsed, geos, developments, owner=None) -> str:
     beds = parsed.get("bedrooms_min") if parsed["type"] == "lead" else parsed.get("beds")
     bed_text = f", {beds:g} bed" if isinstance(beds, (int, float)) else ""
     if parsed["type"] == "lead":
@@ -1468,12 +1479,8 @@ def _confirmation(parsed, geos, developments) -> str:
         property_text = ", ".join(parsed.get("property_types") or [])
         bits = ", ".join(item for item in (place, property_text) if item)
         suffix = f", up to {_money(parsed.get('budget'))}" if parsed.get("budget") is not None else ""
-        parsed_agent = parsed.get("proposing_agent") or {}
-        agent_name = _compact(parsed_agent.get("name"))
-        agent_phone = normalize_phone_number(parsed_agent.get("phone"))
-        prefix = (f"Added lead to {agent_name}: {agent_phone}:"
-                  if agent_name and agent_phone else "Added lead:")
-        confirmation = f"{prefix} {bits}{bed_text}{suffix}."
+        heading = _owner_heading("lead", owner or parsed.get("proposing_agent"))
+        confirmation = f"{heading}\n\n{bits}{bed_text}{suffix}."
         development_names = list(dict.fromkeys(
             item["name"] for item in developments if item.get("matched") and item.get("name")
         ))
@@ -1507,13 +1514,9 @@ def _confirmation(parsed, geos, developments) -> str:
         details.append(f"{_money(parsed['price_rent'])}/month")
     if "Buy/Sell" in transactions and parsed.get("price_sale") is not None:
         details.append(_money(parsed["price_sale"]))
-    parsed_agent = parsed.get("proposing_agent") or {}
-    agent_name = _compact(parsed_agent.get("name"))
-    agent_phone = normalize_phone_number(parsed_agent.get("phone"))
-    prefix = (f"Added listing to {agent_name}: {agent_phone}:"
-              if agent_name and agent_phone else "Added listing:")
     detail_text = f" — {', '.join(details)}" if details else ""
-    return f"{prefix} {place}{detail_text}."
+    heading = _owner_heading("listing", owner or parsed.get("proposing_agent"))
+    return f"{heading}\n\n{place}{detail_text}."
 
 
 def _sanitized_payload(payload):
@@ -2108,22 +2111,49 @@ def _matched_transaction(lead: dict, listing: dict) -> str | None:
 
 def format_import_matches(created_type: str, created_record: dict,
                           matches: list[dict], development_records=None,
-                          bubble_env=None) -> str:
+                          bubble_env=None, geo_records=None) -> str:
     """Render deterministic matches for WhatsApp without affecting match logic."""
-    development_names = {
-        str(item["_id"]): _record_name(item)
-        for item in development_records or [] if item.get("_id")
-    }
+    development_records = list(development_records or [])
+    geo_records = list(geo_records or [])
     owners = {}
-    blocks = []
+    groups = {}
+
+    def common_name(left, right, records):
+        left_ids = _relationship_ids(left)
+        right_ids = set(_relationship_ids(right))
+        shared = [item for item in left_ids if item in right_ids]
+        return _related_record_name(shared, records)
+
+    def group_label(tier, lead, listing):
+        if tier == 1:
+            return common_name(
+                lead.get("preferredDevelopments"), listing.get("development"),
+                development_records,
+            ) or "preferred developments"
+        return (
+            common_name(lead.get("Geo"), listing.get("Geo"), geo_records)
+            or _related_record_name(listing.get("Geo"), geo_records)
+            or _related_record_name(lead.get("Geo"), geo_records)
+            or "the selected area"
+        )
+
+    def heading(tier, count, label, *, summary=False):
+        match_word = "match" if count == 1 else "matches"
+        if tier == 1:
+            icon, text = "🏢", f"{count} {match_word} for {label}"
+        elif tier == 2:
+            icon, text = "📍", f"{count} other {match_word} in {label}"
+        else:
+            icon, text = "🔍", f"{count} possible {match_word} in {label}"
+            if summary:
+                text += " (property type unconfirmed)"
+        return f"{icon} {text}" if summary else f"{icon} *{text.upper()}*"
+
     for match in matches:
         if created_type == "lead":
             lead, listing = created_record, match
-            development = match.get("development")
-            if isinstance(development, dict):
-                label = _record_name(development)
-            else:
-                label = development_names.get(str(development or ""), "")
+            label = _related_record_name(match.get("development"), development_records)
+            label = label or _related_record_name(match.get("Geo"), geo_records)
             details = []
             if (not isinstance(match.get("beds"), bool)
                     and isinstance(match.get("beds"), (int, float)) and match["beds"] > 0):
@@ -2151,6 +2181,8 @@ def format_import_matches(created_type: str, created_record: dict,
                 details.append(f"budget {_money(budget)}")
             record_id = _compact(match.get("_id"))
             path = "lead"
+        tier = classify_match(lead, listing)
+        key = (tier, group_label(tier, lead, listing))
         owner = match.get("owner")
         if isinstance(owner, dict):
             owner_record = owner
@@ -2166,21 +2198,37 @@ def format_import_matches(created_type: str, created_record: dict,
             owner_record = owners.get(owner_id, {})
         agent_name = _compact(owner_record.get("name"))
         agent_phone = _compact(owner_record.get("phone"))
-        summary = label + (f" — {', '.join(details)}" if label and details else "")
+        summary = label + (f"\n{' · '.join(details)}" if label and details else "")
         if not label:
-            summary = ", ".join(details)
+            summary = " · ".join(details)
         url = _record_url(path, record_id)
-        blocks.append("\n".join(item for item in (
-            summary,
+        groups.setdefault(key, []).append("\n".join(item for item in (
+            summary or ("Listing" if created_type == "lead" else "Lead"),
             f"Agent: {agent_name}" if agent_name else "",
             f"Phone: {agent_phone}" if agent_phone else "",
             url,
         ) if item))
     count = len(matches)
-    noun = "listing" if created_type == "lead" else "lead"
-    if count != 1:
-        noun += "s"
-    return f"Found {count} matching {noun}:\n\n" + "\n\n".join(blocks)
+    if not count:
+        return "🔎 No matches found yet."
+    summary_lines = [f"🔎 *Found {count} {'match' if count == 1 else 'matches'}*"]
+    sections = []
+    item_number = 1
+    for (tier, label), blocks in sorted(groups.items(), key=lambda item: item[0][0]):
+        summary_lines.append(heading(tier, len(blocks), label, summary=True))
+        numbered = []
+        for block in blocks:
+            first, *rest = block.split("\n")
+            numbered.append("\n".join([f"*{item_number}. {first}*", *rest]))
+            item_number += 1
+        tier_heading = heading(tier, len(blocks), label)
+        if tier == 3:
+            tier_heading += "\n_Property type unconfirmed_"
+        sections.append(f"{tier_heading}\n\n" + "\n\n".join(numbered))
+    separator = "━━━━━━━━━━━━━━━━"
+    return "\n".join(summary_lines) + "\n\n" + separator + "\n\n" + (
+        f"\n\n{separator}\n\n".join(sections)
+    )
 
 
 def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
@@ -2250,15 +2298,21 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
             geo_records=geo_records,
         )
         duplicate_developments = development_records
-        if duplicate_developments is None:
-            duplicate_developments = rentee_app._property_entity_records(
-                bubble_env
-            )["condo"]
+        duplicate_geos = geo_records
+        if matches and (duplicate_developments is None or duplicate_geos is None):
+            property_records = rentee_app._property_entity_records(bubble_env)
+            duplicate_developments = (
+                property_records["condo"] if duplicate_developments is None
+                else duplicate_developments
+            )
+            duplicate_geos = (
+                property_records["geo"] if duplicate_geos is None else duplicate_geos
+            )
         confirmation = f"This {parsed['type']} already exists."
         if matches:
             confirmation += "\n\n" + format_import_matches(
                 parsed["type"], duplicate, matches, duplicate_developments,
-                bubble_env,
+                bubble_env, duplicate_geos,
             )
         print(f"{LOG_PREFIX} duplicate type={parsed['type']} id={bubble_id}", flush=True)
         return {
@@ -2336,11 +2390,11 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                                      if not item.get("matched")],
             "unresolved_development_names": [item["raw_name"] for item in developments
                                              if not item.get("matched")],
-            "confirmation": _confirmation(parsed, geos, developments),
+            "confirmation": _confirmation(parsed, geos, developments, proposing_agent),
         }
         path = "lead" if parsed["type"] == "lead" else "listing"
         result["confirmation"] += (
-            f"\n\nSee here: https://www.rentee.asia/{path}/{bubble_id}"
+            f"\n\nView {path}:\nhttps://www.rentee.asia/{path}/{bubble_id}"
         )
         if not has_geo and not has_development and location_references:
             result["confirmation"] += (
@@ -2399,12 +2453,14 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                                      if location_reference and not resolved_geo else []),
             "unresolved_development_names": ([development["raw_name"]]
                                              if development and not development.get("matched") else []),
-            "confirmation": _confirmation(parsed, geos_for_confirmation,
-                                          developments_for_confirmation),
+            "confirmation": _confirmation(
+                parsed, geos_for_confirmation, developments_for_confirmation,
+                proposing_agent,
+            ),
         }
         path = "lead" if parsed["type"] == "lead" else "listing"
         result["confirmation"] += (
-            f"\n\nSee here: https://www.rentee.asia/{path}/{bubble_id}"
+            f"\n\nView {path}:\nhttps://www.rentee.asia/{path}/{bubble_id}"
         )
     matches = find_import_matches(
         parsed["type"], created_record, bubble_env
@@ -2415,10 +2471,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         geo_records=geo_records,
     )
     result["matches"] = matches
-    if matches:
-        result["confirmation"] += "\n\n" + format_import_matches(
-            parsed["type"], created_record, matches,
-            development_records, bubble_env,
-        )
+    result["confirmation"] += "\n\n" + format_import_matches(
+        parsed["type"], created_record, matches,
+        development_records, bubble_env, geo_records,
+    )
     print(f"{LOG_PREFIX} created type={parsed['type']} id={bubble_id}", flush=True)
     return result

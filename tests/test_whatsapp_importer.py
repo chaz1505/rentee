@@ -954,9 +954,8 @@ Tech subang
             )
         self.assertNotIn("Geo", create.call_args.args[2])
         self.assertEqual(create.call_args.args[2]["locationReferences"], ["Unknown Place"])
-        self.assertTrue(result["confirmation"].endswith(
-            "Couldn't resolve Geo: Unknown Place."
-        ))
+        self.assertIn("Couldn't resolve Geo: Unknown Place.", result["confirmation"])
+        self.assertTrue(result["confirmation"].endswith("🔎 No matches found yet."))
 
     def test_listing_uses_fallback_only_when_direct_and_development_geo_fail(self):
         parsed = {
@@ -1027,7 +1026,8 @@ Tech subang
         ]
         self.assertEqual(
             importer._confirmation(parsed, geos, developments),
-            "Added lead to Alex Goh: 60164697992: Mont Kiara, Condo, 3 bed, up to RM5,000. "
+            "✅ *Lead added to Alex Goh (60164697992)*\n\n"
+            "Mont Kiara, Condo, 3 bed, up to RM5,000. "
             "Developments: Inspirasi Mont Kiara, Mont Kiara Astana.",
         )
 
@@ -1039,7 +1039,7 @@ Tech subang
         geos = [{"matched": True, "id": "geo-mk", "name": "Mont Kiara"}]
         self.assertEqual(
             importer._confirmation(parsed, geos, []),
-            "Added lead: Mont Kiara, Condo, 3 bed, up to RM5,000.",
+            "✅ *Lead added*\n\nMont Kiara, Condo, 3 bed, up to RM5,000.",
         )
 
     def test_listing_confirmation_includes_agent_and_extracted_details(self):
@@ -1053,7 +1053,7 @@ Tech subang
         developments = [{"matched": True, "name": "Arte Plus"}]
         self.assertEqual(
             importer._confirmation(parsed, geos, developments),
-            "Added listing to Jane Tee: 60173262281: Arte Plus, Ampang — "
+            "✅ *Listing added to Jane Tee (60173262281)*\n\nArte Plus, Ampang — "
             "3 bed, 2 bath, 1,000 sqft, partially furnished, RM850,000.",
         )
 
@@ -1066,7 +1066,7 @@ Tech subang
             importer._confirmation(
                 parsed, [{"matched": True, "name": "Bangsar"}], []
             ),
-            "Added listing: Bangsar — 2 bed, RM4,500/month.",
+            "✅ *Listing added*\n\nBangsar — 2 bed, RM4,500/month.",
         )
 
     def test_rental_listing_and_development_geo_derivation(self):
@@ -1740,7 +1740,7 @@ Tech subang
         self.assertEqual(result["status"], "duplicate")
         self.assertEqual(result["bubble_id"], "lead-existing")
         self.assertTrue(result["confirmation"].startswith(
-            "This lead already exists.\n\nFound 2 matching listings:"
+            "This lead already exists.\n\n🔎 *Found 2 matches*"
         ), result["confirmation"])
         self.assertEqual(create.call_count, 1)
         self.assertEqual(create.call_args.args[1:], (
@@ -1787,7 +1787,7 @@ Tech subang
             )
         self.assertEqual(result["status"], "duplicate")
         self.assertTrue(result["confirmation"].startswith(
-            "This listing already exists.\n\nFound 1 matching lead:"
+            "This listing already exists.\n\n🔎 *Found 1 match*"
         ), result["confirmation"])
         create.assert_called_once_with(
             "https://www.rentee.asia/api/1.1", "match",
@@ -1958,7 +1958,7 @@ Tech subang
 
         self.assertEqual(result["status"], "processed")
         self.assertEqual(result["bubble_id"], "lead-1")
-        self.assertIn("See here: https://www.rentee.asia/lead/lead-1",
+        self.assertIn("View lead:\nhttps://www.rentee.asia/lead/lead-1",
                       result["confirmation"])
         self.assertEqual(create.call_args_list[1].args[2], {
             "lead": "lead-1", "listing": "listing-1",
@@ -2481,13 +2481,12 @@ Tech subang
             )
         self.assertEqual(result["matches"], [match])
         self.assertIn(
-            "See here: https://www.rentee.asia/lead/lead-1\n\n"
-            "Found 1 matching listing:",
+            "View lead:\nhttps://www.rentee.asia/lead/lead-1\n\n"
+            "🔎 *Found 1 match*",
             result["confirmation"],
         )
         self.assertIn(
-            "Found 1 matching listing:\n\n"
-            "One Menerung — 2 bed, RM4,800/month\n"
+            "*1. One Menerung*\n2 bed · RM4,800/month\n"
             "https://www.rentee.asia/listing/listing-1",
             result["confirmation"],
         )
@@ -2520,13 +2519,12 @@ Tech subang
             )
         self.assertEqual(result["matches"], [match])
         self.assertIn(
-            "See here: https://www.rentee.asia/listing/listing-1\n\n"
-            "Found 1 matching lead:",
+            "View listing:\nhttps://www.rentee.asia/listing/listing-1\n\n"
+            "🔎 *Found 1 match*",
             result["confirmation"],
         )
         self.assertIn(
-            "Found 1 matching lead:\n\n"
-            "Alex WTR One Menerung — 2+ bed, budget RM5,200\n"
+            "*1. Alex WTR One Menerung*\n2+ bed · budget RM5,200\n"
             "Agent: Alex Goh\n"
             "Phone: +60164697992\n"
             "https://www.rentee.asia/lead/lead-1",
@@ -2562,13 +2560,9 @@ Tech subang
         rendered = importer.format_import_matches(
             "lead", lead, listings, DEVELOPMENTS
         )
-        self.assertEqual(rendered, (
-            "Found 2 matching listings:\n\n"
-            "One Menerung — 3 bed, RM5,500/month\n"
-            "https://www.rentee.asia/listing/listing-rent\n\n"
-            "Serai\n"
-            "https://www.rentee.asia/listing/listing-empty"
-        ))
+        self.assertIn("🔎 *Found 2 matches*", rendered)
+        self.assertIn("*1. One Menerung*\n3 bed · RM5,500/month", rendered)
+        self.assertIn("*2. Serai*", rendered)
         self.assertNotIn("900,000", rendered)
 
     def test_matching_listing_includes_owner_name_and_omits_empty_phone(self):
@@ -2585,6 +2579,120 @@ Tech subang
             )
         self.assertIn("Agent: James", rendered)
         self.assertNotIn("Phone:", rendered)
+
+    def test_grouped_match_confirmation_uses_all_three_existing_tiers(self):
+        lead = {
+            "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"], "TransactionType": ["Rent/Let"],
+            "budgetRent": 5000,
+        }
+        matches = [
+            {"_id": "tier-1", "development": "dev-one", "Geo": "geo-bangsar",
+             "propertyType": "Condo", "TransactionType": ["Rent/Let"],
+             "beds": 3, "priceRent": 4800,
+             "owner": {"name": "Sandy", "phone": "60111111111"}},
+            {"_id": "tier-2", "development": "dev-serai", "Geo": "geo-bangsar",
+             "propertyType": "Condo", "TransactionType": ["Rent/Let"],
+             "beds": 3, "priceRent": 4900},
+            {"_id": "tier-3", "development": "dev-serai", "Geo": "geo-bangsar",
+             "TransactionType": ["Rent/Let"], "beds": 3, "priceRent": 5000},
+        ]
+        rendered = importer.format_import_matches(
+            "lead", lead, matches, DEVELOPMENTS, geo_records=GEOS
+        )
+        self.assertIn("🔎 *Found 3 matches*", rendered)
+        self.assertIn("🏢 1 match for One Menerung", rendered)
+        self.assertIn("📍 1 other match in Bangsar", rendered)
+        self.assertIn(
+            "🔍 1 possible match in Bangsar (property type unconfirmed)", rendered
+        )
+        self.assertLess(rendered.index("*1. One Menerung*"), rendered.index("*2. Serai*"))
+        self.assertIn("Agent: Sandy\nPhone: 60111111111", rendered)
+        self.assertIn("https://www.rentee.asia/listing/tier-1", rendered)
+
+    def test_tier_one_groups_multiple_preferred_developments_truthfully(self):
+        lead = {
+            "preferredDevelopments": ["dev-one", "dev-serai"],
+            "Geo": ["geo-bangsar", "geo-klcc"],
+        }
+        matches = [
+            {"_id": "one", "development": "dev-one", "Geo": "geo-bangsar"},
+            {"_id": "serai", "development": "dev-serai", "Geo": "geo-klcc"},
+        ]
+        rendered = importer.format_import_matches(
+            "lead", lead, matches, DEVELOPMENTS, geo_records=GEOS
+        )
+        self.assertIn("🏢 1 match for One Menerung", rendered)
+        self.assertIn("🏢 1 match for Serai", rendered)
+        self.assertNotIn("2 matches for One Menerung", rendered)
+
+    def test_single_tier_outputs_omit_empty_sections(self):
+        lead = {
+            "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        cases = [
+            ({"_id": "one", "development": "dev-one", "Geo": "geo-bangsar",
+              "propertyType": "Condo"}, "🏢", ("📍", "🔍")),
+            ({"_id": "two", "development": "dev-serai", "Geo": "geo-bangsar",
+              "propertyType": "Condo"}, "📍", ("🏢", "🔍")),
+            ({"_id": "three", "development": "dev-serai", "Geo": "geo-bangsar"},
+             "🔍", ("🏢", "📍")),
+        ]
+        for match, expected_icon, absent_icons in cases:
+            with self.subTest(match=match["_id"]):
+                rendered = importer.format_import_matches(
+                    "lead", lead, [match], DEVELOPMENTS, geo_records=GEOS
+                )
+                self.assertEqual(rendered.count(expected_icon), 2)
+                for icon in absent_icons:
+                    self.assertNotIn(icon, rendered)
+
+    def test_new_listing_groups_matching_leads_by_the_same_tiers(self):
+        listing = {
+            "development": "dev-one", "Geo": "geo-bangsar",
+            "propertyType": "Condo",
+        }
+        leads = [
+            {"_id": "lead-one", "name": "Buyer A",
+             "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
+             "propertyTypes": ["Condo"]},
+            {"_id": "lead-two", "name": "Buyer B",
+             "preferredDevelopments": [], "Geo": ["geo-bangsar"],
+             "propertyTypes": ["Condo"]},
+            {"_id": "lead-three", "name": "Buyer C",
+             "preferredDevelopments": [], "Geo": ["geo-bangsar"],
+             "propertyTypes": []},
+        ]
+        rendered = importer.format_import_matches(
+            "listing", listing, leads, DEVELOPMENTS, geo_records=GEOS
+        )
+        self.assertIn("🏢 1 match for One Menerung", rendered)
+        self.assertIn("📍 1 other match in Bangsar", rendered)
+        self.assertIn("🔍 1 possible match in Bangsar", rendered)
+        self.assertIn("https://www.rentee.asia/lead/lead-three", rendered)
+
+    def test_missing_names_use_generic_group_headings_without_ids(self):
+        lead = {"preferredDevelopments": ["dev-missing"], "Geo": ["geo-missing"]}
+        listing = {"_id": "listing-1", "development": "dev-missing",
+                   "Geo": "geo-missing"}
+        rendered = importer.format_import_matches(
+            "lead", lead, [listing], [], geo_records=[]
+        )
+        self.assertIn("🏢 1 match for preferred developments", rendered)
+        self.assertNotIn("dev-missing", rendered)
+        self.assertNotIn("geo-missing", rendered)
+
+    def test_owner_heading_omits_missing_components_cleanly(self):
+        self.assertEqual(
+            importer._owner_heading("lead", {"name": "Gwen"}),
+            "✅ *Lead added to Gwen*",
+        )
+        self.assertEqual(
+            importer._owner_heading("listing", {"phone": "017-4156107"}),
+            "✅ *Listing added to 60174156107*",
+        )
+        self.assertEqual(importer._owner_heading("lead", {}), "✅ *Lead added*")
 
     def test_no_matches_append_created_lead_link_to_confirmation(self):
         parsed = {
@@ -2605,7 +2713,8 @@ Tech subang
         self.assertEqual(result["matches"], [])
         self.assertEqual(
             result["confirmation"],
-            expected + "\n\nSee here: https://www.rentee.asia/lead/lead-1",
+            expected + "\n\nView lead:\nhttps://www.rentee.asia/lead/lead-1"
+            "\n\n🔎 No matches found yet.",
         )
 
     def test_unsupported_property_type_is_removed(self):
