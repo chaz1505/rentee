@@ -2561,8 +2561,8 @@ Tech subang
             "lead", lead, listings, DEVELOPMENTS
         )
         self.assertIn("🔎 *Found 2 matches*", rendered)
-        self.assertIn("*1. One Menerung*\n3 bed · RM5,500/month", rendered)
-        self.assertIn("*2. Serai*", rendered)
+        self.assertIn("*1. Serai*", rendered)
+        self.assertIn("*2. One Menerung*\n3 bed · RM5,500/month", rendered)
         self.assertNotIn("900,000", rendered)
 
     def test_matching_listing_includes_owner_name_and_omits_empty_phone(self):
@@ -2682,6 +2682,122 @@ Tech subang
         self.assertIn("🏢 1 match for preferred developments", rendered)
         self.assertNotIn("dev-missing", rendered)
         self.assertNotIn("geo-missing", rendered)
+
+    def test_match_display_limit_defaults_validates_and_accepts_zero(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(importer._match_display_limit(), 5)
+        for raw in ("invalid", "-1", "3.5"):
+            with self.subTest(raw=raw), patch.dict(
+                    os.environ, {"MATCH_DISPLAY_LIMIT": raw}):
+                self.assertEqual(importer._match_display_limit(), 5)
+        with patch.dict(os.environ, {"MATCH_DISPLAY_LIMIT": "0"}):
+            self.assertEqual(importer._match_display_limit(), 0)
+
+    def test_scoring_validates_response_and_batches_candidates(self):
+        matches = [{"_id": f"listing-{index}"} for index in range(21)]
+        first = SimpleNamespace(output_text=json.dumps({"matches": [
+            {"id": f"listing-{index}", "score": 80, "reason": "Good fit"}
+            for index in range(20)
+        ]}))
+        second = SimpleNamespace(output_text=json.dumps({"matches": [
+            {"id": "listing-20", "score": 91, "reason": "Best fit"},
+        ]}))
+        with patch.object(importer.rentee_app.client.responses, "create",
+                          side_effect=[first, second]) as create:
+            scores = importer.score_import_matches("lead", {}, matches)
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(len(scores), 21)
+        self.assertEqual(scores["listing-20"]["score"], 91)
+
+    def test_scoring_keeps_valid_partial_results_and_rejects_bad_ids(self):
+        response = SimpleNamespace(output_text=json.dumps({"matches": [
+            {"id": "listing-1", "score": 90, "reason": "Exact development"},
+            {"id": "unknown", "score": 100, "reason": "Unknown"},
+            {"id": "listing-1", "score": 80, "reason": "Duplicate"},
+        ]}))
+        with patch.object(importer.rentee_app.client.responses, "create",
+                          return_value=response):
+            scores = importer.score_import_matches(
+                "lead", {}, [{"_id": "listing-1"}, {"_id": "listing-2"}]
+            )
+        self.assertEqual(scores, {
+            "listing-1": {"score": 90, "reason": "Exact development"},
+        })
+
+    def test_score_first_ranking_limit_and_stable_tie_breaking(self):
+        lead = {"preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"]}
+        matches = [
+            {"_id": "z-tier-one", "development": "dev-one"},
+            {"_id": "b-tier-three"},
+            {"_id": "a-tier-three"},
+            {"_id": "low"},
+        ]
+        scores = {
+            "z-tier-one": {"score": 80, "reason": "Exact development"},
+            "b-tier-three": {"score": 95, "reason": "Strong requirements"},
+            "a-tier-three": {"score": 95, "reason": "Strong requirements"},
+            "low": {"score": 40, "reason": "Several compromises"},
+        }
+        with patch.dict(os.environ, {"MATCH_DISPLAY_LIMIT": "3"}):
+            rendered = importer.format_import_matches(
+                "lead", lead, matches, DEVELOPMENTS, geo_records=GEOS,
+                match_scores=scores,
+            )
+        self.assertIn("Found 4 matches", rendered)
+        self.assertIn("showing top 3", rendered)
+        self.assertNotIn("/listing/low", rendered)
+        self.assertLess(rendered.index("/listing/a-tier-three"),
+                        rendered.index("/listing/b-tier-three"))
+        self.assertIn("— 95/100", rendered)
+        self.assertIn("Why it matches: Strong requirements", rendered)
+
+    def test_match_display_limit_zero_keeps_total_without_details(self):
+        with patch.dict(os.environ, {"MATCH_DISPLAY_LIMIT": "0"}):
+            rendered = importer.format_import_matches(
+                "lead", {}, [{"_id": "listing-1"}]
+            )
+        self.assertEqual(rendered, "🔎 *Found 1 match* — showing top 0")
+
+    def test_match_scores_are_created_and_existing_match_is_updated_without_alert(self):
+        scoring = {"listing-1": {"score": 92, "reason": "Exact fit"}}
+        with patch.object(importer.rentee_app, "_bubble_records",
+                          side_effect=[[], [{"_id": "match-existing"}]]), \
+             patch.object(importer.rentee_app, "_bubble_create",
+                          return_value="match-new") as create, \
+             patch.object(importer.rentee_app, "_bubble_patch") as update, \
+             patch.object(importer, "maybe_send_match_alert") as alert:
+            importer.create_missing_match_records(
+                "lead", "lead-1", [{"_id": "listing-1"}], "live",
+                match_scores=scoring,
+            )
+            importer.create_missing_match_records(
+                "lead", "lead-1", [{"_id": "listing-1"}], "live",
+                match_scores=scoring,
+            )
+        self.assertEqual(create.call_args.args[2]["match_score"], 92)
+        self.assertEqual(create.call_args.args[2]["match_reason"], "Exact fit")
+        update.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/match/match-existing",
+            {"match_score": 92, "match_reason": "Exact fit"},
+        )
+        self.assertEqual(alert.call_count, 1)
+
+    def test_scoring_failure_falls_back_to_tier_then_record_id(self):
+        lead = {"preferredDevelopments": ["dev-one"]}
+        matches = [
+            {"_id": "b", "development": "other"},
+            {"_id": "z", "development": "dev-one"},
+            {"_id": "a", "development": "other"},
+        ]
+        with patch.object(importer.rentee_app.client.responses, "create",
+                          side_effect=TimeoutError("timeout")):
+            scores = importer.score_import_matches("lead", lead, matches)
+        self.assertEqual(scores, {})
+        self.assertEqual(
+            [item["_id"] for item in importer._rank_import_matches(
+                "lead", lead, matches, scores
+            )], ["z", "a", "b"],
+        )
 
     def test_owner_heading_omits_missing_components_cleanly(self):
         self.assertEqual(
