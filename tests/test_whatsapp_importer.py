@@ -1838,34 +1838,35 @@ Tech subang
         )
         self.assertEqual([match["_id"] for match in matches], original_order)
 
-    def test_alert_limit_reaches_best_recipient_that_can_receive(self):
+    def test_score_ranking_reaches_best_recipient_first(self):
         lead = {
             "preferredDevelopments": ["dev-one"], "Geo": ["geo-bangsar"],
             "propertyTypes": ["Condo"],
         }
         matches = [
-            {"_id": "tier-3"},
-            {"_id": "tier-2", "Geo": "geo-bangsar", "propertyType": "Condo"},
-            {"_id": "tier-1", "development": "dev-one"},
+            {"_id": "tier-3", "owner": "owner-3"},
+            {"_id": "tier-2", "owner": "owner-2", "Geo": "geo-bangsar",
+             "propertyType": "Condo"},
+            {"_id": "tier-1", "owner": "owner-1", "development": "dev-one"},
         ]
         attempts = []
 
         def alert(_match_id, _created_type, _lead, listing, *_args, **kwargs):
-            if kwargs["import_alert_state"]["accepted"] >= kwargs["import_alert_limit"]:
-                return False
             attempts.append(listing["_id"])
-            if listing["_id"] == "tier-2":
-                kwargs["import_alert_state"]["accepted"] += 1
-                return True
-            return False
+            return True
 
-        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_RECIPIENTS": "2"}), \
              patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create",
                           side_effect=["match-1", "match-2", "match-3"]) as create, \
              patch.object(importer, "maybe_send_match_alert", side_effect=alert):
             importer.create_missing_match_records(
-                "lead", "lead-new", matches, "live", created_record=lead
+                "lead", "lead-new", matches, "live", created_record=lead,
+                match_scores={
+                    "tier-1": {"score": 95, "reason": "best"},
+                    "tier-2": {"score": 90, "reason": "next"},
+                    "tier-3": {"score": 85, "reason": "third"},
+                },
             )
         self.assertEqual(attempts, ["tier-1", "tier-2"])
         self.assertEqual(create.call_count, 3)
@@ -1999,6 +2000,7 @@ Tech subang
             importer.create_missing_match_records(
                 "listing", "listing-new", [{"_id": "lead-existing"}],
                 "live", created_record={"owner": "listing-owner"},
+                match_scores={"lead-existing": {"score": 95, "reason": "fit"}},
             )
 
         get_record.assert_called_once_with(
@@ -2010,6 +2012,7 @@ Tech subang
                 "match_source": "whatsapp", "match_tier": 3,
                 "lead_owner": "lead-owner",
                 "listing_owner": "listing-owner",
+                "match_score": 95, "match_reason": "fit",
             },
         )
         self.assertEqual(alert.call_args.args[4:6], (
@@ -2027,10 +2030,11 @@ Tech subang
             importer.create_missing_match_records(
                 "listing", "listing-new", [{"_id": "lead-existing"}],
                 "live", created_record={"owner": "listing-owner"},
+                match_scores={"lead-existing": {"score": 95, "reason": "fit"}},
             )
 
         self.assertNotIn("lead_owner", create.call_args.args[2])
-        self.assertIsNone(alert.call_args.args[4])
+        alert.assert_not_called()
         messages = " ".join(str(item) for item in log.call_args_list)
         self.assertIn("source=full_lead_fetch status=failed", messages)
         self.assertIn("lead_id=lead-existing status=missing", messages)
@@ -2047,10 +2051,11 @@ Tech subang
             importer.create_missing_match_records(
                 "listing", "listing-new", [{"_id": "lead-existing"}],
                 "live", created_record={"owner": "listing-owner"},
+                match_scores={"lead-existing": {"score": 95, "reason": "fit"}},
             )
 
         self.assertNotIn("lead_owner", create.call_args.args[2])
-        self.assertIsNone(alert.call_args.args[4])
+        alert.assert_not_called()
         self.assertIn("lead_id=lead-existing status=missing", " ".join(
             str(item) for item in log.call_args_list
         ))
@@ -2129,6 +2134,7 @@ Tech subang
             importer.create_missing_match_records(
                 "lead", "lead-new", [listing], "live", created_record=lead,
                 development_records=DEVELOPMENTS, geo_records=GEOS,
+                match_scores={listing["_id"]: {"score": 95, "reason": "fit"}},
             )
         self.assertEqual(create.call_args.args[2]["listing_owner"], "user-gwen")
         message = send_text.call_args.args[1]
@@ -2259,14 +2265,14 @@ Tech subang
                 " ".join(str(call) for call in logged.call_args_list),
             )
 
-    def test_import_alert_limit_creates_all_matches_but_sends_once(self):
+    def test_recipient_grouping_creates_all_matches_but_sends_once(self):
         lead, listing = self.match_alert_records()
         listings = [dict(listing, _id=f"listing-{index}") for index in range(20)]
         users = {
             "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
             "user-stephanie": {"name": "Stephanie"},
         }
-        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_RECIPIENTS": "20"}), \
              patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create",
                           side_effect=[f"match-{index}" for index in range(20)]) as create, \
@@ -2281,10 +2287,16 @@ Tech subang
             importer.create_missing_match_records(
                 "lead", "lead-new", listings, "live", created_record=lead,
                 development_records=DEVELOPMENTS, geo_records=GEOS,
+                match_scores={item["_id"]: {"score": 95, "reason": "fit"}
+                              for item in listings},
             )
         self.assertEqual(create.call_count, 20)
         send.assert_called_once()
-        update.assert_called_once()
+        message = send.call_args.args[1]
+        self.assertIn("You have 20 qualifying matches", message)
+        self.assertIn("/listing/listing-0", message)
+        self.assertIn("/listing/listing-19", message)
+        self.assertEqual(update.call_count, 20)
 
     def test_failed_alert_allows_later_attempt_but_success_consumes_limit(self):
         lead, listing = self.match_alert_records()
@@ -2293,7 +2305,7 @@ Tech subang
             "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
             "user-stephanie": {"name": "Stephanie"},
         }
-        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_RECIPIENTS": "20"}), \
              patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create",
                           side_effect=["match-0", "match-1", "match-2"]), \
@@ -2306,10 +2318,11 @@ Tech subang
              patch.object(importer.rentee_app, "_bubble_patch") as update:
             importer.create_missing_match_records(
                 "lead", "lead-new", listings, "live", created_record=lead,
+                match_scores={item["_id"]: {"score": 95, "reason": "fit"}
+                              for item in listings},
             )
-        self.assertEqual(send.call_count, 2)
-        update.assert_called_once()
-        self.assertTrue(update.call_args.args[0].endswith("/match/match-1"))
+        self.assertEqual(send.call_count, 1)
+        update.assert_not_called()
 
     def test_match_patch_failure_does_not_allow_second_send(self):
         lead, listing = self.match_alert_records()
@@ -2318,7 +2331,7 @@ Tech subang
             "user-gwen": {"name": "Gwen", "phone": "0174156107", "alerts": True},
             "user-stephanie": {"name": "Stephanie"},
         }
-        with patch.dict(os.environ, {"MATCH_ALERT_MAX_PER_IMPORT": "1"}), \
+        with patch.dict(os.environ, {"MATCH_ALERT_MAX_RECIPIENTS": "20"}), \
              patch.object(importer.rentee_app, "_bubble_records", return_value=[]), \
              patch.object(importer.rentee_app, "_bubble_create",
                           side_effect=["match-0", "match-1"]), \
@@ -2332,6 +2345,8 @@ Tech subang
                           side_effect=RuntimeError("Bubble down")):
             importer.create_missing_match_records(
                 "lead", "lead-new", listings, "live", created_record=lead,
+                match_scores={item["_id"]: {"score": 95, "reason": "fit"}
+                              for item in listings},
             )
         send.assert_called_once()
 
@@ -2423,10 +2438,11 @@ Tech subang
             importer.create_missing_match_records(
                 "lead", "lead-new", [listing], "live", created_record=lead,
                 development_records=DEVELOPMENTS, geo_records=GEOS,
+                match_scores={listing["_id"]: {"score": 95, "reason": "fit"}},
             )
         create.assert_called_once()
         update.assert_not_called()
-        self.assertIn("[MATCH ALERT ERROR] match_id=match-1", " ".join(
+        self.assertIn("[MATCH ALERT ERROR] recipient_user_id=user-gwen", " ".join(
             str(call) for call in log.call_args_list
         ))
 
@@ -2531,9 +2547,6 @@ Tech subang
             result["confirmation"],
         )
         self.assertEqual(get_owner.call_args_list, [
-            call(
-                "https://www.rentee.asia/api/1.1/obj/user/user-alex"
-            ),
             call(
                 "https://www.rentee.asia/api/1.1/obj/user/user-alex"
             ),
@@ -2780,7 +2793,7 @@ Tech subang
             "https://www.rentee.asia/api/1.1/obj/match/match-existing",
             {"match_score": 92, "match_reason": "Exact fit"},
         )
-        self.assertEqual(alert.call_count, 1)
+        self.assertEqual(alert.call_count, 0)
 
     def test_scoring_failure_falls_back_to_tier_then_record_id(self):
         lead = {"preferredDevelopments": ["dev-one"]}

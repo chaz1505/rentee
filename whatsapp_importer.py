@@ -1850,12 +1850,30 @@ def _match_alert_templates_enabled() -> bool:
     }
 
 
-def _match_alert_max_per_import() -> int:
-    """Return the temporary per-import send cap, safely defaulting to one."""
+def _match_alert_min_score() -> int:
+    """Return the inclusive alert score threshold, safely defaulting to 80."""
     try:
-        return max(0, int(str(os.getenv("MATCH_ALERT_MAX_PER_IMPORT", "1")).strip()))
+        value = int(str(os.getenv("MATCH_ALERT_MIN_SCORE", "80")).strip())
+        if 0 <= value <= 100:
+            return value
     except (TypeError, ValueError):
-        return 1
+        pass
+    print("[MATCH ALERT CONFIG] name=MATCH_ALERT_MIN_SCORE action=default "
+          "value=80 reason=invalid", flush=True)
+    return 80
+
+
+def _match_alert_max_recipients() -> int:
+    """Return the distinct-recipient safety cap, safely defaulting to 20."""
+    try:
+        value = int(str(os.getenv("MATCH_ALERT_MAX_RECIPIENTS", "20")).strip())
+        if value >= 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    print("[MATCH ALERT CONFIG] name=MATCH_ALERT_MAX_RECIPIENTS action=default "
+          "value=20 reason=invalid", flush=True)
+    return 20
 
 
 def _match_display_limit() -> int:
@@ -2008,7 +2026,7 @@ def _rank_import_matches(created_type, created_record, matches, scores=None):
 def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
                            listing_owner, bubble_env="live", *, match_record=None,
                            development_records=None, geo_records=None,
-                           import_alert_state=None, import_alert_limit=None):
+                           grouped_matches=None):
     match_id = _compact(match_id)
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     if match_record is None:
@@ -2021,14 +2039,6 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
     if (match_record or {}).get("alert_sent") is True:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped "
               "reason=already_sent", flush=True)
-        return False
-    if (
-        import_alert_state is not None
-        and import_alert_limit is not None
-        and import_alert_state.get("accepted", 0) >= import_alert_limit
-    ):
-        print(f"[MATCH ALERT] match_id={match_id} action=skipped "
-              "reason=import_alert_limit", flush=True)
         return False
     if lead_owner and lead_owner == listing_owner:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped reason=self_match",
@@ -2066,6 +2076,33 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
         created_type, lead, listing, recipient, other_agent,
         development_records, geo_records,
     )
+    grouped_matches = list(grouped_matches or [])
+    if len(grouped_matches) > 1:
+        item_lines = []
+        for index, item in enumerate(grouped_matches, 1):
+            item_alert = build_match_alert(
+                created_type, item["lead"], item["listing"], recipient, other_agent,
+                development_records, geo_records,
+            )
+            item_lines.append(
+                f"*{index}. {item_alert['existing_summary']} — {item['score']}/100*\n"
+                f"{item_alert['existing_url']}\n"
+                f"Why it matches: {item.get('reason') or item_alert['reason']}"
+            )
+        alert["text"] = (
+            "🔔 *Rentee Match Alert*\n\n"
+            f"Hi {alert['recipient_name']}, {alert['other_agent_name']} has just added "
+            f"a {alert['new_summary']} – {alert['new_url']}.\n\n"
+            f"You have {len(grouped_matches)} qualifying matches:\n\n" +
+            "\n\n".join(item_lines) + "\n\n"
+            f"Take a look and connect with {alert['other_agent_name']} if it’s a good fit."
+        )
+        alert["existing_summary"] = f"{len(grouped_matches)} qualifying matches"
+        alert["existing_url"] = grouped_matches[0].get("existing_url", "")
+        alert["reason"] = "; ".join(
+            f"{item['score']}/100: {item.get('reason') or 'See linked record'}"
+            for item in grouped_matches
+        )
     window = rentee_app.owner_check_whatsapp_window(phone, bubble_env)
     templates_enabled = _match_alert_templates_enabled()
     if window != "open" and not templates_enabled:
@@ -2089,10 +2126,6 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
         )
         logged_content = f"Template: {template_name}\n\n{alert['text']}"
         logged_type = "template"
-    # Meta accepted the send. Consume the import allowance before Bubble state
-    # is updated so a persistence failure cannot cause a second notification.
-    if import_alert_state is not None:
-        import_alert_state["accepted"] = import_alert_state.get("accepted", 0) + 1
     logged_parts = (
         rentee_app.split_whatsapp_text(logged_content)
         if logged_type == "text" else [logged_content]
@@ -2111,11 +2144,16 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
                 "[MATCH ALERT] action=message_logging_failed "
                 f"match_id={match_id} error={type(error).__name__}", flush=True,
             )
-    rentee_app._bubble_patch(f"{base_url}/obj/match/{match_id}", {
-        "alert_sent": True,
-        "alert_sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "alert_recipient": recipient_id,
-    })
+    alert_match_ids = [match_id] + [
+        _compact(item.get("match_id")) for item in grouped_matches
+        if _compact(item.get("match_id")) != match_id
+    ]
+    for alert_match_id in alert_match_ids:
+        rentee_app._bubble_patch(f"{base_url}/obj/match/{alert_match_id}", {
+            "alert_sent": True,
+            "alert_sent_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "alert_recipient": recipient_id,
+        })
     print(f"[MATCH ALERT] match_id={match_id} action=sent", flush=True)
     return True
 
@@ -2126,8 +2164,8 @@ def create_missing_match_records(
     """Persist each unique deterministic Lead/Listing pair once."""
     base_url = rentee_app.get_bubble_base_url(bubble_env)
     seen = set()
-    import_alert_state = {"accepted": 0}
-    import_alert_limit = _match_alert_max_per_import()
+    alert_candidates = []
+    deduplicated = 0
     def match_tier(matched):
         lead_record, listing_record = (
             (created_record, matched) if created_type == "lead"
@@ -2152,6 +2190,14 @@ def create_missing_match_records(
         existing = next(iter(rentee_app._bubble_records(
                 base_url, "match", constraints)), None)
         scoring = (match_scores or {}).get(matched_id)
+        if scoring is not None:
+            score_value = scoring.get("score") if isinstance(scoring, dict) else None
+            score_reason = _compact(scoring.get("reason")) if isinstance(scoring, dict) else ""
+            if (isinstance(score_value, bool) or not isinstance(score_value, int)
+                    or not 0 <= score_value <= 100 or not score_reason):
+                print(f"[MATCH ALERT] match_id={matched_id} action=skipped "
+                      "reason=invalid_score", flush=True)
+                scoring = None
         if existing:
             if scoring and existing.get("_id"):
                 try:
@@ -2163,7 +2209,11 @@ def create_missing_match_records(
                 except Exception as error:
                     print(f"[MATCH SCORE UPDATE] match_id={existing['_id']} "
                           f"error={type(error).__name__}", flush=True)
-            continue
+            match_id = existing.get("_id")
+            match_record = existing
+        else:
+            match_id = None
+            match_record = None
         lead_record, listing_record = (
             (created_record, matched) if created_type == "lead"
             else (matched, created_record)
@@ -2224,31 +2274,79 @@ def create_missing_match_records(
         if scoring:
             payload["match_score"] = scoring["score"]
             payload["match_reason"] = scoring["reason"]
+        if not match_id:
+            try:
+                match_id = rentee_app._bubble_create(base_url, "match", payload)
+                match_record = dict(payload, _id=match_id)
+            except Exception as error:
+                # Matching is downstream of a completed import. Keep each pair
+                # isolated so one rejected Match cannot fail the import or prevent
+                # later candidates from being attempted.
+                print(
+                    "[MATCH CREATE CONTINUE] "
+                    f"lead_id={pair[0]} listing_id={pair[1]} "
+                    f"error={type(error).__name__}",
+                    flush=True,
+                )
+                continue
+        if scoring and (match_record or {}).get("alert_sent"):
+            deduplicated += 1
+        if scoring and not (match_record or {}).get("alert_sent"):
+            recipient_id = listing_owner if created_type == "lead" else lead_owner
+            alert_candidates.append({
+                "match_id": match_id, "match_record": match_record,
+                "lead": dict(lead_record or {}, _id=pair[0]),
+                "listing": dict(listing_record or {}, _id=pair[1]),
+                "lead_owner": lead_owner, "listing_owner": listing_owner,
+                "recipient_id": recipient_id, "score": scoring["score"],
+                "reason": scoring["reason"],
+                "existing_url": _record_url(
+                    "listing" if created_type == "lead" else "lead", matched_id
+                ),
+            })
+
+    min_score = _match_alert_min_score()
+    max_recipients = _match_alert_max_recipients()
+    qualifying = [item for item in alert_candidates if item["score"] >= min_score]
+    below_threshold = len(alert_candidates) - len(qualifying)
+    groups = {}
+    for item in qualifying:
+        if item["recipient_id"]:
+            groups.setdefault(item["recipient_id"], []).append(item)
+    ranked_groups = sorted(
+        groups.items(), key=lambda group: (-max(item["score"] for item in group[1]), group[0])
+    )
+    selected_groups = ranked_groups[:max_recipients]
+    missing_recipient = len(qualifying) - sum(len(items) for items in groups.values())
+    print(f"[MATCH ALERT SELECTION] min_score={min_score} qualifying={len(qualifying)} "
+          f"recipients={len(groups)} max_recipients={max_recipients}", flush=True)
+    sent = failed = 0
+    for recipient_id, items in selected_groups:
+        items.sort(key=lambda item: (-item["score"], item["match_id"]))
+        first = items[0]
         try:
-            match_id = rentee_app._bubble_create(base_url, "match", payload)
-        except Exception as error:
-            # Matching is downstream of a completed import. Keep each pair
-            # isolated so one rejected Match cannot fail the import or prevent
-            # later candidates from being attempted.
-            print(
-                "[MATCH CREATE CONTINUE] "
-                f"lead_id={pair[0]} listing_id={pair[1]} "
-                f"error={type(error).__name__}",
-                flush=True,
-            )
-            continue
-        try:
-            maybe_send_match_alert(
-                match_id, created_type, dict(lead_record or {}, _id=pair[0]),
-                dict(listing_record or {}, _id=pair[1]), lead_owner, listing_owner,
-                bubble_env, match_record=dict(payload, _id=match_id),
+            accepted = maybe_send_match_alert(
+                first["match_id"], created_type, first["lead"], first["listing"],
+                first["lead_owner"], first["listing_owner"], bubble_env,
+                match_record=first["match_record"],
                 development_records=development_records, geo_records=geo_records,
-                import_alert_state=import_alert_state,
-                import_alert_limit=import_alert_limit,
+                grouped_matches=items,
             )
+            if accepted:
+                sent += 1
+                print(f"[MATCH ALERT] recipient_user_id={recipient_id} "
+                      f"score_max={items[0]['score']} matches={len(items)} action=sent",
+                      flush=True)
         except Exception as error:
-            print(f"[MATCH ALERT ERROR] match_id={match_id} "
+            failed += 1
+            print(f"[MATCH ALERT ERROR] recipient_user_id={recipient_id} "
                   f"error={type(error).__name__}: {error}", flush=True)
+    print(f"[MATCH ALERT SUMMARY] qualifying={len(qualifying)} recipients={len(groups)} "
+          f"attempted={len(selected_groups)} sent={sent} failed={failed} "
+          f"skipped={len(selected_groups) - sent - failed} deduplicated={deduplicated} "
+          f"skipped_below_threshold={below_threshold} "
+          f"skipped_missing_recipient={missing_recipient} "
+          f"skipped_cap={max(0, len(groups) - len(selected_groups))}", flush=True)
 
 
 def _matched_transaction(lead: dict, listing: dict) -> str | None:
@@ -2316,8 +2414,12 @@ def format_import_matches(created_type: str, created_record: dict,
     displayed_matches = _rank_import_matches(
         created_type, created_record, matches, match_scores
     )[:_match_display_limit()]
-    print(f"[MATCH RANKING] eligible={total_count} displayed={len(displayed_matches)}",
-          flush=True)
+    scored_count = sum(
+        1 for match in matches or []
+        if _compact(match.get("_id")) in (match_scores or {})
+    )
+    print(f"[MATCH RANKING] eligible={total_count} scored={scored_count} "
+          f"displayed={len(displayed_matches)}", flush=True)
     for match in displayed_matches:
         if created_type == "lead":
             lead, listing = created_record, match
