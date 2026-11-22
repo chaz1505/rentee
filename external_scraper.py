@@ -43,6 +43,16 @@ def _number(value, *, positive=False, nonnegative=False):
     return value
 
 
+def is_scraped_listing(listing) -> bool:
+    """Recognize Bubble yes/no values plus legacy string serialization."""
+    value = (listing or {}).get("scraped?")
+    if value is True:
+        return True
+    if isinstance(value, str) and value.strip().casefold() in {"true", "yes"}:
+        return True
+    return str((listing or {}).get("source") or "").strip().casefold() == EXPECTED_SOURCE
+
+
 def _relationship_ids(value) -> list[str]:
     values = value if isinstance(value, list) else [value]
     result = []
@@ -84,8 +94,7 @@ def build_external_lookup(lead, matches, development_records, lead_id,
         return None
     internal_matches = [
         listing for listing in matches or []
-        if str(listing.get("source") or "").casefold() != EXPECTED_SOURCE
-        and str(listing.get("scraped?") or "").casefold() not in {"yes", "true"}
+        if not is_scraped_listing(listing)
     ]
     if any(classify_match(lead, listing) == 1 for listing in internal_matches):
         return None
@@ -272,6 +281,7 @@ def enqueue_external_lookup(lookup, phone, bubble_env="live"):
         "attempts": 0,
         "availableAt": _iso(_utcnow()),
         "notificationSent": False,
+        "notificationState": "Pending",
     }
     try:
         return app._bubble_create(base_url, JOB_TYPE, payload), True
@@ -291,7 +301,12 @@ def _parse_date(value):
 
 
 def claim_external_job(bubble_env="live", *, lease_seconds=240):
-    """Lease one due job and verify ownership after the Bubble patch."""
+    """Cooperatively lease one job using Bubble's non-atomic Data API.
+
+    The read/patch/read token check reduces overlapping work but is not an
+    atomic compare-and-swap. Production must run exactly one worker instance
+    unless claiming is moved to an atomic backend workflow or database.
+    """
     app = _bubble()
     base_url = app.get_bubble_base_url(bubble_env)
     now = _utcnow()
@@ -355,7 +370,7 @@ def upsert_external_listing(item, lookup, bubble_env="live"):
     ]
     existing = next(iter(app._bubble_records(base_url, "listing", constraints)), None)
     payload = {
-        "scraped?": "Yes", "scraped_last_date": _iso(_utcnow()),
+        "scraped?": True, "scraped_last_date": _iso(_utcnow()),
         "source": EXPECTED_SOURCE, "sourceListingID": item["source_listing_id"],
         "sourceURL": item["source_url"], "priceRent": item["price_rent"],
         "beds": item["beds"], "development": lookup["development_id"],
@@ -450,16 +465,47 @@ def process_external_job(job, bubble_env="live", *, request_post=requests.post,
                 errors.append(f"{item.get('source_listing_id')}: {type(error).__name__}")
         if errors:
             raise RuntimeError("; ".join(errors))
+        notification_state = str(job.get("notificationState") or "Pending")
+        if not job.get("notificationSent") and notification_state == "Sending":
+            # The previous worker may have sent through Meta before dying. Never
+            # send automatically again because Meta offers no application-level
+            # idempotency key for this operation.
+            app._bubble_patch(job_url, {
+                "status": "NotificationUncertain", "leaseUntil": None,
+                "lastError": (
+                    "Notification delivery is uncertain after worker interruption; "
+                    "inspect Meta/Bubble message history before manual retry."
+                ),
+            })
+            return {"status": "notification_uncertain", "listings": persisted}
         if not job.get("notificationSent"):
             message = format_external_matches(lookup["development"], persisted)
-            sent_ids = send_text(job["phone"], message) or []
-            for meta_id in sent_ids:
-                if meta_id:
-                    save_message(
-                        job["phone"], meta_id, message, "Outbound", "text", bubble_env,
-                        lead_id=lookup["lead_id"],
-                    )
-            app._bubble_patch(job_url, {"notificationSent": True})
+            app._bubble_patch(job_url, {
+                "notificationState": "Sending",
+                "notificationAttemptedAt": _iso(_utcnow()),
+            })
+            try:
+                sent_ids = send_text(job["phone"], message) or []
+                if not any(sent_ids):
+                    raise RuntimeError("WhatsApp send returned no message IDs")
+            except Exception:
+                # No accepted Meta message ID is known, so a retry is safe.
+                app._bubble_patch(job_url, {"notificationState": "Pending"})
+                raise
+            try:
+                for meta_id in sent_ids:
+                    if meta_id:
+                        save_message(
+                            job["phone"], meta_id, message, "Outbound", "text", bubble_env,
+                            lead_id=lookup["lead_id"],
+                        )
+                app._bubble_patch(job_url, {
+                    "notificationSent": True, "notificationState": "Sent",
+                })
+            except Exception:
+                # Meta accepted at least one delivery. Preserve Sending so the
+                # next run stops for reconciliation instead of sending twice.
+                raise
         app._bubble_patch(job_url, {
             "status": "Completed", "completedAt": _iso(_utcnow()),
             "leaseUntil": None, "lastError": "",

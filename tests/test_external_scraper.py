@@ -58,10 +58,14 @@ class ExternalScraperEligibilityTests(unittest.TestCase):
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_cached_scraped_tier_one_listing_does_not_block_lookup(self):
-        cached = {"_id": "listing-cached", "source": "iproperty", "scraped?": "Yes"}
-        self.assertIsNotNone(self.lookup(
-            matches=[cached], classifier=lambda _lead, _listing: 1
-        ))
+        for value in (True, "true", "Yes"):
+            cached = {
+                "_id": "listing-cached", "source": "iproperty",
+                "scraped?": value,
+            }
+            self.assertIsNotNone(self.lookup(
+                matches=[cached], classifier=lambda _lead, _listing: 1
+            ))
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_sale_or_mixed_transaction_blocks_lookup(self):
@@ -263,7 +267,7 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(listing["_id"], "listing-1")
         payload = self.app._bubble_create.call_args.args[2]
-        self.assertEqual(payload["scraped?"], "Yes")
+        self.assertIs(payload["scraped?"], True)
         self.assertEqual(payload["source"], "iproperty")
         self.assertEqual(payload["sourceListingID"], "external-1")
         self.assertEqual(payload["development"], "dev-one")
@@ -374,6 +378,49 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "completed")
         send.assert_not_called()
+
+    def test_uncertain_prior_notification_stops_without_resending(self):
+        job = {
+            "_id": "job-1", "attempts": 2, "phone": "60123456789",
+            "notificationSent": False, "notificationState": "Sending",
+            "payload": __import__("json").dumps(self.lookup),
+        }
+        self.app._bubble_records_by_ids.return_value = [{
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "budgetRent": 15000, "bedroomsMin": 3,
+            "preferredDevelopments": ["dev-one"],
+        }]
+        listing = {
+            "_id": "listing-1", "development": "dev-one",
+            "TransactionType": ["Rent/Let"], "priceRent": 15000, "beds": 3,
+        }
+        send = MagicMock()
+        with patch.object(external_scraper, "fetch_external_matches",
+                          return_value=[self.item]), \
+             patch.object(external_scraper, "upsert_external_listing",
+                          return_value=(listing, False)), \
+             patch.object(external_scraper, "create_external_match",
+                          return_value=("match-1", False)):
+            result = external_scraper.process_external_job(
+                job, send_text=send, save_message=MagicMock()
+            )
+        self.assertEqual(result["status"], "notification_uncertain")
+        send.assert_not_called()
+        self.assertEqual(
+            self.app._bubble_patch.call_args.args[1]["status"],
+            "NotificationUncertain",
+        )
+
+    def test_claim_rejects_job_when_readback_token_was_overwritten(self):
+        now = external_scraper._iso(external_scraper._utcnow())
+        queued = {
+            "_id": "job-1", "jobKey": "iproperty:lead-1",
+            "status": "Queued", "attempts": 0, "availableAt": now,
+        }
+        self.app._bubble_records.side_effect = [
+            [queued], [dict(queued, status="Running", workerId="other-worker")],
+        ]
+        self.assertIsNone(external_scraper.claim_external_job())
 
 
 if __name__ == "__main__":

@@ -1294,6 +1294,41 @@ Tech subang
             lead, dict(listing, owner="user-agent")
         ))
 
+    def test_scraped_listing_is_excluded_even_with_owner_or_legacy_flag(self):
+        lead = {
+            "TransactionType": ["Rent/Let"], "Geo": ["geo-bangsar"],
+            "propertyTypes": ["Condo"],
+        }
+        listing = {
+            "_id": "listing-scraped", "TransactionType": ["Rent/Let"],
+            "Geo": "geo-bangsar", "propertyType": "Condo",
+            "owner": "user-agent", "source": "iproperty",
+        }
+        for scraped_value in (True, "true", "Yes"):
+            with self.subTest(scraped_value=scraped_value):
+                self.assertFalse(importer.lead_matches_listing(
+                    lead, dict(listing, **{"scraped?": scraped_value})
+                ))
+
+    def test_normal_match_creation_defensively_skips_scraped_listing(self):
+        lead = {
+            "_id": "lead-1", "owner": "lead-owner",
+            "preferredDevelopments": ["dev-one"],
+        }
+        listing = {
+            "_id": "listing-scraped", "owner": "user-agent",
+            "development": "dev-one", "scraped?": True,
+        }
+        with patch.object(importer.rentee_app, "_bubble_records") as records, \
+             patch.object(importer.rentee_app, "_bubble_create") as create, \
+             patch.object(importer, "maybe_send_match_alert") as alert:
+            importer.create_missing_match_records(
+                "lead", "lead-1", [listing], "live", created_record=lead
+            )
+        records.assert_not_called()
+        create.assert_not_called()
+        alert.assert_not_called()
+
     def test_listing_date_eligibility_uses_calendar_month_window_and_priority(self):
         today = importer.datetime.date(2026, 1, 31)
         self.assertTrue(importer._listing_date_eligible(

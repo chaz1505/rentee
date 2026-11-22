@@ -1593,6 +1593,8 @@ def lead_matches_listing(lead: dict, listing: dict) -> bool:
     """Return whether one Bubble Lead and Listing satisfy deterministic match rules."""
     if lead.get("cancelled") is True:
         return False
+    if external_scraper.is_scraped_listing(listing):
+        return False
     if not _relationship_ids(listing.get("owner")):
         return False
     if str(listing.get("availability_option") or "").strip().lower() == "no":
@@ -2175,6 +2177,9 @@ def create_missing_match_records(
         return classify_match(lead_record or {}, listing_record or {})
 
     for matched in sorted(matches or [], key=match_tier):
+        listing_record = matched if created_type == "lead" else created_record
+        if external_scraper.is_scraped_listing(listing_record):
+            continue
         matched_id = _compact(matched.get("_id"))
         lead_id, listing_id = (
             (created_id, matched_id) if created_type == "lead"
