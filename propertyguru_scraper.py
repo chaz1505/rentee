@@ -50,6 +50,12 @@ BUBBLE_LIVE_BASE_URL = "https://www.rentee.asia/api/1.1"
 IPROPERTY_RENT_SEARCH_ROOT = "https://www.iproperty.com.my/property-for-rent/p"
 DEFAULT_CONDO_CONFIG_PATH = Path(__file__).resolve().parent / "scraper_condos.json"
 IPROPERTY_HOSTS = {"iproperty.com.my", "www.iproperty.com.my"}
+ALLOWED_RESIDENTIAL_TYPES = {
+    "condominium",
+    "service residence",
+    "serviced residence",
+    "apartment",
+}
 LISTING_PATH_RE = re.compile(
     r"/(?:property|bm/properti)/[^?#]+/rent-(\d{7,})/?$", re.I
 )
@@ -634,16 +640,64 @@ def iproperty_project_slug(condo_name: str) -> str:
     return slug
 
 
-def iproperty_search_url(condo_name: str) -> str:
-    return f"{IPROPERTY_RENT_SEARCH_ROOT}/{iproperty_project_slug(condo_name)}"
+def _rental_filter_params(
+    search_name: str,
+    bedrooms_min: int | None = None,
+    budget_rent: float | None = None,
+    max_bedrooms: int = 50,
+) -> list[tuple[str, str | int]]:
+    params: list[tuple[str, str | int]] = [
+        ("listingType", "rent"),
+        ("page", 1),
+        ("isCommercial", "false"),
+        ("_freetextDisplay", compact_text(search_name)),
+    ]
+    if budget_rent is not None:
+        params.extend([
+            ("minPrice", round(budget_rent * 0.8)),
+            ("maxPrice", round(budget_rent * 1.2)),
+        ])
+    if bedrooms_min is not None:
+        params.extend(
+            ("bedrooms", bedroom_count)
+            for bedroom_count in range(bedrooms_min, max_bedrooms + 1)
+        )
+    return params
 
 
-def iproperty_project_search_url(search_name: str, project_id: str) -> str:
-    query = {
-        "isCommercial": "false",
-        "_freetextDisplay": compact_text(search_name),
-        "propertyId": compact_text(project_id),
-    }
+def iproperty_search_url(
+    condo_name: str,
+    bedrooms_min: int | None = None,
+    budget_rent: float | None = None,
+    max_bedrooms: int = 50,
+) -> str:
+    base_url = f"{IPROPERTY_RENT_SEARCH_ROOT}/{iproperty_project_slug(condo_name)}"
+    if bedrooms_min is None and budget_rent is None:
+        return base_url
+    query = _rental_filter_params(
+        condo_name, bedrooms_min, budget_rent, max_bedrooms
+    )
+    return f"{base_url}?{urlencode(query)}"
+
+
+def iproperty_project_search_url(
+    search_name: str,
+    project_id: str,
+    bedrooms_min: int | None = None,
+    budget_rent: float | None = None,
+    max_bedrooms: int = 50,
+) -> str:
+    if bedrooms_min is None and budget_rent is None:
+        query: list[tuple[str, str | int]] = [
+            ("isCommercial", "false"),
+            ("_freetextDisplay", compact_text(search_name)),
+            ("propertyId", compact_text(project_id)),
+        ]
+    else:
+        query = _rental_filter_params(
+            search_name, bedrooms_min, budget_rent, max_bedrooms
+        )
+        query.insert(4, ("propertyId", compact_text(project_id)))
     return f"https://www.iproperty.com.my/property-for-rent?{urlencode(query)}"
 
 
@@ -1284,9 +1338,13 @@ def parse_search_results(
         )
 
     output = []
+    rejected_project = 0
+    rejected_property_type = 0
+    rejected_other = 0
     for wrapper in listings_data:
         listing = wrapper.get("listingData") if isinstance(wrapper, dict) else None
         if not isinstance(listing, dict):
+            rejected_other += 1
             continue
         relative_url = compact_text(listing.get("url"))
         relative_url_match = LISTING_PATH_RE.search(urlparse(relative_url).path)
@@ -1301,13 +1359,18 @@ def parse_search_results(
             if expected_project.project_id
             else project_name.casefold() == expected_project.name.casefold()
         )
+        if not project_matches:
+            rejected_project += 1
+            continue
+        if property_type.casefold() not in ALLOWED_RESIDENTIAL_TYPES:
+            rejected_property_type += 1
+            continue
         if (
             not re.fullmatch(r"\d{7,}", listing_id)
             or relative_url_match is None
-            or not project_matches
-            or property_type.casefold() != "condominium"
             or transaction_type != "RENT"
         ):
+            rejected_other += 1
             continue
 
         source_url = canonical_iproperty_url(urljoin(search_url, relative_url))
@@ -1375,6 +1438,12 @@ def parse_search_results(
             cover_photo_url=photos[0] if photos else None,
             photo_urls=photos,
         ))
+    LOGGER.info(
+        "iProperty records: raw=%d accepted=%d rejected_project=%d "
+        "rejected_property_type=%d rejected_other=%d",
+        len(listings_data), len(output), rejected_project,
+        rejected_property_type, rejected_other,
+    )
     return output
 
 

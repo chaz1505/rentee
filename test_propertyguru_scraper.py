@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import requests
+from bs4 import BeautifulSoup
 
 from propertyguru_scraper import (
     AccessBlockedError,
@@ -370,6 +371,68 @@ class IPropertyParserTests(unittest.TestCase):
             self.search_html([villa, bungalow]),
             "https://www.iproperty.com.my/property-for-rent/p/one-menerung",
             "One Menerung",
+        )
+        self.assertEqual(items, [])
+
+    def test_supported_residential_types_are_accepted(self):
+        cases = (
+            ("Service Residence", "The Ritz-Carlton Residences", "zltrst"),
+            ("Condominium", "One Menerung", "fd12m8"),
+            ("Apartment", "One Menerung", "fd12m8"),
+        )
+        for property_type, project_name, project_id in cases:
+            with self.subTest(property_type=property_type):
+                listing = self.listing_record()
+                listing["property"] = {"subTypeText": property_type}
+                listing["price"] = {"value": 13000, "pretty": "RM 13,000 /mo"}
+                listing["bedrooms"] = 2
+                if project_id == "zltrst":
+                    listing["id"] = 502313463
+                    listing["url"] = (
+                        "/property/kl-city-centre/the-ritz-carlton-residences/"
+                        "rent-502313463/"
+                    )
+                expected = IPropertyProject(project_name, project_id, property_type)
+                html = self.search_html([listing])
+                if project_id == "zltrst":
+                    data = json.loads(
+                        BeautifulSoup(html, "html.parser").select_one(
+                            "script#__NEXT_DATA__"
+                        ).string
+                    )
+                    wrapper = data["props"]["pageProps"]["pageData"]["data"][
+                        "listingsData"
+                    ][0]
+                    wrapper["segment"]["parameters"]["metaData"]["listingData"][
+                        "projectNanoId"
+                    ] = "zltrst"
+                    wrapper["listingData"]["localizedTitle"] = (
+                        "The Ritz-Carlton Residences, KL City Centre"
+                    )
+                    html = (
+                        '<script id="__NEXT_DATA__" type="application/json">'
+                        f"{json.dumps(data)}</script>"
+                    )
+                items = parse_search_results(
+                    html,
+                    "https://www.iproperty.com.my/property-for-rent",
+                    project_name,
+                    expected,
+                )
+                self.assertEqual(len(items), 1)
+                if project_id == "zltrst":
+                    self.assertEqual(items[0].source_listing_id, "502313463")
+                self.assertEqual(items[0].price_rent, 13000)
+                self.assertEqual(items[0].beds, 2)
+
+    def test_non_rental_listing_is_rejected(self):
+        listing = self.listing_record()
+        listing["typeCode"] = "SALE"
+        items = parse_search_results(
+            self.search_html([listing]),
+            "https://www.iproperty.com.my/property-for-rent/p/one-menerung",
+            "One Menerung",
+            IPropertyProject("One Menerung", "fd12m8", "Condominium"),
         )
         self.assertEqual(items, [])
 

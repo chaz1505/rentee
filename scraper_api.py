@@ -77,14 +77,22 @@ def configured_development(development: str) -> CondoConfig:
     )
 
 
-def load_listings(development: str) -> tuple[str, list[dict[str, Any]]]:
+def load_listings(
+    development: str, bedrooms_min: int, budget_rent: float
+) -> tuple[str, list[dict[str, Any]]]:
     config = configured_development(development)
     if config.iproperty_project_id:
         search_url = iproperty_project_search_url(
-            config.iproperty_search_name, config.iproperty_project_id
+            config.iproperty_search_name, config.iproperty_project_id,
+            bedrooms_min, budget_rent, MAX_BEDROOMS,
         )
     else:
-        search_url = iproperty_search_url(config.iproperty_search_name)
+        search_url = iproperty_search_url(
+            config.iproperty_search_name, bedrooms_min, budget_rent, MAX_BEDROOMS
+        )
+
+    app.logger.info("Searching iProperty development: %s", config.bubble_name)
+    app.logger.info("iProperty search URL: %s", search_url)
 
     with IPropertyClient() as client:
         listings = client.discover_listings(
@@ -162,7 +170,7 @@ def external_matches():
         return error_response("invalid_request", str(error), 400)
 
     try:
-        resolved_development, listings = load_listings(development)
+        resolved_development, listings = load_listings(development, bedrooms, budget)
     except AmbiguousProjectError as error:
         return error_response("ambiguous_development", str(error), 409)
     except ProjectNotFoundError as error:
@@ -205,6 +213,9 @@ def external_matches():
     matches.sort(key=lambda item: (
         abs(item["price_rent"] - budget), item["source_listing_id"]
     ))
+    app.logger.info(
+        "iProperty listings passing budget and bedroom filters: %d", len(matches)
+    )
     return jsonify({
         "development": resolved_development,
         "source": "iproperty",

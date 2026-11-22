@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, patch
 
 import scraper_api
@@ -90,6 +91,26 @@ class ScraperApiTests(unittest.TestCase):
             "beds", "sq_ft", "description",
         })
 
+    @patch("scraper_api.load_listings")
+    def test_ritz_carlton_listing_passes_lead_filters(self, load_listings):
+        load_listings.return_value = ("The Ritz-Carlton Residences", [
+            self.listing("502313463", 13000, 2)
+        ])
+
+        response = self.post({
+            "development": "The Ritz Carlton Residence",
+            "bedrooms_min": 2,
+            "budget_rent": 12000,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["total_matches"], 1)
+        self.assertEqual(body["matches"][0]["source_listing_id"], "502313463")
+        load_listings.assert_called_once_with(
+            "The Ritz Carlton Residence", 2, 12000.0
+        )
+
     @patch("scraper_api.IPropertyClient")
     @patch("scraper_api.load_condo_configs")
     def test_other_configured_development_reuses_project_id(self, configs, client_type):
@@ -101,12 +122,21 @@ class ScraperApiTests(unittest.TestCase):
             source_url="https://www.iproperty.com.my/property/x/rent-500000001/",
         )]
 
-        resolved, listings = scraper_api.load_listings("  the   troika ")
+        resolved, listings = scraper_api.load_listings(
+            "  the   troika ", bedrooms_min=2, budget_rent=12000
+        )
 
         self.assertEqual(resolved, "The Troika")
         self.assertEqual(listings[0]["source_listing_id"], "500000001")
         call = client.discover_listings.call_args.kwargs
-        self.assertIn("propertyId=troika-id", call["search_url"])
+        query = parse_qs(urlparse(call["search_url"]).query)
+        self.assertEqual(query["propertyId"], ["troika-id"])
+        self.assertEqual(query["listingType"], ["rent"])
+        self.assertEqual(query["page"], ["1"])
+        self.assertEqual(query["minPrice"], ["9600"])
+        self.assertEqual(query["maxPrice"], ["14400"])
+        self.assertEqual(query["bedrooms"][:3], ["2", "3", "4"])
+        self.assertEqual(query["bedrooms"][-1], str(scraper_api.MAX_BEDROOMS))
         self.assertEqual(call["config"].requested_name, "The Troika")
 
     @patch("scraper_api.load_condo_configs", return_value=[])
