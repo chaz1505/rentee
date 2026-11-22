@@ -1,0 +1,5 @@
+.scraper_api_key
+.venv/
+__pycache__/
+*.pyc
+*_backup.py
