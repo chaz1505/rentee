@@ -70,6 +70,14 @@ class ScraperError(RuntimeError):
     pass
 
 
+class ProjectNotFoundError(ScraperError):
+    """No iProperty rental project confidently matched the requested name."""
+
+
+class AmbiguousProjectError(ScraperError):
+    """More than one iProperty rental project plausibly matched the request."""
+
+
 class AccessBlockedError(ScraperError):
     pass
 
@@ -844,7 +852,7 @@ def resolve_iproperty_project(
                 _log_relaxed_project_match(configured_name, matches[0], reason)
             return _project_from_group(matches[0])
         if len(matches) > 1:
-            raise ScraperError(
+            raise AmbiguousProjectError(
                 f'SKIPPED: multiple plausible project IDs remain for "{search_name}".\n\n'
                 f"Candidates:\n{format_project_candidates(candidates)}\n\nConfig not modified."
             )
@@ -923,7 +931,8 @@ def resolve_iproperty_project(
         if len(projects) > 1
         else "no candidate passed relaxed project-name matching"
     )
-    raise ScraperError(
+    error_type = AmbiguousProjectError if len(projects) > 1 else ProjectNotFoundError
+    raise error_type(
         f'SKIPPED: {failure_reason} for "{search_name}".\n\n'
         f"Configured:\n{configured}\n\nCandidate projects found:\n"
         f"{format_project_candidates(candidates)}\n\nConfig not modified."
