@@ -289,6 +289,24 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
         self.assertNotIn("owner", payload)
         self.app._bubble_create.assert_not_called()
 
+    def test_external_listing_deduplicates_when_job_is_retried(self):
+        self.app._bubble_records.side_effect = [
+            [], [{"_id": "listing-1", "owner": "user-manual"}],
+        ]
+        self.app._bubble_create.return_value = "listing-1"
+
+        first_listing, first_created = external_scraper.upsert_external_listing(
+            self.item, self.lookup
+        )
+        retry_listing, retry_created = external_scraper.upsert_external_listing(
+            self.item, self.lookup
+        )
+
+        self.assertEqual(first_listing["_id"], retry_listing["_id"])
+        self.assertTrue(first_created)
+        self.assertFalse(retry_created)
+        self.app._bubble_create.assert_called_once()
+
     def test_external_match_has_source_tier_owner_and_no_alert(self):
         self.app._bubble_records.return_value = []
         self.app._bubble_create.return_value = "match-1"
@@ -310,6 +328,23 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
             "lead_owner": "lead-owner",
         })
 
+    def test_existing_external_match_prevents_duplicate_creation(self):
+        self.app._bubble_records.return_value = [{"_id": "match-existing"}]
+        lead = {
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "budgetRent": 15000, "bedroomsMin": 3,
+            "preferredDevelopments": ["dev-one"],
+        }
+        listing = {
+            "_id": "listing-1", "development": "dev-one",
+            "TransactionType": ["Rent/Let"], "priceRent": 18000, "beds": 3,
+        }
+
+        result = external_scraper.create_external_match(lead, listing)
+
+        self.assertEqual(result, ("match-existing", False))
+        self.app._bubble_create.assert_not_called()
+
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_enqueue_deduplicates_by_stable_lead_job_key(self):
         existing = {"_id": "job-existing", "jobKey": "iproperty:lead-1"}
@@ -327,16 +362,67 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
         self.assertIn("https://www.rentee.asia/listing/listing-1", message)
         self.assertIn(self.item["source_url"], message)
 
+    def test_worker_passes_lead_record_dictionary_to_match_creation(self):
+        job = {
+            "_id": "job-1", "attempts": 1, "phone": "60123456789",
+            "notificationSent": True,
+            "payload": __import__("json").dumps(self.lookup),
+        }
+        lead = {
+            "_id": "lead-1", "TransactionType": ["Rent/Let"],
+            "budgetRent": 30000, "bedroomsMin": 3,
+            "preferredDevelopments": ["dev-one"],
+        }
+        listing = {
+            "_id": "listing-1", "development": "dev-one",
+            "TransactionType": ["Rent/Let"], "priceRent": 30000, "beds": 3,
+        }
+        self.app._bubble_records_by_ids.return_value = ([lead], 1)
+
+        with patch.object(external_scraper, "fetch_external_matches",
+                          return_value=[self.item]), \
+             patch.object(external_scraper, "upsert_external_listing",
+                          return_value=(listing, False)), \
+             patch.object(external_scraper, "create_external_match",
+                          return_value=("match-1", False)) as create_match:
+            result = external_scraper.process_external_job(
+                job, send_text=MagicMock(), save_message=MagicMock()
+            )
+
+        self.assertEqual(result["status"], "completed")
+        passed_lead = create_match.call_args.args[0]
+        self.assertIs(passed_lead, lead)
+        self.assertIsInstance(passed_lead, dict)
+
+    def test_worker_handles_missing_lead_records(self):
+        job = {
+            "_id": "job-1", "attempts": 1, "phone": "60123456789",
+            "payload": __import__("json").dumps(self.lookup),
+        }
+        self.app._bubble_records_by_ids.return_value = ([], 1)
+
+        with patch.object(external_scraper, "fetch_external_matches") as fetch:
+            result = external_scraper.process_external_job(
+                job, send_text=MagicMock(), save_message=MagicMock()
+            )
+
+        self.assertEqual(result["status"], "retry")
+        fetch.assert_not_called()
+        failure = self.app._bubble_patch.call_args.args[1]
+        self.assertEqual(failure["status"], "Retry")
+        self.assertEqual(failure["lastError"],
+                         "ValueError: Lead no longer exists")
+
     def test_partial_persistence_failure_retries_without_sending(self):
         job = {
             "_id": "job-1", "attempts": 1, "phone": "60123456789",
             "payload": __import__("json").dumps(self.lookup),
         }
-        self.app._bubble_records_by_ids.return_value = [{
+        self.app._bubble_records_by_ids.return_value = ([{
             "_id": "lead-1", "owner": "lead-owner",
             "TransactionType": ["Rent/Let"], "budgetRent": 15000,
             "bedroomsMin": 3, "preferredDevelopments": ["dev-one"],
-        }]
+        }], 1)
         send = MagicMock()
         with patch.object(external_scraper, "fetch_external_matches",
                           return_value=[self.item]), \
@@ -361,7 +447,7 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
             "TransactionType": ["Rent/Let"], "budgetRent": 15000,
             "bedroomsMin": 3, "preferredDevelopments": ["dev-one"],
         }
-        self.app._bubble_records_by_ids.return_value = [lead]
+        self.app._bubble_records_by_ids.return_value = ([lead], 1)
         listing = {
             "_id": "listing-1", "development": "dev-one",
             "TransactionType": ["Rent/Let"], "priceRent": 15000, "beds": 3,
@@ -385,11 +471,11 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
             "notificationSent": False, "notificationState": "Sending",
             "payload": __import__("json").dumps(self.lookup),
         }
-        self.app._bubble_records_by_ids.return_value = [{
+        self.app._bubble_records_by_ids.return_value = ([{
             "_id": "lead-1", "TransactionType": ["Rent/Let"],
             "budgetRent": 15000, "bedroomsMin": 3,
             "preferredDevelopments": ["dev-one"],
-        }]
+        }], 1)
         listing = {
             "_id": "listing-1", "development": "dev-one",
             "TransactionType": ["Rent/Let"], "priceRent": 15000, "beds": 3,

@@ -445,9 +445,10 @@ def process_external_job(job, bubble_env="live", *, request_post=requests.post,
     job_url = f"{base_url}/obj/{JOB_TYPE}/{job['_id']}"
     try:
         lookup = json.loads(job["payload"])
-        lead = next(iter(app._bubble_records_by_ids(
+        lead_records, _ = app._bubble_records_by_ids(
             base_url, "lead", [lookup["lead_id"]]
-        )), None)
+        )
+        lead = next(iter(lead_records), None)
         if not lead:
             raise ValueError("Lead no longer exists")
         matches = fetch_external_matches(lookup, request_post=request_post)
