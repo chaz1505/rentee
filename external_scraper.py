@@ -24,6 +24,7 @@ EXPECTED_HOSTS = {"iproperty.com.my", "www.iproperty.com.my"}
 REQUEST_TIMEOUT_SECONDS = 165
 JOB_TYPE = "external_lookup_job"
 MAX_JOB_ATTEMPTS = 4
+DEFAULT_EXTERNAL_SCRAPER_MAX_AGE_DAYS = 7
 
 
 def external_scraper_enabled() -> bool:
@@ -288,9 +289,82 @@ def enqueue_external_lookup(lookup, phone, bubble_env="live"):
 
 def _parse_date(value):
     try:
-        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def external_scraper_max_age_days():
+    """Return the configured positive freshness window, defaulting to 7 days."""
+    try:
+        value = int(os.getenv(
+            "EXTERNAL_SCRAPER_MAX_AGE_DAYS",
+            str(DEFAULT_EXTERNAL_SCRAPER_MAX_AGE_DAYS),
+        ))
+    except (TypeError, ValueError):
+        return DEFAULT_EXTERNAL_SCRAPER_MAX_AGE_DAYS
+    return value if value > 0 else DEFAULT_EXTERNAL_SCRAPER_MAX_AGE_DAYS
+
+
+def get_fresh_external_listings(lookup, bubble_env="live", *, now=None):
+    """Return up to three suitable, recently refreshed iProperty listings."""
+    app = _bubble()
+    base_url = app.get_bubble_base_url(bubble_env)
+    constraints = [
+        {"key": "scraped?", "constraint_type": "equals", "value": True},
+        {"key": "source", "constraint_type": "equals", "value": EXPECTED_SOURCE},
+        {"key": "development", "constraint_type": "equals",
+         "value": lookup["development_id"]},
+    ]
+    current = now or _utcnow()
+    cutoff = current - datetime.timedelta(days=external_scraper_max_age_days())
+    suitable = []
+    for listing in app._bubble_records(base_url, "listing", constraints):
+        refreshed = _parse_date(listing.get("scraped_last_date"))
+        price = _number(listing.get("priceRent"), positive=True)
+        beds = _number(listing.get("beds"), nonnegative=True)
+        transactions = listing.get("TransactionType") or []
+        if isinstance(transactions, str):
+            transactions = [transactions]
+        if (
+            not listing.get("_id")
+            or not is_scraped_listing(listing)
+            or str(listing.get("source") or "").strip().casefold() != EXPECTED_SOURCE
+            or lookup["development_id"] not in _relationship_ids(
+                listing.get("development")
+            )
+            or refreshed is None or refreshed < cutoff or refreshed > current
+            or price is None or price > lookup["budget_rent"]
+            or beds is None or beds < lookup["bedrooms_min"]
+            or "Rent/Let" not in transactions
+            or not _valid_listing_url(listing.get("sourceURL"))
+        ):
+            continue
+        suitable.append((refreshed, listing))
+    suitable.sort(key=lambda item: item[0], reverse=True)
+    return [listing for _, listing in suitable[:3]]
+
+
+def _cached_listing_item(listing):
+    """Normalize a Bubble Listing for existing Match/message processing."""
+    item = {
+        "source_listing_id": str(listing.get("sourceListingID") or listing["_id"]),
+        "source_url": listing["sourceURL"],
+        "price_rent": listing["priceRent"],
+        "beds": listing["beds"],
+        "bubble_listing_id": str(listing["_id"]),
+    }
+    optional = {
+        "agent": listing.get("sourceAgentName"),
+        "sq_ft": listing.get("Sq Ft"),
+        "description": listing.get("Notes"),
+    }
+    item.update({key: value for key, value in optional.items()
+                 if value is not None and str(value).strip()})
+    return item
 
 
 def claim_external_job(bubble_env="live", *, lease_seconds=240):
@@ -352,6 +426,28 @@ def _external_listing_matches(lead, listing):
     )
 
 
+def _reusable_external_listing_matches(lead, listing):
+    """Recheck cached-listing eligibility against the current lead record."""
+    budget = _number(lead.get("budgetRent"), positive=True)
+    bedrooms = _number(lead.get("bedroomsMin"), nonnegative=True)
+    price = _number(listing.get("priceRent"), positive=True)
+    beds = _number(listing.get("beds"), nonnegative=True)
+    lead_developments = set(_relationship_ids(lead.get("preferredDevelopments")))
+    listing_developments = set(_relationship_ids(listing.get("development")))
+    transactions = listing.get("TransactionType") or []
+    if isinstance(transactions, str):
+        transactions = [transactions]
+    return bool(
+        "Rent/Let" in (lead.get("TransactionType") or [])
+        and "Rent/Let" in transactions
+        and budget is not None and bedrooms is not None
+        and price is not None and price <= budget
+        and beds is not None and beds >= bedrooms
+        and lead_developments & listing_developments
+        and _valid_listing_url(listing.get("sourceURL"))
+    )
+
+
 def upsert_external_listing(item, lookup, bubble_env="live"):
     """Create or refresh scraper-owned fields without touching manual fields."""
     app = _bubble()
@@ -395,9 +491,13 @@ def upsert_external_listing(item, lookup, bubble_env="live"):
     return dict(payload, _id=str(listing_id)), True
 
 
-def create_external_match(lead, listing, bubble_env="live"):
+def create_external_match(lead, listing, bubble_env="live", *, prequalified=False):
     """Create the explicit no-alert iProperty Match for one eligible pair."""
-    if not _external_listing_matches(lead, listing):
+    eligible = (
+        _reusable_external_listing_matches(lead, listing)
+        if prequalified else _external_listing_matches(lead, listing)
+    )
+    if not eligible:
         return None, False
     app = _bubble()
     base_url = app.get_bubble_base_url(bubble_env)
@@ -444,15 +544,44 @@ def process_external_job(job, bubble_env="live", *, request_post=requests.post,
         lead = next(iter(lead_records), None)
         if not lead:
             raise ValueError("Lead no longer exists")
-        matches = fetch_external_matches(lookup, request_post=request_post)
-        if matches is None:
-            raise RuntimeError("External scraper request failed")
+        fresh_listings = get_fresh_external_listings(lookup, bubble_env)
+        reuse_fresh = bool(fresh_listings)
+        if reuse_fresh:
+            print(
+                f"{LOG_PREFIX} action=reuse_fresh "
+                f"development={lookup['development']} listings={len(fresh_listings)} "
+                f"max_age_days={external_scraper_max_age_days()}",
+                flush=True,
+            )
+            matches = [_cached_listing_item(listing) for listing in fresh_listings]
+        else:
+            print(
+                f"{LOG_PREFIX} action=fetch_required "
+                f"development={lookup['development']} reason=no_fresh_matches",
+                flush=True,
+            )
+            matches = fetch_external_matches(lookup, request_post=request_post)
+            if matches is None:
+                raise RuntimeError("External scraper request failed")
+            print(
+                f"{LOG_PREFIX} action=fetch_completed "
+                f"development={lookup['development']} listings={len(matches)}",
+                flush=True,
+            )
         persisted = []
         errors = []
         for item in matches:
             try:
-                listing, _ = upsert_external_listing(item, lookup, bubble_env)
-                match_id, _ = create_external_match(lead, listing, bubble_env)
+                if reuse_fresh:
+                    listing = next(
+                        listing for listing in fresh_listings
+                        if str(listing["_id"]) == item["bubble_listing_id"]
+                    )
+                else:
+                    listing, _ = upsert_external_listing(item, lookup, bubble_env)
+                match_id, _ = create_external_match(
+                    lead, listing, bubble_env, prequalified=reuse_fresh
+                )
                 if match_id:
                     persisted.append(dict(item, bubble_listing_id=listing["_id"]))
             except Exception as error:

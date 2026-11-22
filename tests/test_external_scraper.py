@@ -1,4 +1,5 @@
 import os
+import datetime
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -258,6 +259,114 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
             "description": "Park view",
         }
 
+    def cached_listing(self, listing_id="listing-1", **updates):
+        item = {
+            "_id": listing_id, "scraped?": True, "source": "iproperty",
+            "sourceListingID": f"external-{listing_id}",
+            "sourceURL": f"https://www.iproperty.com.my/listing/{listing_id}",
+            "scraped_last_date": external_scraper._iso(
+                external_scraper._utcnow() - datetime.timedelta(days=1)
+            ),
+            "development": "dev-one", "beds": 3, "priceRent": 15000,
+            "TransactionType": ["Rent/Let"],
+        }
+        item.update(updates)
+        return item
+
+    def test_fresh_listing_selection_filters_and_limits_without_refreshing(self):
+        now = external_scraper._utcnow()
+        fresh_date = external_scraper._iso(now - datetime.timedelta(days=1))
+        fresh = [self.cached_listing(
+            f"listing-{index}", scraped_last_date=fresh_date
+        ) for index in range(4)]
+        rejected = [
+            self.cached_listing("stale", scraped_last_date=external_scraper._iso(
+                now - datetime.timedelta(days=8))),
+            self.cached_listing("missing-date", scraped_last_date=None),
+            self.cached_listing("invalid-date", scraped_last_date="not-a-date"),
+            self.cached_listing("expensive", priceRent=15001),
+            self.cached_listing("small", beds=2),
+            self.cached_listing("wrong-development", development="dev-other"),
+            self.cached_listing("sale", TransactionType=["Buy/Sell"]),
+            self.cached_listing("bad-url", sourceURL="https://example.com/listing"),
+        ]
+        self.app._bubble_records.return_value = fresh + rejected
+
+        result = external_scraper.get_fresh_external_listings(
+            self.lookup, now=now
+        )
+
+        self.assertEqual(len(result), 3)
+        self.assertTrue(all(item in fresh for item in result))
+        self.app._bubble_patch.assert_not_called()
+        constraints = self.app._bubble_records.call_args.args[2]
+        self.assertIn({"key": "development", "constraint_type": "equals",
+                       "value": "dev-one"}, constraints)
+
+    def test_max_age_defaults_for_missing_or_invalid_values(self):
+        for value in (None, "invalid", "0", "-2"):
+            environment = {} if value is None else {
+                "EXTERNAL_SCRAPER_MAX_AGE_DAYS": value
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(
+                    external_scraper.external_scraper_max_age_days(), 7
+                )
+        with patch.dict(os.environ, {"EXTERNAL_SCRAPER_MAX_AGE_DAYS": "3"},
+                        clear=True):
+            self.assertEqual(external_scraper.external_scraper_max_age_days(), 3)
+
+    def test_worker_reuses_partial_fresh_results_without_scraping_or_upserting(self):
+        job = {
+            "_id": "job-1", "attempts": 1, "phone": "60123456789",
+            "payload": __import__("json").dumps(self.lookup),
+        }
+        lead = dict(eligible_lead(), _id="lead-1")
+        listing = self.cached_listing(priceRent=10000)
+        self.app._bubble_records_by_ids.return_value = ([lead], 1)
+        send = MagicMock(return_value=["wamid.cached"])
+        with patch.object(external_scraper, "get_fresh_external_listings",
+                          return_value=[listing]), \
+             patch.object(external_scraper, "fetch_external_matches") as fetch, \
+             patch.object(external_scraper, "upsert_external_listing") as upsert, \
+             patch.object(external_scraper, "create_external_match",
+                          return_value=("match-1", True)) as create_match:
+            result = external_scraper.process_external_job(
+                job, send_text=send, save_message=MagicMock()
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["listings"][0]["bubble_listing_id"], "listing-1")
+        fetch.assert_not_called()
+        upsert.assert_not_called()
+        self.assertTrue(create_match.call_args.kwargs["prequalified"])
+        self.assertIn(listing["sourceURL"], send.call_args.args[1])
+
+    def test_no_fresh_listing_uses_original_fetch_and_upsert_path(self):
+        job = {
+            "_id": "job-1", "attempts": 1, "phone": "60123456789",
+            "notificationSent": True,
+            "payload": __import__("json").dumps(self.lookup),
+        }
+        lead = dict(eligible_lead(), _id="lead-1")
+        persisted_listing = self.cached_listing()
+        self.app._bubble_records_by_ids.return_value = ([lead], 1)
+        with patch.object(external_scraper, "get_fresh_external_listings",
+                          return_value=[]), \
+             patch.object(external_scraper, "fetch_external_matches",
+                          return_value=[self.item]) as fetch, \
+             patch.object(external_scraper, "upsert_external_listing",
+                          return_value=(persisted_listing, False)) as upsert, \
+             patch.object(external_scraper, "create_external_match",
+                          return_value=("match-1", False)):
+            result = external_scraper.process_external_job(
+                job, send_text=MagicMock(), save_message=MagicMock()
+            )
+
+        self.assertEqual(result["status"], "completed")
+        fetch.assert_called_once()
+        upsert.assert_called_once()
+
     def test_external_listing_creation_maps_only_supported_fields(self):
         self.app._bubble_records.return_value = []
         self.app._bubble_create.return_value = "listing-1"
@@ -344,6 +453,18 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
 
         self.assertEqual(result, ("match-existing", False))
         self.app._bubble_create.assert_not_called()
+
+    def test_prequalified_fresh_match_accepts_any_positive_price_within_budget(self):
+        self.app._bubble_records.return_value = []
+        self.app._bubble_create.return_value = "match-fresh"
+        lead = dict(eligible_lead(), _id="lead-1")
+        listing = self.cached_listing(priceRent=10000)
+
+        result = external_scraper.create_external_match(
+            lead, listing, prequalified=True
+        )
+
+        self.assertEqual(result, ("match-fresh", True))
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_enqueue_deduplicates_by_stable_lead_job_key(self):
