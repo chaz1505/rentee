@@ -18,7 +18,6 @@ import requests
 
 
 LOG_PREFIX = "[EXTERNAL SCRAPER]"
-EXPECTED_DEVELOPMENT = "One Menerung"
 EXPECTED_SOURCE = "iproperty"
 EXPECTED_HOSTS = {"iproperty.com.my", "www.iproperty.com.my"}
 REQUEST_TIMEOUT_SECONDS = 165
@@ -66,7 +65,7 @@ def _relationship_ids(value) -> list[str]:
 
 def build_external_lookup(lead, matches, development_records, lead_id,
                           classify_match):
-    """Build a scrape request for the single supported no-Tier-1 lead case."""
+    """Build a scrape request for a resolved single-development no-Tier-1 lead."""
     if not external_scraper_enabled():
         return None
     transactions = set(lead.get("TransactionType") or [])
@@ -86,7 +85,7 @@ def build_external_lookup(lead, matches, development_records, lead_id,
         or (development_record or {}).get("Name")
         or ""
     ).strip()
-    if development.casefold() != EXPECTED_DEVELOPMENT.casefold():
+    if not development:
         return None
 
     budget = _number(lead.get("budgetRent"), positive=True)
@@ -103,7 +102,7 @@ def build_external_lookup(lead, matches, development_records, lead_id,
     return {
         "lead_id": str(lead_id),
         "development_id": development_ids[0],
-        "development": EXPECTED_DEVELOPMENT,
+        "development": development,
         "bedrooms_min": bedrooms,
         "budget_rent": budget,
     }

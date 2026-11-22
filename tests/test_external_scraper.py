@@ -10,7 +10,9 @@ import external_scraper
 
 DEVELOPMENTS = [
     {"_id": "dev-one", "name": "One Menerung"},
+    {"_id": "dev-troika", "name": "The Troika"},
     {"_id": "dev-other", "name": "Serai"},
+    {"_id": "dev-unnamed", "name": "   "},
 ]
 
 
@@ -76,8 +78,22 @@ class ExternalScraperEligibilityTests(unittest.TestCase):
             )))
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
-    def test_development_must_be_single_resolved_one_menerung(self):
-        for preferred in ([], ["dev-one", "dev-other"], ["missing"], ["dev-other"]):
+    def test_any_single_resolved_named_development_builds_lookup(self):
+        for development_id, development_name in (
+            ("dev-one", "One Menerung"),
+            ("dev-troika", "The Troika"),
+            ("dev-other", "Serai"),
+        ):
+            lookup = self.lookup(eligible_lead(
+                preferredDevelopments=[development_id]
+            ))
+            self.assertEqual(lookup["development_id"], development_id)
+            self.assertEqual(lookup["development"], development_name)
+
+    @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
+    def test_development_must_be_single_and_resolved_with_a_name(self):
+        for preferred in ([], ["dev-one", "dev-other"], ["missing"],
+                          ["dev-unnamed"]):
             self.assertIsNone(self.lookup(eligible_lead(
                 preferredDevelopments=preferred
             )))
@@ -153,6 +169,29 @@ class ExternalScraperClientTests(unittest.TestCase):
         self.assertEqual(external_scraper.fetch_external_matches(
             self.lookup, request_post=post
         ), [])
+
+    def test_dynamic_development_name_is_sent_to_scraper(self):
+        lookup = dict(self.lookup, development="The Troika",
+                      development_id="dev-troika")
+        body = self.body([])
+        body["development"] = "The Troika"
+        post = MagicMock(return_value=self.response(body))
+
+        self.assertEqual(external_scraper.fetch_external_matches(
+            lookup, request_post=post
+        ), [])
+        self.assertEqual(
+            post.call_args.kwargs["json"]["development"], "The Troika"
+        )
+
+    def test_response_for_different_development_is_rejected(self):
+        body = self.body([])
+        body["development"] = "The Troika"
+        post = MagicMock(return_value=self.response(body))
+
+        self.assertIsNone(external_scraper.fetch_external_matches(
+            self.lookup, request_post=post
+        ))
 
     def test_timeout_http_error_and_malformed_json_fail_gracefully(self):
         for error in (requests.Timeout(), requests.HTTPError(), ValueError("json")):
