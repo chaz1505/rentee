@@ -462,7 +462,20 @@ def process_external_job(job, bubble_env="live", *, request_post=requests.post,
                 if match_id:
                     persisted.append(dict(item, bubble_listing_id=listing["_id"]))
             except Exception as error:
-                errors.append(f"{item.get('source_listing_id')}: {type(error).__name__}")
+                import traceback
+
+                print(
+                    f"[EXTERNAL SCRAPER] listing_failed "
+                    f"source_listing_id={item.get('source_listing_id')} "
+                    f"error={type(error).__name__}: {error}",
+                    flush=True,
+                )
+                traceback.print_exc()
+
+                errors.append(
+                    f"{item.get('source_listing_id')}: "
+                    f"{type(error).__name__}: {error}"
+                )
         if errors:
             raise RuntimeError("; ".join(errors))
         notification_state = str(job.get("notificationState") or "Pending")
