@@ -355,12 +355,21 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
         self.assertEqual(result, ("job-existing", False))
         self.app._bubble_create.assert_not_called()
 
-    def test_followup_uses_rentee_and_original_listing_links(self):
+    def test_followup_uses_only_original_listing_links(self):
+        second_url = "https://www.iproperty.com.my/listing/external-2"
         message = external_scraper.format_external_matches("One Menerung", [
-            dict(self.item, bubble_listing_id="listing-1")
+            dict(self.item, bubble_listing_id="listing-1"),
+            dict(self.item, source_listing_id="external-2",
+                 source_url=second_url, bubble_listing_id="listing-2"),
         ])
-        self.assertIn("https://www.rentee.asia/listing/listing-1", message)
         self.assertIn(self.item["source_url"], message)
+        self.assertIn(second_url, message)
+        self.assertNotIn("View on Rentee", message)
+        self.assertNotIn("https://www.rentee.asia/listing/", message)
+        self.assertNotIn("Original iProperty listing:", message)
+        self.assertIn("RM18,000/month · 3 bed · 3,282 sqft", message)
+        self.assertIn("Agent: Agent External", message)
+        self.assertIn("Availability has not been verified by Rentee", message)
 
     def test_worker_passes_lead_record_dictionary_to_match_creation(self):
         job = {

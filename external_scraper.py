@@ -207,13 +207,6 @@ def format_external_matches(development, matches) -> str:
         agent = str(listing.get("agent") or "").strip()
         if agent:
             lines.append(f"Agent: {agent}")
-        listing_id = str(listing.get("bubble_listing_id") or "").strip()
-        if listing_id:
-            lines.extend([
-                "", "View on Rentee:",
-                f"https://www.rentee.asia/listing/{listing_id}",
-                "", "Original iProperty listing:",
-            ])
         lines.append(listing["source_url"])
     lines.extend([
         "",
