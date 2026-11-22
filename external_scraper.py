@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import os
 import math
+import datetime
+import json
+import uuid
 from urllib.parse import urlparse
 
 import requests
@@ -19,6 +22,8 @@ EXPECTED_DEVELOPMENT = "One Menerung"
 EXPECTED_SOURCE = "iproperty"
 EXPECTED_HOSTS = {"iproperty.com.my", "www.iproperty.com.my"}
 REQUEST_TIMEOUT_SECONDS = 165
+JOB_TYPE = "external_lookup_job"
+MAX_JOB_ATTEMPTS = 4
 
 
 def external_scraper_enabled() -> bool:
@@ -77,11 +82,17 @@ def build_external_lookup(lead, matches, development_records, lead_id,
     bedrooms = _number(lead.get("bedroomsMin"), nonnegative=True)
     if budget is None or bedrooms is None:
         return None
-    if any(classify_match(lead, listing) == 1 for listing in matches or []):
+    internal_matches = [
+        listing for listing in matches or []
+        if str(listing.get("source") or "").casefold() != EXPECTED_SOURCE
+        and str(listing.get("scraped?") or "").casefold() not in {"yes", "true"}
+    ]
+    if any(classify_match(lead, listing) == 1 for listing in internal_matches):
         return None
 
     return {
         "lead_id": str(lead_id),
+        "development_id": development_ids[0],
         "development": EXPECTED_DEVELOPMENT,
         "bedrooms_min": bedrooms,
         "budget_rent": budget,
@@ -139,7 +150,8 @@ def fetch_external_matches(lookup, *, request_post=requests.post):
         price = _number(item.get("price_rent"), positive=True)
         beds = _number(item.get("beds"), nonnegative=True)
         if (not listing_id or listing_id in seen_ids or price is None or beds is None
-                or price > lookup["budget_rent"]
+                or price < lookup["budget_rent"] * 0.8
+                or price > lookup["budget_rent"] * 1.2
                 or beds < lookup["bedrooms_min"]
                 or not _valid_listing_url(item.get("source_url"))):
             continue
@@ -186,6 +198,13 @@ def format_external_matches(development, matches) -> str:
         agent = str(listing.get("agent") or "").strip()
         if agent:
             lines.append(f"Agent: {agent}")
+        listing_id = str(listing.get("bubble_listing_id") or "").strip()
+        if listing_id:
+            lines.extend([
+                "", "View on Rentee:",
+                f"https://www.rentee.asia/listing/{listing_id}",
+                "", "Original iProperty listing:",
+            ])
         lines.append(listing["source_url"])
     lines.extend([
         "",
@@ -217,3 +236,243 @@ def run_external_lookup(lookup, phone, *, send_text, save_message,
         "status": "sent", "matches": matches,
         "sent_ids": [item for item in sent_ids if item],
     }
+
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _iso(value):
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def _bubble():
+    # Lazy import avoids coupling application startup to worker-only code.
+    import app
+    return app
+
+
+def enqueue_external_lookup(lookup, phone, bubble_env="live"):
+    """Persist a deduplicated lookup request for the background worker."""
+    if not external_scraper_enabled() or not lookup:
+        return None, False
+    app = _bubble()
+    base_url = app.get_bubble_base_url(bubble_env)
+    job_key = f"iproperty:{lookup['lead_id']}"
+    constraints = [{"key": "jobKey", "constraint_type": "equals", "value": job_key}]
+    existing = next(iter(app._bubble_records(base_url, JOB_TYPE, constraints)), None)
+    if existing and existing.get("_id"):
+        return str(existing["_id"]), False
+    payload = {
+        "jobKey": job_key,
+        "lead": lookup["lead_id"],
+        "phone": app.normalize_phone(phone),
+        "payload": json.dumps(lookup, separators=(",", ":")),
+        "status": "Queued",
+        "attempts": 0,
+        "availableAt": _iso(_utcnow()),
+        "notificationSent": False,
+    }
+    try:
+        return app._bubble_create(base_url, JOB_TYPE, payload), True
+    except Exception:
+        # A Bubble uniqueness rule may reject a concurrent duplicate create.
+        existing = next(iter(app._bubble_records(base_url, JOB_TYPE, constraints)), None)
+        if existing and existing.get("_id"):
+            return str(existing["_id"]), False
+        raise
+
+
+def _parse_date(value):
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def claim_external_job(bubble_env="live", *, lease_seconds=240):
+    """Lease one due job and verify ownership after the Bubble patch."""
+    app = _bubble()
+    base_url = app.get_bubble_base_url(bubble_env)
+    now = _utcnow()
+    jobs = app._bubble_records(base_url, JOB_TYPE)
+    candidates = []
+    for job in jobs:
+        attempts = int(job.get("attempts") or 0)
+        available = _parse_date(job.get("availableAt")) or now
+        lease_until = _parse_date(job.get("leaseUntil"))
+        status = job.get("status")
+        lease_available = not lease_until or lease_until <= now
+        if (((status in {"Queued", "Retry"} and available <= now)
+             or (status == "Running" and lease_available))
+                and attempts < MAX_JOB_ATTEMPTS and lease_available):
+            candidates.append(job)
+    candidates.sort(key=lambda item: str(item.get("availableAt") or ""))
+    if not candidates:
+        return None
+    job = candidates[0]
+    token = str(uuid.uuid4())
+    patch = {
+        "status": "Running", "workerId": token,
+        "leaseUntil": _iso(now + datetime.timedelta(seconds=lease_seconds)),
+        "attempts": int(job.get("attempts") or 0) + 1,
+    }
+    app._bubble_patch(f"{base_url}/obj/{JOB_TYPE}/{job['_id']}", patch)
+    current = next(iter(app._bubble_records(
+        base_url, JOB_TYPE,
+        [{"key": "jobKey", "constraint_type": "equals", "value": job["jobKey"]}],
+    )), None)
+    if not current or current.get("workerId") != token:
+        return None
+    return current
+
+
+def _external_listing_matches(lead, listing):
+    budget = _number(lead.get("budgetRent"), positive=True)
+    bedrooms = _number(lead.get("bedroomsMin"), nonnegative=True)
+    price = _number(listing.get("priceRent"), positive=True)
+    beds = _number(listing.get("beds"), nonnegative=True)
+    lead_developments = set(_relationship_ids(lead.get("preferredDevelopments")))
+    listing_developments = set(_relationship_ids(listing.get("development")))
+    return bool(
+        "Rent/Let" in (lead.get("TransactionType") or [])
+        and budget is not None and bedrooms is not None
+        and price is not None and beds is not None
+        and budget * 0.8 <= price <= budget * 1.2
+        and beds >= bedrooms
+        and lead_developments & listing_developments
+    )
+
+
+def upsert_external_listing(item, lookup, bubble_env="live"):
+    """Create or refresh scraper-owned fields without touching manual fields."""
+    app = _bubble()
+    base_url = app.get_bubble_base_url(bubble_env)
+    constraints = [
+        {"key": "source", "constraint_type": "equals", "value": EXPECTED_SOURCE},
+        {"key": "sourceListingID", "constraint_type": "equals",
+         "value": item["source_listing_id"]},
+    ]
+    existing = next(iter(app._bubble_records(base_url, "listing", constraints)), None)
+    payload = {
+        "scraped?": "Yes", "scraped_last_date": _iso(_utcnow()),
+        "source": EXPECTED_SOURCE, "sourceListingID": item["source_listing_id"],
+        "sourceURL": item["source_url"], "priceRent": item["price_rent"],
+        "beds": item["beds"], "development": lookup["development_id"],
+        "TransactionType": ["Rent/Let"], "propertyType": "Condo",
+    }
+    optional = {
+        "sourceAgentName": item.get("agent"),
+        "sourceAgencyName": item.get("source_agency_name"),
+        "Sq Ft": _number(item.get("sq_ft"), positive=True),
+        "Notes": item.get("description"),
+    }
+    payload.update({key: value for key, value in optional.items()
+                    if value is not None and str(value).strip()})
+    if existing and existing.get("_id"):
+        app._bubble_patch(f"{base_url}/obj/listing/{existing['_id']}", payload)
+        return dict(existing, **payload, _id=str(existing["_id"])), False
+    try:
+        listing_id = app._bubble_create(base_url, "listing", payload)
+    except Exception:
+        concurrent = next(iter(app._bubble_records(
+            base_url, "listing", constraints
+        )), None)
+        if not concurrent or not concurrent.get("_id"):
+            raise
+        app._bubble_patch(
+            f"{base_url}/obj/listing/{concurrent['_id']}", payload
+        )
+        return dict(concurrent, **payload, _id=str(concurrent["_id"])), False
+    return dict(payload, _id=str(listing_id)), True
+
+
+def create_external_match(lead, listing, bubble_env="live"):
+    """Create the explicit no-alert iProperty Match for one eligible pair."""
+    if not _external_listing_matches(lead, listing):
+        return None, False
+    app = _bubble()
+    base_url = app.get_bubble_base_url(bubble_env)
+    constraints = [
+        {"key": "lead", "constraint_type": "equals", "value": lead["_id"]},
+        {"key": "listing", "constraint_type": "equals", "value": listing["_id"]},
+    ]
+    existing = next(iter(app._bubble_records(base_url, "match", constraints)), None)
+    if existing and existing.get("_id"):
+        return str(existing["_id"]), False
+    payload = {
+        "lead": lead["_id"], "listing": listing["_id"],
+        "match_source": EXPECTED_SOURCE, "match_tier": 1,
+    }
+    lead_owner = next(iter(_relationship_ids(lead.get("owner"))), None)
+    if lead_owner:
+        payload["lead_owner"] = lead_owner
+    try:
+        return app._bubble_create(base_url, "match", payload), True
+    except Exception:
+        concurrent = next(iter(app._bubble_records(
+            base_url, "match", constraints
+        )), None)
+        if concurrent and concurrent.get("_id"):
+            return str(concurrent["_id"]), False
+        raise
+
+
+def process_external_job(job, bubble_env="live", *, request_post=requests.post,
+                         send_text=None, save_message=None):
+    """Run one leased job, retaining partial failures for a safe retry."""
+    app = _bubble()
+    send_text = send_text or app.send_whatsapp_text
+    if save_message is None:
+        from whatsapp_importer import save_whatsapp_message as importer_save_message
+        save_message = importer_save_message
+    base_url = app.get_bubble_base_url(bubble_env)
+    job_url = f"{base_url}/obj/{JOB_TYPE}/{job['_id']}"
+    try:
+        lookup = json.loads(job["payload"])
+        lead = next(iter(app._bubble_records_by_ids(
+            base_url, "lead", [lookup["lead_id"]]
+        )), None)
+        if not lead:
+            raise ValueError("Lead no longer exists")
+        matches = fetch_external_matches(lookup, request_post=request_post)
+        if matches is None:
+            raise RuntimeError("External scraper request failed")
+        persisted = []
+        errors = []
+        for item in matches:
+            try:
+                listing, _ = upsert_external_listing(item, lookup, bubble_env)
+                match_id, _ = create_external_match(lead, listing, bubble_env)
+                if match_id:
+                    persisted.append(dict(item, bubble_listing_id=listing["_id"]))
+            except Exception as error:
+                errors.append(f"{item.get('source_listing_id')}: {type(error).__name__}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        if not job.get("notificationSent"):
+            message = format_external_matches(lookup["development"], persisted)
+            sent_ids = send_text(job["phone"], message) or []
+            for meta_id in sent_ids:
+                if meta_id:
+                    save_message(
+                        job["phone"], meta_id, message, "Outbound", "text", bubble_env,
+                        lead_id=lookup["lead_id"],
+                    )
+            app._bubble_patch(job_url, {"notificationSent": True})
+        app._bubble_patch(job_url, {
+            "status": "Completed", "completedAt": _iso(_utcnow()),
+            "leaseUntil": None, "lastError": "",
+        })
+        return {"status": "completed", "listings": persisted}
+    except Exception as error:
+        attempts = int(job.get("attempts") or 1)
+        terminal = attempts >= MAX_JOB_ATTEMPTS
+        app._bubble_patch(job_url, {
+            "status": "Failed" if terminal else "Retry",
+            "availableAt": _iso(_utcnow() + datetime.timedelta(minutes=2 ** attempts)),
+            "leaseUntil": None, "lastError": f"{type(error).__name__}: {error}"[:500],
+        })
+        print(f"{LOG_PREFIX} action=job_failed job_id={job.get('_id')} "
+              f"error={type(error).__name__}", flush=True)
+        return {"status": "failed" if terminal else "retry"}

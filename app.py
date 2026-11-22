@@ -8118,6 +8118,18 @@ def _process_whatsapp_message(message):
                                 "action=outbound_persistence_failed "
                                 f"error={type(error).__name__}", flush=True,
                             )
+                    if (import_result.get("status") == "processed"
+                            and import_result.get("external_lookup")):
+                        try:
+                            from external_scraper import enqueue_external_lookup
+                            enqueue_external_lookup(
+                                import_result["external_lookup"], phone, "live"
+                            )
+                        except Exception as error:
+                            print(
+                                "[EXTERNAL SCRAPER] action=enqueue_failed "
+                                f"error={type(error).__name__}", flush=True,
+                            )
                     reply_sent = True
                     return
 
