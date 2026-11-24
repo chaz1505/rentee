@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 from typing import Any, Iterable
 
@@ -12,7 +13,22 @@ import app as rentee_app
 
 FUZZY_THRESHOLD = 0.90
 FUZZY_MARGIN = 0.08
-VERIFICATION_CONFIDENCE = 0.90
+
+
+def _development_verification_confidence() -> float:
+    """Return the configured verification threshold, safely defaulting to 0.85."""
+    try:
+        value = float(str(os.getenv(
+            "DEVELOPMENT_VERIFICATION_CONFIDENCE", "0.85"
+        )).strip())
+        if 0.0 <= value <= 1.0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return 0.85
+
+
+VERIFICATION_CONFIDENCE = _development_verification_confidence()
 DEVELOPMENT_VERIFIER_MAX_OUTPUT_TOKENS = 800
 
 
@@ -316,6 +332,7 @@ def verify_development_candidate(raw_name: str, context: dict,
         return _verification_error(raw, "schema_validation_failed", value)
     log_details = (
         f" confidence={float(confidence)!r}"
+        f" threshold={VERIFICATION_CONFIDENCE!r}"
         f" canonical={_compact(value['canonical_name']) or None!r}"
         f" geo={_compact(value['geo_name']) or None!r}"
         f" verification_url={value['verification_url']!r}"

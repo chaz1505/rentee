@@ -21,6 +21,76 @@ DEVELOPMENTS = [
 
 
 class DevelopmentResolverTests(unittest.TestCase):
+    @staticmethod
+    def verified_output(confidence):
+        return {
+            "status": "verified", "canonical_name": "Desa Kiara",
+            "geo_name": "Taman Tun Dr Ismail (TTDI), Kuala Lumpur",
+            "verification_url": "https://www.propertyguru.com.my/condo/desa-kiara-303",
+            "confidence": confidence, "reason": "credible_match",
+        }
+
+    def verify_output(self, output):
+        with patch.object(
+            resolver.rentee_app.client.responses, "create",
+            return_value=SimpleNamespace(output_text=json.dumps(output)),
+        ):
+            return resolver.verify_development_candidate("Desa Kiara Condo", {})
+
+    def test_verification_confidence_default_is_inclusive(self):
+        with patch.object(resolver, "VERIFICATION_CONFIDENCE", 0.85):
+            for confidence in (0.86, 0.85):
+                with self.subTest(confidence=confidence):
+                    result = self.verify_output(self.verified_output(confidence))
+                    self.assertEqual(result["status"], "verified")
+
+            result = self.verify_output(self.verified_output(0.84))
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["reason"],
+                         "verification_confidence_below_threshold")
+
+    def test_verification_confidence_environment_override(self):
+        with patch.dict(os.environ, {
+            "DEVELOPMENT_VERIFICATION_CONFIDENCE": "0.90"
+        }):
+            threshold = resolver._development_verification_confidence()
+            with patch.object(
+                resolver, "VERIFICATION_CONFIDENCE", threshold
+            ), patch("builtins.print") as log:
+                result = self.verify_output(self.verified_output(0.86))
+        self.assertEqual(result["reason"],
+                         "verification_confidence_below_threshold")
+        rendered = " ".join(str(call.args[0]) for call in log.call_args_list)
+        self.assertIn("confidence=0.86", rendered)
+        self.assertIn("threshold=0.9", rendered)
+
+    def test_verification_confidence_invalid_environment_defaults(self):
+        for value in (None, "", "not-a-number", "-0.01", "1.01"):
+            environment = {} if value is None else {
+                "DEVELOPMENT_VERIFICATION_CONFIDENCE": value
+            }
+            with self.subTest(value=value), patch.dict(
+                os.environ, environment, clear=True
+            ):
+                self.assertEqual(
+                    resolver._development_verification_confidence(), 0.85
+                )
+
+    def test_invalid_verification_status_rejected_regardless_of_confidence(self):
+        output = self.verified_output(1.0)
+        output.update({
+            "status": "ambiguous",
+            "reason": "multiple_plausible_candidates",
+        })
+        result = self.verify_output(output)
+        self.assertEqual(result["status"], "ambiguous")
+
+        output = self.verified_output(1.0)
+        output["reason"] = "multiple_plausible_candidates"
+        result = self.verify_output(output)
+        self.assertEqual((result["status"], result["reason"]),
+                         ("error", "schema_validation_failed"))
+
     def test_existing_development_returns_without_web_verification(self):
         with patch.object(resolver, "verify_development_candidate") as verify:
             result = resolver.resolve_or_create_development(
@@ -210,6 +280,7 @@ class DevelopmentResolverTests(unittest.TestCase):
         self.assertIn("status=verified", rendered)
         self.assertIn("reason='credible_match'", rendered)
         self.assertIn("confidence=0.96", rendered)
+        self.assertIn("threshold=0.85", rendered)
         self.assertIn("canonical='Harbour Residences'", rendered)
         self.assertIn("geo='George Town, Penang'", rendered)
         self.assertIn(
