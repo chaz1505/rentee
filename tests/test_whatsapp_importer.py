@@ -1272,6 +1272,100 @@ Tech subang
             with self.subTest(parsed=parsed):
                 self.assertEqual(importer.validate_import_submission(parsed), [])
 
+    def test_listing_details_accept_property_type_bedrooms_or_size_independently(self):
+        base = {
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Rent/Let"], "price_rent": 4500,
+            "proposing_agent": {"name": "Alex Goh", "phone": "016-4697992"},
+        }
+        for detail in (
+            {"property_type": "Landed"},
+            {"beds": 3},
+            {"sqft": 1200},
+            {"land_sqft": 1800},
+        ):
+            with self.subTest(detail=detail):
+                self.assertEqual(
+                    importer.validate_import_submission(dict(base, **detail)), []
+                )
+
+        self.assertIn(
+            "missing_property_details",
+            importer.validate_import_submission(base),
+        )
+        self.assertIn(
+            "missing_property_details",
+            importer.validate_import_submission(dict(base, property_type="Unknown")),
+        )
+
+    def test_property_type_only_landed_listing_is_created_with_missing_values(self):
+        raw = """WTL
+2 storey corner house
+BK9 Bandar Kinrara Puchong
+Partly furnished
+minimum 2 yrs contact
+Rental 4.5k
+
+James Lim
+0133944472
+Ren22443
+IQI Realty"""
+        parsed = {
+            "type": "listing", "geo_name": "BK9, Bandar Kinrara, Puchong",
+            "location_reference": "BK9 Bandar Kinrara Puchong",
+            "transaction_types": ["Rent/Let"], "property_type": "Landed",
+            "price_rent": 4500, "furnishing": "Partially Furnished",
+            "notes": "2 storey corner house; minimum 2 years contract",
+            "proposing_agent": {
+                "name": "James Lim", "phone": "0133944472", "ren": "Ren22443",
+            },
+        }
+        agent = {
+            "status": "existing", "user_id": "user-james",
+            "normalized_phone": "60133944472", "name": "James Lim",
+            "ren": "22443", "pea": None,
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch.object(importer, "resolve_or_create_proposing_agent", return_value=agent), \
+             patch.object(importer, "_find_duplicate_import", return_value=None), \
+             patch.object(importer, "resolve_location_references", return_value=[]), \
+             patch.object(importer, "_create_import_record", return_value="listing-1") as create, \
+             patch.object(importer, "find_import_matches", return_value=[]) as find, \
+             patch.object(importer, "score_import_matches", return_value={}), \
+             patch.object(importer, "create_missing_match_records"):
+            result = importer.process_whatsapp_import(
+                raw, import_type="listing", geo_records=[], development_records=[]
+            )
+        payload = create.call_args.args[1]
+        self.assertEqual(result["status"], "processed")
+        self.assertEqual(payload["TransactionType"], ["Rent/Let"])
+        self.assertEqual(payload["propertyType"], "Landed")
+        self.assertEqual(payload["priceRent"], 4500)
+        self.assertEqual(payload["owner"], "user-james")
+        self.assertNotIn("beds", payload)
+        self.assertNotIn("Sq Ft", payload)
+        self.assertNotIn("Landed_sqft", payload)
+        find.assert_called_once()
+
+    def test_rejection_log_contains_property_checks_without_agent_identity(self):
+        parsed = {
+            "type": "listing", "geo_name": "Bangsar",
+            "transaction_types": ["Rent/Let"], "price_rent": 4500,
+            "proposing_agent": {"name": "Private Name", "phone": "0123456789"},
+        }
+        with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
+             patch("builtins.print") as log:
+            importer.process_whatsapp_import("listing", geo_records=[], development_records=[])
+        rendered = " ".join(str(item) for item in log.call_args_list)
+        self.assertIn('"transaction_type": ["Rent/Let"]', rendered)
+        self.assertIn('"geo": "Bangsar"', rendered)
+        self.assertIn('"property_type": null', rendered)
+        self.assertIn('"bedrooms": null', rendered)
+        self.assertIn('"property_details_present": false', rendered)
+        self.assertIn('"failed_conditions": ["missing_property_details"]', rendered)
+        self.assertNotIn("Private Name", rendered)
+        self.assertNotIn("0123456789", rendered)
+
     def test_strict_submission_validator_reports_all_rejection_categories(self):
         base = {
             "type": "listing", "geo_name": "KLCC", "property_type": "Condo",
@@ -2834,6 +2928,10 @@ Tech subang
         self.assertEqual(create.call_count, 2)
         self.assertEqual(len(scores), 21)
         self.assertEqual(scores["listing-20"]["score"], 91)
+        prompt = create.call_args_list[0].kwargs["input"]
+        self.assertIn("Missing facts are unknown, not matches", prompt)
+        self.assertIn("information is unconfirmed", prompt)
+        self.assertIn("Do not apply a fixed or arbitrary penalty", prompt)
 
     def test_scoring_keeps_valid_partial_results_and_rejects_bad_ids(self):
         response = SimpleNamespace(output_text=json.dumps({"matches": [
@@ -3082,6 +3180,8 @@ Polygon Properties
         schema = create.call_args.kwargs["text"]["format"]["schema"]
         self.assertEqual(schema["properties"]["type"]["enum"], ["lead"])
         self.assertIn("do not classify it", create.call_args.kwargs["input"])
+        self.assertIn("storey count describes the building", create.call_args.kwargs["input"])
+        self.assertIn("must leave beds null", create.call_args.kwargs["input"])
         self.assertEqual(parsed["type"], "lead")
 
     def test_process_passes_forced_import_type_to_parser(self):
