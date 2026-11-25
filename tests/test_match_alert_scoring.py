@@ -10,7 +10,7 @@ import whatsapp_importer as importer
 
 class MatchAlertScoringTests(unittest.TestCase):
     def _run(self, scores, *, owners=None, created_type="lead", existing=None,
-             max_recipients="20", send_side_effect=None):
+             max_recipients="20", send_side_effect=None, disabled_owners=None):
         owners = owners or {record_id: f"owner-{record_id}" for record_id in scores}
         matches = [
             {"_id": record_id, "owner": owners[record_id],
@@ -29,6 +29,14 @@ class MatchAlertScoringTests(unittest.TestCase):
         def bubble_records(*_args, **_kwargs):
             return next(records)
 
+        def bubble(url):
+            if "/obj/lead/" in url:
+                return {"owner": "importer"}
+            owner = url.rsplit("/", 1)[-1]
+            if owner in (disabled_owners or set()):
+                return {"alerts": False, "phone": "0123456789", "name": "Disabled"}
+            return {"alerts": True, "phone": "0123456789", "name": "Recipient"}
+
         send_patch = patch.object(importer, "maybe_send_match_alert")
         with patch.dict(os.environ, {
             "MATCH_ALERT_MIN_SCORE": "80",
@@ -38,6 +46,8 @@ class MatchAlertScoringTests(unittest.TestCase):
         ), patch.object(
             importer.rentee_app, "_bubble_create",
             side_effect=[f"match-{index}" for index in range(len(matches))],
+        ), patch.object(
+            importer.rentee_app, "bubble", side_effect=bubble,
         ), send_patch as send:
             if send_side_effect is None:
                 send.return_value = True
@@ -53,23 +63,24 @@ class MatchAlertScoringTests(unittest.TestCase):
         send = self._run({"high": 95, "edge": 80, "low": 79, "missing": None})
         self.assertEqual(send.call_count, 2)
         self.assertEqual(
-            [call.kwargs["grouped_matches"][0]["score"] for call in send.call_args_list],
+            [call.kwargs["score"] for call in send.call_args_list],
             [95, 80],
         )
 
-    def test_multiple_matches_for_one_recipient_are_consolidated_and_score_sorted(self):
+    def test_multiple_matches_for_one_recipient_are_individual_and_score_sorted(self):
         owners = {"a": "caroline", "b": "caroline", "c": "caroline"}
         send = self._run({"a": 80, "b": 95, "c": 88}, owners=owners)
-        send.assert_called_once()
-        grouped = send.call_args.kwargs["grouped_matches"]
-        self.assertEqual([item["score"] for item in grouped], [95, 88, 80])
+        self.assertEqual(send.call_count, 3)
+        self.assertEqual(
+            [call.kwargs["score"] for call in send.call_args_list], [95, 88, 80]
+        )
 
     def test_recipient_cap_selects_twenty_highest_ranked_groups(self):
         scores = {f"listing-{index}": 80 + index for index in range(21)}
         send = self._run(scores, max_recipients="20")
         self.assertEqual(send.call_count, 20)
         selected = [
-            call.kwargs["grouped_matches"][0]["score"]
+            call.kwargs["score"]
             for call in send.call_args_list
         ]
         self.assertEqual(selected, list(range(100, 80, -1)))
@@ -80,6 +91,14 @@ class MatchAlertScoringTests(unittest.TestCase):
             send_side_effect=[RuntimeError("Meta unavailable"), True],
         )
         self.assertEqual(send.call_count, 2)
+
+    def test_disabled_recipient_does_not_consume_cap(self):
+        send = self._run(
+            {"disabled": 99, "enabled": 90}, max_recipients="1",
+            disabled_owners={"owner-disabled"},
+        )
+        send.assert_called_once()
+        self.assertEqual(send.call_args.kwargs["score"], 90)
 
     def test_existing_alert_sent_match_is_not_reprocessed(self):
         send = self._run(

@@ -2231,21 +2231,33 @@ def owner_check_whatsapp_window(phone, bubble_env="live", now=None):
 
 
 def send_whatsapp_template(to_phone, template_name, language_code="en_US",
-                           parameters=None):
-    """Send one configured Meta template, optionally with text body parameters."""
+                           parameters=None, button_parameters=None):
+    """Send one Meta template with optional body and dynamic URL parameters.
+
+    ``button_parameters`` is a sequence of dynamic URL suffixes.  Its position is
+    the zero-based Meta button index; the configured template owns the URL prefix.
+    """
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
     access_token = os.environ["WHATSAPP_ACCESS_TOKEN"]
     template = {
         "name": template_name,
         "language": {"code": language_code},
     }
+    components = []
     if parameters is not None:
-        template["components"] = [{
+        components.append({
             "type": "body",
             "parameters": [
                 {"type": "text", "text": str(value)} for value in parameters
             ],
-        }]
+        })
+    if button_parameters is not None:
+        components.extend({
+            "type": "button", "sub_type": "url", "index": str(index),
+            "parameters": [{"type": "text", "text": str(value)}],
+        } for index, value in enumerate(button_parameters))
+    if components:
+        template["components"] = components
     response = requests.post(
         f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
         f"{phone_number_id}/messages",
