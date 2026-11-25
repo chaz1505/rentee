@@ -34,6 +34,9 @@ DEVELOPMENTS = [
 def full_model_output(**updates):
     value = {
         "type": "unknown", "geo_names": [], "geo_name": None,
+        "contains_multiple_entries": False,
+        "unsupported_property_type": False, "vacant_land_only": False,
+        "size_min_sqft": None,
         "location_references": [], "location_reference": None,
         "preferred_development_names": [], "development_name": None,
         "transaction_types": [], "property_types": [], "property_type": None,
@@ -135,6 +138,19 @@ class WhatsAppImporterTests(unittest.TestCase):
         self.assertIn("usage={'input_tokens': 100, 'output_tokens': 2000}", rendered)
 
     def process_as(self, parsed):
+        parsed = dict(parsed)
+        parsed.setdefault("proposing_agent", {
+            "name": "Fixture Agent", "phone": "0123456789",
+        })
+        if parsed.get("type") == "lead":
+            parsed.setdefault("bedrooms_min", 1)
+        elif parsed.get("type") == "listing":
+            parsed.setdefault("property_type", "Condo")
+            parsed.setdefault("beds", 1)
+            if "Rent/Let" in parsed.get("transaction_types", []):
+                parsed.setdefault("price_rent", 1000)
+            if "Buy/Sell" in parsed.get("transaction_types", []):
+                parsed.setdefault("price_sale", 100000)
         create = MagicMock(return_value="bubble-1")
         with patch.object(importer, "parse_forwarded_message", return_value=parsed), \
              patch.object(importer.rentee_app, "_bubble_create", create), \
@@ -156,6 +172,9 @@ class WhatsAppImporterTests(unittest.TestCase):
             "preferred_development_names": [],
             "transaction_types": ["Rent/Let"], "property_types": ["Condo"],
             "proposing_agent": {"name": None, "phone": None, "ren": None},
+            "contains_multiple_entries": False,
+            "unsupported_property_type": False,
+            "vacant_land_only": False,
             "budget": 8000, "bedrooms_min": 3,
         })
         payload = importer.build_lead_payload(
@@ -1203,7 +1222,7 @@ Tech subang
                 "WTR", geo_records=GEOS, development_records=DEVELOPMENTS
             )
         self.assertEqual(result["status"], "invalid")
-        self.assertIn("resend the full forwarded message", result["confirmation"])
+        self.assertEqual(result["confirmation"], importer.IMPORT_REJECTION_MESSAGE)
         create.assert_not_called()
         resolve_agent.assert_not_called()
 
@@ -1222,9 +1241,68 @@ Tech subang
                     development_records=DEVELOPMENTS,
                 )
             self.assertEqual(result["status"], "invalid")
-            self.assertIn("resend the full forwarded message", result["confirmation"])
+            self.assertEqual(result["confirmation"], importer.IMPORT_REJECTION_MESSAGE)
             create.assert_not_called()
             resolve_agent.assert_not_called()
+
+    def test_strict_submission_validator_accepts_supported_variants(self):
+        agent = {"name": "Alex Goh", "phone": "016-4697992"}
+        accepted = (
+            {"type": "lead", "geo_names": ["Bangsar", "KLCC"],
+             "transaction_types": ["Rent/Let"], "budget": 8000,
+             "property_types": ["Condo", "Landed"], "proposing_agent": agent},
+            {"type": "lead", "preferred_development_names": ["One Menerung"],
+             "transaction_types": ["Buy/Sell"], "bedrooms_min": 3,
+             "proposing_agent": agent},
+            {"type": "lead", "location_references": ["Jalan Maarof"],
+             "transaction_types": ["Rent/Let"], "size_min_sqft": 1500,
+             "proposing_agent": agent},
+            {"type": "listing", "geo_name": "Bangsar", "property_type": "Condo",
+             "transaction_types": ["Rent/Let"], "price_rent": 4200, "beds": 0,
+             "proposing_agent": agent},
+            {"type": "listing", "geo_name": "Damansara Heights",
+             "property_type": "Landed", "transaction_types": ["Buy/Sell"],
+             "price_sale": 3000000, "land_sqft": 3200, "proposing_agent": agent},
+            {"type": "listing", "development_name": "One Menerung",
+             "property_type": "Condo", "transaction_types": ["Rent/Let", "Buy/Sell"],
+             "price_rent": 8000, "price_sale": 2500000, "sqft": 3000,
+             "proposing_agent": agent},
+        )
+        for parsed in accepted:
+            with self.subTest(parsed=parsed):
+                self.assertEqual(importer.validate_import_submission(parsed), [])
+
+    def test_strict_submission_validator_reports_all_rejection_categories(self):
+        base = {
+            "type": "listing", "geo_name": "KLCC", "property_type": "Condo",
+            "transaction_types": ["Rent/Let", "Buy/Sell"], "price_rent": 5000,
+            "beds": 2, "proposing_agent": {"name": "Alex", "phone": "03-12345678"},
+            "contains_multiple_entries": True, "unsupported_property_type": True,
+            "vacant_land_only": True,
+        }
+        self.assertEqual(importer.validate_import_submission(base), [
+            "multiple_entries", "unsupported_property_type", "vacant_land_only",
+            "invalid_agent_phone", "missing_sale_price",
+        ])
+        missing = importer.validate_import_submission({"type": "lead"})
+        self.assertEqual(missing, [
+            "missing_transaction_type", "missing_location", "missing_agent_name",
+            "missing_agent_phone", "missing_property_details",
+        ])
+        self.assertEqual(
+            importer.validate_import_submission({"type": "unknown"}),
+            ["unable_to_interpret"],
+        )
+
+    def test_size_min_survives_normalization_and_is_preserved_in_notes(self):
+        parsed = self.parse_as({
+            "type": "lead", "location_references": ["Bangsar"],
+            "transaction_types": ["Buy/Sell"], "size_min_sqft": 3000,
+            "notes": "Own stay", "contains_multiple_entries": False,
+            "unsupported_property_type": False, "vacant_land_only": False,
+        })
+        self.assertEqual(parsed["size_min_sqft"], 3000)
+        self.assertEqual(parsed["notes"], "Own stay; Minimum property size: 3000 sqft")
 
     def test_matching_requires_exact_shared_transaction(self):
         lead = {
@@ -3111,10 +3189,7 @@ Polygon Properties
             "id": "wamid.simple-image", "from": "60123456789", "type": "image",
             "image": {"id": "media-1"},
         }
-        expected = (
-            "Rentee currently helps you add and match property leads and listings. "
-            "Forward me a lead or listing and I'll add it for you."
-        )
+        expected = importer.IMPORT_REJECTION_MESSAGE
         with patch.object(app, "RENTEE_MODE", "simple"), \
              patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
              patch.object(app, "_stop_whatsapp_typing"), \

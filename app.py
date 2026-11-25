@@ -8139,10 +8139,14 @@ def _process_whatsapp_message(message):
                     f"action=unsupported_message type={message_type}",
                     flush=True,
                 )
-                response_text = (
-                    "Rentee currently helps you add and match property leads "
-                    "and listings. Forward me a lead or listing and I'll add it for you."
-                )
+                if message_type in {"image", "document", "video"}:
+                    from whatsapp_importer import IMPORT_REJECTION_MESSAGE
+                    response_text = IMPORT_REJECTION_MESSAGE
+                else:
+                    response_text = (
+                        "Rentee currently helps you add and match property leads "
+                        "and listings. Forward me a lead or listing and I'll add it for you."
+                    )
                 _stop_whatsapp_typing(typing_keepalive)
                 sent_ids = send_whatsapp_text(phone, response_text)
                 for meta_id, segment in zip(
@@ -9130,7 +9134,10 @@ def _whatsapp_text_messages(payload):
             }
             for item in value.get("messages", []) or []:
                 message_type = item.get("type")
-                if message_type not in {"text", "audio", "image"}:
+                supported_types = {"text", "audio", "image"}
+                if RENTEE_MODE == "simple":
+                    supported_types.update({"document", "video"})
+                if message_type not in supported_types:
                     continue
                 if not item.get("id") or not item.get("from"):
                     continue
@@ -9144,7 +9151,7 @@ def _whatsapp_text_messages(payload):
                         # Keep a genuine audio event so the worker can log and send
                         # the standard transcription failure response.
                         item = {**item, "audio": {**(item.get("audio") or {})}}
-                else:
+                elif message_type == "image":
                     media_id = (item.get("image") or {}).get("id")
                     if not isinstance(media_id, str) or not media_id.strip():
                         continue
@@ -9154,6 +9161,10 @@ def _whatsapp_text_messages(payload):
                             **item,
                             "text": {"body": caption},
                         }
+                else:
+                    media_id = (item.get(message_type) or {}).get("id")
+                    if not isinstance(media_id, str) or not media_id.strip():
+                        continue
                 clean = dict(item)
                 clean["customer_name"] = names.get(str(item.get("from")))
                 messages.append(clean)

@@ -27,6 +27,108 @@ IMPORT_ROUTING_THRESHOLD = 0.90
 MATCH_AVAILABILITY_MONTHS = 3
 MATCH_SCORING_BATCH_SIZE = 20
 
+IMPORT_REJECTION_MESSAGE = """Hi! 👋 We've received your message, but Rentee was unable to process your submission.
+
+Please check the following before resending:
+
+1️⃣ *Residential properties only*
+Commercial properties and vacant land are not currently supported.
+
+2️⃣ *Send as text*
+Photos, screenshots and documents are not currently supported.
+
+3️⃣ *One entry per message*
+Please send each listing or lead separately.
+
+4️⃣ *Transaction type*
+Include WTR, WTB, WTS or WTL.
+
+5️⃣ *Property details*
+Include the area and/or condo name.
+
+For listings, include the asking price and bedrooms or property size.
+
+For leads, include at least one of budget, bedrooms or property size.
+
+6️⃣ *Agent details*
+Include the agent's name and phone number.
+
+Here are some examples to help you 👇
+
+━━━━━━━━━━━━━━━━
+
+*EXAMPLE 1 — RENTAL LISTING*
+
+WTL Bangsar Hill Park
+
+Size: 978 sqft
+2+1 rooms, 2 bathrooms
+Carpark: 1 covered carpark
+Rental price: RM4,200/month
+Fully furnished
+
+[Agent name]
+[Agency]
+[REN number]
+[Phone number]
+
+━━━━━━━━━━━━━━━━
+
+*EXAMPLE 2 — SALE LISTING*
+
+WTS
+📍 The Camellia @ Gamuda Cove
+
+Property type: Semi-D, Type B
+Land size: 3,200 sqft
+Built-up: 3,055 sqft
+Bedrooms: 4+1
+Bathrooms: 4+1
+Furnishing: Unfurnished
+Asking price: RM3M
+
+[Agent name]
+[Agency]
+[REN number]
+[Phone number]
+
+━━━━━━━━━━━━━━━━
+
+*EXAMPLE 3 — RENTAL LEAD*
+
+WTR
+Bangsar or Damansara Heights
+Condo
+Minimum 3 bedrooms
+Budget: RM8,000/month
+Fully furnished
+Expat family
+
+[Agent name]
+[Agency]
+[REN number]
+[Phone number]
+
+━━━━━━━━━━━━━━━━
+
+*EXAMPLE 4 — PURCHASE LEAD*
+
+WTB
+One Menerung ONLY
+Minimum 3 bedrooms
+Minimum 3,000 sqft
+Budget: RM5.5M
+Own stay
+
+[Agent name]
+[Agency]
+[REN number]
+[Phone number]
+
+━━━━━━━━━━━━━━━━
+
+Please update your message and resend it. Happy matching! 🎯"""
+
 STRONG_IMPORT_MARKERS = (
     ("lead_import", "WTR", r"(?<![A-Z0-9])WTR(?![A-Z0-9])"),
     ("lead_import", "WTB", r"(?<![A-Z0-9])WTB(?![A-Z0-9])"),
@@ -43,6 +145,10 @@ PARSER_SCHEMA = {
     "type": "object",
     "properties": {
         "type": {"type": "string", "enum": ["lead", "listing", "unknown"]},
+        "contains_multiple_entries": {"type": "boolean"},
+        "unsupported_property_type": {"type": "boolean"},
+        "vacant_land_only": {"type": "boolean"},
+        "size_min_sqft": {"type": ["number", "null"], "minimum": 0},
         "geo_names": {
             "type": "array", "items": {"type": "string"},
             "description": (
@@ -166,7 +272,9 @@ PARSER_SCHEMA = {
         },
     },
     "required": [
-        "type", "geo_names", "geo_name", "location_references", "location_reference",
+        "type", "contains_multiple_entries", "unsupported_property_type",
+        "vacant_land_only", "size_min_sqft", "geo_names", "geo_name",
+        "location_references", "location_reference",
         "preferred_development_names",
         "development_name", "transaction_types", "property_types",
         "property_type", "budget", "price_rent", "price_sale",
@@ -289,6 +397,11 @@ def _validate_parsed(value: Any) -> dict:
     }
     if _compact(raw_agent.get("pea")):
         proposing_agent["pea"] = _compact(raw_agent["pea"])
+    validation_fields = {
+        "contains_multiple_entries": value.get("contains_multiple_entries") is True,
+        "unsupported_property_type": value.get("unsupported_property_type") is True,
+        "vacant_land_only": value.get("vacant_land_only") is True,
+    }
 
     if value["type"] == "lead":
         result = {
@@ -303,8 +416,9 @@ def _validate_parsed(value: Any) -> dict:
             "transaction_types": transactions,
             "property_types": property_types,
             "proposing_agent": proposing_agent,
+            **validation_fields,
         }
-        for key in ("budget", "bedrooms_min"):
+        for key in ("budget", "bedrooms_min", "size_min_sqft"):
             if isinstance(value.get(key), (int, float)) and value[key] >= 0:
                 result[key] = int(value[key]) if float(value[key]).is_integer() else value[key]
         for key in ("adults", "children", "bathrooms_min", "helpers"):
@@ -314,6 +428,12 @@ def _validate_parsed(value: Any) -> dict:
         for key in ("nationality", "occupation", "pets", "notes"):
             if _compact(value.get(key)):
                 result[key] = _compact(value[key])
+        if result.get("size_min_sqft") is not None:
+            size_note = f"Minimum property size: {result['size_min_sqft']:g} sqft"
+            if size_note.casefold() not in result.get("notes", "").casefold():
+                result["notes"] = "; ".join(filter(None, (
+                    result.get("notes"), size_note,
+                )))
         if _compact(value.get("source_agency_name")):
             result["source_agency_name"] = _compact(value["source_agency_name"])
         result["location_references"] = _without_agent_metadata_locations(
@@ -336,6 +456,7 @@ def _validate_parsed(value: Any) -> dict:
         "type": "listing",
         "transaction_types": transactions,
         "proposing_agent": proposing_agent,
+        **validation_fields,
     }
     location_references = _location_references([
         value.get("location_reference") or value.get("geo_name")
@@ -475,6 +596,15 @@ def parse_forwarded_message(raw_text: str, import_type: str | None = None) -> di
             model="gpt-5-mini",
             input=(
             "Parse one forwarded Malaysian property WhatsApp message. " + task +
+            "Set contains_multiple_entries true for multiple independent listings, multiple "
+            "independent client requirements, or a mixture of a lead and a listing. Multiple "
+            "preferred locations, developments, or property types within one requirement are "
+            "not multiple entries. One property offered for both rent and sale is one entry. "
+            "Set unsupported_property_type true for commercial, retail, office, industrial, "
+            "warehouse, or any other non-residential property. Set vacant_land_only true for "
+            "vacant land, including residential or agricultural land, but never for a residential "
+            "house merely because its land size is stated. For Leads, extract an explicitly stated "
+            "minimum property size into size_min_sqft. "
             "Lead evidence: "
             "WTR, WTB, looking for, seeking, wanted, requirement, tenant requirement, buyer "
             "requirement. Listing evidence: WTS, WTL, for sale, for rent, available, owner "
@@ -925,6 +1055,23 @@ def detect_import_intent(raw_text: str) -> dict:
     if conversational:
         signals.append("conversational_request")
         return _detector_result("normal_chat", 0.96, signals, "conversational_request")
+
+    # Explicit submission wording should reach deterministic validation even when
+    # the submitted record is incomplete or unsupported.
+    if re.search(
+        r"\b(?:office|retail|warehouse|industrial|commercial)\b.*\bfor\s+(?:rent|sale)\b|"
+        r"\bfor\s+(?:rent|sale)\b.*\b(?:office|retail|warehouse|industrial|commercial)\b",
+        lower,
+    ):
+        return _detector_result(
+            "listing_import", 0.96, signals, "explicit_listing_attempt"
+        )
+    if re.search(
+        r"\b(?:looking for|seeking|wanted|requirement)\b.*"
+        r"\b(?:vacant\s+land|agricultural\s+land|residential\s+land)\b",
+        lower,
+    ):
+        return _detector_result("lead_import", 0.96, signals, "explicit_lead_attempt")
 
     facts = len(set(signals) & {
         "money", "bedrooms", "property_type", "size", "tenancy", "phone",
@@ -2518,6 +2665,72 @@ def format_import_matches(created_type: str, created_record: dict,
     )
 
 
+def validate_import_submission(parsed):
+    """Return stable rejection codes without performing any writes."""
+    if not isinstance(parsed, dict) or parsed.get("type") not in {"lead", "listing"}:
+        return ["unable_to_interpret"]
+    reasons = []
+    for field, code in (
+        ("contains_multiple_entries", "multiple_entries"),
+        ("unsupported_property_type", "unsupported_property_type"),
+        ("vacant_land_only", "vacant_land_only"),
+    ):
+        if parsed.get(field) is True:
+            reasons.append(code)
+    transactions = parsed.get("transaction_types") or []
+    if not transactions or any(item not in TRANSACTION_TYPES for item in transactions):
+        reasons.append("missing_transaction_type")
+    location = (
+        parsed.get("geo_names") or parsed.get("preferred_development_names")
+        or parsed.get("location_references")
+        if parsed["type"] == "lead" else
+        parsed.get("geo_name") or parsed.get("development_name")
+        or parsed.get("location_reference")
+    )
+    if not location:
+        reasons.append("missing_location")
+    agent = parsed.get("proposing_agent")
+    agent = agent if isinstance(agent, dict) else {}
+    if not _compact(agent.get("name")):
+        reasons.append("missing_agent_name")
+    raw_phone = _compact(agent.get("phone"))
+    if not raw_phone:
+        reasons.append("missing_agent_phone")
+    elif not normalize_phone_number(raw_phone):
+        reasons.append("invalid_agent_phone")
+    if parsed["type"] == "lead":
+        if not any(
+            isinstance(parsed.get(field), (int, float))
+            and not isinstance(parsed.get(field), bool)
+            and parsed[field] > 0
+            for field in ("budget", "bedrooms_min", "size_min_sqft")
+        ):
+            reasons.append("missing_property_details")
+    else:
+        if parsed.get("property_type") not in PROPERTY_TYPES:
+            reasons.append("missing_property_type")
+        if "Rent/Let" in transactions and not (
+            isinstance(parsed.get("price_rent"), (int, float))
+            and not isinstance(parsed.get("price_rent"), bool)
+            and parsed["price_rent"] > 0
+        ):
+            reasons.append("missing_rental_price")
+        if "Buy/Sell" in transactions and not (
+            isinstance(parsed.get("price_sale"), (int, float))
+            and not isinstance(parsed.get("price_sale"), bool)
+            and parsed["price_sale"] > 0
+        ):
+            reasons.append("missing_sale_price")
+        if not any(
+            isinstance(parsed.get(field), (int, float))
+            and not isinstance(parsed.get(field), bool)
+            and (parsed[field] >= 0 if field == "beds" else parsed[field] > 0)
+            for field in ("beds", "sqft", "land_sqft")
+        ):
+            reasons.append("missing_property_details")
+    return reasons
+
+
 def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
                             import_type: str | None = None,
                             geo_records=None, development_records=None) -> dict:
@@ -2527,30 +2740,26 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         return {"status": "unknown", "type": "unknown"}
     if bubble_env not in {"live", "development"}:
         raise ValueError("bubble_env must be 'live' or 'development'.")
-    valid_import = (
-        any(parsed.get(field) for field in (
-            "geo_names", "preferred_development_names", "transaction_types",
-            "property_types",
-        ))
-        or parsed.get("budget") is not None
-        or parsed.get("bedrooms_min") is not None
-    ) if parsed["type"] == "lead" else (
-        bool(parsed.get("development_name") or parsed.get("geo_name")
-             or parsed.get("location_reference"))
-        and (
-            bool(parsed.get("transaction_types") or parsed.get("property_type"))
-            or parsed.get("price_rent") is not None
-            or parsed.get("price_sale") is not None
-            or parsed.get("beds") is not None
+    # An already-known development is read-only evidence that a listing is a
+    # residential condo. Never create or web-verify a development at this stage.
+    if (parsed["type"] == "listing" and not parsed.get("property_type")
+            and parsed.get("development_name") and development_records is not None):
+        resolved = development_resolver.resolve_development_name(
+            parsed["development_name"], development_records
         )
-    )
-    if not valid_import:
+        if resolved.get("matched"):
+            parsed["property_type"] = "Condo"
+    rejection_reasons = validate_import_submission(parsed)
+    if rejection_reasons:
+        print(
+            "[WHATSAPP IMPORT VALIDATION] status=rejected "
+            f"type={parsed.get('type')} reasons={','.join(rejection_reasons)}",
+            flush=True,
+        )
         return {
-            "status": "invalid", "type": parsed["type"], "parsed": parsed,
-            "confirmation": (
-                "I couldn't add that property record because it did not contain enough "
-                "details. Please resend the full forwarded message."
-            ),
+            "status": "invalid", "type": parsed.get("type"), "parsed": parsed,
+            "rejection_reasons": rejection_reasons,
+            "confirmation": IMPORT_REJECTION_MESSAGE,
         }
     parsed_agent = parsed.get("proposing_agent")
     parsed_agent = parsed_agent if isinstance(parsed_agent, dict) else {}

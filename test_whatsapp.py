@@ -61,6 +61,15 @@ def image_webhook_payload(
     return payload
 
 
+def media_webhook_payload(message_type, message_id="wamid.media-1"):
+    payload = webhook_payload(message_id)
+    message = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+    message["type"] = message_type
+    message.pop("text", None)
+    message[message_type] = {"id": f"{message_type}-1"}
+    return payload
+
+
 class ImmediateThread:
     def __init__(self, target, args=(), **_kwargs):
         self.target, self.args = target, args
@@ -1068,6 +1077,24 @@ class WhatsAppTests(unittest.TestCase):
         )
         self.mocked_whatsapp_user = self.whatsapp_user_patcher.start()
         self.addCleanup(self.whatsapp_user_patcher.stop)
+
+    def test_simple_mode_accepts_document_and_video_events_for_rejection(self):
+        with patch.object(app_module, "RENTEE_MODE", "simple"):
+            for message_type in ("document", "video"):
+                with self.subTest(message_type=message_type):
+                    messages = app_module._whatsapp_text_messages(
+                        media_webhook_payload(message_type)
+                    )
+                    self.assertEqual(len(messages), 1)
+                    self.assertEqual(messages[0]["type"], message_type)
+
+    def test_full_mode_still_ignores_document_and_video_events(self):
+        with patch.object(app_module, "RENTEE_MODE", "full"):
+            for message_type in ("document", "video"):
+                with self.subTest(message_type=message_type):
+                    self.assertEqual(app_module._whatsapp_text_messages(
+                        media_webhook_payload(message_type)
+                    ), [])
         direct_persistence_tests = {
             "test_inbound_message_persists_whatsapp_fields_once",
             "test_duplicate_inbound_meta_id_reuses_existing_message",
