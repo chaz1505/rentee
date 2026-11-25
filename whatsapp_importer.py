@@ -2065,6 +2065,8 @@ def build_match_alert(created_type, lead, listing, recipient, other_agent,
     matching = listing if created_type == "listing" else lead
     own = lead if created_type == "listing" else listing
     agent_phone = normalize_phone_number(other_agent.get("phone")) or "Not provided"
+    if agent_phone.startswith("60"):
+        agent_phone = agent_phone[1:]
     agency = _compact(other_agent.get("AgencyName") or other_agent.get("agency")
                       or other_agent.get("source_agency_name"))
     if not agency:

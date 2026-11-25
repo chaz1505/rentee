@@ -49,7 +49,7 @@ class MatchAlertV2Tests(unittest.TestCase):
         alert = importer.build_match_alert(
             "listing", lead, listing,
             {"name": "Stephanie"},
-            {"name": "Gwen Lim", "phone": "0174156107", "AgencyName": "Prestige Realty"},
+            {"name": "Gwen Lim", "phone": "60174156107", "AgencyName": "Prestige Realty"},
             DEVELOPMENTS, GEOS, score=93, explanation="Strong location and budget fit",
         )
         self.assertEqual(alert["parameters"], [
@@ -58,13 +58,14 @@ class MatchAlertV2Tests(unittest.TestCase):
             "WTL · One Menerung, Bangsar · Condo · 3 bedrooms · 2 bathrooms · RM12,000/month · Uploaded 24 Nov 2026",
             "WTR · One Menerung, Bangsar · Condo · 3 bedrooms · 2 bathrooms · Budget RM15,000/month",
             "93", "Strong location and budget fit", "Gwen Lim · Prestige Realty",
-            "60174156107", "Gwen",
+            "0174156107", "Gwen",
         ])
         sparse = importer.build_match_alert(
             "listing", {"_id": "lead-1"}, {"_id": "listing-1"},
             {}, {}, score=80, explanation="fit",
         )["parameters"]
         self.assertEqual(len(sparse), 9)
+        self.assertEqual(sparse[7], "Not provided")
         self.assertTrue(all("\n" not in value and value for value in sparse))
 
     def test_template_is_used_inside_and_outside_window_with_both_buttons(self):
