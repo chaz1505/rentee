@@ -1570,6 +1570,18 @@ def _bubble_patch(url, payload):
     return response
 
 
+def update_whatsapp_alert_preference(
+    phone, enabled, profile_name=None, bubble_env="live"
+):
+    """Resolve a WhatsApp identity and update only its match-alert preference."""
+    user = resolve_whatsapp_user(phone, profile_name, bubble_env)
+    _bubble_patch(
+        f"{get_bubble_base_url(bubble_env)}/obj/user/{user['_id']}",
+        {"alerts": bool(enabled)},
+    )
+    return user
+
+
 def _bubble_records(base_url, object_type, constraints=None, query_params=None):
     cursor = 0
     while True:
@@ -8066,6 +8078,80 @@ def _process_whatsapp_message(message):
                     )
                 _stop_whatsapp_typing(typing_keepalive)
                 send_whatsapp_text(phone, reply)
+                reply_sent = True
+                return
+            alert_commands = {
+                "stop": False, "/stop": False,
+                "start": True, "/start": True,
+            }
+            alert_preference = (
+                alert_commands.get(text.casefold()) if message_type == "text" else None
+            )
+            if alert_preference is not None:
+                masked_phone = _masked_whatsapp_phone(phone)
+                try:
+                    update_whatsapp_alert_preference(
+                        phone, alert_preference, message.get("customer_name"), "live"
+                    )
+                    reply = (
+                        "🔔 Rentee match alerts switched on!\n\n"
+                        "You'll now receive alerts when we find relevant matches for "
+                        "your leads and listings.\n\n"
+                        "Reply *STOP* at any time to switch off alerts."
+                    ) if alert_preference else (
+                        "🔕 Rentee match alerts switched off.\n\n"
+                        "You will no longer receive match alerts from Rentee.\n\n"
+                        "To start receiving alerts again, simply reply *START*."
+                    )
+                    print(
+                        "[WHATSAPP ALERT PREFERENCE] "
+                        f"phone={masked_phone} requested={alert_preference} "
+                        "status=success",
+                        flush=True,
+                    )
+                except Exception as error:
+                    reply = (
+                        "Sorry, we couldn't update your alert settings right now. "
+                        "Please try again shortly."
+                    )
+                    print(
+                        "[WHATSAPP ALERT PREFERENCE] "
+                        f"phone={masked_phone} requested={alert_preference} "
+                        f"status=failed error={type(error).__name__}",
+                        flush=True,
+                    )
+                if RENTEE_MODE != "simple":
+                    try:
+                        save_whatsapp_message(
+                            phone, message_id, text, "Inbound", "text", "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP ALERT PREFERENCE] "
+                            f"phone={masked_phone} requested={alert_preference} "
+                            "status=inbound_persistence_failed "
+                            f"error={type(error).__name__}",
+                            flush=True,
+                        )
+                _stop_whatsapp_typing(typing_keepalive)
+                sent_ids = send_whatsapp_text(phone, reply)
+                for meta_id, segment in zip(
+                    sent_ids or [], split_whatsapp_text(reply)
+                ):
+                    if not meta_id:
+                        continue
+                    try:
+                        save_whatsapp_message(
+                            phone, meta_id, segment, "Outbound", "text", "live"
+                        )
+                    except Exception as error:
+                        print(
+                            "[WHATSAPP ALERT PREFERENCE] "
+                            f"phone={masked_phone} requested={alert_preference} "
+                            "status=outbound_persistence_failed "
+                            f"error={type(error).__name__}",
+                            flush=True,
+                        )
                 reply_sent = True
                 return
             try:

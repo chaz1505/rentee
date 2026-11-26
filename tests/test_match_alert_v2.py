@@ -116,6 +116,37 @@ class MatchAlertV2Tests(unittest.TestCase):
         self.assertFalse(sent)
         update.assert_not_called()
 
+    def test_stale_enabled_recipient_is_reloaded_and_stop_prevents_delivery(self):
+        lead, listing = self.records()
+        with patch.object(
+            importer.rentee_app, "bubble",
+            return_value={"phone": "0122017185", "alerts": False},
+        ) as bubble, patch.object(
+            importer.rentee_app, "send_whatsapp_template"
+        ) as send:
+            sent = importer.maybe_send_match_alert(
+                "match-1", "listing", lead, listing,
+                "lead-agent", "listing-agent", match_record={},
+                recipient_record={"phone": "0122017185", "alerts": True},
+            )
+        self.assertFalse(sent)
+        bubble.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/lead-agent"
+        )
+        send.assert_not_called()
+
+    def test_alert_preference_reload_failure_fails_closed(self):
+        lead, listing = self.records()
+        with patch.object(
+            importer.rentee_app, "bubble", side_effect=RuntimeError("unavailable")
+        ), patch.object(importer.rentee_app, "send_whatsapp_template") as send:
+            sent = importer.maybe_send_match_alert(
+                "match-1", "listing", lead, listing,
+                "lead-agent", "listing-agent", match_record={},
+                recipient_record={"phone": "0122017185", "alerts": True},
+            )
+        self.assertFalse(sent)
+        send.assert_not_called()
 
 class WhatsAppTemplatePayloadV2Tests(unittest.TestCase):
     @patch("app.requests.post")

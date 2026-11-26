@@ -970,6 +970,100 @@ class WhatsAppUserIdentityTests(unittest.TestCase):
         )
 
 
+class WhatsAppAlertPreferenceTests(unittest.TestCase):
+    STOP_REPLY = (
+        "🔕 Rentee match alerts switched off.\n\n"
+        "You will no longer receive match alerts from Rentee.\n\n"
+        "To start receiving alerts again, simply reply *START*."
+    )
+    START_REPLY = (
+        "🔔 Rentee match alerts switched on!\n\n"
+        "You'll now receive alerts when we find relevant matches for your leads "
+        "and listings.\n\nReply *STOP* at any time to switch off alerts."
+    )
+
+    def test_helper_resolves_whatsapp_only_user_and_patches_only_alerts(self):
+        with patch(
+            "app.resolve_whatsapp_user", return_value={"_id": "user-new"}
+        ) as resolve, patch("app._bubble_patch") as bubble_patch:
+            result = app_module.update_whatsapp_alert_preference(
+                "+60 12-345 6789", False, "Aisha", "live"
+            )
+        self.assertEqual(result["_id"], "user-new")
+        resolve.assert_called_once_with(
+            "+60 12-345 6789", "Aisha", "live"
+        )
+        bubble_patch.assert_called_once_with(
+            "https://www.rentee.asia/api/1.1/obj/user/user-new",
+            {"alerts": False},
+        )
+
+    def test_command_variants_update_preference_confirm_and_bypass_routing(self):
+        variants = (
+            ("STOP", False, self.STOP_REPLY), (" /stop ", False, self.STOP_REPLY),
+            ("start", True, self.START_REPLY), (" /START ", True, self.START_REPLY),
+            ("STOP", False, self.STOP_REPLY), ("START", True, self.START_REPLY),
+        )
+        for index, (command, enabled, expected_reply) in enumerate(variants):
+            with self.subTest(command=command), patch(
+                "app.whatsapp_typing_keepalive", return_value=MagicMock()
+            ), patch(
+                "app.update_whatsapp_alert_preference"
+            ) as update, patch(
+                "app.send_whatsapp_text", return_value=[f"wamid.reply-{index}"]
+            ) as send, patch(
+                "whatsapp_importer.save_whatsapp_message"
+            ) as save, patch(
+                "whatsapp_importer.detect_import_intent"
+            ) as detect, patch("app.find_reply_context") as conversation:
+                item = webhook_payload(
+                    message_id=f"wamid.command-{index}", text=command
+                )["entry"][0]["changes"][0]["value"]["messages"][0]
+                app_module._process_whatsapp_message(item)
+            update.assert_called_once_with("60123456789", enabled, None, "live")
+            send.assert_called_once_with("60123456789", expected_reply)
+            self.assertEqual(save.call_count, 2)
+            detect.assert_not_called()
+            conversation.assert_not_called()
+
+    def test_update_failure_sends_only_failure_confirmation(self):
+        with patch(
+            "app.whatsapp_typing_keepalive", return_value=MagicMock()
+        ), patch(
+            "app.update_whatsapp_alert_preference", side_effect=requests.HTTPError()
+        ), patch(
+            "app.send_whatsapp_text", return_value=["wamid.failure"]
+        ) as send, patch("whatsapp_importer.save_whatsapp_message"):
+            item = webhook_payload(text="STOP")["entry"][0]["changes"][0]["value"]["messages"][0]
+            app_module._process_whatsapp_message(item)
+        self.assertEqual(send.call_args.args[1], (
+            "Sorry, we couldn't update your alert settings right now. "
+            "Please try again shortly."
+        ))
+
+    def test_non_standalone_text_image_caption_and_audio_transcript_are_ignored(self):
+        messages = [
+            webhook_payload(text="Please stop sending this listing"),
+            image_webhook_payload(caption="STOP"),
+            audio_webhook_payload(),
+        ]
+        for index, payload in enumerate(messages):
+            item = payload["entry"][0]["changes"][0]["value"]["messages"][0]
+            with self.subTest(index=index), patch(
+                "app.whatsapp_typing_keepalive", return_value=MagicMock()
+            ), patch(
+                "app.transcribe_whatsapp_audio", return_value="STOP"
+            ), patch(
+                "app.update_whatsapp_alert_preference"
+            ) as update, patch(
+                "app.resolve_whatsapp_user", side_effect=RuntimeError("past gate")
+            ), patch(
+                "app.send_whatsapp_text", return_value=["wamid.fallback"]
+            ), patch("whatsapp_importer.save_whatsapp_message"):
+                app_module._process_whatsapp_message(item)
+            update.assert_not_called()
+
+
 class WhatsAppLoginTests(unittest.TestCase):
     def test_magic_link_request_uses_live_workflow_and_plain_text_response(self):
         response = MagicMock()
@@ -1058,7 +1152,6 @@ class WhatsAppLoginTests(unittest.TestCase):
 
         magic_link.assert_not_called()
         resolve.assert_called_once_with("60123456789", None, "live")
-
 
 class WhatsAppTests(unittest.TestCase):
     def setUp(self):

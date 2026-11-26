@@ -2321,11 +2321,13 @@ def maybe_send_match_alert(match_id, created_type, lead, listing, lead_owner,
               "reason=missing_recipient", flush=True)
         return False
     try:
-        recipient = recipient_record or rentee_app.bubble(
-            f"{base_url}/obj/user/{recipient_id}")
-    except Exception:
+        # Always re-read immediately before delivery so a recent STOP wins over
+        # any recipient record cached during candidate selection.
+        recipient = rentee_app.bubble(f"{base_url}/obj/user/{recipient_id}")
+    except Exception as error:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped "
-              "reason=alerts_disabled", flush=True)
+              f"reason=alert_preference_unavailable error={type(error).__name__}",
+              flush=True)
         return False
     if recipient.get("alerts") is not True:
         print(f"[MATCH ALERT] match_id={match_id} action=skipped "

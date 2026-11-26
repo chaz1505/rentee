@@ -3789,7 +3789,7 @@ Polygon Properties
 
     def test_existing_proposing_agent_is_reused_without_create(self):
         user = {"_id": "user-agent", "phone": "60164697992", "name": "Alex Goh",
-                "REN": "E2265", "email": "alex@example.com"}
+                "REN": "E2265", "email": "alex@example.com", "alerts": False}
         with patch.object(importer.rentee_app, "find_bubble_users_by_phone",
                           return_value=[user]), \
              patch.object(importer.rentee_app, "_bubble_create") as create, \
@@ -3797,6 +3797,7 @@ Polygon Properties
             result = importer.resolve_or_create_proposing_agent(
                 "Alex Goh", "016-4697992", "E2265")
         self.assertEqual(result["user_id"], "user-agent")
+        self.assertIs(result["user"]["alerts"], False)
         create.assert_not_called()
         patch_user.assert_not_called()
 
