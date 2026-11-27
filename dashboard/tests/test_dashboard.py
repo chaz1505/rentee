@@ -121,9 +121,12 @@ class DashboardTestCase(unittest.TestCase):
              "Created Date": "2026-11-26T03:00:00Z"},
         ]
         client.records.side_effect = [
-            records,
+            records, records,
             [{"phone": "60123456789", "name": "Marcus Yeoh"}],
-            records,
+        ]
+        client.bounded_page.side_effect = [
+            (records, False),
+            (records, False),
         ]
         self.login()
 
@@ -140,6 +143,72 @@ class DashboardTestCase(unittest.TestCase):
         ).get_json()["messages"]
         self.assertEqual([message["id"] for message in messages], ["old", "new"])
         self.assertEqual(messages[-1]["timestamp"], conversations[0]["timestamp"])
+        self.assertEqual(client.bounded_page.call_count, 2)
+        self.assertTrue(all(call.args[1] for call in client.bounded_page.call_args_list))
+        self.assertTrue(all(call.kwargs["limit"] == 30 for call in client.bounded_page.call_args_list))
+        self.assertEqual(client.bounded_page.call_args_list[-1].args[1][0]["key"], "phone")
+
+    @patch("dashboard_app.BubbleAPI")
+    def test_inbox_paginates_thirty_with_stable_ties_and_search(self, client_class):
+        client = client_class.return_value
+        rows = [{
+            "_id": f"m{i:02d}", "phone": f"6012000{i:04d}",
+            "messageContent": f"Message {i}", "direction": "inbound",
+            "whatsapp_timestamp": "2026-11-27T01:00:00Z",
+            "Created Date": "2026-11-27T01:00:00Z",
+        } for i in range(35)]
+        client.records.side_effect = [rows, rows, [], rows, rows, []]
+        client.bounded_page.side_effect = [
+            ([rows[0]], False),
+            ([rows[0]], False),
+        ]
+        self.login()
+
+        first = self.client.get("/api/inbox/conversations").get_json()
+        self.assertEqual(len(first["conversations"]), 30)
+        self.assertTrue(first["has_more"])
+        second = self.client.get(
+            f'/api/inbox/conversations?cursor={first["next_cursor"]}'
+        ).get_json()
+        self.assertEqual(len(second["conversations"]), 5)
+        self.assertFalse(second["has_more"])
+        found = self.client.get("/api/inbox/conversations?search=6012").get_json()
+        self.assertEqual(len(found["conversations"]), 30)
+
+        # A separate app avoids sharing the conversation cache with this phone.
+        phone = rows[0]["phone"]
+        messages = self.client.get(f"/api/inbox/messages?phone={phone}").get_json()
+        self.assertEqual(len(messages["messages"]), 1)
+
+    @patch("dashboard_app.BubbleAPI")
+    def test_message_pagination_is_chronological_deduplicated_and_stable(self, client_class):
+        client = client_class.return_value
+        phone = "60123456789"
+        rows = [{
+            "_id": f"m{i:02d}", "phone": "+60 12-345 6789",
+            "messageContent": str(i), "direction": "outbound",
+            "whatsapp_timestamp": "2026-11-27T01:00:00Z",
+            "Created Date": "2026-11-27T01:00:00Z",
+        } for i in range(65)]
+        # The duplicate stream simulates the same rows returned by both Bubble sorts.
+        chunks = [rows[35:], rows[35:], rows[5:35], rows[5:35], rows[:5], rows[:5]]
+        client.bounded_page.side_effect = [
+            (chunk, index < 4)
+            for index, chunk in enumerate(chunks)
+        ]
+        self.login()
+        first = self.client.get(f"/api/inbox/messages?phone={phone}").get_json()
+        second = self.client.get(
+            f'/api/inbox/messages?phone={phone}&cursor={first["next_cursor"]}'
+        ).get_json()
+        third = self.client.get(
+            f'/api/inbox/messages?phone={phone}&cursor={second["next_cursor"]}'
+        ).get_json()
+        ids = [item["id"] for page in (first, second, third) for item in page["messages"]]
+        self.assertEqual(len(ids), 65)
+        self.assertEqual(len(set(ids)), 65)
+        self.assertFalse(third["has_more"])
+        self.assertEqual(ids[:2], ["m35", "m36"])
 
     @patch("dashboard_app.BubbleAPI")
     def test_not_sent_filter_applies_before_twenty_record_limit(self, client_class):

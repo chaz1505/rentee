@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime as dt
+import base64
 import hmac
+import json
 import os
 import secrets
 import threading
@@ -20,6 +22,9 @@ KL = ZoneInfo("Asia/Kuala_Lumpur")
 VALID_RANGES = {"today", "7d", "30d", "all"}
 VALID_MATCH_FILTERS = {"all", "sent", "not_sent"}
 SITE_URL = "https://www.rentee.asia"
+INBOX_PAGE_SIZE = 30
+INBOX_BUBBLE_PAGE = 100
+INBOX_CACHE_ROWS = 600
 
 
 def _normal_phone(value):
@@ -44,6 +49,72 @@ def _message_datetime(row):
     if value.tzinfo is None:
         value = value.replace(tzinfo=dt.timezone.utc)
     return value.astimezone(dt.timezone.utc)
+
+
+def _message_key(row):
+    """A deterministic key for mixed timestamps, including timestamp ties."""
+    return (_message_datetime(row), str(row.get("_id") or ""))
+
+
+def _cursor(value):
+    if not value:
+        return 0
+    try:
+        raw = base64.urlsafe_b64decode(value.encode() + b"=" * (-len(value) % 4))
+        decoded = json.loads(raw)
+        offset = int(decoded["offset"])
+        if offset < 0:
+            raise ValueError
+        return offset
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise ValueError("Invalid pagination cursor")
+
+
+def _next_cursor(offset):
+    raw = json.dumps({"offset": offset}, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _message_cursor(row):
+    raw = json.dumps({
+        "time": _message_datetime(row).isoformat(),
+        "id": str(row.get("_id") or ""),
+    }, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _message_boundary(value):
+    if not value:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value.encode() + b"=" * (-len(value) % 4))
+        decoded = json.loads(raw)
+        stamp = _datetime(decoded["time"])
+        if stamp is None:
+            raise ValueError
+        return (stamp.astimezone(dt.timezone.utc), str(decoded["id"]))
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise ValueError("Invalid pagination cursor")
+
+
+def _phone_constraints(phone):
+    # The stable suffix is deliberately used instead of an exact match: old rows
+    # contain '+', spaces and dashes. Results are normalised and checked again.
+    return [{"key": "phone", "constraint_type": "contains", "value": phone[-4:]}]
+
+
+def _bounded_message_rows(client, constraints, cap=INBOX_CACHE_ROWS):
+    """Merge Bubble's two sortable timestamp streams without an unbounded scan."""
+    timestamped = client.records(
+        "message", constraints, limit=cap,
+        sort_field="whatsapp_timestamp", descending=True,
+    )
+    created = client.records(
+        "message", constraints, limit=cap,
+        sort_field="Created Date", descending=True,
+    )
+    rows = {str(row.get("_id") or id(row)): row for row in timestamped + created}
+    return sorted(rows.values(), key=_message_key, reverse=True)[:cap]
 
 
 def _number(value):
@@ -123,6 +194,7 @@ def create_app(config=None):
         app.config.update(config)
 
     cache = TTLCache(60)
+    inbox_cache = TTLCache(10)
     attempts = defaultdict(deque)
     attempt_lock = threading.Lock()
 
@@ -242,34 +314,91 @@ def create_app(config=None):
     @require_api_auth
     def inbox_conversations():
         try:
+            offset = _cursor(request.args.get("cursor"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        query = request.args.get("search", "").strip().lower()[:100]
+        try:
             client = api()
-            messages = client.records(
-                "message", [], sort_field="whatsapp_timestamp", descending=True
-            )
-            latest = {}
-            for row in messages:
-                phone = _normal_phone(row.get("phone"))
-                if phone and (phone not in latest or
-                              _message_datetime(row) > _message_datetime(latest[phone])):
-                    latest[phone] = row
-            users = client.records("user", [])
-            names = {}
-            for user in users:
-                phone = _normal_phone(user.get("phone") or user.get("Phone"))
-                if phone:
-                    names[phone] = user.get("name") or user.get("Name")
-            output = [{
-                "phone": phone,
-                "name": names.get(phone) or phone,
-                "preview": _redact_inbox_content(row.get("messageContent"))[:120],
-                "timestamp": _message_time(row),
-                "direction": row.get("direction"),
-            } for phone, row in latest.items()]
-            output.sort(
-                key=lambda item: _message_datetime({"whatsapp_timestamp": item.get("timestamp")}),
-                reverse=True,
-            )
-            return jsonify({"conversations": output})
+            def load_conversations():
+                latest = {}
+                for row in _bounded_message_rows(client, [], INBOX_BUBBLE_PAGE):
+                    phone = _normal_phone(row.get("phone"))
+                    if phone and (phone not in latest or _message_key(row) > _message_key(latest[phone])):
+                        latest[phone] = row
+
+                # The user lookup is bounded and shared across Inbox requests.
+                users = inbox_cache.get_or_create("inbox-users", lambda: client.records(
+                    "user", [], limit=INBOX_CACHE_ROWS,
+                    sort_field="Modified Date", descending=True,
+                ))
+                names = {}
+                for user in users:
+                    phone = _normal_phone(user.get("phone") or user.get("Phone"))
+                    if phone:
+                        names[phone] = user.get("name") or user.get("Name")
+                output = [{
+                    "phone": phone, "name": names.get(phone) or phone,
+                    "preview": _redact_inbox_content(row.get("messageContent"))[:120],
+                    "timestamp": _message_time(row), "direction": row.get("direction"),
+                } for phone, row in latest.items()]
+                return sorted(output, key=lambda item: (
+                    _message_datetime({"whatsapp_timestamp": item.get("timestamp")}),
+                    item["phone"],
+                ), reverse=True)
+
+            output = inbox_cache.get_or_create("inbox-conversations", load_conversations)
+            if query:
+                local = [item for item in output if query in
+                         f'{item["name"]} {item["phone"]}'.lower()]
+
+                def remote_search():
+                    rows, names = [], {}
+                    digits = _normal_phone(query)
+                    if len(digits) >= 4:
+                        rows.extend(_bounded_message_rows(
+                            client, _phone_constraints(digits), INBOX_BUBBLE_PAGE
+                        ))
+                    users = client.records("user", [{
+                        "key": "name", "constraint_type": "contains", "value": query,
+                    }], limit=INBOX_PAGE_SIZE,
+                                      sort_field="Modified Date", descending=True)
+                    for user in users:
+                        user_phone = _normal_phone(user.get("phone") or user.get("Phone"))
+                        if not user_phone:
+                            continue
+                        names[user_phone] = user.get("name") or user.get("Name") or user_phone
+                        rows.extend(_bounded_message_rows(
+                            client, _phone_constraints(user_phone), INBOX_PAGE_SIZE
+                        ))
+                    latest = {}
+                    for row in rows:
+                        row_phone = _normal_phone(row.get("phone"))
+                        if row_phone and (not digits or digits in row_phone or row_phone in names):
+                            if row_phone not in latest or _message_key(row) > _message_key(latest[row_phone]):
+                                latest[row_phone] = row
+                    return [{
+                        "phone": item_phone, "name": names.get(item_phone) or item_phone,
+                        "preview": _redact_inbox_content(row.get("messageContent"))[:120],
+                        "timestamp": _message_time(row), "direction": row.get("direction"),
+                    } for item_phone, row in sorted(
+                        latest.items(), key=lambda item: _message_key(item[1]), reverse=True
+                    )]
+
+                remote = inbox_cache.get_or_create(f"inbox-search:{query}", remote_search)
+                combined = {item["phone"]: item for item in remote}
+                combined.update({item["phone"]: item for item in local})
+                output = sorted(combined.values(), key=lambda item: (
+                    _message_datetime({"whatsapp_timestamp": item.get("timestamp")}),
+                    item["phone"],
+                ), reverse=True)
+            page = output[offset:offset + INBOX_PAGE_SIZE]
+            next_offset = offset + len(page)
+            has_more = next_offset < len(output)
+            return jsonify({
+                "conversations": page, "has_more": has_more,
+                "next_cursor": _next_cursor(next_offset) if has_more else None,
+            })
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503
 
@@ -280,11 +409,58 @@ def create_app(config=None):
         if not _phone_valid(phone):
             return jsonify({"error": "Invalid phone number"}), 400
         try:
-            # Historical rows may contain punctuation or a leading plus. Fetching
-            # and normalising avoids splitting one WhatsApp identity into threads.
-            rows = [row for row in api().records(
-                "message", [], sort_field="whatsapp_timestamp", descending=False
-            ) if _normal_phone(row.get("phone")) == phone]
+            boundary = _message_boundary(request.args.get("cursor"))
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        since = _datetime(request.args.get("since"))
+        try:
+            client = api()
+            state = inbox_cache.get_or_create(f"inbox-messages:{phone}", lambda: {
+                "rows": {}, "offsets": {"whatsapp_timestamp": 0, "Created Date": 0},
+                "more": {"whatsapp_timestamp": True, "Created Date": True},
+            })
+
+            def fetch_batch():
+                changed = False
+                for field in ("whatsapp_timestamp", "Created Date"):
+                    if not state["more"][field]:
+                        continue
+                    found, more = client.bounded_page(
+                        "message", _phone_constraints(phone),
+                        cursor=state["offsets"][field], limit=INBOX_PAGE_SIZE,
+                        sort_field=field, descending=True,
+                    )
+                    state["offsets"][field] += len(found)
+                    state["more"][field] = more
+                    for row in found:
+                        if _normal_phone(row.get("phone")) == phone:
+                            state["rows"][str(row.get("_id") or id(row))] = row
+                            changed = True
+                return changed
+
+            if not state["rows"]:
+                fetch_batch()
+            rows = sorted(state["rows"].values(), key=_message_key, reverse=True)
+            if not since:
+                eligible = [row for row in rows if boundary is None or _message_key(row) < boundary]
+                while len(eligible) < INBOX_PAGE_SIZE and any(state["more"].values()):
+                    if not fetch_batch():
+                        break
+                    rows = sorted(state["rows"].values(), key=_message_key, reverse=True)
+                    eligible = [row for row in rows if boundary is None or _message_key(row) < boundary]
+            if since:
+                selected = [row for row in rows if _message_datetime(row) >= since]
+                # Refresh responses are chronological and include equal timestamps;
+                # the browser de-duplicates by immutable Bubble id.
+                selected.sort(key=_message_key)
+                has_more = False
+                next_value = None
+            else:
+                eligible = [row for row in rows if boundary is None or _message_key(row) < boundary]
+                selected = eligible[:INBOX_PAGE_SIZE]
+                has_more = len(eligible) > len(selected) or any(state["more"].values())
+                next_value = _message_cursor(selected[-1]) if has_more and selected else None
+                selected = list(reversed(selected))
             messages = [{
                 "id": row.get("_id"), "phone": phone,
                 "direction": row.get("direction"),
@@ -294,11 +470,11 @@ def create_app(config=None):
                 "timestamp": _message_time(row),
                 "status": row.get("whatsapp_status"),
                 "error": _redact_inbox_content(row.get("whatsapp_error")),
-            } for row in rows]
-            messages.sort(
-                key=lambda item: _message_datetime({"whatsapp_timestamp": item.get("timestamp")})
-            )
-            return jsonify({"phone": phone, "messages": messages})
+            } for row in selected]
+            return jsonify({
+                "phone": phone, "messages": messages, "has_more": has_more,
+                "next_cursor": next_value,
+            })
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503
 

@@ -68,6 +68,20 @@ class BubbleAPI:
             f"obj/{object_type}", self._params(constraints, **params), object_type
         )
 
+    def bounded_page(self, object_type: str, constraints=None, cursor=0, limit=30,
+                     **params) -> tuple[list[dict], bool]:
+        """Return one validated Bubble page; never follow `remaining` implicitly."""
+        if not 1 <= limit <= 100 or cursor < 0:
+            raise ValueError("Invalid Bubble page bounds")
+        payload = self.page(
+            object_type, constraints, cursor=cursor, limit=limit, **params
+        )
+        results = payload.get("results") or []
+        remaining = payload.get("remaining", 0)
+        if not isinstance(results, list) or not isinstance(remaining, int):
+            raise BubbleAPIError("Bubble returned invalid pagination metadata")
+        return results, remaining > 0
+
     def count(self, object_type: str, constraints=None) -> int:
         # Bubble's `remaining` is the number after this page. Requesting one row
         # keeps counts cheap while remaining + returned rows gives the exact total.
