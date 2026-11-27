@@ -65,47 +65,69 @@ def _relationship_ids(value) -> list[str]:
 
 def build_external_lookup(lead, matches, development_records, lead_id,
                           classify_match):
-    """Build a scrape request for a resolved single-development no-Tier-1 lead."""
+    """Build one scrape request per resolved development without a Tier 1 match."""
     if not external_scraper_enabled():
-        return None
+        return []
     transactions = set(lead.get("TransactionType") or [])
     if "Rent/Let" not in transactions or "Buy/Sell" in transactions:
-        return None
+        return []
 
-    development_ids = _relationship_ids(lead.get("preferredDevelopments"))
-    if len(development_ids) != 1:
-        return None
+    development_ids = list(dict.fromkeys(
+        _relationship_ids(lead.get("preferredDevelopments"))
+    ))
     by_id = {
         str(record.get("_id")): record
         for record in development_records or [] if record.get("_id")
     }
-    development_record = by_id.get(development_ids[0])
-    development = str(
-        (development_record or {}).get("name")
-        or (development_record or {}).get("Name")
-        or ""
-    ).strip()
-    if not development:
-        return None
 
     budget = _number(lead.get("budgetRent"), positive=True)
     bedrooms = _number(lead.get("bedroomsMin"), nonnegative=True)
     if budget is None or bedrooms is None:
-        return None
+        return []
     internal_matches = [
         listing for listing in matches or []
         if not is_scraped_listing(listing)
     ]
-    if any(classify_match(lead, listing) == 1 for listing in internal_matches):
-        return None
-
-    return {
-        "lead_id": str(lead_id),
-        "development_id": development_ids[0],
-        "development": development,
-        "bedrooms_min": bedrooms,
-        "budget_rent": budget,
-    }
+    lookups = []
+    for development_id in development_ids:
+        development_record = by_id.get(development_id)
+        development = str(
+            (development_record or {}).get("name")
+            or (development_record or {}).get("Name")
+            or ""
+        ).strip()
+        if not development:
+            print(
+                f"{LOG_PREFIX} development_id={development_id} "
+                "action=skipped reason=development_unresolved",
+                flush=True,
+            )
+            continue
+        tier_one_exists = any(
+            development_id in _relationship_ids(listing.get("development"))
+            and classify_match(lead, listing) == 1
+            for listing in internal_matches
+        )
+        if tier_one_exists:
+            print(
+                f"{LOG_PREFIX} development={development} "
+                "action=skipped reason=internal_tier1_exists",
+                flush=True,
+            )
+            continue
+        print(
+            f"{LOG_PREFIX} development={development} "
+            "action=eligible reason=no_internal_tier1",
+            flush=True,
+        )
+        lookups.append({
+            "lead_id": str(lead_id),
+            "development_id": development_id,
+            "development": development,
+            "bedrooms_min": bedrooms,
+            "budget_rent": budget,
+        })
+    return lookups
 
 
 def _valid_listing_url(value) -> bool:
@@ -220,7 +242,7 @@ def run_external_lookup(lookup, phone, *, send_text, save_message,
     """Execute one already-deduplicated job and persist its outbound segments.
 
     Durable infrastructure must claim the stable job key
-    ``external_iproperty:<lead_id>`` before calling this function.
+    ``iproperty:<lead_id>:<development_id>`` before calling this function.
     """
     matches = fetch_external_matches(lookup, request_post=request_post)
     if matches is None:
@@ -260,11 +282,33 @@ def enqueue_external_lookup(lookup, phone, bubble_env="live"):
         return None, False
     app = _bubble()
     base_url = app.get_bubble_base_url(bubble_env)
-    job_key = f"iproperty:{lookup['lead_id']}"
+    job_key = f"iproperty:{lookup['lead_id']}:{lookup['development_id']}"
     constraints = [{"key": "jobKey", "constraint_type": "equals", "value": job_key}]
     existing = next(iter(app._bubble_records(base_url, JOB_TYPE, constraints)), None)
     if existing and existing.get("_id"):
         return str(existing["_id"]), False
+
+    # Jobs created before development-specific keys must still suppress a
+    # duplicate notification for the development stored in their payload.
+    legacy_key = f"iproperty:{lookup['lead_id']}"
+    legacy_constraints = [
+        {"key": "jobKey", "constraint_type": "equals", "value": legacy_key}
+    ]
+    legacy = next(iter(app._bubble_records(
+        base_url, JOB_TYPE, legacy_constraints
+    )), None)
+    if legacy and legacy.get("_id"):
+        try:
+            legacy_lookup = json.loads(legacy.get("payload") or "{}")
+        except (TypeError, ValueError):
+            legacy_lookup = {}
+        legacy_development_id = str(
+            legacy_lookup.get("development_id") or ""
+        ).strip()
+        if not legacy_development_id or legacy_development_id == str(
+            lookup["development_id"]
+        ):
+            return str(legacy["_id"]), False
     payload = {
         "jobKey": job_key,
         "lead": lookup["lead_id"],

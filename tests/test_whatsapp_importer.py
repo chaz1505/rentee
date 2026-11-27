@@ -12,6 +12,7 @@ os.environ.setdefault("BUBBLE_API_TOKEN", "test-token")
 
 import whatsapp_importer as importer
 import development_resolver as resolver
+import external_scraper
 
 
 FIND_IMPORT_MATCHES = importer.find_import_matches
@@ -3225,6 +3226,69 @@ Polygon Properties
         send.assert_called_once_with("60123456789", "Added lead.")
         base_url.assert_not_called()
         reply_context.assert_not_called()
+
+    def test_whatsapp_import_enqueues_each_external_development(self):
+        app = importer.rentee_app
+        text = "Want To Rent at One Menerung or The Troika"
+        message = {
+            "id": "wamid.import-multi", "from": "60123456789", "type": "text",
+            "text": {"body": text},
+        }
+        lookups = [
+            {"lead_id": "lead-1", "development_id": "dev-one",
+             "development": "One Menerung"},
+            {"lead_id": "lead-1", "development_id": "dev-troika",
+             "development": "The Troika"},
+        ]
+        imported = {
+            "status": "processed", "type": "lead", "bubble_id": "lead-1",
+            "confirmation": "Added lead.", "external_lookups": lookups,
+        }
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+             patch.object(app, "_stop_whatsapp_typing"), \
+             patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent", return_value={"intent": "lead_import"}), \
+             patch.object(importer, "process_whatsapp_import", return_value=imported), \
+             patch.object(app, "send_whatsapp_text"), \
+             patch.object(external_scraper, "enqueue_external_lookup",
+                          side_effect=[("job-1", True), ("job-2", True)]) as enqueue:
+            app._process_whatsapp_message(message)
+
+        self.assertEqual(enqueue.call_args_list, [
+            call(lookups[0], "60123456789", "live"),
+            call(lookups[1], "60123456789", "live"),
+        ])
+
+    def test_external_enqueue_failure_does_not_block_other_developments(self):
+        app = importer.rentee_app
+        text = "Want To Rent at One Menerung or The Troika"
+        message = {
+            "id": "wamid.import-multi-failure", "from": "60123456789",
+            "type": "text", "text": {"body": text},
+        }
+        lookups = [
+            {"lead_id": "lead-1", "development_id": "dev-one",
+             "development": "One Menerung"},
+            {"lead_id": "lead-1", "development_id": "dev-troika",
+             "development": "The Troika"},
+        ]
+        imported = {
+            "status": "processed", "type": "lead", "bubble_id": "lead-1",
+            "confirmation": "Added lead.", "external_lookups": lookups,
+        }
+        with patch.object(app, "RENTEE_MODE", "simple"), \
+             patch.object(app, "whatsapp_typing_keepalive", return_value=MagicMock()), \
+             patch.object(app, "_stop_whatsapp_typing"), \
+             patch.object(app, "resolve_whatsapp_user", return_value={"_id": "user-1"}), \
+             patch.object(importer, "detect_import_intent", return_value={"intent": "lead_import"}), \
+             patch.object(importer, "process_whatsapp_import", return_value=imported), \
+             patch.object(app, "send_whatsapp_text"), \
+             patch.object(external_scraper, "enqueue_external_lookup",
+                          side_effect=[RuntimeError("Bubble unavailable"), ("job-2", True)]) as enqueue:
+            app._process_whatsapp_message(message)
+
+        self.assertEqual(enqueue.call_count, 2)
 
     def test_whatsapp_simple_mode_listing_import_returns_before_conversation_routing(self):
         app = importer.rentee_app

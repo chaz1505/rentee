@@ -37,25 +37,26 @@ class ExternalScraperEligibilityTests(unittest.TestCase):
     def test_feature_flag_is_disabled_by_default_and_requires_true(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertFalse(external_scraper.external_scraper_enabled())
-            self.assertIsNone(self.lookup())
+            self.assertEqual(self.lookup(), [])
         with patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": " TRUE "}, clear=True):
             self.assertTrue(external_scraper.external_scraper_enabled())
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_eligible_rental_lead_without_tier_one_builds_lookup(self):
-        self.assertEqual(self.lookup(), {
+        self.assertEqual(self.lookup(), [{
             "lead_id": "lead-1", "development": "One Menerung",
             "development_id": "dev-one",
             "bedrooms_min": 3, "budget_rent": 15000,
-        })
+        }])
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_tier_one_blocks_lookup_but_tier_two_and_three_do_not(self):
         listing = {"_id": "listing-1"}
-        self.assertIsNone(self.lookup(eligible_lead(), [listing],
-                                      lambda _lead, _listing: 1))
+        listing["development"] = "dev-one"
+        self.assertEqual(self.lookup(eligible_lead(), [listing],
+                                     lambda _lead, _listing: 1), [])
         for tier in (2, 3):
-            self.assertIsNotNone(self.lookup(matches=[listing], classifier=(
+            self.assertTrue(self.lookup(matches=[listing], classifier=(
                 lambda _lead, _listing, value=tier: value
             )))
 
@@ -66,16 +67,16 @@ class ExternalScraperEligibilityTests(unittest.TestCase):
                 "_id": "listing-cached", "source": "iproperty",
                 "scraped?": value,
             }
-            self.assertIsNotNone(self.lookup(
+            self.assertTrue(self.lookup(
                 matches=[cached], classifier=lambda _lead, _listing: 1
             ))
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_sale_or_mixed_transaction_blocks_lookup(self):
         for transactions in (["Buy/Sell"], ["Rent/Let", "Buy/Sell"]):
-            self.assertIsNone(self.lookup(eligible_lead(
+            self.assertEqual(self.lookup(eligible_lead(
                 TransactionType=transactions
-            )))
+            )), [])
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_any_single_resolved_named_development_builds_lookup(self):
@@ -87,24 +88,50 @@ class ExternalScraperEligibilityTests(unittest.TestCase):
             lookup = self.lookup(eligible_lead(
                 preferredDevelopments=[development_id]
             ))
-            self.assertEqual(lookup["development_id"], development_id)
-            self.assertEqual(lookup["development"], development_name)
+            self.assertEqual(lookup[0]["development_id"], development_id)
+            self.assertEqual(lookup[0]["development"], development_name)
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
-    def test_development_must_be_single_and_resolved_with_a_name(self):
-        for preferred in ([], ["dev-one", "dev-other"], ["missing"],
-                          ["dev-unnamed"]):
-            self.assertIsNone(self.lookup(eligible_lead(
+    def test_multiple_developments_are_deduplicated_and_resolved(self):
+        lookups = self.lookup(eligible_lead(
+            preferredDevelopments=["dev-one", "dev-other", "dev-one"]
+        ))
+        self.assertEqual(
+            [item["development_id"] for item in lookups],
+            ["dev-one", "dev-other"],
+        )
+        for preferred in ([], ["missing"], ["dev-unnamed"]):
+            self.assertEqual(self.lookup(eligible_lead(
                 preferredDevelopments=preferred
-            )))
+            )), [])
+
+    @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
+    def test_tier_one_only_blocks_its_own_development(self):
+        lead = eligible_lead(
+            preferredDevelopments=["dev-one", "dev-troika"]
+        )
+        one_match = {"_id": "listing-1", "development": "dev-one"}
+        lookups = self.lookup(
+            lead, [one_match], lambda _lead, _listing: 1
+        )
+        self.assertEqual(
+            [item["development_id"] for item in lookups], ["dev-troika"]
+        )
+        both_matches = [
+            one_match,
+            {"_id": "listing-2", "development": ["dev-troika"]},
+        ]
+        self.assertEqual(
+            self.lookup(lead, both_matches, lambda _lead, _listing: 1), []
+        )
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
     def test_budget_and_bedrooms_must_be_valid_numbers(self):
         for budget in (None, 0, -1, True, "15000"):
-            self.assertIsNone(self.lookup(eligible_lead(budgetRent=budget)))
+            self.assertEqual(self.lookup(eligible_lead(budgetRent=budget)), [])
         for bedrooms in (None, -1, True, "3"):
-            self.assertIsNone(self.lookup(eligible_lead(bedroomsMin=bedrooms)))
-        self.assertIsNotNone(self.lookup(eligible_lead(bedroomsMin=0)))
+            self.assertEqual(self.lookup(eligible_lead(bedroomsMin=bedrooms)), [])
+        self.assertTrue(self.lookup(eligible_lead(bedroomsMin=0)))
 
 
 class ExternalScraperClientTests(unittest.TestCase):
@@ -506,14 +533,72 @@ class ExternalBubblePersistenceTests(unittest.TestCase):
         self.assertEqual(result, ("match-fresh", True))
 
     @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
-    def test_enqueue_deduplicates_by_stable_lead_job_key(self):
-        existing = {"_id": "job-existing", "jobKey": "iproperty:lead-1"}
+    def test_enqueue_deduplicates_same_lead_and_development(self):
+        existing = {
+            "_id": "job-existing",
+            "jobKey": "iproperty:lead-1:dev-one",
+        }
         self.app._bubble_records.return_value = [existing]
         result = external_scraper.enqueue_external_lookup(
             self.lookup, "60123456789"
         )
         self.assertEqual(result, ("job-existing", False))
         self.app._bubble_create.assert_not_called()
+
+    @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
+    def test_enqueue_allows_different_development_for_same_lead(self):
+        self.app._bubble_records.return_value = []
+        self.app._bubble_create.return_value = "job-two"
+        lookup = dict(
+            self.lookup, development_id="dev-troika", development="The Troika"
+        )
+
+        result = external_scraper.enqueue_external_lookup(
+            lookup, "60123456789"
+        )
+
+        self.assertEqual(result, ("job-two", True))
+        payload = self.app._bubble_create.call_args.args[2]
+        self.assertEqual(payload["jobKey"], "iproperty:lead-1:dev-troika")
+
+    @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
+    def test_legacy_job_key_deduplicates_its_payload_development(self):
+        for status in ("Queued", "Running", "Completed"):
+            with self.subTest(status=status):
+                legacy = {
+                    "_id": "job-legacy", "jobKey": "iproperty:lead-1",
+                    "payload": __import__("json").dumps(self.lookup),
+                    "status": status,
+                    "notificationSent": status == "Completed",
+                }
+                self.app._bubble_records.side_effect = [[], [legacy]]
+
+                result = external_scraper.enqueue_external_lookup(
+                    self.lookup, "60123456789"
+                )
+
+                self.assertEqual(result, ("job-legacy", False))
+        self.app._bubble_create.assert_not_called()
+
+    @patch.dict(os.environ, {"EXTERNAL_SCRAPER_ENABLED": "true"})
+    def test_legacy_job_for_other_development_does_not_block(self):
+        legacy = {
+            "_id": "job-legacy", "jobKey": "iproperty:lead-1",
+            "payload": __import__("json").dumps(dict(
+                self.lookup, development_id="dev-troika",
+                development="The Troika",
+            )),
+        }
+        self.app._bubble_records.side_effect = [[], [legacy]]
+        self.app._bubble_create.return_value = "job-one"
+
+        result = external_scraper.enqueue_external_lookup(
+            self.lookup, "60123456789"
+        )
+
+        self.assertEqual(result, ("job-one", True))
+        payload = self.app._bubble_create.call_args.args[2]
+        self.assertEqual(payload["jobKey"], "iproperty:lead-1:dev-one")
 
     def test_followup_uses_only_original_listing_links(self):
         second_url = "https://www.iproperty.com.my/listing/external-2"

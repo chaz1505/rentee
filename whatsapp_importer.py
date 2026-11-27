@@ -3152,9 +3152,9 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
     matches = find_import_matches(
         parsed["type"], created_record, bubble_env
     )
-    external_lookup = None
+    external_lookups = []
     if parsed["type"] == "lead":
-        external_lookup = external_scraper.build_external_lookup(
+        external_lookups = external_scraper.build_external_lookup(
             created_record, matches, development_records, bubble_id,
             classify_match,
         )
@@ -3167,7 +3167,7 @@ def process_whatsapp_import(raw_text: str, bubble_env: str = "live", *,
         geo_records=geo_records, match_scores=match_scores,
     )
     result["matches"] = matches
-    result["external_lookup"] = external_lookup
+    result["external_lookups"] = external_lookups
     result["confirmation"] += "\n\n" + format_import_matches(
         parsed["type"], created_record, matches,
         development_records, bubble_env, geo_records, match_scores,
