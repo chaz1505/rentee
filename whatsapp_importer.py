@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from typing import Any, Iterable
 
 import app as rentee_app
@@ -2189,6 +2190,53 @@ def _scoring_record(record, development_records=None, geo_records=None) -> dict:
     return value
 
 
+def _match_scoring_field(value, name, default=None):
+    """Read a response metadata field without assuming SDK object shapes."""
+    try:
+        if isinstance(value, dict):
+            return value.get(name, default)
+        return getattr(value, name, default)
+    except Exception:
+        return default
+
+
+def _log_match_scoring_response(response, candidate_count, duration,
+                                json_error=None, response_length=None):
+    """Best-effort, non-sensitive scoring diagnostics that can never break scoring."""
+    try:
+        status = _match_scoring_field(response, "status", "unknown") or "unknown"
+        incomplete = _match_scoring_field(response, "incomplete_details")
+        incomplete_reason = _match_scoring_field(incomplete, "reason")
+        usage = _match_scoring_field(response, "usage")
+        input_tokens = _match_scoring_field(usage, "input_tokens")
+        output_tokens = _match_scoring_field(usage, "output_tokens")
+        output_details = _match_scoring_field(usage, "output_tokens_details")
+        reasoning_tokens = _match_scoring_field(output_details, "reasoning_tokens")
+        fields = [
+            f"status={status}",
+            f"incomplete_reason={incomplete_reason or 'none'}",
+            f"input_tokens={input_tokens if input_tokens is not None else 'unknown'}",
+            f"output_tokens={output_tokens if output_tokens is not None else 'unknown'}",
+            f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'unknown'}",
+            f"candidates={int(candidate_count)}",
+            f"duration_seconds={float(duration):.3f}",
+        ]
+        if json_error is not None:
+            error_message = str(getattr(json_error, "msg", "unknown"))
+            error_message = re.sub(r"[^A-Za-z0-9 _.,:;()'\"-]", "?", error_message)[:160]
+            fields.extend([
+                "json_error=JSONDecodeError",
+                f"json_error_message={error_message}",
+                f"json_error_line={getattr(json_error, 'lineno', 'unknown')}",
+                f"json_error_column={getattr(json_error, 'colno', 'unknown')}",
+                f"json_error_position={getattr(json_error, 'pos', 'unknown')}",
+                f"response_length={response_length if response_length is not None else 'unknown'}",
+            ])
+        print("[MATCH SCORING] response " + " ".join(fields), flush=True)
+    except Exception:
+        pass
+
+
 def score_import_matches(created_type, created_record, matches,
                          development_records=None, geo_records=None) -> dict[str, dict]:
     """Score eligible candidates in batches; return only strictly valid results."""
@@ -2213,6 +2261,7 @@ def score_import_matches(created_type, created_record, matches,
                 match, development_records, geo_records
             )} for record_id, match in batch],
         }
+        request_started = time.monotonic()
         try:
             response = rentee_app.client.responses.create(
                 model="gpt-5-mini",
@@ -2232,7 +2281,7 @@ def score_import_matches(created_type, created_record, matches,
                     "Give one brief factual reason per candidate.\n\nDATA:\n" +
                     json.dumps(payload, ensure_ascii=False, default=str)
                 ),
-                reasoning={"effort": "low"}, max_output_tokens=2000, timeout=30,
+                reasoning={"effort": "low"}, max_output_tokens=4000, timeout=60,
                 text={"format": {"type": "json_schema", "name": "import_match_scores",
                     "strict": True, "schema": {
                         "type": "object", "properties": {
@@ -2247,7 +2296,17 @@ def score_import_matches(created_type, created_record, matches,
                         }, "required": ["matches"], "additionalProperties": False,
                     }}},
             )
-            value = json.loads(str(response.output_text or ""))
+            request_duration = time.monotonic() - request_started
+            _log_match_scoring_response(response, len(batch), request_duration)
+            response_text = str(response.output_text or "")
+            try:
+                value = json.loads(response_text)
+            except json.JSONDecodeError as error:
+                _log_match_scoring_response(
+                    response, len(batch), request_duration,
+                    json_error=error, response_length=len(response_text),
+                )
+                raise
             returned = value.get("matches")
             if not isinstance(returned, list):
                 raise ValueError("missing matches array")

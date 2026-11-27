@@ -2927,12 +2927,60 @@ IQI Realty"""
                           side_effect=[first, second]) as create:
             scores = importer.score_import_matches("lead", {}, matches)
         self.assertEqual(create.call_count, 2)
+        self.assertEqual(create.call_args_list[0].kwargs["max_output_tokens"], 4000)
+        self.assertEqual(create.call_args_list[0].kwargs["timeout"], 60)
         self.assertEqual(len(scores), 21)
         self.assertEqual(scores["listing-20"]["score"], 91)
         prompt = create.call_args_list[0].kwargs["input"]
         self.assertIn("Missing facts are unknown, not matches", prompt)
         self.assertIn("information is unconfirmed", prompt)
         self.assertIn("Do not apply a fixed or arbitrary penalty", prompt)
+
+    def test_scoring_logs_safe_response_metadata_and_json_error_details(self):
+        response = SimpleNamespace(
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            usage=SimpleNamespace(
+                input_tokens=321,
+                output_tokens=4000,
+                output_tokens_details=SimpleNamespace(reasoning_tokens=123),
+            ),
+            output_text='{"matches": [',
+        )
+        with patch.object(importer.rentee_app.client.responses, "create",
+                          return_value=response), patch("builtins.print") as log:
+            scores = importer.score_import_matches(
+                "lead", {}, [{"_id": "listing-1"}]
+            )
+        self.assertEqual(scores, {})
+        rendered = "\n".join(str(call) for call in log.call_args_list)
+        self.assertIn("status=incomplete", rendered)
+        self.assertIn("incomplete_reason=max_output_tokens", rendered)
+        self.assertIn("input_tokens=321", rendered)
+        self.assertIn("output_tokens=4000", rendered)
+        self.assertIn("reasoning_tokens=123", rendered)
+        self.assertIn("candidates=1", rendered)
+        self.assertIn("duration_seconds=", rendered)
+        self.assertIn("json_error=JSONDecodeError", rendered)
+        self.assertIn("json_error_message=Expecting value", rendered)
+        self.assertIn("json_error_line=1", rendered)
+        self.assertIn("response_length=13", rendered)
+        self.assertNotIn(response.output_text, rendered)
+
+    def test_scoring_diagnostic_failure_does_not_discard_scores(self):
+        response = SimpleNamespace(output_text=json.dumps({"matches": [
+            {"id": "listing-1", "score": 90, "reason": "Exact development"},
+        ]}))
+        with patch.object(importer.rentee_app.client.responses, "create",
+                          return_value=response), \
+             patch.object(importer, "_match_scoring_field",
+                          side_effect=RuntimeError("metadata failed")):
+            scores = importer.score_import_matches(
+                "lead", {}, [{"_id": "listing-1"}]
+            )
+        self.assertEqual(scores, {
+            "listing-1": {"score": 90, "reason": "Exact development"},
+        })
 
     def test_scoring_keeps_valid_partial_results_and_rejects_bad_ids(self):
         response = SimpleNamespace(output_text=json.dumps({"matches": [
