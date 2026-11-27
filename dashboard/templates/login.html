@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in · Rentee Dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body class="login-page">
+  <main class="login-card">
+    <div class="brand"><span class="brand-mark">R</span><span>rentee</span></div>
+    <p class="eyebrow">Private dashboard</p>
+    <h1>Welcome, Gwen</h1>
+    <p class="muted">Sign in to view the latest Rentee network activity.</p>
+    {% if error %}<div class="notice error" role="alert">{{ error }}</div>{% endif %}
+    {% if auth_configured is not sameas false %}<form method="post" class="login-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="password">Dashboard password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit" class="primary">Sign in</button>
+    </form>{% endif %}
+  </main>
+</body>
+</html>
