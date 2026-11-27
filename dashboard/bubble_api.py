@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class BubbleAPIError(RuntimeError):
@@ -24,7 +27,9 @@ class BubbleAPI:
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {token}"})
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
+    def _get(
+        self, path: str, params: dict | None = None, object_type: str = "unknown"
+    ) -> dict:
         try:
             response = self._session.get(
                 f"{self.base_url}/{path.lstrip('/')}", params=params,
@@ -35,7 +40,20 @@ class BubbleAPI:
             if not isinstance(payload, dict):
                 raise BubbleAPIError("Bubble returned an invalid response")
             return payload
+        except requests.Timeout as exc:
+            logger.warning(
+                "Bubble API request failed: object_type=%s status=%s reason=%s timeout=%s",
+                object_type, "none", "timeout", self.timeout,
+            )
+            raise BubbleAPIError("Bubble data is temporarily unavailable") from exc
         except (requests.RequestException, ValueError, TypeError) as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            reason = getattr(response, "reason", None) or type(exc).__name__
+            logger.warning(
+                "Bubble API request failed: object_type=%s status=%s reason=%s",
+                object_type, status if status is not None else "none", reason,
+            )
             raise BubbleAPIError("Bubble data is temporarily unavailable") from exc
 
     @staticmethod
@@ -47,7 +65,7 @@ class BubbleAPI:
 
     def page(self, object_type: str, constraints=None, **params) -> dict:
         return self._get(
-            f"obj/{object_type}", self._params(constraints, **params)
+            f"obj/{object_type}", self._params(constraints, **params), object_type
         )
 
     def count(self, object_type: str, constraints=None) -> int:

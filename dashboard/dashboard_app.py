@@ -83,7 +83,8 @@ def create_app(config=None):
             start -= dt.timedelta(days=6)
         elif period == "30d":
             start -= dt.timedelta(days=29)
-        return [{"key": "Created Date", "constraint_type": "greater than or equal", "value": start.isoformat()}]
+        start -= dt.timedelta(milliseconds=1)
+        return [{"key": "Created Date", "constraint_type": "greater than", "value": start.isoformat()}]
 
     def alert_date_constraints(period):
         constraints = [{"key": "alert_sent", "constraint_type": "equals", "value": True}]

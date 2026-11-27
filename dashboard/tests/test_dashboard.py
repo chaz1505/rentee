@@ -67,7 +67,9 @@ class DashboardTestCase(unittest.TestCase):
         self.assertEqual(queries["leads"][1][0]["key"], "Created Date")
         self.assertEqual(queries["alerts_sent"][1][0]["key"], "alert_sent")
         self.assertEqual(queries["alerts_sent"][1][1]["key"], "alert_sent_at")
-        self.assertIn("+08:00", queries["leads"][1][0]["value"])
+        date_filter = queries["leads"][1][0]
+        self.assertEqual(date_filter["constraint_type"], "greater than")
+        self.assertRegex(date_filter["value"], r"T23:59:59\.999000\+08:00$")
 
     @patch("dashboard_app.parallel_counts", side_effect=BubbleAPIError("unavailable"))
     def test_api_error_is_not_zero(self, _counts):
@@ -129,8 +131,32 @@ class BubbleClientTests(unittest.TestCase):
     @patch("bubble_api.requests.Session.get")
     def test_http_errors_are_sanitized(self, get):
         get.side_effect = __import__("requests").Timeout("secret details")
-        with self.assertRaisesRegex(BubbleAPIError, "temporarily unavailable"):
-            BubbleAPI("https://bubble.test", "token").count("lead")
+        with self.assertLogs("bubble_api", level="WARNING") as logs:
+            with self.assertRaisesRegex(BubbleAPIError, "temporarily unavailable"):
+                BubbleAPI("https://bubble.test", "secret-token").count("lead")
+        message = logs.output[0]
+        self.assertIn("object_type=lead", message)
+        self.assertIn("reason=timeout", message)
+        self.assertIn("timeout=(3.05, 12)", message)
+        self.assertNotIn("secret details", message)
+        self.assertNotIn("secret-token", message)
+
+    @patch("bubble_api.requests.Session.get")
+    def test_http_status_and_reason_are_logged_without_response_contents(self, get):
+        response = Mock(status_code=503, reason="Service Unavailable")
+        response.raise_for_status.side_effect = __import__("requests").HTTPError(
+            "private record contents", response=response
+        )
+        get.return_value = response
+        with self.assertLogs("bubble_api", level="WARNING") as logs:
+            with self.assertRaisesRegex(BubbleAPIError, "temporarily unavailable"):
+                BubbleAPI("https://bubble.test", "secret-token").count("listing")
+        message = logs.output[0]
+        self.assertIn("object_type=listing", message)
+        self.assertIn("status=503", message)
+        self.assertIn("reason=Service Unavailable", message)
+        self.assertNotIn("private record contents", message)
+        self.assertNotIn("secret-token", message)
 
     def test_cache_coalesces_concurrent_refresh_and_expires(self):
         cache = TTLCache(.03)
