@@ -99,9 +99,16 @@ def _message_boundary(value):
 
 
 def _phone_constraints(phone):
-    # The stable suffix is deliberately used instead of an exact match: old rows
-    # contain '+', spaces and dashes. Results are normalised and checked again.
-    return [{"key": "phone", "constraint_type": "contains", "value": phone[-4:]}]
+    return [{"key": "phone", "constraint_type": "equals", "value": _normal_phone(phone)}]
+
+
+def _phone_constraint_sets(phone):
+    """Exact current format first, plus a bounded legacy-format lookup."""
+    normal = _normal_phone(phone)
+    return [
+        _phone_constraints(normal),
+        [{"key": "phone", "constraint_type": "text contains", "value": normal[-4:]}],
+    ]
 
 
 def _bounded_message_rows(client, constraints, cap=INBOX_CACHE_ROWS):
@@ -115,6 +122,15 @@ def _bounded_message_rows(client, constraints, cap=INBOX_CACHE_ROWS):
         sort_field="Created Date", descending=True,
     )
     rows = {str(row.get("_id") or id(row)): row for row in timestamped + created}
+    return sorted(rows.values(), key=_message_key, reverse=True)[:cap]
+
+
+def _bounded_phone_message_rows(client, phone, cap=INBOX_CACHE_ROWS):
+    rows = {}
+    for constraints in _phone_constraint_sets(phone):
+        for row in _bounded_message_rows(client, constraints, cap):
+            if _normal_phone(row.get("phone")) == _normal_phone(phone):
+                rows[str(row.get("_id") or id(row))] = row
     return sorted(rows.values(), key=_message_key, reverse=True)[:cap]
 
 
@@ -357,11 +373,17 @@ def create_app(config=None):
                     rows, names = [], {}
                     digits = _normal_phone(query)
                     if len(digits) >= 4:
-                        rows.extend(_bounded_message_rows(
-                            client, _phone_constraints(digits), INBOX_BUBBLE_PAGE
-                        ))
+                        if _phone_valid(digits):
+                            rows.extend(_bounded_phone_message_rows(
+                                client, digits, INBOX_BUBBLE_PAGE
+                            ))
+                        else:
+                            rows.extend(_bounded_message_rows(client, [{
+                                "key": "phone", "constraint_type": "text contains",
+                                "value": digits,
+                            }], INBOX_BUBBLE_PAGE))
                     users = client.records("user", [{
-                        "key": "name", "constraint_type": "contains", "value": query,
+                        "key": "name", "constraint_type": "text contains", "value": query,
                     }], limit=INBOX_PAGE_SIZE,
                                       sort_field="Modified Date", descending=True)
                     for user in users:
@@ -369,8 +391,8 @@ def create_app(config=None):
                         if not user_phone:
                             continue
                         names[user_phone] = user.get("name") or user.get("Name") or user_phone
-                        rows.extend(_bounded_message_rows(
-                            client, _phone_constraints(user_phone), INBOX_PAGE_SIZE
+                        rows.extend(_bounded_phone_message_rows(
+                            client, user_phone, INBOX_PAGE_SIZE
                         ))
                     latest = {}
                     for row in rows:
@@ -417,22 +439,27 @@ def create_app(config=None):
         try:
             client = api()
             state = inbox_cache.get_or_create(f"inbox-messages:{phone}", lambda: {
-                "rows": {}, "offsets": {"whatsapp_timestamp": 0, "Created Date": 0},
-                "more": {"whatsapp_timestamp": True, "Created Date": True},
+                "rows": {},
+                "streams": {
+                    (source, field): {"offset": 0, "more": True}
+                    for source in range(len(_phone_constraint_sets(phone)))
+                    for field in ("whatsapp_timestamp", "Created Date")
+                },
             })
 
             def fetch_batch():
                 changed = False
-                for field in ("whatsapp_timestamp", "Created Date"):
-                    if not state["more"][field]:
+                constraint_sets = _phone_constraint_sets(phone)
+                for (source, field), stream in state["streams"].items():
+                    if not stream["more"]:
                         continue
                     found, more = client.bounded_page(
-                        "message", _phone_constraints(phone),
-                        cursor=state["offsets"][field], limit=INBOX_PAGE_SIZE,
+                        "message", constraint_sets[source],
+                        cursor=stream["offset"], limit=INBOX_PAGE_SIZE,
                         sort_field=field, descending=True,
                     )
-                    state["offsets"][field] += len(found)
-                    state["more"][field] = more
+                    stream["offset"] += len(found)
+                    stream["more"] = more
                     for row in found:
                         if _normal_phone(row.get("phone")) == phone:
                             state["rows"][str(row.get("_id") or id(row))] = row
@@ -444,7 +471,9 @@ def create_app(config=None):
             rows = sorted(state["rows"].values(), key=_message_key, reverse=True)
             if not since:
                 eligible = [row for row in rows if boundary is None or _message_key(row) < boundary]
-                while len(eligible) < INBOX_PAGE_SIZE and any(state["more"].values()):
+                while len(eligible) < INBOX_PAGE_SIZE and any(
+                    stream["more"] for stream in state["streams"].values()
+                ):
                     if not fetch_batch():
                         break
                     rows = sorted(state["rows"].values(), key=_message_key, reverse=True)
@@ -459,7 +488,9 @@ def create_app(config=None):
             else:
                 eligible = [row for row in rows if boundary is None or _message_key(row) < boundary]
                 selected = eligible[:INBOX_PAGE_SIZE]
-                has_more = len(eligible) > len(selected) or any(state["more"].values())
+                has_more = len(eligible) > len(selected) or any(
+                    stream["more"] for stream in state["streams"].values()
+                )
                 next_value = _message_cursor(selected[-1]) if has_more and selected else None
                 selected = list(reversed(selected))
             messages = [{

@@ -14,6 +14,38 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+def _safe_params(params):
+    """Describe a failed query without logging constraint values or PII."""
+    safe = {}
+    for key, value in (params or {}).items():
+        if key != "constraints":
+            safe[key] = value
+            continue
+        try:
+            constraints = json.loads(value)
+            safe[key] = [{
+                "key": item.get("key"),
+                "constraint_type": item.get("constraint_type"),
+                "value": "[REDACTED]",
+            } for item in constraints]
+        except (TypeError, ValueError):
+            safe[key] = "[INVALID/REDACTED]"
+    return safe
+
+
+def _safe_response_body(response):
+    import re
+    text = str(getattr(response, "text", "") or "")[:1000]
+    text = " ".join(text.split())
+    text = re.sub(
+        r'(?i)(authorization|token|password|messageContent)(["\s:=]+)([^,}\s]+)',
+        r'\1\2[REDACTED]', text,
+    )
+    text = re.sub(r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', '[REDACTED EMAIL]', text)
+    text = re.sub(r'(?<!\d)\+?[\d ()-]{8,}\d', '[REDACTED PHONE]', text)
+    return text or "[empty]"
+
+
 class BubbleAPIError(RuntimeError):
     """Raised when Bubble cannot provide trustworthy dashboard data."""
 
@@ -54,6 +86,11 @@ class BubbleAPI:
                 "Bubble API request failed: object_type=%s status=%s reason=%s",
                 object_type, status if status is not None else "none", reason,
             )
+            if status == 400 and response is not None:
+                logger.warning(
+                    "Bubble API 400 diagnostics: object_type=%s params=%s body=%s",
+                    object_type, _safe_params(params), _safe_response_body(response),
+                )
             raise BubbleAPIError("Bubble data is temporarily unavailable") from exc
 
     @staticmethod

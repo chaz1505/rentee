@@ -133,6 +133,8 @@ class DashboardTestCase(unittest.TestCase):
         client.bounded_page.side_effect = [
             (records, False),
             (records, False),
+            (records, False),
+            (records, False),
         ]
         self.login()
 
@@ -149,10 +151,16 @@ class DashboardTestCase(unittest.TestCase):
         ).get_json()["messages"]
         self.assertEqual([message["id"] for message in messages], ["old", "new"])
         self.assertEqual(messages[-1]["timestamp"], conversations[0]["timestamp"])
-        self.assertEqual(client.bounded_page.call_count, 2)
+        self.assertEqual(client.bounded_page.call_count, 4)
         self.assertTrue(all(call.args[1] for call in client.bounded_page.call_args_list))
         self.assertTrue(all(call.kwargs["limit"] == 30 for call in client.bounded_page.call_args_list))
-        self.assertEqual(client.bounded_page.call_args_list[-1].args[1][0]["key"], "phone")
+        constraint_types = {
+            call.args[1][0]["constraint_type"]
+            for call in client.bounded_page.call_args_list
+        }
+        self.assertEqual(constraint_types, {"equals", "text contains"})
+        exact = client.bounded_page.call_args_list[0].args[1][0]
+        self.assertEqual(exact["value"], "60123456789")
 
     @patch("dashboard_app.BubbleAPI")
     def test_inbox_paginates_thirty_with_stable_ties_and_search(self, client_class):
@@ -165,6 +173,8 @@ class DashboardTestCase(unittest.TestCase):
         } for i in range(35)]
         client.records.side_effect = [rows, rows, [], rows, rows, []]
         client.bounded_page.side_effect = [
+            ([rows[0]], False),
+            ([rows[0]], False),
             ([rows[0]], False),
             ([rows[0]], False),
         ]
@@ -180,6 +190,13 @@ class DashboardTestCase(unittest.TestCase):
         self.assertFalse(second["has_more"])
         found = self.client.get("/api/inbox/conversations?search=6012").get_json()
         self.assertEqual(len(found["conversations"]), 30)
+        query_constraints = [call.args[1] for call in client.records.call_args_list]
+        self.assertTrue(any(items == [{
+            "key": "phone", "constraint_type": "text contains", "value": "6012",
+        }] for items in query_constraints))
+        self.assertTrue(any(items == [{
+            "key": "name", "constraint_type": "text contains", "value": "6012",
+        }] for items in query_constraints))
 
         # A separate app avoids sharing the conversation cache with this phone.
         phone = rows[0]["phone"]
@@ -198,10 +215,14 @@ class DashboardTestCase(unittest.TestCase):
         } for i in range(65)]
         # The duplicate stream simulates the same rows returned by both Bubble sorts.
         chunks = [rows[35:], rows[35:], rows[5:35], rows[5:35], rows[:5], rows[:5]]
-        client.bounded_page.side_effect = [
-            (chunk, index < 4)
-            for index, chunk in enumerate(chunks)
-        ]
+        calls = []
+        for index in range(0, len(chunks), 2):
+            more = index < 4
+            calls.extend([
+                (chunks[index], more), (chunks[index + 1], more),
+                ([], more), ([], more),
+            ])
+        client.bounded_page.side_effect = calls
         self.login()
         first = self.client.get(f"/api/inbox/messages?phone={phone}").get_json()
         second = self.client.get(
@@ -318,6 +339,27 @@ class DashboardTestCase(unittest.TestCase):
 
 class BubbleClientTests(unittest.TestCase):
     @patch("bubble_api.requests.Session.get")
+    def test_phone_constraint_is_serialized_as_full_normalized_equals(self, get):
+        response = Mock()
+        response.json.return_value = {"response": {"results": [], "remaining": 0}}
+        get.return_value = response
+        constraints = [{
+            "key": "phone", "constraint_type": "equals", "value": "60123456789",
+        }]
+
+        BubbleAPI("https://bubble.test", "token").bounded_page(
+            "message", constraints, cursor=0, limit=30,
+            sort_field="whatsapp_timestamp", descending=True,
+        )
+
+        params = get.call_args.kwargs["params"]
+        self.assertEqual(json.loads(params["constraints"]), constraints)
+        self.assertEqual(params["cursor"], 0)
+        self.assertEqual(params["limit"], 30)
+        self.assertEqual(params["sort_field"], "whatsapp_timestamp")
+        self.assertIs(params["descending"], True)
+
+    @patch("bubble_api.requests.Session.get")
     def test_count_uses_metadata_without_full_download(self, get):
         response = Mock()
         response.json.return_value = {"response": {"results": [{"_id": "1"}], "remaining": 41}}
@@ -363,6 +405,31 @@ class BubbleClientTests(unittest.TestCase):
         self.assertIn("status=503", message)
         self.assertIn("reason=Service Unavailable", message)
         self.assertNotIn("private record contents", message)
+        self.assertNotIn("secret-token", message)
+
+    @patch("bubble_api.requests.Session.get")
+    def test_http_400_logs_sanitized_body_and_query_shape(self, get):
+        response = Mock(status_code=400, reason="Bad Request")
+        response.text = ('{"status":"ERROR","message":"bad constraint for '
+                         '60123456789","token":"secret-token"}')
+        response.raise_for_status.side_effect = __import__("requests").HTTPError(
+            "private record contents", response=response
+        )
+        get.return_value = response
+        constraints = [{
+            "key": "phone", "constraint_type": "equals", "value": "60123456789",
+        }]
+        with self.assertLogs("bubble_api", level="WARNING") as logs:
+            with self.assertRaises(BubbleAPIError):
+                BubbleAPI("https://bubble.test", "secret-token").bounded_page(
+                    "message", constraints, cursor=0, limit=30,
+                )
+        message = "\n".join(logs.output)
+        self.assertIn("Bubble API 400 diagnostics", message)
+        self.assertIn("constraint_type': 'equals'", message)
+        self.assertIn("value': '[REDACTED]'", message)
+        self.assertIn("[REDACTED PHONE]", message)
+        self.assertNotIn("60123456789", message)
         self.assertNotIn("secret-token", message)
 
     def test_cache_coalesces_concurrent_refresh_and_expires(self):
