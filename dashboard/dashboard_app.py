@@ -8,6 +8,7 @@ import os
 import secrets
 import threading
 import time
+import re
 from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,21 @@ KL = ZoneInfo("Asia/Kuala_Lumpur")
 VALID_RANGES = {"today", "7d", "30d", "all"}
 VALID_MATCH_FILTERS = {"all", "sent", "not_sent"}
 SITE_URL = "https://www.rentee.asia"
+
+
+def _normal_phone(value):
+    return "".join(character for character in str(value or "") if character.isdigit())
+
+
+def _redact_inbox_content(value):
+    text = str(value or "")
+    text = re.sub(r"(?i)(\b(?:otp|code|token)\s*[:=-]?\s*)\d{4,8}\b", r"\1[REDACTED]", text)
+    text = re.sub(r"https?://[^\s]*(?:login|magic|auth|token)[^\s]*", "[REDACTED LOGIN LINK]", text, flags=re.I)
+    return text
+
+
+def _message_time(row):
+    return row.get("whatsapp_timestamp") or row.get("Created Date") or row.get("created_date")
 
 
 def _number(value):
@@ -206,6 +222,70 @@ def create_app(config=None):
         if not authenticated():
             return redirect(url_for("login"))
         return render_template("dashboard.html")
+
+    @app.get("/inbox")
+    def inbox():
+        if not authenticated():
+            return redirect(url_for("login"))
+        return render_template("inbox.html")
+
+    @app.get("/api/inbox/conversations")
+    @require_api_auth
+    def inbox_conversations():
+        try:
+            client = api()
+            messages = client.records(
+                "message", [], sort_field="whatsapp_timestamp", descending=True
+            )
+            latest = {}
+            for row in messages:
+                phone = _normal_phone(row.get("phone"))
+                if phone and phone not in latest:
+                    latest[phone] = row
+            users = client.records("user", [])
+            names = {}
+            for user in users:
+                phone = _normal_phone(user.get("phone") or user.get("Phone"))
+                if phone:
+                    names[phone] = user.get("name") or user.get("Name")
+            output = [{
+                "phone": phone,
+                "name": names.get(phone) or phone,
+                "preview": _redact_inbox_content(row.get("messageContent"))[:120],
+                "timestamp": _message_time(row),
+                "direction": row.get("direction"),
+            } for phone, row in latest.items()]
+            output.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+            return jsonify({"conversations": output})
+        except BubbleAPIError as exc:
+            return jsonify({"error": str(exc)}), 503
+
+    @app.get("/api/inbox/messages")
+    @require_api_auth
+    def inbox_messages():
+        phone = _normal_phone(request.args.get("phone"))
+        if not _phone_valid(phone):
+            return jsonify({"error": "Invalid phone number"}), 400
+        try:
+            # Historical rows may contain punctuation or a leading plus. Fetching
+            # and normalising avoids splitting one WhatsApp identity into threads.
+            rows = [row for row in api().records(
+                "message", [], sort_field="whatsapp_timestamp", descending=False
+            ) if _normal_phone(row.get("phone")) == phone]
+            messages = [{
+                "id": row.get("_id"), "phone": phone,
+                "direction": row.get("direction"),
+                "content": _redact_inbox_content(row.get("messageContent")),
+                "type": row.get("messageType") or "text",
+                "image_url": row.get("image_URL"),
+                "timestamp": _message_time(row),
+                "status": row.get("whatsapp_status"),
+                "error": _redact_inbox_content(row.get("whatsapp_error")),
+            } for row in rows]
+            messages.sort(key=lambda item: str(item.get("timestamp") or ""))
+            return jsonify({"phone": phone, "messages": messages})
+        except BubbleAPIError as exc:
+            return jsonify({"error": str(exc)}), 503
 
     @app.get("/api/stats")
     @require_api_auth

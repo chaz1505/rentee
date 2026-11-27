@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import conversation as conversation_store
+import whatsapp_inbox
 from listing_creation import (
     ACTIVE_SKILL as LISTING_CREATION_SKILL,
     handle_listing_creation,
@@ -126,6 +127,67 @@ _geo_name_cache = {}
 _geo_name_cache_lock = threading.Lock()
 _location_web_identity_cache = {}
 _location_web_identity_lock = threading.Lock()
+
+
+def _inbox_records(object_type, constraints=None):
+    return _bubble_records(get_bubble_base_url("live"), object_type, constraints)
+
+
+def _inbox_create(object_type, payload):
+    return _bubble_create(get_bubble_base_url("live"), object_type, payload)
+
+
+def _inbox_patch(message_id, payload):
+    return _bubble_patch(
+        f"{get_bubble_base_url('live')}/obj/message/{message_id}", payload
+    )
+
+
+def _capture_inbox_event(event):
+    if not whatsapp_inbox.enabled():
+        return None
+    try:
+        message_id = whatsapp_inbox.upsert_transport(
+            event, records=_inbox_records, create=_inbox_create,
+            patch=_inbox_patch, normalize_phone=normalize_phone,
+        )
+        pending = whatsapp_inbox.pending_status(event.get("whatsappMessageId"))
+        if pending:
+            whatsapp_inbox.apply_status(
+                pending, records=_inbox_records, patch=_inbox_patch,
+                create=_inbox_create,
+            )
+        return message_id
+    except Exception as error:
+        whatsapp_inbox.log_failure("capture", error)
+        return None
+
+
+def _capture_outbound(phone, content, message_type, meta_id=None, image_url="",
+                      status="submitted", error=""):
+    if not whatsapp_inbox.enabled():
+        return None
+    event = {
+        "phone": phone, "direction": "Outbound", "own_Sent?": "No",
+        "messageContent": str(content or ""), "messageType": message_type,
+        "image_URL": str(image_url or ""), "inbox_only": True,
+        "whatsapp_status": status,
+        "whatsapp_timestamp": datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat(),
+    }
+    if meta_id:
+        event["whatsappMessageId"] = meta_id
+        return _capture_inbox_event(event)
+    # Rejected attempts have no Meta ID. They are intentionally retained as
+    # distinct attempts and never assigned a fabricated transport identifier.
+    event["whatsapp_status"] = "failed"
+    event["whatsapp_error"] = str(error or "Send rejected")[:240]
+    try:
+        return _inbox_create("message", event)
+    except Exception as capture_error:
+        whatsapp_inbox.log_failure("capture_failed_send", capture_error)
+        return None
 
 CORE_PROMPT = """You are Rentee, an intelligent rental advisor helping people find a home.
 
@@ -2270,24 +2332,33 @@ def send_whatsapp_template(to_phone, template_name, language_code="en_US",
         } for index, value in enumerate(button_parameters))
     if components:
         template["components"] = components
-    response = requests.post(
-        f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
-        f"{phone_number_id}/messages",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "messaging_product": "whatsapp",
-            "to": normalize_phone(to_phone),
-            "type": "template",
-            "template": template,
-        },
-        timeout=30,
+    display = whatsapp_inbox.template_display(
+        template_name, parameters, button_parameters
     )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            f"https://graph.facebook.com/{WHATSAPP_GRAPH_API_VERSION}/"
+            f"{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": normalize_phone(to_phone),
+                "type": "template",
+                "template": template,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception as error:
+        _capture_outbound(to_phone, display, "template", status="failed",
+                          error=type(error).__name__)
+        raise
     payload = response.json()
     message_id = ((payload.get("messages") or [{}])[0]).get("id")
+    _capture_outbound(to_phone, display, "template", message_id)
     safe_phone = normalize_phone(to_phone)
     print(
         f"WhatsApp sent to ...{safe_phone[-4:]} status={response.status_code} "
@@ -3235,9 +3306,27 @@ def persist_sent_whatsapp_text(
     }
     if lead_id:
         payload["lead"] = lead_id
-    message_id = _bubble_create(
-        get_bubble_base_url(bubble_env), "message", payload
-    )
+    if whatsapp_inbox.enabled():
+        payload["inbox_only"] = False
+        existing = next(iter(_bubble_records(
+            get_bubble_base_url(bubble_env), "message", [{
+                "key": "whatsappMessageId", "constraint_type": "equals",
+                "value": meta_message_id,
+            }]
+        )), None)
+        if existing and existing.get("_id"):
+            message_id = existing["_id"]
+            _bubble_patch(
+                f"{get_bubble_base_url(bubble_env)}/obj/message/{message_id}", payload
+            )
+        else:
+            message_id = _bubble_create(
+                get_bubble_base_url(bubble_env), "message", payload
+            )
+    else:
+        message_id = _bubble_create(
+            get_bubble_base_url(bubble_env), "message", payload
+        )
     conversation_store.update_conversation_last_outbound_at(
         conversation_id, bubble_env
     )
@@ -3303,6 +3392,7 @@ def find_latest_ai_message(lead_id, bubble_env="live"):
     eligible = [
         message for message in messages
         if message.get("lead") == lead_id
+        and message.get("inbox_only") is not True
         and str(message.get("direction") or "Outbound").strip().casefold()
         == "outbound"
         and str(message.get("own_Sent?") or "").strip().casefold() != "yes"
@@ -3359,6 +3449,9 @@ def persist_inbound_whatsapp_message(
             existing.get("Conversation")
         ):
             patch["Conversation"] = conversation_id
+        if (whatsapp_inbox.enabled() and conversation_id
+                and existing.get("inbox_only") is not False):
+            patch["inbox_only"] = False
         existing_listing_id = conversation_store.relationship_id(
             existing.get("listing")
         )
@@ -3396,6 +3489,8 @@ def persist_inbound_whatsapp_message(
         "whatsappMessageId": meta_id,
         "messageContent": str(message_content or ""),
     }
+    if whatsapp_inbox.enabled():
+        payload.update({"inbox_only": False, "whatsapp_status": "received"})
     if message_type:
         payload["messageType"] = str(message_type).casefold()
     if lead_id:
@@ -3617,18 +3712,24 @@ def send_whatsapp_text(to_phone, text):
     )
     sent_ids = []
     for part in split_whatsapp_text(text):
-        response = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {access_token}",
-                     "Content-Type": "application/json"},
-            json={"messaging_product": "whatsapp", "to": normalize_phone(to_phone),
-                  "type": "text", "text": {"body": part}},
-            timeout=30,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {access_token}",
+                         "Content-Type": "application/json"},
+                json={"messaging_product": "whatsapp", "to": normalize_phone(to_phone),
+                      "type": "text", "text": {"body": part}},
+                timeout=30,
+            )
+            response.raise_for_status()
+        except Exception as error:
+            _capture_outbound(to_phone, part, "text", status="failed",
+                              error=type(error).__name__)
+            raise
         payload = response.json()
         message_id = ((payload.get("messages") or [{}])[0]).get("id")
         sent_ids.append(message_id)
+        _capture_outbound(to_phone, part, "text", message_id)
         safe_phone = normalize_phone(to_phone)
         print(
             f"WhatsApp sent to ...{safe_phone[-4:]} status={response.status_code} "
@@ -3696,6 +3797,8 @@ def _send_whatsapp_image_link(to_phone, image_url):
         timeout=30,
     )
     response.raise_for_status()
+    message_id = (((response.json() or {}).get("messages") or [{}])[0]).get("id")
+    _capture_outbound(to_phone, "[Image]", "image", message_id, image_url)
     return response
 
 
@@ -3740,6 +3843,8 @@ def send_whatsapp_image(to_phone, image_url):
         timeout=30,
     )
     response.raise_for_status()
+    message_id = (((response.json() or {}).get("messages") or [{}])[0]).get("id")
+    _capture_outbound(to_phone, "[Image]", "image", message_id, image_url)
     return response
 
 
@@ -9283,9 +9388,25 @@ def verify_whatsapp_webhook():
 
 @app.route("/whatsapp/webhook", methods=["POST"])
 def receive_whatsapp_webhook():
+    raw_body = request.get_data(cache=True)
+    if whatsapp_inbox.enabled() and not whatsapp_inbox.verify_signature(
+        raw_body, request.headers.get("X-Hub-Signature-256")
+    ):
+        return "Forbidden", 403
     payload = request.get_json(silent=True)
     if not isinstance(payload, dict):
         return jsonify({"error": "Invalid webhook payload"}), 400
+    if whatsapp_inbox.enabled():
+        for event in whatsapp_inbox.inbound_events(payload):
+            _capture_inbox_event(event)
+        for event in whatsapp_inbox.status_events(payload):
+            try:
+                whatsapp_inbox.apply_status(
+                    event, records=_inbox_records, patch=_inbox_patch,
+                    create=_inbox_create,
+                )
+            except Exception as error:
+                whatsapp_inbox.log_failure("status", error)
     for message in _whatsapp_text_messages(payload):
         message_id = str(message["id"])
         with _whatsapp_processing_lock:

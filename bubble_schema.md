@@ -81,8 +81,13 @@ Known fields:
 | phone | text | Existing exact field name |
 | direction | text | Exact values Inbound / Outbound |
 | whatsappMessageId | text | Meta WhatsApp message ID |
+| whatsapp_status | text | Transport state: received, submitted, sent, delivered, read, or failed. This is separate from MessageStatus. |
+| whatsapp_error | text | Sanitised Meta error code and description for a failed transport attempt |
+| whatsapp_timestamp | date | Meta event time when available; UTC storage, displayed in Asia/Kuala_Lumpur |
+| inbox_only | Boolean | Yes for transport-only inbox capture without a normal Rentee Conversation; missing/empty means No |
 | lead | Lead | Existing relationship |
 | messageContent | text | Message content |
+| messageType | messageType option set | text, image, template, audio, document, video, or other |
 | response_ID | text | Existing OpenAI response ID |
 | own_Sent? | text | Human vs AI authorship |
 
@@ -91,9 +96,10 @@ Message semantics:
 - own_Sent? describes human vs AI authorship
 - normal inbound human = Inbound + Yes
 - AI outbound = Outbound + No
-- every Message newly persisted by Python must have exactly one Conversation
+- normal workflow Messages newly persisted by Python have exactly one Conversation; inbox-only transport records may leave Conversation empty
 - historical Message records without Conversation remain readable during migration
 - Meta reply context resolves through Message.whatsappMessageId to Message.Conversation
+- inbox-only records are excluded from AI history and reply-context selection until reconciled; they remain valid for transport-level messaging-window calculations
 - `listing` is an existing optional Bubble relationship to Listing; its exact field name is lowercase and it identifies the property referred to by that particular Message, not the Conversation as a whole
 
 ## Listing
