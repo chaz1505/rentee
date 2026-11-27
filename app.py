@@ -6,6 +6,7 @@ import csv
 import datetime
 import difflib
 import io
+from hmac import compare_digest
 import os
 import requests
 import json
@@ -9381,6 +9382,46 @@ def _whatsapp_text_messages(payload):
                 clean["customer_name"] = names.get(str(item.get("from")))
                 messages.append(clean)
     return messages
+
+
+@app.post("/whatsapp/group-import")
+def whatsapp_group_import():
+    """Import a Baileys group post through the existing property workflow."""
+    token = os.environ.get("RENTEE_GROUP_IMPORT_TOKEN", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        return jsonify(error="Group import is disabled"), 404
+
+    authorization = request.headers.get("Authorization", "").encode("utf-8")
+    if not compare_digest(authorization, f"Bearer {token}".encode("ascii")):
+        return jsonify(error="Unauthorized"), 401
+    if request.content_length is None or request.content_length > 262144:
+        return jsonify(error="Invalid request length"), 413
+    payload = request.get_json(silent=True)
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return jsonify(error="Expected WhatsApp message text"), 400
+
+    bubble_env = os.environ.get("RENTEE_GROUP_IMPORT_BUBBLE_ENV", "development")
+    if bubble_env not in {"development", "live"}:
+        return jsonify(error="Invalid group import configuration"), 503
+
+    from whatsapp_importer import detect_import_intent, process_whatsapp_import
+
+    try:
+        intent = detect_import_intent(text)["intent"]
+        if intent not in {"lead_import", "listing_import"}:
+            return jsonify(status="ignored")
+        result = process_whatsapp_import(
+            text, bubble_env=bubble_env, import_type=intent.removesuffix("_import")
+        )
+    except Exception as error:
+        app.logger.error("Group property import failed (%s)", type(error).__name__)
+        return jsonify(error="Group import failed"), 503
+
+    status = result.get("status")
+    if status not in {"processed", "duplicate", "invalid", "unknown"}:
+        return jsonify(error="Group import did not complete"), 503
+    return jsonify(status=status)
 
 
 @app.route("/whatsapp/webhook", methods=["GET"])
