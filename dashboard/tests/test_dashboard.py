@@ -53,6 +53,8 @@ class DashboardTestCase(unittest.TestCase):
         self.assertEqual(self.client.get("/api/stats?range=year").status_code, 400)
         self.assertEqual(self.client.get("/api/alerts?range=year").status_code, 400)
         self.assertEqual(self.client.get("/api/matches?status=failed").status_code, 400)
+        self.assertEqual(self.client.get("/api/matches?page=0").status_code, 400)
+        self.assertEqual(self.client.get("/api/matches?page=abc").status_code, 400)
 
     @patch("dashboard_app.parallel_counts")
     @patch("dashboard_app.BubbleAPI")
@@ -82,6 +84,7 @@ class DashboardTestCase(unittest.TestCase):
     @patch("dashboard_app.BubbleAPI")
     def test_recent_matches_batch_fetch_and_missing_data(self, client_class):
         client = client_class.return_value
+        client.count.return_value = 1
         client.records.return_value = [{
             "_id": "m1", "lead": "l1", "listing": "x1",
             "lead_owner": "u1", "listing_owner": "u2",
@@ -104,6 +107,9 @@ class DashboardTestCase(unittest.TestCase):
         _, constraints = client.records.call_args.args[:2]
         self.assertEqual(constraints, [])
         self.assertEqual(client.records.call_args.kwargs["sort_field"], "Created Date")
+        self.assertEqual(response.get_json()["page"], 1)
+        self.assertEqual(response.get_json()["page_size"], 20)
+        self.assertEqual(response.get_json()["total_matches"], 1)
 
     @patch("dashboard_app.BubbleAPI")
     def test_inbox_uses_effective_latest_timestamp_across_mixed_records(self, client_class):
@@ -213,16 +219,68 @@ class DashboardTestCase(unittest.TestCase):
     @patch("dashboard_app.BubbleAPI")
     def test_not_sent_filter_applies_before_twenty_record_limit(self, client_class):
         client = client_class.return_value
-        client.records.return_value = [
-            {"_id": f"m{i}", "alert_sent": i < 5, "Created Date": f"2026-11-{27-i:02d}T01:00:00Z"}
-            for i in range(25)
-        ]
+        false_rows = [{"_id": f"f{i:02d}", "alert_sent": False,
+                       "Created Date": f"2026-11-27T{i:02d}:00:00Z"} for i in range(12)]
+        empty_rows = [{"_id": f"e{i:02d}",
+                       "Created Date": f"2026-11-26T{i:02d}:00:00Z"} for i in range(11)]
+        client.count.side_effect = [12, 11]
+        client.records.side_effect = [false_rows, empty_rows]
         client.records_by_ids.return_value = []
         self.login()
         payload = self.client.get("/api/matches?range=all&status=not_sent").get_json()
         self.assertEqual(len(payload["matches"]), 20)
         self.assertTrue(all(item["status"] == "Not sent" for item in payload["matches"]))
-        self.assertIsNone(client.records.call_args.kwargs["limit"])
+        self.assertEqual(payload["total_matches"], 23)
+        self.assertEqual(payload["total_pages"], 2)
+        self.assertTrue(payload["has_next"])
+        constraints = [call.args[1][-1] for call in client.records.call_args_list]
+        self.assertEqual(constraints[0], {"key": "alert_sent", "constraint_type": "equals", "value": False})
+        self.assertEqual(constraints[1], {"key": "alert_sent", "constraint_type": "is_empty"})
+        self.assertTrue(all(call.kwargs["limit"] <= 20 for call in client.records.call_args_list))
+
+    @patch("dashboard_app.BubbleAPI")
+    def test_match_pages_partial_final_out_of_range_and_cache_isolation(self, client_class):
+        client = client_class.return_value
+        client.count.return_value = 43
+        client.records.side_effect = [
+            [{"_id": f"m{i}", "Created Date": f"2026-11-27T00:{i:02d}:00Z"}
+             for i in range(20)],
+            [{"_id": f"m{i}", "Created Date": f"2026-11-26T00:{i:02d}:00Z"}
+             for i in range(3)],
+        ]
+        client.records_by_ids.return_value = []
+        self.login()
+
+        first = self.client.get("/api/matches?range=all&page=1").get_json()
+        cached = self.client.get("/api/matches?range=all&page=1").get_json()
+        last = self.client.get("/api/matches?range=all&page=3").get_json()
+        beyond = self.client.get("/api/matches?range=all&page=4").get_json()
+
+        self.assertEqual(first, cached)
+        self.assertEqual(len(first["matches"]), 20)
+        self.assertEqual(len(last["matches"]), 3)
+        self.assertTrue(last["has_previous"])
+        self.assertFalse(last["has_next"])
+        self.assertEqual(beyond["matches"], [])
+        self.assertEqual(client.records.call_count, 2)
+        self.assertEqual(client.records.call_args_list[1].kwargs["cursor"], 40)
+
+    @patch("dashboard_app.BubbleAPI")
+    def test_match_status_and_date_filters_are_isolated(self, client_class):
+        client = client_class.return_value
+        client.count.return_value = 0
+        self.login()
+        for period in ("today", "7d", "30d", "all"):
+            for status in ("all", "sent"):
+                response = self.client.get(
+                    f"/api/matches?range={period}&status={status}&page=1"
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()["total_matches"], 0)
+        sent_constraints = [call.args[1] for call in client.count.call_args_list
+                            if any(item.get("key") == "alert_sent" for item in call.args[1])]
+        self.assertTrue(sent_constraints)
+        self.assertTrue(all(items[-1]["value"] is True for items in sent_constraints))
 
     def test_unsent_reason_precedence_and_threshold(self):
         self.assertEqual(_unsent_reason({}, None, 80), "Match not scored")

@@ -92,8 +92,9 @@ class BubbleAPI:
             raise BubbleAPIError("Bubble returned invalid count metadata")
         return len(results) + remaining
 
-    def records(self, object_type: str, constraints=None, limit=None, **params):
-        cursor = 0
+    def records(self, object_type: str, constraints=None, limit=None, cursor=0, **params):
+        if cursor < 0:
+            raise ValueError("Invalid Bubble cursor")
         output = []
         while limit is None or len(output) < limit:
             page_limit = min(100, limit - len(output)) if limit else 100

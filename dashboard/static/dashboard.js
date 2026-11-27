@@ -1,9 +1,15 @@
 const range = document.querySelector('#range');
 const errorBox = document.querySelector('#error');
 const alertsBox = document.querySelector('#alerts');
+const pagination = document.querySelector('#pagination');
+const matchCount = document.querySelector('#match-count');
+const recentHeading = document.querySelector('#recent-heading');
 const refresh = document.querySelector('#refresh');
 const filters = [...document.querySelectorAll('[data-status]')];
 let statusFilter = 'all';
+let currentPage = 1;
+let requestSequence = 0;
+let loading = false;
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
@@ -29,21 +35,58 @@ function renderAlerts(items) {
     <div class="links">${item.lead_url ? `<a href="${escapeHtml(item.lead_url)}" target="_blank" rel="noopener">View Lead</a>` : ''}${item.listing_url ? `<a href="${escapeHtml(item.listing_url)}" target="_blank" rel="noopener">View Listing</a>` : ''}</div>
   </article>`).join('');
 }
-async function load() {
+function pageItems(page, total) {
+  if (total <= 7) return Array.from({length: total}, (_, index) => index + 1);
+  const values = new Set([1, total, page - 1, page, page + 1]);
+  const pages = [...values].filter(value => value >= 1 && value <= total).sort((a, b) => a - b);
+  const output = [];
+  pages.forEach((value, index) => {
+    if (index && value - pages[index - 1] > 1) output.push('…');
+    output.push(value);
+  });
+  return output;
+}
+function renderPagination(data) {
+  const start = data.total_matches ? (data.page - 1) * data.page_size + 1 : 0;
+  const end = Math.min(data.page * data.page_size, data.total_matches);
+  matchCount.textContent = data.total_matches && start <= end ? `Showing ${start}–${end} of ${data.total_matches.toLocaleString('en-MY')} matches` : data.total_matches ? `Showing 0 of ${data.total_matches.toLocaleString('en-MY')} matches` : 'Showing 0 matches';
+  const numbers = pageItems(data.page, data.total_pages).map(value => value === '…'
+    ? '<span class="page-ellipsis" aria-hidden="true">…</span>'
+    : `<button type="button" class="page-button${value === data.page ? ' active' : ''}" data-page="${value}" ${value === data.page ? 'aria-current="page"' : ''}>${value}</button>`).join('');
+  pagination.innerHTML = `<button type="button" class="page-button page-direction" data-page="${data.page - 1}" ${data.has_previous ? '' : 'disabled'}>Previous</button><div class="page-numbers">${numbers}</div><button type="button" class="page-button page-direction" data-page="${data.page + 1}" ${data.has_next ? '' : 'disabled'}>Next</button>`;
+}
+async function load({includeStats = true, scrollToMatches = false} = {}) {
+  loading = true;
+  const sequence = ++requestSequence;
   refresh.disabled = true; errorBox.classList.add('hidden');
+  alertsBox.setAttribute('aria-busy', 'true');
+  alertsBox.innerHTML = '<p class="empty">Loading matches…</p>';
   try {
     const query = encodeURIComponent(range.value);
-    const [stats, alerts] = await Promise.all([getJson(`/api/stats?range=${query}`), getJson(`/api/matches?range=${query}&status=${encodeURIComponent(statusFilter)}`)]);
-    document.querySelectorAll('[data-stat]').forEach(node => { node.textContent = Number(stats[node.dataset.stat]).toLocaleString('en-MY'); });
+    const statsRequest = includeStats ? getJson(`/api/stats?range=${query}`) : Promise.resolve(null);
+    const [stats, alerts] = await Promise.all([statsRequest, getJson(`/api/matches?range=${query}&status=${encodeURIComponent(statusFilter)}&page=${currentPage}`)]);
+    if (sequence !== requestSequence) return;
+    if (stats) document.querySelectorAll('[data-stat]').forEach(node => { node.textContent = Number(stats[node.dataset.stat]).toLocaleString('en-MY'); });
     alerts.matches.forEach(item => { item.threshold = alerts.threshold; });
     renderAlerts(alerts.matches);
+    renderPagination(alerts);
     document.querySelector('#updated').textContent = `Updated ${new Intl.DateTimeFormat('en-MY',{timeStyle:'short',timeZone:'Asia/Kuala_Lumpur'}).format(new Date())}`;
+    if (scrollToMatches) recentHeading.scrollIntoView({behavior:'smooth', block:'start'});
   } catch (error) { errorBox.textContent = error.message; errorBox.classList.remove('hidden'); }
-  finally { refresh.disabled = false; }
+  finally { if (sequence === requestSequence) { loading = false; refresh.disabled = false; alertsBox.removeAttribute('aria-busy'); } }
 }
-range.addEventListener('change', load); refresh.addEventListener('click', load); load();
+range.addEventListener('change', () => { currentPage = 1; load(); });
+refresh.addEventListener('click', () => load());
+pagination.addEventListener('click', event => {
+  const button = event.target.closest('[data-page]');
+  if (!button || button.disabled || loading) return;
+  currentPage = Number(button.dataset.page);
+  load({includeStats:false, scrollToMatches:true});
+});
+load();
 filters.forEach(button => button.addEventListener('click', () => {
   statusFilter = button.dataset.status;
+  currentPage = 1;
   filters.forEach(item => item.classList.toggle('active', item === button));
   load();
 }));

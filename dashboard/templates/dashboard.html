@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="csrf-token" content="{{ csrf_token() }}">
   <title>Rentee Dashboard</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
-  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css', v='2') }}">
+  <script src="{{ url_for('static', filename='dashboard.js', v='2') }}" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -42,7 +42,7 @@
       <div><p>Users with alerts enabled</p><strong data-stat="users_alerts_enabled">—</strong></div>
     </section>
     <section class="recent">
-      <div class="section-title"><div><p class="eyebrow">Latest activity</p><h2>Recent matches</h2></div><span id="updated" class="muted"></span></div>
+      <div class="section-title" id="recent-heading"><div><p class="eyebrow">Latest activity</p><h2>Recent matches</h2></div><span id="updated" class="muted"></span></div>
       <div class="match-filters" role="group" aria-label="Alert status">
         <button class="filter active" data-status="all" type="button">All matches</button>
         <button class="filter" data-status="sent" type="button">Alert sent</button>
@@ -50,6 +50,10 @@
       </div>
       <p class="inference-note">Reasons for unsent alerts are inferred from available match data and current agent settings. Historical sending errors are not recorded.</p>
       <div id="alerts" class="alert-list"><p class="empty">Loading matches…</p></div>
+      <nav class="match-pagination" aria-label="Match results pages">
+        <p id="match-count" class="muted" aria-live="polite"></p>
+        <div id="pagination" class="pagination-controls"></div>
+      </nav>
     </section>
   </main>
 </body>

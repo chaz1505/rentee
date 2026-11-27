@@ -25,6 +25,7 @@ SITE_URL = "https://www.rentee.asia"
 INBOX_PAGE_SIZE = 30
 INBOX_BUBBLE_PAGE = 100
 INBOX_CACHE_ROWS = 600
+MATCH_PAGE_SIZE = 20
 
 
 def _normal_phone(value):
@@ -515,6 +516,12 @@ def create_app(config=None):
         if status_filter not in VALID_MATCH_FILTERS:
             return jsonify({"error": "Invalid match status"}), 400
         try:
+            page = int(request.args.get("page", "1"))
+            if page < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid page number"}), 400
+        try:
             threshold = float(app.config.get("MATCH_ALERT_MIN_SCORE", 80))
         except (TypeError, ValueError):
             threshold = 80.0
@@ -524,13 +531,41 @@ def create_app(config=None):
             constraints = date_constraints(period)
             if status_filter == "sent":
                 constraints = constraints + [{"key": "alert_sent", "constraint_type": "equals", "value": True}]
-            matches = client.records(
-                "match", constraints,
-                limit=None if status_filter == "not_sent" else 20,
-                sort_field="Created Date", descending=True,
-            )
+            offset = (page - 1) * MATCH_PAGE_SIZE
             if status_filter == "not_sent":
-                matches = [match for match in matches if match.get("alert_sent") is not True][:20]
+                # Bubble does not treat an empty boolean as false. Query both
+                # states explicitly, then merge only the bounded prefix needed
+                # to produce this page in newest-first order.
+                false_constraints = constraints + [{
+                    "key": "alert_sent", "constraint_type": "equals", "value": False,
+                }]
+                empty_constraints = constraints + [{
+                    "key": "alert_sent", "constraint_type": "is_empty",
+                }]
+                false_total = client.count("match", false_constraints)
+                empty_total = client.count("match", empty_constraints)
+                total_matches = false_total + empty_total
+                prefix_size = min(offset + MATCH_PAGE_SIZE, total_matches)
+                false_rows = client.records(
+                    "match", false_constraints, limit=min(prefix_size, false_total),
+                    sort_field="Created Date", descending=True,
+                )
+                empty_rows = client.records(
+                    "match", empty_constraints, limit=min(prefix_size, empty_total),
+                    sort_field="Created Date", descending=True,
+                )
+                combined = false_rows + empty_rows
+                combined.sort(key=lambda row: (
+                    _datetime(row.get("Created Date")) or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+                    str(row.get("_id") or ""),
+                ), reverse=True)
+                matches = combined[offset:offset + MATCH_PAGE_SIZE]
+            else:
+                total_matches = client.count("match", constraints)
+                matches = [] if offset >= total_matches else client.records(
+                    "match", constraints, limit=MATCH_PAGE_SIZE,
+                    cursor=offset, sort_field="Created Date", descending=True,
+                )
             user_ids, lead_ids, listing_ids = set(), set(), set()
             for match in matches:
                 user_ids.update(filter(None, [match.get("alert_recipient"), match.get("lead_owner"), match.get("listing_owner")]))
@@ -564,9 +599,17 @@ def create_app(config=None):
                     "lead_url": f"{SITE_URL}/lead/{match.get('lead')}" if match.get("lead") else None,
                     "listing_url": f"{SITE_URL}/listing/{match.get('listing')}" if match.get("listing") else None,
                 })
-            return {"range": period, "status": status_filter, "threshold": threshold, "matches": output, "alerts": output}
+            total_pages = (total_matches + MATCH_PAGE_SIZE - 1) // MATCH_PAGE_SIZE
+            return {
+                "range": period, "status": status_filter, "threshold": threshold,
+                "matches": output, "alerts": output, "page": page,
+                "page_size": MATCH_PAGE_SIZE, "total_matches": total_matches,
+                "total_pages": total_pages, "has_previous": page > 1 and total_pages > 0,
+                "has_next": page < total_pages,
+            }
         try:
-            return jsonify(cache.get_or_create(f"matches:{period}:{status_filter}:{threshold}", load))
+            key = f"matches:{period}:{status_filter}:page:{page}:threshold:{threshold}"
+            return jsonify(cache.get_or_create(key, load))
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503
 
