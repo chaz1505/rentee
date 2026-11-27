@@ -37,6 +37,15 @@ def _message_time(row):
     return row.get("whatsapp_timestamp") or row.get("Created Date") or row.get("created_date")
 
 
+def _message_datetime(row):
+    value = _datetime(_message_time(row))
+    if value is None:
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
 def _number(value):
     if isinstance(value, bool):
         return None
@@ -240,7 +249,8 @@ def create_app(config=None):
             latest = {}
             for row in messages:
                 phone = _normal_phone(row.get("phone"))
-                if phone and phone not in latest:
+                if phone and (phone not in latest or
+                              _message_datetime(row) > _message_datetime(latest[phone])):
                     latest[phone] = row
             users = client.records("user", [])
             names = {}
@@ -255,7 +265,10 @@ def create_app(config=None):
                 "timestamp": _message_time(row),
                 "direction": row.get("direction"),
             } for phone, row in latest.items()]
-            output.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+            output.sort(
+                key=lambda item: _message_datetime({"whatsapp_timestamp": item.get("timestamp")}),
+                reverse=True,
+            )
             return jsonify({"conversations": output})
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503
@@ -282,7 +295,9 @@ def create_app(config=None):
                 "status": row.get("whatsapp_status"),
                 "error": _redact_inbox_content(row.get("whatsapp_error")),
             } for row in rows]
-            messages.sort(key=lambda item: str(item.get("timestamp") or ""))
+            messages.sort(
+                key=lambda item: _message_datetime({"whatsapp_timestamp": item.get("timestamp")})
+            )
             return jsonify({"phone": phone, "messages": messages})
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503

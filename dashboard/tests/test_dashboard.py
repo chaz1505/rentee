@@ -106,6 +106,42 @@ class DashboardTestCase(unittest.TestCase):
         self.assertEqual(client.records.call_args.kwargs["sort_field"], "Created Date")
 
     @patch("dashboard_app.BubbleAPI")
+    def test_inbox_uses_effective_latest_timestamp_across_mixed_records(self, client_class):
+        client = client_class.return_value
+        records = [
+            {"_id": "old", "phone": "+60 12-345 6789", "direction": "outbound",
+             "messageContent": "Older timestamped message",
+             "whatsapp_timestamp": "2026-11-10T23:00:00+08:00",
+             "Created Date": "2026-11-10T15:00:00Z"},
+            {"_id": "other", "phone": "60111111111", "direction": "inbound",
+             "messageContent": "Later in local time, earlier in UTC",
+             "whatsapp_timestamp": "2026-11-26T10:00:00+08:00"},
+            {"_id": "new", "phone": "60123456789", "direction": "inbound",
+             "messageContent": "Newest message without WhatsApp timestamp",
+             "Created Date": "2026-11-26T03:00:00Z"},
+        ]
+        client.records.side_effect = [
+            records,
+            [{"phone": "60123456789", "name": "Marcus Yeoh"}],
+            records,
+        ]
+        self.login()
+
+        conversations = self.client.get("/api/inbox/conversations").get_json()["conversations"]
+
+        self.assertEqual(conversations[0]["name"], "Marcus Yeoh")
+        self.assertEqual(conversations[0]["preview"],
+                         "Newest message without WhatsApp timestamp")
+        self.assertEqual(conversations[0]["timestamp"], "2026-11-26T03:00:00Z")
+        self.assertEqual(conversations[0]["direction"], "inbound")
+
+        messages = self.client.get(
+            "/api/inbox/messages?phone=60123456789"
+        ).get_json()["messages"]
+        self.assertEqual([message["id"] for message in messages], ["old", "new"])
+        self.assertEqual(messages[-1]["timestamp"], conversations[0]["timestamp"])
+
+    @patch("dashboard_app.BubbleAPI")
     def test_not_sent_filter_applies_before_twenty_record_limit(self, client_class):
         client = client_class.return_value
         client.records.return_value = [
