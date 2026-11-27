@@ -17,7 +17,68 @@ from bubble_api import BubbleAPI, BubbleAPIError, TTLCache, parallel_counts
 
 KL = ZoneInfo("Asia/Kuala_Lumpur")
 VALID_RANGES = {"today", "7d", "30d", "all"}
+VALID_MATCH_FILTERS = {"all", "sent", "not_sent"}
 SITE_URL = "https://www.rentee.asia"
+
+
+def _number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value) if value is not None and str(value).strip() else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _datetime(value):
+    if not value:
+        return None
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _phone_valid(value):
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return 8 <= len(digits) <= 15
+
+
+def _intended_recipient(match, lead, listing):
+    """Use persisted recipient, or conservatively infer which record triggered the match."""
+    if match.get("alert_recipient"):
+        return match["alert_recipient"]
+    lead_created = _datetime(lead.get("Created Date"))
+    listing_created = _datetime(listing.get("Created Date"))
+    match_created = _datetime(match.get("Created Date"))
+    if not all((lead_created, listing_created, match_created)):
+        return None
+    # Production creates matches immediately after importing the new side. Only
+    # infer when exactly one side is both newer and close to match creation.
+    lead_age = (match_created - lead_created).total_seconds()
+    listing_age = (match_created - listing_created).total_seconds()
+    lead_is_trigger = 0 <= lead_age <= 300 and lead_created > listing_created
+    listing_is_trigger = 0 <= listing_age <= 300 and listing_created > lead_created
+    if lead_is_trigger != listing_is_trigger:
+        return match.get("listing_owner") if lead_is_trigger else match.get("lead_owner")
+    return None
+
+
+def _unsent_reason(match, recipient, threshold):
+    score = _number(match.get("match_score"))
+    if score is None:
+        return "Match not scored"
+    if score < threshold:
+        return f"Below minimum alert score ({threshold:g})"
+    lead_owner, listing_owner = match.get("lead_owner"), match.get("listing_owner")
+    if lead_owner and lead_owner == listing_owner:
+        return "Same agent owns lead and listing"
+    if recipient is not None:
+        if recipient.get("alerts") is not True:
+            return "Agent alerts disabled"
+        if not _phone_valid(recipient.get("phone")):
+            return "Missing or invalid phone number"
+    return "Reason not recorded"
 
 
 def create_app(config=None):
@@ -27,6 +88,7 @@ def create_app(config=None):
         DASHBOARD_PASSWORD=os.getenv("DASHBOARD_PASSWORD"),
         BUBBLE_API_BASE_URL=os.getenv("BUBBLE_API_BASE_URL"),
         BUBBLE_API_TOKEN=os.getenv("BUBBLE_API_TOKEN"),
+        MATCH_ALERT_MIN_SCORE=os.getenv("MATCH_ALERT_MIN_SCORE", "80"),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SECURE=True,
         SESSION_COOKIE_SAMESITE="Lax",
@@ -172,18 +234,32 @@ def create_app(config=None):
             return jsonify({"error": str(exc)}), 503
 
     @app.get("/api/alerts")
+    @app.get("/api/matches")
     @require_api_auth
     def alerts():
         period = request.args.get("range", "today")
         if period not in VALID_RANGES:
             return jsonify({"error": "Invalid date range"}), 400
+        status_filter = request.args.get("status", "all")
+        if status_filter not in VALID_MATCH_FILTERS:
+            return jsonify({"error": "Invalid match status"}), 400
+        try:
+            threshold = float(app.config.get("MATCH_ALERT_MIN_SCORE", 80))
+        except (TypeError, ValueError):
+            threshold = 80.0
 
         def load():
             client = api()
+            constraints = date_constraints(period)
+            if status_filter == "sent":
+                constraints = constraints + [{"key": "alert_sent", "constraint_type": "equals", "value": True}]
             matches = client.records(
-                "match", alert_date_constraints(period), limit=10,
-                sort_field="alert_sent_at", descending=True,
+                "match", constraints,
+                limit=None if status_filter == "not_sent" else 20,
+                sort_field="Created Date", descending=True,
             )
+            if status_filter == "not_sent":
+                matches = [match for match in matches if match.get("alert_sent") is not True][:20]
             user_ids, lead_ids, listing_ids = set(), set(), set()
             for match in matches:
                 user_ids.update(filter(None, [match.get("alert_recipient"), match.get("lead_owner"), match.get("listing_owner")]))
@@ -195,27 +271,31 @@ def create_app(config=None):
             developments = {r.get("_id"): r for r in client.records_by_ids("development", development_ids)}
             output = []
             for match in matches:
-                recipient_id = match.get("alert_recipient")
-                other_id = match.get("listing_owner") if recipient_id == match.get("lead_owner") else match.get("lead_owner")
                 listing = listings.get(match.get("listing"), {})
                 lead = leads.get(match.get("lead"), {})
+                recipient_id = _intended_recipient(match, lead, listing)
+                recipient_record = users.get(recipient_id) if recipient_id else None
                 development = developments.get(listing.get("development"), {})
                 area = development.get("name") or development.get("Name")
                 if not area:
                     geo = lead.get("Geo") or listing.get("Geo")
                     area = geo if isinstance(geo, str) and not geo.startswith("1") else "Not specified"
                 output.append({
-                    "id": match.get("_id"), "status": "Sent",
-                    "recipient": users.get(recipient_id, {}).get("name") or "Unknown agent",
-                    "other_agent": users.get(other_id, {}).get("name") or "Unknown agent",
+                    "id": match.get("_id"),
+                    "status": "Sent" if match.get("alert_sent") is True else "Not sent",
+                    "alert_recipient": (recipient_record or {}).get("name") or "Not recorded",
+                    "lead_owner": users.get(match.get("lead_owner"), {}).get("name") or "Unknown agent",
+                    "listing_owner": users.get(match.get("listing_owner"), {}).get("name") or "Unknown agent",
                     "area": area, "score": match.get("match_score"),
-                    "reason": match.get("match_reason"), "sent_at": match.get("alert_sent_at"),
+                    "explanation": match.get("match_reason"),
+                    "unsent_reason": None if match.get("alert_sent") is True else _unsent_reason(match, recipient_record, threshold),
+                    "created_at": match.get("Created Date"),
                     "lead_url": f"{SITE_URL}/lead/{match.get('lead')}" if match.get("lead") else None,
                     "listing_url": f"{SITE_URL}/listing/{match.get('listing')}" if match.get("listing") else None,
                 })
-            return {"range": period, "alerts": output}
+            return {"range": period, "status": status_filter, "threshold": threshold, "matches": output, "alerts": output}
         try:
-            return jsonify(cache.get_or_create(f"alerts:{period}", load))
+            return jsonify(cache.get_or_create(f"matches:{period}:{status_filter}:{threshold}", load))
         except BubbleAPIError as exc:
             return jsonify({"error": str(exc)}), 503
 

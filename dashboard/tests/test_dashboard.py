@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bubble_api import BubbleAPI, BubbleAPIError, TTLCache
-from dashboard_app import create_app
+from dashboard_app import _intended_recipient, _unsent_reason, create_app
 
 
 class DashboardTestCase(unittest.TestCase):
@@ -52,6 +52,7 @@ class DashboardTestCase(unittest.TestCase):
         self.login()
         self.assertEqual(self.client.get("/api/stats?range=year").status_code, 400)
         self.assertEqual(self.client.get("/api/alerts?range=year").status_code, 400)
+        self.assertEqual(self.client.get("/api/matches?status=failed").status_code, 400)
 
     @patch("dashboard_app.parallel_counts")
     @patch("dashboard_app.BubbleAPI")
@@ -79,25 +80,68 @@ class DashboardTestCase(unittest.TestCase):
         self.assertNotIn("leads", response.get_json())
 
     @patch("dashboard_app.BubbleAPI")
-    def test_recent_alerts_batch_fetch_and_missing_data(self, client_class):
+    def test_recent_matches_batch_fetch_and_missing_data(self, client_class):
         client = client_class.return_value
         client.records.return_value = [{
             "_id": "m1", "lead": "l1", "listing": "x1",
             "lead_owner": "u1", "listing_owner": "u2",
-            "alert_recipient": "u1", "alert_sent_at": "2026-11-27T01:00:00Z",
+            "alert_recipient": "u1", "alert_sent": True,
+            "Created Date": "2026-11-27T01:00:00Z",
         }]
         client.records_by_ids.side_effect = [
             [{"_id": "u1", "name": "Gwen"}],
             [{"_id": "l1"}], [{"_id": "x1"}], [],
         ]
         self.login()
-        payload = self.client.get("/api/alerts?range=all").get_json()["alerts"][0]
-        self.assertEqual(payload["recipient"], "Gwen")
-        self.assertEqual(payload["other_agent"], "Unknown agent")
+        response = self.client.get("/api/matches?range=all")
+        payload = response.get_json()["matches"][0]
+        self.assertEqual(payload["alert_recipient"], "Gwen")
+        self.assertEqual(payload["listing_owner"], "Unknown agent")
         self.assertEqual(payload["area"], "Not specified")
         self.assertEqual(payload["status"], "Sent")
         self.assertEqual(payload["lead_url"], "https://www.rentee.asia/lead/l1")
         self.assertEqual(client.records_by_ids.call_count, 4)
+        _, constraints = client.records.call_args.args[:2]
+        self.assertEqual(constraints, [])
+        self.assertEqual(client.records.call_args.kwargs["sort_field"], "Created Date")
+
+    @patch("dashboard_app.BubbleAPI")
+    def test_not_sent_filter_applies_before_twenty_record_limit(self, client_class):
+        client = client_class.return_value
+        client.records.return_value = [
+            {"_id": f"m{i}", "alert_sent": i < 5, "Created Date": f"2026-11-{27-i:02d}T01:00:00Z"}
+            for i in range(25)
+        ]
+        client.records_by_ids.return_value = []
+        self.login()
+        payload = self.client.get("/api/matches?range=all&status=not_sent").get_json()
+        self.assertEqual(len(payload["matches"]), 20)
+        self.assertTrue(all(item["status"] == "Not sent" for item in payload["matches"]))
+        self.assertIsNone(client.records.call_args.kwargs["limit"])
+
+    def test_unsent_reason_precedence_and_threshold(self):
+        self.assertEqual(_unsent_reason({}, None, 80), "Match not scored")
+        self.assertEqual(_unsent_reason({"match_score": 79}, None, 80),
+                         "Below minimum alert score (80)")
+        exact = {"match_score": 80, "lead_owner": "u1", "listing_owner": "u1"}
+        self.assertEqual(_unsent_reason(exact, None, 80),
+                         "Same agent owns lead and listing")
+        match = {"match_score": 90, "lead_owner": "u1", "listing_owner": "u2"}
+        self.assertEqual(_unsent_reason(match, {"alerts": False, "phone": "60123456789"}, 80),
+                         "Agent alerts disabled")
+        self.assertEqual(_unsent_reason(match, {"alerts": True, "phone": "12"}, 80),
+                         "Missing or invalid phone number")
+        self.assertEqual(_unsent_reason(match, None, 80), "Reason not recorded")
+
+    def test_recipient_inference_is_conservative(self):
+        match = {"Created Date": "2026-11-27T01:02:00Z", "lead_owner": "lead-owner",
+                 "listing_owner": "listing-owner"}
+        lead = {"Created Date": "2026-11-27T01:00:00Z"}
+        listing = {"Created Date": "2026-10-01T01:00:00Z"}
+        self.assertEqual(_intended_recipient(match, lead, listing), "listing-owner")
+        self.assertIsNone(_intended_recipient(match, {}, listing))
+        match["alert_recipient"] = "persisted"
+        self.assertEqual(_intended_recipient(match, {}, {}), "persisted")
 
     def test_missing_credentials_fail_closed_and_health_stays_lightweight(self):
         app = create_app({"TESTING": True, "SECRET_KEY": None,

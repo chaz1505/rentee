@@ -8,6 +8,7 @@ A standalone, read-only Flask dashboard for Rentee platform activity. It does no
 - `BUBBLE_API_BASE_URL` — production API root, normally `https://www.rentee.asia/api/1.1`.
 - `DASHBOARD_PASSWORD` — a strong, unique dashboard password.
 - `DASHBOARD_SECRET_KEY` — a long random value used to sign sessions (for example, output from `python -c "import secrets; print(secrets.token_hex(32))"`).
+- `MATCH_ALERT_MIN_SCORE` — optional inclusive alert threshold used for dashboard inference; defaults to `80`.
 
 The service fails closed when authentication or Bubble credentials are absent. Bubble credentials are used only by the server. The Bubble client exposes GET operations only.
 
@@ -20,7 +21,7 @@ Create a separate free Render web service connected to this repository:
 - Start command: `gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT dashboard_app:app`
 - Health check path: `/health`
 
-Add all four environment variables in Render. Point `dashboard.rentee.asia` to the new service using Render's custom-domain instructions. Secure cookies require HTTPS, which Render provides for its hostname and configured custom domains.
+Add the four required environment variables in Render, plus `MATCH_ALERT_MIN_SCORE` if production uses a value other than `80`. Point `dashboard.rentee.asia` to the new service using Render's custom-domain instructions. Secure cookies require HTTPS, which Render provides for its hostname and configured custom domains.
 
 ## Local development and tests
 

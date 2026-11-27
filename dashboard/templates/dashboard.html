@@ -41,8 +41,14 @@
       <div><p>Users with alerts enabled</p><strong data-stat="users_alerts_enabled">—</strong></div>
     </section>
     <section class="recent">
-      <div class="section-title"><div><p class="eyebrow">Latest activity</p><h2>Recent match alerts</h2></div><span id="updated" class="muted"></span></div>
-      <div id="alerts" class="alert-list"><p class="empty">Loading alerts…</p></div>
+      <div class="section-title"><div><p class="eyebrow">Latest activity</p><h2>Recent matches</h2></div><span id="updated" class="muted"></span></div>
+      <div class="match-filters" role="group" aria-label="Alert status">
+        <button class="filter active" data-status="all" type="button">All matches</button>
+        <button class="filter" data-status="sent" type="button">Alert sent</button>
+        <button class="filter" data-status="not_sent" type="button">Alert not sent</button>
+      </div>
+      <p class="inference-note">Reasons for unsent alerts are inferred from available match data and current agent settings. Historical sending errors are not recorded.</p>
+      <div id="alerts" class="alert-list"><p class="empty">Loading matches…</p></div>
     </section>
   </main>
 </body>
