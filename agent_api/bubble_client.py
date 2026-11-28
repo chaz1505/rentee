@@ -1,8 +1,11 @@
 """Small Bubble client with constrained queries and redacted failures."""
 
 import json
+import logging
 import os
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 class BubbleUnavailable(RuntimeError):
@@ -11,32 +14,74 @@ class BubbleUnavailable(RuntimeError):
 
 class BubbleClient:
     def __init__(self):
-        base = os.getenv("BUBBLE_API_BASE_URL") or "https://rentee.bubbleapps.io/api/1.1"
+        # Keep the fallback aligned with the existing live Rentee integrations.
+        base = os.getenv("BUBBLE_API_BASE_URL") or "https://www.rentee.asia/api/1.1"
         self.base = base.rstrip("/")
         self.headers = {"Authorization": f"Bearer {os.environ['BUBBLE_API_TOKEN']}", "Content-Type": "application/json"}
         self.timeout = (3.05, float(os.getenv("AGENT_BUBBLE_TIMEOUT_SECONDS", "12")))
 
-    def _request(self, method, path, **kwargs):
+    @staticmethod
+    def _log_failure(operation, object_type, status, reason):
+        # reason is deliberately a fixed classification, never an exception
+        # message or response body, since either may contain sensitive data.
+        logger.warning(
+            "Agent Bubble request failed: operation=%s object_type=%s status=%s reason=%s",
+            operation, object_type, status if status is not None else "none", reason,
+        )
+
+    def _request(self, method, path, object_type, operation, **kwargs):
         try:
             response = requests.request(method, f"{self.base}/{path.lstrip('/')}", headers=self.headers, timeout=self.timeout, **kwargs)
             response.raise_for_status()
             return response
-        except (requests.RequestException, ValueError) as exc:
+        except requests.Timeout as exc:
+            self._log_failure(operation, object_type, None, "timeout")
             raise BubbleUnavailable("Bubble data is temporarily unavailable") from exc
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            reason = "http_error" if status is not None else "connection_error"
+            self._log_failure(operation, object_type, status, reason)
+            raise BubbleUnavailable("Bubble data is temporarily unavailable") from exc
+
+    def _json(self, response, operation, object_type):
+        try:
+            data = response.json()
+        except (ValueError, TypeError) as exc:
+            self._log_failure(operation, object_type, response.status_code, "invalid_json")
+            raise BubbleUnavailable("Bubble returned invalid data") from exc
+        if not isinstance(data, dict):
+            self._log_failure(operation, object_type, response.status_code, "invalid_response")
+            raise BubbleUnavailable("Bubble returned invalid data")
+        return data
 
     def search(self, object_type, constraints, limit=100, cursor=0, sort_field=None, descending=False):
         params = {"constraints": json.dumps(constraints, separators=(",", ":")), "limit": min(max(int(limit), 1), 100), "cursor": max(int(cursor), 0)}
         if sort_field:
             params.update({"sort_field": sort_field, "descending": str(bool(descending)).lower()})
-        payload = self._request("GET", f"obj/{object_type}", params=params).json().get("response", {})
+        response = self._request("GET", f"obj/{object_type}", object_type, "search", params=params)
+        payload = self._json(response, "search", object_type).get("response", {})
+        if not isinstance(payload, dict):
+            self._log_failure("search", object_type, response.status_code, "invalid_response")
+            raise BubbleUnavailable("Bubble returned invalid data")
         rows = payload.get("results")
         if not isinstance(rows, list):
+            self._log_failure("search", object_type, response.status_code, "invalid_response")
             raise BubbleUnavailable("Bubble returned invalid data")
-        return rows, int(payload.get("remaining") or 0)
+        try:
+            remaining = int(payload.get("remaining") or 0)
+        except (TypeError, ValueError) as exc:
+            self._log_failure("search", object_type, response.status_code, "invalid_response")
+            raise BubbleUnavailable("Bubble returned invalid data") from exc
+        return rows, remaining
 
     def one(self, object_type, record_id):
         try:
-            return self._request("GET", f"obj/{object_type}/{record_id}").json().get("response") or None
+            response = self._request("GET", f"obj/{object_type}/{record_id}", object_type, "get")
+            record = self._json(response, "get", object_type).get("response")
+            if record is not None and not isinstance(record, dict):
+                self._log_failure("get", object_type, response.status_code, "invalid_response")
+                raise BubbleUnavailable("Bubble returned invalid data")
+            return record or None
         except BubbleUnavailable as exc:
             cause = exc.__cause__
             if getattr(getattr(cause, "response", None), "status_code", None) == 404:
@@ -44,14 +89,19 @@ class BubbleClient:
             raise
 
     def create(self, object_type, payload):
-        data = self._request("POST", f"obj/{object_type}", json=payload).json()
-        record_id = data.get("id")
+        response = self._request("POST", f"obj/{object_type}", object_type, "create", json=payload)
+        data = self._json(response, "create", object_type)
+        # Bubble normally returns {"status":"success","id":"..."}; accept
+        # the wrapped form too so a successful write is never misclassified.
+        wrapped = data.get("response")
+        record_id = data.get("id") or (wrapped.get("id") if isinstance(wrapped, dict) else None)
         if not record_id:
+            self._log_failure("create", object_type, response.status_code, "missing_id")
             raise BubbleUnavailable("Bubble did not confirm creation")
         return record_id
 
     def patch(self, object_type, record_id, payload):
-        self._request("PATCH", f"obj/{object_type}/{record_id}", json=payload)
+        self._request("PATCH", f"obj/{object_type}/{record_id}", object_type, "patch", json=payload)
 
     def all(self, object_type, constraints, maximum=1000):
         output, cursor = [], 0
