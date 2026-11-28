@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, ReactNode } from "react";
 import { Routes, Route, Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowRight, Building2, Check, ChevronRight, Clock3, Handshake, LayoutList, ListFilter, LoaderCircle, MessageCircle, Plus, Search, ShieldCheck, UserRound, Users } from "lucide-react";
 import { agent, Inventory, Match, money, priceLabel } from "./data";
@@ -8,6 +8,12 @@ import { api, ApiNetworkError, logout, redeem } from "./api";
 const mine = (i: Inventory) => i.ownerId === agent.id;
 const demo = import.meta.env.DEV && import.meta.env.VITE_USE_MOCK_DATA === "true";
 const days = (date: string) => Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
+function PageSentinel({resource}:{resource:"listings"|"leads"|"matches"}) {
+  const {hasMore,states,loadNext}=useStore(), ref=useRef<HTMLDivElement>(null);
+  useEffect(()=>{const node=ref.current;if(!node||!hasMore[resource])return;const observer=new IntersectionObserver(entries=>{if(entries[0].isIntersecting&&states[resource]!=="loading")loadNext(resource).catch(()=>{})},{rootMargin:"300px"});observer.observe(node);return()=>observer.disconnect()},[resource,hasMore,states,loadNext]);
+  if(!hasMore[resource])return null;
+  return <div ref={ref} className="grid min-h-14 place-items-center">{states[resource]==="error"?<button className="text-sm font-semibold text-brand" onClick={()=>loadNext(resource).catch(()=>{})}>Couldn’t load more. Retry</button>:<LoaderCircle className="animate-spin text-brand" size={20}/>}</div>
+}
 function Home() {
   const { inventory, matches, actionable, home, states, loadHome, profile, logoutLocal } = useStore();
   useEffect(()=>{loadHome().catch(()=>{})},[loadHome]);
@@ -218,6 +224,7 @@ function Matches() {
             })}
           </div>
         )}
+        <PageSentinel resource="matches" />
       </div>
     </Shell>
   );
@@ -301,6 +308,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
             </div>
           );
         })}
+        <PageSentinel resource={kind === "listing" ? "listings" : "leads"} />
       </div>
     </Shell>
   );

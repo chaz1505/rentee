@@ -22,6 +22,7 @@ class BubbleClient:
         self.timeout = (3.05, float(os.getenv("AGENT_BUBBLE_TIMEOUT_SECONDS", "12")))
         self.request_count = 0
         self.request_seconds = 0.0
+        self.records_retrieved = 0
 
     @staticmethod
     def _log_failure(operation, object_type, status, reason):
@@ -79,6 +80,7 @@ class BubbleClient:
         except (TypeError, ValueError) as exc:
             self._log_failure("search", object_type, response.status_code, "invalid_response")
             raise BubbleUnavailable("Bubble returned invalid data") from exc
+        self.records_retrieved += len(rows)
         return rows, remaining
 
     def one(self, object_type, record_id):
@@ -88,6 +90,8 @@ class BubbleClient:
             if record is not None and not isinstance(record, dict):
                 self._log_failure("get", object_type, response.status_code, "invalid_response")
                 raise BubbleUnavailable("Bubble returned invalid data")
+            if record:
+                self.records_retrieved += 1
             return record or None
         except BubbleUnavailable as exc:
             cause = exc.__cause__

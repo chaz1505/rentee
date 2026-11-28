@@ -34,3 +34,13 @@ python -m unittest discover -s tests -v
 ```
 
 The UI refreshes on initial load, date-range changes, and the Refresh button. It does not poll. Successful responses are cached for 60 seconds; errors are never converted to zero values or cached.
+
+## Agent App performance configuration
+
+`AGENT_PAGE_SIZE` defaults to `20`. `AGENT_REFERENCE_CACHE_TTL_SECONDS`
+defaults to `3600`, and `AGENT_DASHBOARD_CACHE_TTL_SECONDS` defaults to `60`.
+The caches are bounded, thread-safe, process-local memory caches. They are
+cleared by service restarts and are not shared between Python workers, so a
+worker may independently refresh the same value. Authentication, revocation,
+and ownership checks are never cached; dashboard cache lookup happens only
+after authentication.

@@ -7,6 +7,7 @@ from flask import Blueprint, g, jsonify, make_response, request
 
 from .auth import AuthError, COOKIE_NAME, authenticate as _authenticate, cookie_options, redeem, assert_origin
 from .bubble_client import BubbleUnavailable
+from .cache import dashboard_cache, reference_cache
 from .serializers import inactive, inventory, profile, relation_id, relation_ids
 
 blueprint = Blueprint("agent_api", __name__, url_prefix="/api/agent")
@@ -24,6 +25,14 @@ class RelationshipResolver:
 
     def resolve(self, object_type, ids):
         wanted = {str(value) for value in ids if value}
+        ttl = int(os.getenv("AGENT_REFERENCE_CACHE_TTL_SECONDS", "3600"))
+        for value in tuple(wanted):
+            label, hit = reference_cache.get((object_type, value))
+            add_cache(hit)
+            if hit:
+                self.loaded[object_type].add(value)
+                if label:
+                    self.names[object_type][value] = label
         missing = wanted - self.loaded[object_type]
         if missing:
             started = time.perf_counter()
@@ -33,7 +42,11 @@ class RelationshipResolver:
             for row in rows:
                 label = next((row.get(field) for field in DISPLAY_FIELDS if row.get(field)), None)
                 if row.get("_id") and label:
-                    self.names[object_type][str(row["_id"])] = str(label)
+                    key = str(row["_id"]); self.names[object_type][key] = str(label)
+                    reference_cache.set((object_type, key), str(label), ttl)
+            for value in missing:
+                if value not in self.names[object_type]:
+                    reference_cache.set((object_type, value), "", ttl)
         return self.names[object_type]
 
     def collect(self, records=(), users=()):
@@ -90,6 +103,13 @@ def add_timing(name, seconds):
         timings[name] = timings.get(name, 0.0) + seconds
 
 
+def add_cache(hit):
+    timings = getattr(g, "agent_timings", None)
+    if timings is not None:
+        key = "cache_hits" if hit else "cache_misses"
+        timings[key] = timings.get(key, 0) + 1
+
+
 def authenticate(client=None):
     """Attach Bubble counters to this request without changing auth behavior."""
     result = _authenticate(client)
@@ -118,11 +138,12 @@ def cors(response):
         client = getattr(g, "bubble_client", None)
         timings = getattr(g, "agent_timings", {})
         logger.info(
-            "Agent API timing endpoint=%s status=%s total_ms=%.1f bubble_requests=%s bubble_ms=%.1f relationship_ms=%.1f match_filter_ms=%.1f stats_ms=%.1f",
+            "Agent API timing endpoint=%s status=%s total_ms=%.1f bubble_requests=%s bubble_ms=%.1f records_retrieved=%s records_returned=%s relationship_ms=%.1f match_filter_ms=%.1f stats_ms=%.1f cache_hits=%s cache_misses=%s",
             request.endpoint or "unknown", response.status_code, total * 1000,
             getattr(client, "request_count", 0), getattr(client, "request_seconds", 0.0) * 1000,
+            getattr(client, "records_retrieved", 0), timings.get("records_returned", 0),
             timings.get("relationship", 0.0) * 1000, timings.get("match_filter", 0.0) * 1000,
-            timings.get("stats", 0.0) * 1000,
+            timings.get("stats", 0.0) * 1000, timings.get("cache_hits", 0), timings.get("cache_misses", 0),
         )
     return response
 
@@ -290,15 +311,22 @@ def me():
 
 
 def page_args():
-    try: return max(1,int(request.args.get("page","1"))), min(100,max(1,int(request.args.get("limit","30"))))
+    default = int(os.getenv("AGENT_PAGE_SIZE", "20"))
+    try: return max(1,int(request.args.get("page","1"))), min(100,max(1,int(request.args.get("limit",str(default)))))
     except ValueError: raise AuthError("Invalid pagination", 400)
 
 
 def own_inventory(kind):
     user, _session, client = authenticate(); page, limit = page_args()
-    rows, remaining = client.search(kind, [{"key":"owner","constraint_type":"equals","value":user["_id"]}], limit, (page-1)*limit, "Created Date", True)
+    constraints=[{"key":"owner","constraint_type":"equals","value":user["_id"]}]
+    status=request.args.get("status")
+    if status and status != "all":
+        constraints.append({"key":"active","constraint_type":"equals","value":status != "inactive"})
+    rows, remaining = client.search(kind, constraints, limit, (page-1)*limit, "Created Date", True)
     relationships=resolver(client).collect(rows,[user])
-    return jsonify(items=[inventory(row,kind,user,True,relationships) for row in rows], page=page, has_more=remaining>0)
+    items=[inventory(row,kind,user,True,relationships) for row in rows]
+    g.agent_timings["records_returned"]=len(items)
+    return jsonify(items=items, page=page, page_size=limit, has_more=remaining>0, next_page=page+1 if remaining>0 else None)
 
 
 @blueprint.get("/listings")
@@ -326,18 +354,22 @@ def lead_detail(record_id): return own_detail("lead",record_id)
 
 @blueprint.get("/matches")
 def matches():
-    user, _session, client = authenticate(); uid=user["_id"]
+    user, _session, client = authenticate(); uid=user["_id"]; page, limit=page_args()
     valid, actionable, cache = match_pipeline(client,uid)
     actionable_ids={row.get("_id") for row,_resolved in actionable}
-    related_records=[value for (kind,_id),value in cache.items() if kind in {"lead","listing"} and value]
-    related_users=[value for (kind,_id),value in cache.items() if kind=="user" and value]
+    ordered=sorted(valid,key=lambda item:(item[0].get("match_score") or 0,item[0].get("Created Date") or ""),reverse=True)
+    selected=ordered[(page-1)*limit:page*limit]
+    selected_record_ids={relation_id(row.get(kind)) for row,_resolved in selected for kind in ("lead","listing")}
+    related_records=[value for (kind,record_id),value in cache.items() if kind in {"lead","listing"} and record_id in selected_record_ids and value]
+    selected_owner_ids={relation_id(record.get("owner")) for record in related_records}
+    related_users=[value for (kind,record_id),value in cache.items() if kind=="user" and record_id in selected_owner_ids and value]
     resolver(client).collect(related_records,related_users)
     items=[]
-    for row, resolved in valid:
+    for row, resolved in selected:
         lead, listing, lead_owner, listing_owner, side = resolved
         items.append({"id":row.get("_id"),"listing_id":relation_id(row.get("listing")),"lead_id":relation_id(row.get("lead")),"score":row.get("match_score"),"reason":row.get("match_reason") or [],"created_at":row.get("Created Date"),"review_status":row.get(f"{side}_review_status") or "","actionable":row.get("_id") in actionable_ids,"listing":matched_inventory(client,listing,"listing",listing_owner,cache),"lead":matched_inventory(client,lead,"lead",lead_owner,cache)})
-    items.sort(key=lambda x:(x["score"],x["created_at"] or ""),reverse=True)
-    return jsonify(items=items)
+    g.agent_timings["records_returned"]=len(items)
+    return jsonify(items=items,page=page,page_size=limit,has_more=page*limit<len(ordered),next_page=page+1 if page*limit<len(ordered) else None,total=len(ordered))
 
 
 @blueprint.get("/matches/<record_id>")
@@ -367,6 +399,11 @@ def match_contact(record_id):
 @blueprint.get("/home")
 def home():
     user,_session,client=authenticate(); uid=user["_id"]
+    cache_key=("home",uid)
+    cached,hit=dashboard_cache.get(cache_key); add_cache(hit)
+    if hit:
+        g.agent_timings["records_returned"]=1
+        return jsonify(cached)
     # The network collections already contain the current agent's inventory;
     # reuse them instead of issuing two repeated owner queries.
     stats_started=time.perf_counter()
@@ -392,4 +429,8 @@ def home():
     owners={relation_id(x.get("owner")) for x in network_listings+network_leads if relation_id(x.get("owner"))}
     network={"active_listings":sum(x["active"] for x in network_listing_views),"active_leads":sum(x["active"] for x in network_lead_views),"agents":len(owners),"matches_this_week":sum(this_week(x) for x in network_unique.values())}
     add_timing("stats",time.perf_counter()-stats_started)
-    return jsonify(profile=profile(user,relationships),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network)
+    recent=sorted(valid,key=lambda item:str(item[0].get("Created Date") or ""),reverse=True)[:5]
+    payload=dict(profile=profile(user,relationships),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network,recent_activities=[{"id":row.get("_id"),"created_at":row.get("Created Date"),"score":row.get("match_score")} for row,_side in recent])
+    dashboard_cache.set(cache_key,payload,int(os.getenv("AGENT_DASHBOARD_CACHE_TTL_SECONDS","60")))
+    g.agent_timings["records_returned"]=1
+    return jsonify(payload)
