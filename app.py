@@ -3698,8 +3698,14 @@ def split_whatsapp_text(text, limit=WHATSAPP_TEXT_LIMIT):
     return parts
 
 
+def _redact_agent_login_token(value):
+    return re.sub(
+        r"(?i)(/login#token=)[^\s]+", r"\1[REDACTED]", str(value or "")
+    )
+
+
 def send_whatsapp_text(to_phone, text):
-    rendered_text = " ".join(str(text or "").split())
+    rendered_text = " ".join(_redact_agent_login_token(text).split())
     print(
         "[WHATSAPP OUTBOUND TEXT] "
         f"phone={_masked_whatsapp_phone(to_phone)} text={rendered_text!r}",
@@ -3724,13 +3730,13 @@ def send_whatsapp_text(to_phone, text):
             )
             response.raise_for_status()
         except Exception as error:
-            _capture_outbound(to_phone, part, "text", status="failed",
+            _capture_outbound(to_phone, _redact_agent_login_token(part), "text", status="failed",
                               error=type(error).__name__)
             raise
         payload = response.json()
         message_id = ((payload.get("messages") or [{}])[0]).get("id")
         sent_ids.append(message_id)
-        _capture_outbound(to_phone, part, "text", message_id)
+        _capture_outbound(to_phone, _redact_agent_login_token(part), "text", message_id)
         safe_phone = normalize_phone(to_phone)
         print(
             f"WhatsApp sent to ...{safe_phone[-4:]} status={response.status_code} "
@@ -8186,6 +8192,40 @@ def _process_whatsapp_message(message):
                 send_whatsapp_text(phone, reply)
                 reply_sent = True
                 return
+            if message_type == "text" and text.casefold() == "/app":
+                print(
+                    "[AGENT APP LOGIN] command=received "
+                    f"phone={_masked_whatsapp_phone(phone)}", flush=True,
+                )
+                try:
+                    from agent_api.auth import issue_login
+                    from agent_api.config import enabled as agent_app_enabled
+                    if not agent_app_enabled():
+                        reply = "The Rentee agent workspace is not available yet."
+                    else:
+                        users = find_bubble_users_by_phone(phone, "live")
+                        if len(users) != 1:
+                            reply = "We couldn't verify access to the Rentee agent workspace."
+                        else:
+                            token = issue_login(users[0]["_id"])
+                            app_url = os.getenv("AGENT_APP_URL", "https://app.rentee.asia").rstrip("/")
+                            reply = (
+                                "👋 Your Rentee workspace is ready.\n\n"
+                                "View your latest matches, listings and leads.\n\n"
+                                f"Open your Rentee workspace:\n{app_url}/login#token={token}\n\n"
+                                f"This link expires in {int(os.getenv('AGENT_LOGIN_TOKEN_TTL_MINUTES', '15'))} minutes."
+                            )
+                    print("[AGENT APP LOGIN] status=handled", flush=True)
+                except Exception as error:
+                    reply = "We couldn't create a secure workspace link right now. Please try again shortly."
+                    print(
+                        "[AGENT APP LOGIN] status=failed "
+                        f"error={type(error).__name__}", flush=True,
+                    )
+                _stop_whatsapp_typing(typing_keepalive)
+                send_whatsapp_text(phone, reply)
+                reply_sent = True
+                return
             alert_commands = {
                 "stop": False, "/stop": False,
                 "start": True, "/start": True,
@@ -9472,6 +9512,10 @@ def receive_whatsapp_webhook():
         )
         worker.start()
     return "EVENT_RECEIVED", 200
+
+
+from agent_api import blueprint as agent_api_blueprint
+app.register_blueprint(agent_api_blueprint)
 
 
 if __name__ == "__main__":
