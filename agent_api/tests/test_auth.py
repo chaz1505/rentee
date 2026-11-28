@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
-from agent_api.auth import AuthError, issue_login, redeem, token_hash
+from agent_api.auth import AuthError, issue_login, issue_match_link, issue_match_login, parse_date, redeem, token_hash, utcnow
 
 
 class FakeBubble:
@@ -28,7 +28,7 @@ class FakeBubble:
 class AuthTests(unittest.TestCase):
     def setUp(self):
         self.app=Flask(__name__); self.client=FakeBubble()
-        self.env=patch.dict(os.environ,{"AGENT_APP_ENABLED":"true","AGENT_APP_ALLOWED_USERS":"u1","AGENT_APP_ALLOWED_ORIGINS":"https://app.test","AGENT_REDEMPTION_SINGLE_PROCESS":"true","WEB_CONCURRENCY":"1","AGENT_LOGIN_RATE_LIMIT_SECONDS":"0"},clear=False); self.env.start()
+        self.env=patch.dict(os.environ,{"AGENT_APP_ENABLED":"true","AGENT_APP_ALLOWED_USERS":"u1","AGENT_APP_ALLOWED_ORIGINS":"https://app.test","AGENT_LOGIN_RATE_LIMIT_SECONDS":"0"},clear=False); self.env.start()
     def tearDown(self): self.env.stop()
 
     def issue(self):
@@ -43,7 +43,25 @@ class AuthTests(unittest.TestCase):
 
     def test_replay_is_rejected(self):
         token=self.issue(); self.redeem(token)
+        self.assertAlmostEqual(parse_date(self.client.rows[0]["used_at"]).timestamp(), parse_date(self.client.rows[0]["expires_at"]).timestamp(), delta=2)
         with self.assertRaises(AuthError): self.redeem(token)
+
+    def test_standard_login_defaults_to_five_minutes(self):
+        self.issue()
+        remaining=parse_date(self.client.rows[-1]["expires_at"])-utcnow()
+        self.assertAlmostEqual(remaining.total_seconds(), 300, delta=2)
+
+    def test_match_login_defaults_to_seven_days_and_is_redeemable(self):
+        with self.app.test_request_context(): token=issue_match_login("u1",self.client)
+        self.assertEqual(self.client.rows[-1]["token_type"], "match")
+        remaining=parse_date(self.client.rows[-1]["expires_at"])-utcnow()
+        self.assertAlmostEqual(remaining.total_seconds(), 7*86400, delta=2)
+        self.redeem(token)
+
+    def test_match_link_keeps_match_destination_and_token_in_fragment(self):
+        with self.app.test_request_context(): link=issue_match_link("u1","match_123",self.client)
+        self.assertTrue(link.startswith("https://app.rentee.asia/matches/match_123#token="))
+        self.assertNotIn(self.client.rows[-1]["token_hash"], link)
 
     def test_expired_and_revoked_tokens_are_rejected(self):
         for mutation in ({"expires_at":(dt.datetime.now(dt.timezone.utc)-dt.timedelta(minutes=1)).isoformat()},{"revoked":True}):

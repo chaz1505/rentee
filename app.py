@@ -8213,7 +8213,7 @@ def _process_whatsapp_message(message):
                                 "👋 Your Rentee workspace is ready.\n\n"
                                 "View your latest matches, listings and leads.\n\n"
                                 f"Open your Rentee workspace:\n{app_url}/login#token={token}\n\n"
-                                f"This link expires in {int(os.getenv('AGENT_LOGIN_TOKEN_TTL_MINUTES', '15'))} minutes."
+                                f"This link expires in {int(os.getenv('AGENT_LOGIN_TOKEN_TTL_MINUTES', '5'))} minutes."
                             )
                     print("[AGENT APP LOGIN] status=handled", flush=True)
                 except Exception as error:

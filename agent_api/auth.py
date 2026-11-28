@@ -1,6 +1,7 @@
 import datetime as dt
 import hashlib
 import os
+import re
 import secrets
 import threading
 
@@ -49,25 +50,39 @@ def assert_enabled():
     if not enabled(): raise AuthError("Agent application is unavailable", 503)
 
 
-def redemption_runtime_safe():
-    # This explicitly acknowledges the deployment-level limitation. Render must
-    # have one active process and non-overlapping deploys for this to be true.
-    return flag("AGENT_REDEMPTION_SINGLE_PROCESS") and os.getenv("WEB_CONCURRENCY", "1") == "1"
+def issue_login(user_id, client=None, token_type="login"):
+    """Issue a hashed, single-use app token using the existing AgentSession type.
 
-
-def issue_login(user_id, client=None):
+    ``match`` tokens are generated per recipient.  The permanent Match id stays
+    in the URL and is deliberately not persisted on AgentSession.
+    """
     assert_enabled()
     if not user_allowed(user_id): raise AuthError("Agent application access is unavailable", 403)
+    if token_type not in {"login", "match"}: raise ValueError("Unsupported login token type")
     now = utcnow()
-    with _rate_lock:
-        last = _last_login.get(str(user_id))
-        wait = int(os.getenv("AGENT_LOGIN_RATE_LIMIT_SECONDS", "60"))
-        if last and (now-last).total_seconds() < wait: raise AuthError("Please wait before requesting another link", 429)
-        _last_login[str(user_id)] = now
+    if token_type == "login":
+        with _rate_lock:
+            last = _last_login.get(str(user_id))
+            wait = int(os.getenv("AGENT_LOGIN_RATE_LIMIT_SECONDS", "60"))
+            if last and (now-last).total_seconds() < wait: raise AuthError("Please wait before requesting another link", 429)
+            _last_login[str(user_id)] = now
     token = secrets.token_urlsafe(32)
-    ttl = int(os.getenv("AGENT_LOGIN_TOKEN_TTL_MINUTES", "15"))
-    (client or BubbleClient()).create(TOKEN_OBJECT, {"user": user_id, "token_hash": token_hash(token), "token_type": "login", "expires_at": iso(now+dt.timedelta(minutes=ttl)), "revoked": False})
+    expires_at = now + (dt.timedelta(days=int(os.getenv("AGENT_MATCH_TOKEN_TTL_DAYS", "7"))) if token_type == "match" else dt.timedelta(minutes=int(os.getenv("AGENT_LOGIN_TOKEN_TTL_MINUTES", "5"))))
+    (client or BubbleClient()).create(TOKEN_OBJECT, {"user": user_id, "token_hash": token_hash(token), "token_type": token_type, "expires_at": iso(expires_at), "revoked": False})
     return token
+
+
+def issue_match_login(user_id, client=None):
+    return issue_login(user_id, client, "match")
+
+
+def issue_match_link(user_id, match_id, client=None):
+    """Build a recipient-specific future Match Alert URL without sending it."""
+    if not isinstance(match_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", match_id):
+        raise ValueError("Invalid Match id")
+    token=issue_match_login(user_id,client)
+    base=os.getenv("AGENT_APP_URL","https://app.rentee.asia").rstrip("/")
+    return f"{base}/matches/{match_id}#token={token}"
 
 
 def _valid(record, kind):
@@ -76,21 +91,25 @@ def _valid(record, kind):
 
 def redeem(login_token, client=None):
     assert_enabled(); assert_origin()
-    if not redemption_runtime_safe(): raise AuthError("Secure login redemption is not available", 503)
     if not isinstance(login_token, str) or not 20 <= len(login_token) <= 256: raise AuthError("This login link is invalid or expired")
     client = client or BubbleClient(); digest = token_hash(login_token)
     with _redeem_lock:
-        rows, _ = client.search(TOKEN_OBJECT, [{"key":"token_hash","constraint_type":"equals","value":digest},{"key":"token_type","constraint_type":"equals","value":"login"}], limit=2)
+        # Bubble is checked immediately before the best-effort consume.  The
+        # process lock prevents same-process races; Bubble has no approved
+        # compare-and-set primitive, so cross-process atomicity is not claimed.
+        rows, _ = client.search(TOKEN_OBJECT, [{"key":"token_hash","constraint_type":"equals","value":digest}], limit=2)
         if len(rows) != 1: raise AuthError("This login link is invalid or expired")
         record = rows[0]
-        if not _valid(record, "login") or record.get("used_at"): raise AuthError("This login link is invalid or expired")
+        kind = record.get("token_type")
+        if kind not in {"login", "match"} or not _valid(record, kind) or record.get("used_at"): raise AuthError("This login link is invalid or expired")
         user_id = record.get("user")
         if not user_allowed(user_id) or not client.one("user", user_id): raise AuthError("This login link is invalid or expired")
-        consumed_at = iso(utcnow()); client.patch(TOKEN_OBJECT, record["_id"], {"used_at": consumed_at})
+        consumed_at = iso(utcnow()); client.patch(TOKEN_OBJECT, record["_id"], {"used_at": consumed_at, "expires_at": consumed_at})
         confirmed = client.one(TOKEN_OBJECT, record["_id"])
         confirmed_used = parse_date((confirmed or {}).get("used_at"))
+        confirmed_expiry = parse_date((confirmed or {}).get("expires_at"))
         expected_used = parse_date(consumed_at)
-        if not confirmed_used or not expected_used or abs((confirmed_used-expected_used).total_seconds()) > 2:
+        if not confirmed_used or not confirmed_expiry or not expected_used or abs((confirmed_used-expected_used).total_seconds()) > 2 or abs((confirmed_expiry-expected_used).total_seconds()) > 2:
             raise AuthError("Secure login could not be confirmed", 503)
         session_token = secrets.token_urlsafe(32)
         days = int(os.getenv("AGENT_SESSION_DAYS", "30"))
