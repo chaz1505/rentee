@@ -294,7 +294,7 @@ def match_pipeline(client, uid, owned_listings=None, owned_leads=None):
     return historical, actionable, cache
 
 
-def matched_inventory(client, record, kind, owner_id, cache=None):
+def matched_inventory(client, record, kind, owner_id, cache=None, include_private=False):
     cache = cache if cache is not None else {}
     key=("user",owner_id)
     started = time.perf_counter()
@@ -304,7 +304,7 @@ def matched_inventory(client, record, kind, owner_id, cache=None):
         if timings is not None: timings["match_users"]=timings.get("match_users",0)+1
     add_timing("relationship", time.perf_counter() - started)
     relationships = resolver(client).collect([record], [cache[key]])
-    return inventory(record, kind, cache[key], True, relationships)
+    return inventory(record, kind, cache[key], include_private, relationships)
 
 
 def deduplicated_match_rows(client, uid):
@@ -347,7 +347,7 @@ def own_inventory(kind):
         constraints.append({"key":"active","constraint_type":"equals","value":status != "inactive"})
     rows, remaining = client.search(kind, constraints, limit, (page-1)*limit, "Created Date", True)
     relationships=resolver(client).collect(rows,[user])
-    items=[inventory(row,kind,user,True,relationships) for row in rows]
+    items=[inventory(row,kind,user,False,relationships) for row in rows]
     g.agent_timings["records_returned"]=len(items)
     g.agent_timings["match_serialized"]=len(items)
     return jsonify(items=items, page=page, page_size=limit, has_more=remaining>0, next_page=page+1 if remaining>0 else None)
@@ -402,7 +402,7 @@ def match_detail(record_id):
     resolved=matched_records(client,row,uid)
     if not resolved: return jsonify(error="Not found"),404
     lead,listing,lead_owner,listing_owner,side=resolved
-    return jsonify(id=row.get("_id"),score=row.get("match_score"),reason=row.get("match_reason") or [],created_at=row.get("Created Date"),review_status=row.get(f"{side}_review_status") or "",listing=matched_inventory(client,listing,"listing",listing_owner),lead=matched_inventory(client,lead,"lead",lead_owner))
+    return jsonify(id=row.get("_id"),score=row.get("match_score"),reason=row.get("match_reason") or [],created_at=row.get("Created Date"),review_status=row.get(f"{side}_review_status") or "",listing=matched_inventory(client,listing,"listing",listing_owner,include_private=True),lead=matched_inventory(client,lead,"lead",lead_owner,include_private=True))
 
 
 @blueprint.get("/matches/<record_id>/contact")
