@@ -60,7 +60,9 @@ app = Flask(__name__)
 CORS(
     app,
     resources={
-        r"/*": {
+        # Agent API CORS is credentialed and enforced by its own exact-origin
+        # allowlist. Keep the legacy service-wide policy away from that scope.
+        r"^(?!/api/agent(?:/|$)).*": {
             "origins": [
                 "https://www.rentee.asia",
                 "https://rentee.bubbleapps.io"

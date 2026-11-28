@@ -4,7 +4,7 @@ import { ArrowRight, Building2, Check, ChevronRight, Clock3, Handshake, LayoutLi
 import { agent, Inventory, Match, money } from "./data";
 import { useStore } from "./store";
 import { ConfirmDialog, Filters, Header, InboxZero, InventoryCard, MatchCard, OriginalMessage, Progress, ResetButton, Score, Shell, Status } from "./components";
-import { api, logout, redeem } from "./api";
+import { api, ApiNetworkError, logout, redeem } from "./api";
 const mine = (i: Inventory) => i.ownerId === agent.id;
 const demo = import.meta.env.DEV && import.meta.env.VITE_USE_MOCK_DATA === "true";
 const days = (date: string) => Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
@@ -579,8 +579,8 @@ function Login() {
       sessionStorage.removeItem("rentee_return_path");
       nav(destination);
       location.reload();
-    } catch {
-      setError("This login link is invalid, expired, or already used.");
+    } catch (e) {
+      setError(e instanceof ApiNetworkError ? e.message : "This login link is invalid, expired, or already used.");
     } finally {
       setBusy(false);
     }

@@ -23,15 +23,31 @@ def cors(response):
     from .config import permitted_origins
     origin = (request.headers.get("Origin") or "").rstrip("/")
     if origin in permitted_origins():
-        response.headers.update({"Access-Control-Allow-Origin":origin,"Access-Control-Allow-Credentials":"true","Vary":"Origin","Referrer-Policy":"no-referrer","Cache-Control":"no-store"})
+        response.headers.update({"Access-Control-Allow-Origin":origin,"Access-Control-Allow-Credentials":"true","Referrer-Policy":"no-referrer","Cache-Control":"no-store"})
+        response.vary.add("Origin")
+    return response
+
+
+@blueprint.before_request
+def options():
+    """Answer every Agent API preflight before route auth can run.
+
+    Flask's automatic OPTIONS handlers take precedence over a catch-all OPTIONS
+    route, so this must run at blueprint level to cover every Agent endpoint.
+    """
+    if request.method != "OPTIONS":
+        return None
+    assert_origin()
+    response = make_response("", 204)
+    response.headers.update({"Access-Control-Allow-Methods":"GET, POST, OPTIONS","Access-Control-Allow-Headers":"Content-Type"})
     return response
 
 
 @blueprint.route("/<path:_path>", methods=["OPTIONS"])
-def options(_path):
-    assert_origin(); response = make_response("", 204)
-    response.headers.update({"Access-Control-Allow-Methods":"GET, POST, OPTIONS","Access-Control-Allow-Headers":"Content-Type"})
-    return response
+def options_route(_path):
+    # Retain the explicit OPTIONS-only rule so unsupported Agent paths keep
+    # their previous method-not-allowed behavior for non-OPTIONS requests.
+    return options()
 
 
 def matched_records(client, row, uid, cache=None):

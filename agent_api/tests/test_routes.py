@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
+from agent_api.auth import AuthError
 from agent_api.routes import blueprint
 
 
@@ -66,6 +67,41 @@ class MatchRouteTests(unittest.TestCase):
         response = self.client.post("/api/agent/matches/m1/review", json={"status": "dismissed"}, headers={"Origin": "https://app.rentee.asia"})
         self.assertEqual(response.status_code, 405)
         self.assertEqual(self.bubble.patches, [])
+
+    def test_authorized_post_preflight_includes_required_cors_headers(self):
+        response = self.client.options(
+            "/api/agent/auth/redeem",
+            headers={
+                "Origin": "https://app.rentee.asia",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://app.rentee.asia")
+        self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertEqual(response.headers["Access-Control-Allow-Headers"], "Content-Type")
+        self.assertEqual(response.headers["Access-Control-Allow-Methods"], "GET, POST, OPTIONS")
+        self.assertIn("Origin", response.headers.getlist("Vary"))
+
+    def test_unauthorized_origin_preflight_remains_blocked(self):
+        response = self.client.options(
+            "/api/agent/auth/redeem",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+
+    def test_authentication_errors_include_cors_for_authorized_origin(self):
+        with patch("agent_api.routes.authenticate", side_effect=AuthError()):
+            response = self.client.get("/api/agent/me", headers={"Origin": "https://app.rentee.asia"})
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "https://app.rentee.asia")
+        self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
 
     def test_home_and_inbox_use_consistent_deduplicated_match_count(self):
         match=self.bubble.rows["match"]["m1"]
