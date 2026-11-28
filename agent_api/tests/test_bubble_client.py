@@ -77,6 +77,15 @@ class BubbleClientTests(unittest.TestCase):
         constraints=request.call_args.kwargs["params"]["constraints"]
         self.assertEqual(constraints,'[{"key":"_id","constraint_type":"in","value":["c1","c2"]}]')
 
+    @patch("agent_api.bubble_client.BubbleClient.search")
+    def test_all_without_maximum_follows_every_page(self, search):
+        search.side_effect=[([{"_id":str(i)} for i in range(100)],150),
+                            ([{"_id":str(i)} for i in range(100,200)],50),
+                            ([{"_id":str(i)} for i in range(200,250)],0)]
+        rows=BubbleClient().all("match",[],None)
+        self.assertEqual(len(rows),250)
+        self.assertEqual([call.args[3] for call in search.call_args_list],[0,100,200])
+
 
 if __name__ == "__main__":
     unittest.main()

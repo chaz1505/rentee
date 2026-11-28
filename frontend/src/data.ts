@@ -1,7 +1,7 @@
 export type Kind='listing'|'lead'; export type Availability='available'|'unconfirmed'|'unavailable';
 export type Inventory={id:string;kind:Kind;ownerId:string;owner:string;agency:string;intent:string;title:string;location:string;developments:string[];price:number;bedrooms:string;propertyType:string;bathrooms?:string;size?:string;furnishing?:string;moveIn?:string;posted:string;confirmed:string;availability:Availability;freshness?:'confirmed_active'|'recently_added'|'needs_confirmation'|'inactive';message:string};
 export type MatchStatus='new'|'reviewed'|'dismissed'|'contacted';
-export type Match={id:string;listingId:string;leadId:string;score:number;discovered:string;reasons:string[];differences:string[];checks:string[];status:MatchStatus};
+export type Match={id:string;listingId:string;leadId:string;score:number;discovered:string;reasons:string[];differences:string[];checks:string[];status:MatchStatus;actionable?:boolean};
 export const agent={id:'a1',name:'Aisha Rahman',agency:'Cedar Property'};
 export const inventory:Inventory[]=[
  {id:'l1',kind:'listing',ownerId:'a1',owner:'Aisha Rahman',agency:'Cedar Property',intent:'For rent',title:'One Menerung',location:'Bangsar',developments:['One Menerung'],price:8500,bedrooms:'3+1',bathrooms:'4',size:'2,250 sq ft',propertyType:'Condominium',furnishing:'Fully furnished',moveIn:'Available now',posted:'2026-11-22',confirmed:'2026-11-25',availability:'available',message:'ONE MENERUNG FOR RENT 🌿\n\n3+1 bed • 4 bath • 2,250 sqft\nTastefully renovated, fully furnished. Quiet high floor with green view.\n\nRM8,500 nego\nAvailable immediately. Viewing with 1 day notice.\n\nPrefer family / professional tenants. No short stays please 🙏'},

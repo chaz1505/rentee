@@ -112,8 +112,9 @@ class BubbleClient:
 
     def all(self, object_type, constraints, maximum=1000):
         output, cursor = [], 0
-        while len(output) < maximum:
-            rows, remaining = self.search(object_type, constraints, min(100, maximum-len(output)), cursor)
+        while maximum is None or len(output) < maximum:
+            limit = 100 if maximum is None else min(100, maximum-len(output))
+            rows, remaining = self.search(object_type, constraints, limit, cursor)
             output.extend(rows)
             if not rows or remaining <= 0:
                 break

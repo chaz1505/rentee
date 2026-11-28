@@ -7,7 +7,7 @@ from flask import Blueprint, g, jsonify, make_response, request
 
 from .auth import AuthError, COOKIE_NAME, authenticate as _authenticate, cookie_options, redeem, assert_origin
 from .bubble_client import BubbleUnavailable
-from .serializers import inventory, profile, relation_id, relation_ids
+from .serializers import inactive, inventory, profile, relation_id, relation_ids
 
 blueprint = Blueprint("agent_api", __name__, url_prefix="/api/agent")
 logger = logging.getLogger(__name__)
@@ -178,6 +178,81 @@ def matched_records(client, row, uid, cache=None):
     return lead, listing, lead_owner, listing_owner, side
 
 
+def _created_at(row):
+    try:
+        value = dt.datetime.fromisoformat(str(row.get("Created Date") or "").replace("Z", "+00:00"))
+        return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _related_matches(client, kind, record_ids):
+    ids = list(dict.fromkeys(str(value) for value in record_ids if value))
+    rows = []
+    for offset in range(0, len(ids), 50):
+        group = ids[offset:offset + 50]
+        constraint = {"key": kind, "constraint_type": "equals" if len(group) == 1 else "in",
+                      "value": group[0] if len(group) == 1 else group}
+        rows.extend(client.all("match", [constraint], None))
+    return rows
+
+
+def match_pipeline(client, uid, owned_listings=None, owned_leads=None):
+    """Return historical/actionable matches and safe stage diagnostics."""
+    started = time.perf_counter()
+    owned_listings = owned_listings if owned_listings is not None else client.all("listing", [{"key":"owner", "constraint_type":"equals", "value":uid}], None)
+    owned_leads = owned_leads if owned_leads is not None else client.all("lead", [{"key":"owner", "constraint_type":"equals", "value":uid}], None)
+    by_lead_owner = client.all("match", [{"key":"lead_owner", "constraint_type":"equals", "value":uid}], None)
+    by_listing_owner = client.all("match", [{"key":"listing_owner", "constraint_type":"equals", "value":uid}], None)
+    discovered = _related_matches(client, "listing", [row.get("_id") for row in owned_listings])
+    discovered += _related_matches(client, "lead", [row.get("_id") for row in owned_leads])
+    combined = by_lead_owner + by_listing_owner + discovered
+    keys = ("raw_lead_owner", "raw_listing_owner", "inventory_discovered", "combined_before_filtering",
+            "ownership_excluded", "missing_score_excluded", "below_score_excluded", "inactive_excluded",
+            "age_excluded_actionable", "review_excluded", "duplicates_removed", "final_historical", "final_actionable")
+    counts = dict.fromkeys(keys, 0)
+    counts.update(raw_lead_owner=len(by_lead_owner), raw_listing_owner=len(by_listing_owner),
+                  inventory_discovered=len(discovered), combined_before_filtering=len(combined))
+    records = {}
+    for row in combined:
+        key = row.get("_id") or id(row)
+        if key in records: counts["duplicates_removed"] += 1
+        else: records[key] = row
+    cache = {}; prefetch_match_records(client, records.values(), cache)
+    qualified = []; threshold = int(os.getenv("AGENT_INBOX_MIN_SCORE", "80"))
+    for row in records.values():
+        score = row.get("match_score")
+        if isinstance(score, bool) or not isinstance(score, (int, float)): counts["missing_score_excluded"] += 1; continue
+        if score < threshold: counts["below_score_excluded"] += 1; continue
+        lead_id, listing_id = relation_id(row.get("lead")), relation_id(row.get("listing"))
+        lead, listing = cache.get(("lead", lead_id)), cache.get(("listing", listing_id))
+        lead_owner = relation_id((lead or {}).get("owner")); listing_owner = relation_id((listing or {}).get("owner"))
+        if not lead or not listing or not lead_owner or not listing_owner or lead_owner == listing_owner or uid not in {lead_owner, listing_owner}:
+            counts["ownership_excluded"] += 1; continue
+        if inactive(lead, "lead") or inactive(listing, "listing"):
+            counts["inactive_excluded"] += 1; continue
+        side = "lead" if lead_owner == uid else "listing"
+        qualified.append((row, (lead, listing, lead_owner, listing_owner, side)))
+    unique = {}
+    for row, resolved in qualified:
+        pair = (relation_id(row.get("listing")), relation_id(row.get("lead"))); current = unique.get(pair)
+        if current is None or (str(row.get("Created Date") or ""), str(row.get("_id") or "")) > (str(current[0].get("Created Date") or ""), str(current[0].get("_id") or "")):
+            if current is not None: counts["duplicates_removed"] += 1
+            unique[pair] = (row, resolved)
+        else: counts["duplicates_removed"] += 1
+    historical = list(unique.values()); actionable = []
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+    for row, resolved in historical:
+        created = _created_at(row)
+        if created is None or created < cutoff: counts["age_excluded_actionable"] += 1; continue
+        if row.get(f"{resolved[-1]}_review_status"): counts["review_excluded"] += 1; continue
+        actionable.append((row, resolved))
+    counts.update(final_historical=len(historical), final_actionable=len(actionable))
+    logger.info("Agent match diagnostics " + " ".join(f"{key}=%d" for key in keys), *(counts[key] for key in keys))
+    add_timing("match_filter", time.perf_counter() - started)
+    return historical, actionable, cache
+
+
 def matched_inventory(client, record, kind, owner_id, cache=None):
     cache = cache if cache is not None else {}
     key=("user",owner_id)
@@ -189,17 +264,8 @@ def matched_inventory(client, record, kind, owner_id, cache=None):
 
 
 def deduplicated_match_rows(client, uid):
-    started = time.perf_counter()
-    rows = client.all("match", [{"key":"lead_owner","constraint_type":"equals","value":uid}], 500)+client.all("match", [{"key":"listing_owner","constraint_type":"equals","value":uid}], 500)
-    unique={}
-    for row in rows:
-        lead, listing = relation_id(row.get("lead")), relation_id(row.get("listing")); score=row.get("match_score")
-        if not lead or not listing or not isinstance(score,(int,float)) or score < int(os.getenv("AGENT_INBOX_MIN_SCORE","80")): continue
-        key=(listing,lead); current=unique.get(key)
-        if current is None or (str(row.get("Created Date") or ""),str(row.get("_id"))) > (str(current.get("Created Date") or ""),str(current.get("_id"))): unique[key]=row
-    result = list(unique.values())
-    add_timing("match_filter", time.perf_counter() - started)
-    return result
+    historical, _actionable, _cache = match_pipeline(client, uid)
+    return [row for row, _resolved in historical]
 
 
 @blueprint.post("/auth/redeem")
@@ -261,17 +327,15 @@ def lead_detail(record_id): return own_detail("lead",record_id)
 @blueprint.get("/matches")
 def matches():
     user, _session, client = authenticate(); uid=user["_id"]
-    rows = deduplicated_match_rows(client,uid); cache={}; prefetch_match_records(client,rows,cache)
+    valid, actionable, cache = match_pipeline(client,uid)
+    actionable_ids={row.get("_id") for row,_resolved in actionable}
     related_records=[value for (kind,_id),value in cache.items() if kind in {"lead","listing"} and value]
     related_users=[value for (kind,_id),value in cache.items() if kind=="user" and value]
     resolver(client).collect(related_records,related_users)
     items=[]
-    for row in rows:
-        resolved = matched_records(client, row, uid, cache)
-        if not resolved:
-            continue
+    for row, resolved in valid:
         lead, listing, lead_owner, listing_owner, side = resolved
-        items.append({"id":row.get("_id"),"listing_id":relation_id(row.get("listing")),"lead_id":relation_id(row.get("lead")),"score":row.get("match_score"),"reason":row.get("match_reason") or [],"created_at":row.get("Created Date"),"review_status":row.get(f"{side}_review_status") or "","listing":matched_inventory(client,listing,"listing",listing_owner,cache),"lead":matched_inventory(client,lead,"lead",lead_owner,cache)})
+        items.append({"id":row.get("_id"),"listing_id":relation_id(row.get("listing")),"lead_id":relation_id(row.get("lead")),"score":row.get("match_score"),"reason":row.get("match_reason") or [],"created_at":row.get("Created Date"),"review_status":row.get(f"{side}_review_status") or "","actionable":row.get("_id") in actionable_ids,"listing":matched_inventory(client,listing,"listing",listing_owner,cache),"lead":matched_inventory(client,lead,"lead",lead_owner,cache)})
     items.sort(key=lambda x:(x["score"],x["created_at"] or ""),reverse=True)
     return jsonify(items=items)
 
@@ -311,11 +375,9 @@ def home():
     leads=[x for x in network_leads if relation_id(x.get("owner"))==uid]
     relationships=resolver(client).collect(listings+leads,[user])
     sl=[inventory(x,"listing",user,False,relationships) for x in listings]; sd=[inventory(x,"lead",user,False,relationships) for x in leads]
-    rows=deduplicated_match_rows(client,uid); cache={}; prefetch_match_records(client,rows,cache); valid=[]
-    for row in rows:
-        resolved=matched_records(client,row,uid,cache)
-        if resolved: valid.append((row,resolved[-1]))
-    actionable=sum(not (row.get(f"{side}_review_status") or "") for row,side in valid)
+    valid_rows, actionable_rows, _cache=match_pipeline(client,uid,listings,leads)
+    valid=[(row,resolved[-1]) for row,resolved in valid_rows]
+    actionable=len(actionable_rows)
     myt=dt.timezone(dt.timedelta(hours=8)); local_now=dt.datetime.now(dt.timezone.utc).astimezone(myt); week_start=(local_now-dt.timedelta(days=local_now.weekday())).date()
     def this_week(row):
         try: return dt.datetime.fromisoformat(str(row.get("Created Date") or "").replace("Z","+00:00")).astimezone(myt).date() >= week_start

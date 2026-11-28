@@ -4,6 +4,7 @@ from unittest.mock import patch
 from flask import Flask
 
 from agent_api.auth import AuthError
+from agent_api.bubble_client import BubbleUnavailable
 from agent_api.routes import blueprint
 
 
@@ -27,7 +28,11 @@ class FakeBubble:
 
     def all(self, kind, constraints, maximum=1000):
         rows=list(self.rows.get(kind, {}).values())
-        return [row for row in rows if all(row.get(c["key"]) == c["value"] for c in constraints)][:maximum]
+        def matches(row, constraint):
+            expected=constraint["value"]
+            return row.get(constraint["key"]) in expected if constraint["constraint_type"] == "in" else row.get(constraint["key"]) == expected
+        filtered=[row for row in rows if all(matches(row,c) for c in constraints)]
+        return filtered if maximum is None else filtered[:maximum]
 
     def many(self, kind, record_ids, chunk_size=50):
         ids=set(record_ids); self.many_calls.append((kind,ids))
@@ -121,6 +126,42 @@ class MatchRouteTests(unittest.TestCase):
         self.assertEqual(len(inbox),1)
         self.assertEqual(home["lifetime_matches"],1)
         self.assertEqual(home["actionable_matches"],0)
+
+    def test_legacy_match_without_owner_fields_is_found_through_owned_inventory(self):
+        match=self.bubble.rows["match"]["m1"]
+        match.update({"Created Date":"2099-01-01T00:00:00Z", "lead_review_status":""})
+        match.pop("lead_owner",None); match.pop("listing_owner",None)
+        response=self.client.get("/api/agent/matches")
+        self.assertEqual(response.status_code,200)
+        self.assertEqual([item["id"] for item in response.get_json()["items"]],["m1"])
+        self.assertTrue(response.get_json()["items"][0]["actionable"])
+
+    def test_old_match_remains_historical_but_not_actionable(self):
+        match=self.bubble.rows["match"]["m1"]
+        match.update({"Created Date":"2020-01-01T00:00:00Z", "lead_review_status":""})
+        items=self.client.get("/api/agent/matches").get_json()["items"]
+        home=self.client.get("/api/agent/home").get_json()
+        self.assertEqual(len(items),1)
+        self.assertFalse(items[0]["actionable"])
+        self.assertEqual((home["lifetime_matches"],home["actionable_matches"]),(1,0))
+
+    def test_match_diagnostics_include_every_aggregate_stage(self):
+        self.bubble.rows["match"]["m1"].update({"Created Date":"2099-01-01T00:00:00Z"})
+        with self.assertLogs("agent_api.routes",level="INFO") as captured:
+            self.client.get("/api/agent/matches")
+        line=" ".join(captured.output)
+        for field in ("raw_lead_owner", "raw_listing_owner", "inventory_discovered",
+                      "combined_before_filtering", "ownership_excluded", "missing_score_excluded",
+                      "below_score_excluded", "inactive_excluded", "age_excluded_actionable",
+                      "review_excluded", "duplicates_removed", "final_historical", "final_actionable"):
+            self.assertIn(f"{field}=",line)
+        self.assertNotIn("u1",line)
+
+    def test_bubble_failure_is_503_not_an_empty_match_list(self):
+        self.bubble.all=lambda *_args,**_kwargs: (_ for _ in ()).throw(BubbleUnavailable("down"))
+        response=self.client.get("/api/agent/matches")
+        self.assertEqual(response.status_code,503)
+        self.assertEqual(response.get_json(),{"error":"Data is temporarily unavailable"})
 
     def test_relationship_ids_are_bulk_resolved_to_display_names(self):
         self.bubble.rows.update({
