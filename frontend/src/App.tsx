@@ -1,14 +1,13 @@
 import { useEffect, useMemo, useState, ReactNode } from "react";
 import { Routes, Route, Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowRight, Building2, Check, ChevronRight, Clock3, Handshake, LayoutList, ListFilter, LoaderCircle, MessageCircle, Plus, Search, ShieldCheck, UserRound, Users } from "lucide-react";
-import { agent, Inventory, Match, money } from "./data";
+import { agent, Inventory, Match, money, priceLabel } from "./data";
 import { useStore } from "./store";
 import { ConfirmDialog, Filters, Header, InboxZero, InventoryCard, MatchCard, OriginalMessage, Progress, ResetButton, Score, Shell, Status } from "./components";
 import { api, ApiNetworkError, logout, redeem } from "./api";
 const mine = (i: Inventory) => i.ownerId === agent.id;
 const demo = import.meta.env.DEV && import.meta.env.VITE_USE_MOCK_DATA === "true";
 const days = (date: string) => Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
-const fresh = (i: Inventory) => (days(i.confirmed) > 30 ? "Needs confirmation" : days(i.posted) < 7 ? "Recently added" : "Recently confirmed");
 function Home() {
   const { inventory, matches, actionable, home, states, loadHome, profile, logoutLocal } = useStore();
   useEffect(()=>{loadHome().catch(()=>{})},[loadHome]);
@@ -188,7 +187,7 @@ function Matches() {
                     <p className="label">Your {own.kind}</p>
                     <h2 className="font-bold">{own.title}</h2>
                     <p className="text-xs text-slate-500">
-                      {money(own.price)} · {own.bedrooms} bed
+                      {priceLabel(own)} · {own.bedrooms} bed
                     </p>
                   </div>
                   <span className="text-xs font-bold text-brand">{ms.filter(actionable).length} new</span>
@@ -224,9 +223,10 @@ function Matches() {
   );
 }
 function InventoryList({ kind }: { kind: "listing" | "lead" }) {
-  const { inventory, matches, actionable, confirm, deactivate, states, loadListings, loadLeads } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, states, loadListings, loadLeads, loadMatches } = useStore();
   const loadKind=kind==="listing"?loadListings:loadLeads,state=kind==="listing"?states.listings:states.leads;
   useEffect(()=>{loadKind().catch(()=>{})},[loadKind]);
+  useEffect(()=>{loadMatches().catch(()=>{})},[loadMatches]);
   const [filter, setFilter] = useState("Active"),
     [select, setSelect] = useState(false),
     [selected, setSelected] = useState<string[]>([]);
@@ -242,7 +242,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
         <p className="label">Your inventory</p>
         <div className="flex items-end justify-between">
           <h1 className="mt-1 text-3xl font-extrabold">My {kind === "listing" ? "listings" : "leads"}</h1>
-          <button
+          {demo&&<button
             className="text-sm font-semibold text-brand"
             onClick={() => {
               setSelect(!select);
@@ -250,13 +250,13 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
             }}
           >
             {select ? "Cancel" : "Select"}
-          </button>
+          </button>}
         </div>
       </div>
       <div className="content space-y-4">
         {(state==="idle"||state==="loading")&&all.length===0?<CardsSkeleton/>:state==="error"&&all.length===0?<LoadError onRetry={()=>loadKind(true)}/>:null}
         <Filters items={["Active", "Needs confirmation", "Inactive", "All"]} value={filter} onChange={setFilter} />
-        {select && selected.length > 0 && (
+        {demo && select && selected.length > 0 && (
           <button
             className="btn-primary w-full"
             onClick={() => {
@@ -272,7 +272,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
           const c = counts(i.id);
           return (
             <div key={i.id} className="relative">
-              {select && i.availability !== "unavailable" && (
+              {demo && select && i.availability !== "unavailable" && (
                 <button onClick={() => setSelected((s) => (s.includes(i.id) ? s.filter((x) => x !== i.id) : [...s, i.id]))} className={`absolute right-3 top-3 z-10 grid size-7 place-items-center rounded-full border ${selected.includes(i.id) ? "bg-brand text-white" : "bg-white"}`}>
                   {selected.includes(i.id) && <Check size={16} />}
                 </button>
@@ -284,7 +284,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
                 <Link to={`/matches?inventory=${i.id}`} className="btn-secondary flex-1">
                   View matches
                 </Link>
-                {i.availability !== "unavailable" && (
+                {demo && i.availability !== "unavailable" && (
                   <>
                     <button onClick={() => confirm([i.id])} className="btn-secondary px-3" aria-label="Confirm">
                       <ShieldCheck size={17} />
@@ -296,6 +296,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
                     </ConfirmDialog>
                   </>
                 )}
+                {!demo&&<span className="self-center px-2 text-[11px] text-slate-400">Read-only pilot</span>}
               </div>
             </div>
           );
@@ -334,7 +335,7 @@ function MatchDetail() {
   const rows = [
     ["Development", listing.title, lead.developments.join(", ")],
     ["Location", listing.location, lead.location],
-    ["Price / budget", money(listing.price), `${money(lead.price)} max`],
+    ["Price / budget", priceLabel(listing), `${priceLabel(lead)} max`],
     ["Bedrooms", listing.bedrooms, lead.bedrooms],
     ["Property type", listing.propertyType, lead.propertyType],
     ["Furnishing", listing.furnishing || "Unknown", lead.furnishing || "Unknown"],
@@ -375,7 +376,7 @@ function MatchDetail() {
                     {item.location} · {item.bedrooms} bed
                   </p>
                   <p className="mt-2 font-bold">
-                    {money(item.price)}
+                    {priceLabel(item)}
                     {item.kind === "lead" ? " max" : ""}
                   </p>
                 </div>
@@ -449,9 +450,10 @@ function Explanation({ title, items, good = false }: { title: string; items: str
 }
 function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
   const { id } = useParams();
-  const { inventory, matches, actionable, confirm, deactivate, loadInventoryDetail } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, loadInventoryDetail, loadMatches } = useStore();
   const [detailState,setDetailState]=useState<"loading"|"ready"|"error">(inventory.some(i=>i.id===id&&i.kind===kind)?"ready":"loading");
   useEffect(()=>{if(!id)return;loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))},[id,kind,loadInventoryDetail]);
+  useEffect(()=>{loadMatches().catch(()=>{})},[loadMatches]);
   const item = inventory.find((i) => i.id === id && i.kind === kind);
   if (!item) return detailState==="error"?<DetailError onRetry={()=>{setDetailState("loading");id&&loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))}}/>:<DetailSkeleton title={`${kind === "listing" ? "Listing" : "Lead"} details`}/>;
   const owner = mine(item),
@@ -460,7 +462,7 @@ function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
   const facts =
     kind === "listing"
       ? [
-          [item.intent, money(item.price)],
+          [item.intent, priceLabel(item)],
           ["Bedrooms", item.bedrooms],
           ["Bathrooms", item.bathrooms || "Not provided"],
           ["Size", item.size || "Not provided"],
@@ -469,7 +471,7 @@ function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
           ["Availability", item.moveIn || "Not provided"],
         ]
       : [
-          [item.intent, `${money(item.price)} max`],
+          [item.intent, `${priceLabel(item)} max`],
           ["Bedrooms", item.bedrooms],
           ["Preferred areas", item.location],
           ["Developments", item.developments.join(", ")],
@@ -483,8 +485,7 @@ function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
       <div className="content space-y-5 pb-5 pt-5">
         <section>
           <div className="flex items-center gap-2">
-            <Status value={item.availability} />
-            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">{fresh(item)}</span>
+            <Status value={item.availability} freshness={item.freshness} />
           </div>
           <h1 className="mt-3 text-3xl font-extrabold">{item.title}</h1>
           <p className="mt-1 text-slate-500">{item.location}</p>
@@ -508,11 +509,11 @@ function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
               month: "long",
               year: "numeric",
             })}{" "}
-            · Last confirmed{" "}
+            {item.confirmed&&<>· Last confirmed{" "}
             {new Date(item.confirmed).toLocaleDateString("en-MY", {
               day: "numeric",
               month: "short",
-            })}
+            })}</>}
           </div>
         </section>
         <OriginalMessage message={item.message} label={`Original WhatsApp ${kind}`} />

@@ -66,6 +66,17 @@ class BubbleClientTests(unittest.TestCase):
         self.assertIn("operation=search object_type=AgentSession status=200 reason=invalid_json", " ".join(captured.output))
         self.assertNotIn("contains response contents", " ".join(captured.output))
 
+    @patch("agent_api.bubble_client.requests.request")
+    def test_many_deduplicates_ids_and_uses_bubble_in_constraint(self, request):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"response":{"results":[{"_id":"c1"},{"_id":"c2"}],"remaining":0}}
+        request.return_value = response
+        rows=BubbleClient().many("condo",["c1","c2","c1"])
+        self.assertEqual([row["_id"] for row in rows],["c1","c2"])
+        constraints=request.call_args.kwargs["params"]["constraints"]
+        self.assertEqual(constraints,'[{"key":"_id","constraint_type":"in","value":["c1","c2"]}]')
+
 
 if __name__ == "__main__":
     unittest.main()

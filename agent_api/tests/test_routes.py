@@ -16,6 +16,7 @@ class FakeBubble:
             "user": {"u1": {"_id": "u1", "name": "Aisha", "phone": "+60111111111"}, "u2": {"_id": "u2", "name": "Daniel", "Agency": "North & Co", "phone": "+60122222222"}},
         }
         self.patches = []
+        self.many_calls = []
 
     def one(self, kind, record_id):
         return self.rows.get(kind, {}).get(record_id)
@@ -27,6 +28,14 @@ class FakeBubble:
     def all(self, kind, constraints, maximum=1000):
         rows=list(self.rows.get(kind, {}).values())
         return [row for row in rows if all(row.get(c["key"]) == c["value"] for c in constraints)][:maximum]
+
+    def many(self, kind, record_ids, chunk_size=50):
+        ids=set(record_ids); self.many_calls.append((kind,ids))
+        return [row for key,row in self.rows.get(kind,{}).items() if key in ids]
+
+    def search(self, kind, constraints, limit=100, cursor=0, sort_field=None, descending=False):
+        rows=self.all(kind,constraints,1000)
+        return rows[cursor:cursor+limit],max(0,len(rows)-cursor-limit)
 
 
 class MatchRouteTests(unittest.TestCase):
@@ -112,6 +121,42 @@ class MatchRouteTests(unittest.TestCase):
         self.assertEqual(len(inbox),1)
         self.assertEqual(home["lifetime_matches"],1)
         self.assertEqual(home["actionable_matches"],0)
+
+    def test_relationship_ids_are_bulk_resolved_to_display_names(self):
+        self.bubble.rows.update({
+            "condo": {
+                "1700000000001x100000000000001": {"_id":"1700000000001x100000000000001","name":"One Menerung"},
+                "1700000000002x100000000000002": {"_id":"1700000000002x100000000000002","Condo name":"Serai"},
+            },
+            "geo": {
+                "1700000000003x100000000000003": {"_id":"1700000000003x100000000000003","Name":"Bangsar"},
+                "1700000000004x100000000000004": {"_id":"1700000000004x100000000000004","name":"Damansara Heights"},
+            },
+            "agency": {"1700000000005x100000000000005":{"_id":"1700000000005x100000000000005","Name":"Cedar Property"}},
+        })
+        self.bubble.rows["user"]["u1"]["Agency"]="1700000000005x100000000000005"
+        self.bubble.rows["listing"]["l1"].update({"owner":"u1","condo":"1700000000001x100000000000001","Geo":"1700000000003x100000000000003"})
+        self.bubble.rows["lead"]["q1"].update({
+            "preferredDevelopments":["1700000000001x100000000000001","1700000000002x100000000000002"],
+            "Geo":["1700000000003x100000000000003","1700000000004x100000000000004"],
+        })
+
+        listing=self.client.get("/api/agent/listings").get_json()["items"][0]
+        lead=self.client.get("/api/agent/leads").get_json()["items"][0]
+        self.assertEqual((listing["title"],listing["location"]),("One Menerung","Bangsar"))
+        self.assertEqual(lead["developments"],["One Menerung","Serai"])
+        self.assertEqual(lead["location"],"Bangsar, Damansara Heights")
+        self.assertEqual(lead["owner"]["agency"],"Cedar Property")
+        rendered=str((listing,lead))
+        self.assertNotIn("170000000000",rendered)
+
+    def test_unresolved_relationships_use_labels_not_raw_ids(self):
+        raw="1700000000099x100000000000099"
+        self.bubble.rows["listing"]["l1"].update({"owner":"u1","condo":raw,"Geo":raw})
+        item=self.client.get("/api/agent/listings").get_json()["items"][0]
+        self.assertEqual(item["title"],"Listing")
+        self.assertEqual(item["location"],"Area not specified")
+        self.assertNotIn(raw,str(item))
 
 
 if __name__ == "__main__":

@@ -7,10 +7,81 @@ from flask import Blueprint, g, jsonify, make_response, request
 
 from .auth import AuthError, COOKIE_NAME, authenticate as _authenticate, cookie_options, redeem, assert_origin
 from .bubble_client import BubbleUnavailable
-from .serializers import inventory, profile, relation_id
+from .serializers import inventory, profile, relation_id, relation_ids
 
 blueprint = Blueprint("agent_api", __name__, url_prefix="/api/agent")
 logger = logging.getLogger(__name__)
+
+DISPLAY_FIELDS = ("name", "Name", "Condo name", "title")
+
+
+class RelationshipResolver:
+    """Request-scoped, bulk relationship resolver shared by every serializer."""
+    def __init__(self, client):
+        self.client = client
+        self.names = {"condo": {}, "geo": {}, "agency": {}}
+        self.loaded = {"condo": set(), "geo": set(), "agency": set()}
+
+    def resolve(self, object_type, ids):
+        wanted = {str(value) for value in ids if value}
+        missing = wanted - self.loaded[object_type]
+        if missing:
+            started = time.perf_counter()
+            rows = self.client.many(object_type, missing)
+            add_timing("relationship", time.perf_counter() - started)
+            self.loaded[object_type].update(missing)
+            for row in rows:
+                label = next((row.get(field) for field in DISPLAY_FIELDS if row.get(field)), None)
+                if row.get("_id") and label:
+                    self.names[object_type][str(row["_id"])] = str(label)
+        return self.names[object_type]
+
+    def collect(self, records=(), users=()):
+        condo_ids, geo_ids, agency_ids = [], [], []
+        for record in records:
+            for field in ("development", "condo", "preferredDevelopments", "preferredCondos"):
+                condo_ids.extend(relation_ids(record.get(field)))
+            geo_ids.extend(relation_ids(record.get("Geo")))
+        for user in users:
+            value = relation_id((user or {}).get("Agency"))
+            if value:
+                agency_ids.append(value)
+        self.resolve("condo", condo_ids)
+        self.resolve("geo", geo_ids)
+        self.resolve("agency", agency_ids)
+        return self.names
+
+
+def resolver(client):
+    current = getattr(g, "relationship_resolver", None)
+    if current is None:
+        current = g.relationship_resolver = RelationshipResolver(client)
+    return current
+
+
+def prefetch_match_records(client, rows, cache):
+    ids = {"lead": set(), "listing": set()}
+    for row in rows:
+        for kind in ids:
+            value = relation_id(row.get(kind))
+            if value and (kind, value) not in cache:
+                ids[kind].add(value)
+    started = time.perf_counter()
+    for kind, values in ids.items():
+        for record in client.many(kind, values):
+            cache[(kind, record.get("_id"))] = record
+        for value in values:
+            cache.setdefault((kind, value), None)
+    owner_ids = {
+        relation_id(record.get("owner"))
+        for (kind, _record_id), record in cache.items()
+        if kind in {"lead", "listing"} and record and relation_id(record.get("owner"))
+    }
+    for user in client.many("user", owner_ids):
+        cache[("user", user.get("_id"))] = user
+    for value in owner_ids:
+        cache.setdefault(("user", value), None)
+    add_timing("relationship", time.perf_counter() - started)
 
 
 def add_timing(name, seconds):
@@ -113,7 +184,8 @@ def matched_inventory(client, record, kind, owner_id, cache=None):
     started = time.perf_counter()
     if key not in cache: cache[key]=client.one("user",owner_id)
     add_timing("relationship", time.perf_counter() - started)
-    return inventory(record, kind, cache[key], True)
+    relationships = resolver(client).collect([record], [cache[key]])
+    return inventory(record, kind, cache[key], True, relationships)
 
 
 def deduplicated_match_rows(client, uid):
@@ -148,7 +220,7 @@ def logout():
 
 @blueprint.get("/me")
 def me():
-    user, _session, _client = authenticate(); return jsonify(profile(user))
+    user, _session, client = authenticate(); relationships=resolver(client).collect(users=[user]); return jsonify(profile(user,relationships))
 
 
 def page_args():
@@ -159,7 +231,8 @@ def page_args():
 def own_inventory(kind):
     user, _session, client = authenticate(); page, limit = page_args()
     rows, remaining = client.search(kind, [{"key":"owner","constraint_type":"equals","value":user["_id"]}], limit, (page-1)*limit, "Created Date", True)
-    return jsonify(items=[inventory(row,kind,user,True) for row in rows], page=page, has_more=remaining>0)
+    relationships=resolver(client).collect(rows,[user])
+    return jsonify(items=[inventory(row,kind,user,True,relationships) for row in rows], page=page, has_more=remaining>0)
 
 
 @blueprint.get("/listings")
@@ -173,7 +246,8 @@ def leads(): return own_inventory("lead")
 def own_detail(kind, record_id):
     user, _session, client = authenticate(); row = client.one(kind, record_id)
     if not row or relation_id(row.get("owner")) != user["_id"]: return jsonify(error="Not found"), 404
-    return jsonify(inventory(row,kind,user,True))
+    relationships=resolver(client).collect([row],[user])
+    return jsonify(inventory(row,kind,user,True,relationships))
 
 
 @blueprint.get("/listings/<record_id>")
@@ -187,7 +261,10 @@ def lead_detail(record_id): return own_detail("lead",record_id)
 @blueprint.get("/matches")
 def matches():
     user, _session, client = authenticate(); uid=user["_id"]
-    rows = deduplicated_match_rows(client,uid); cache={}
+    rows = deduplicated_match_rows(client,uid); cache={}; prefetch_match_records(client,rows,cache)
+    related_records=[value for (kind,_id),value in cache.items() if kind in {"lead","listing"} and value]
+    related_users=[value for (kind,_id),value in cache.items() if kind=="user" and value]
+    resolver(client).collect(related_records,related_users)
     items=[]
     for row in rows:
         resolved = matched_records(client, row, uid, cache)
@@ -218,7 +295,9 @@ def match_contact(record_id):
     owner=client.one("user",owner_id)
     phone=(owner or {}).get("phone")
     if not phone: return jsonify(error="Contact is unavailable"),404
-    return jsonify(agent={"name":owner.get("name") or owner.get("Name") or "Agent","agency":owner.get("Agency") or ""},phone=phone)
+    relationships=resolver(client).collect(users=[owner])
+    owner_profile=profile(owner,relationships)
+    return jsonify(agent={"name":owner_profile["name"],"agency":owner_profile["agency"]},phone=phone)
 
 
 @blueprint.get("/home")
@@ -230,8 +309,9 @@ def home():
     network_listings=client.all("listing",[],5000); network_leads=client.all("lead",[],5000); network_matches=client.all("match",[],5000)
     listings=[x for x in network_listings if relation_id(x.get("owner"))==uid]
     leads=[x for x in network_leads if relation_id(x.get("owner"))==uid]
-    sl=[inventory(x,"listing",user,False) for x in listings]; sd=[inventory(x,"lead",user,False) for x in leads]
-    rows=deduplicated_match_rows(client,uid); cache={}; valid=[]
+    relationships=resolver(client).collect(listings+leads,[user])
+    sl=[inventory(x,"listing",user,False,relationships) for x in listings]; sd=[inventory(x,"lead",user,False,relationships) for x in leads]
+    rows=deduplicated_match_rows(client,uid); cache={}; prefetch_match_records(client,rows,cache); valid=[]
     for row in rows:
         resolved=matched_records(client,row,uid,cache)
         if resolved: valid.append((row,resolved[-1]))
@@ -240,7 +320,7 @@ def home():
     def this_week(row):
         try: return dt.datetime.fromisoformat(str(row.get("Created Date") or "").replace("Z","+00:00")).astimezone(myt).date() >= week_start
         except ValueError: return False
-    network_listing_views=[inventory(x,"listing",None,False) for x in network_listings]; network_lead_views=[inventory(x,"lead",None,False) for x in network_leads]
+    network_listing_views=[inventory(x,"listing",None,False,relationships) for x in network_listings]; network_lead_views=[inventory(x,"lead",None,False,relationships) for x in network_leads]
     network_unique={}
     for row in network_matches:
         pair=(relation_id(row.get("listing")),relation_id(row.get("lead")))
@@ -250,4 +330,4 @@ def home():
     owners={relation_id(x.get("owner")) for x in network_listings+network_leads if relation_id(x.get("owner"))}
     network={"active_listings":sum(x["active"] for x in network_listing_views),"active_leads":sum(x["active"] for x in network_lead_views),"agents":len(owners),"matches_this_week":sum(this_week(x) for x in network_unique.values())}
     add_timing("stats",time.perf_counter()-stats_started)
-    return jsonify(profile=profile(user),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network)
+    return jsonify(profile=profile(user,relationships),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network)

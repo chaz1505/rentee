@@ -1,5 +1,5 @@
 export type Kind='listing'|'lead'; export type Availability='available'|'unconfirmed'|'unavailable';
-export type Inventory={id:string;kind:Kind;ownerId:string;owner:string;agency:string;intent:string;title:string;location:string;developments:string[];price:number;bedrooms:string;propertyType:string;bathrooms?:string;size?:string;furnishing?:string;moveIn?:string;posted:string;confirmed:string;availability:Availability;message:string};
+export type Inventory={id:string;kind:Kind;ownerId:string;owner:string;agency:string;intent:string;title:string;location:string;developments:string[];price:number;bedrooms:string;propertyType:string;bathrooms?:string;size?:string;furnishing?:string;moveIn?:string;posted:string;confirmed:string;availability:Availability;freshness?:'confirmed_active'|'recently_added'|'needs_confirmation'|'inactive';message:string};
 export type MatchStatus='new'|'reviewed'|'dismissed'|'contacted';
 export type Match={id:string;listingId:string;leadId:string;score:number;discovered:string;reasons:string[];differences:string[];checks:string[];status:MatchStatus};
 export const agent={id:'a1',name:'Aisha Rahman',agency:'Cedar Property'};
@@ -26,3 +26,4 @@ export const matches:Match[]=[
 ];
 export const network={listings:1847,leads:963,agents:428,matchesWeek:136,newToday:47};
 export const money=(n:number)=>n>=1000000?`RM ${(n/1000000).toFixed(n%1000000?1:0)}m`:`RM ${n.toLocaleString()}`;
+export const priceLabel=(item:Inventory)=>`${money(item.price)}${item.intent.toLowerCase().includes('rent')?'/month':''}`;

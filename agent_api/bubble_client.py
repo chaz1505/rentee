@@ -119,3 +119,17 @@ class BubbleClient:
                 break
             cursor += len(rows)
         return output
+
+    def many(self, object_type, record_ids, chunk_size=50):
+        """Load a deduplicated set of Bubble records in bounded ID batches."""
+        ids = list(dict.fromkeys(str(value) for value in record_ids or [] if value))
+        output = []
+        for offset in range(0, len(ids), chunk_size):
+            group = ids[offset:offset + chunk_size]
+            constraint = {
+                "key": "_id",
+                "constraint_type": "equals" if len(group) == 1 else "in",
+                "value": group[0] if len(group) == 1 else group,
+            }
+            output.extend(self.all(object_type, [constraint], maximum=len(group)))
+        return output
