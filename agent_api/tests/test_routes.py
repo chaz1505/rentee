@@ -57,6 +57,39 @@ class MatchRouteTests(unittest.TestCase):
     def tearDown(self):
         self.auth.stop()
 
+    def test_inventory_lists_omit_messages_until_owned_detail(self):
+        self.bubble.rows["listing"]["l1"]["owner"] = "u1"
+        listing_list = self.client.get("/api/agent/listings")
+        self.assertEqual(listing_list.status_code, 200)
+        self.assertEqual(len(listing_list.get_json()["items"]), 1)
+        self.assertNotIn("original_message", listing_list.get_json()["items"][0])
+
+        listing_detail = self.client.get("/api/agent/listings/l1")
+        self.assertEqual(listing_detail.status_code, 200)
+        self.assertEqual(listing_detail.get_json()["original_message"], "Condo available")
+
+        lead_list = self.client.get("/api/agent/leads")
+        self.assertEqual(lead_list.status_code, 200)
+        self.assertNotIn("original_message", lead_list.get_json()["items"][0])
+        lead_detail = self.client.get("/api/agent/leads/q1")
+        self.assertEqual(lead_detail.get_json()["original_message"], "Need a family home")
+
+    def test_match_list_omits_messages_but_detail_loads_them(self):
+        response = self.client.get("/api/agent/matches")
+        self.assertEqual(response.status_code, 200)
+        row = response.get_json()["items"][0]
+        self.assertNotIn("original_message", row["listing"])
+        self.assertNotIn("original_message", row["lead"])
+        detail = self.client.get("/api/agent/matches/m1")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.get_json()["listing"]["original_message"], "Condo available")
+        self.assertEqual(detail.get_json()["lead"]["original_message"], "Need a family home")
+
+    def test_unowned_listing_detail_cannot_disclose_message(self):
+        response = self.client.get("/api/agent/listings/l1")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("Condo available", response.get_data(as_text=True))
+
     def test_match_detail_allows_approved_counterparty_fields_only(self):
         response = self.client.get("/api/agent/matches/m1")
         self.assertEqual(response.status_code, 200)
