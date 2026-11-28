@@ -19,7 +19,7 @@ class BubbleClientTests(unittest.TestCase):
     def test_default_uses_verified_live_api_root(self):
         self.assertEqual(BubbleClient().base, "https://www.rentee.asia/api/1.1")
 
-    @patch("agent_api.bubble_client.requests.request")
+    @patch("agent_api.bubble_client.requests.Session.request")
     def test_create_accepts_standard_top_level_id(self, request):
         response = Mock(status_code=201)
         response.raise_for_status.return_value = None
@@ -30,7 +30,7 @@ class BubbleClientTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[:2], ("POST", "https://www.rentee.asia/api/1.1/obj/AgentSession"))
         self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer secret-test-token")
 
-    @patch("agent_api.bubble_client.requests.request")
+    @patch("agent_api.bubble_client.requests.Session.request")
     def test_create_accepts_wrapped_id(self, request):
         response = Mock(status_code=200)
         response.raise_for_status.return_value = None
@@ -38,7 +38,7 @@ class BubbleClientTests(unittest.TestCase):
         request.return_value = response
         self.assertEqual(BubbleClient().create("AgentSession", {}), "session-2")
 
-    @patch("agent_api.bubble_client.requests.request")
+    @patch("agent_api.bubble_client.requests.Session.request")
     def test_failure_log_is_diagnostic_and_redacted(self, request):
         response = Mock(status_code=401)
         error = requests.HTTPError("secret-test-token raw-sensitive-body", response=response)
@@ -54,7 +54,7 @@ class BubbleClientTests(unittest.TestCase):
         self.assertNotIn("sensitive-hash", rendered)
         self.assertNotIn("raw-sensitive-body", rendered)
 
-    @patch("agent_api.bubble_client.requests.request")
+    @patch("agent_api.bubble_client.requests.Session.request")
     def test_invalid_success_body_is_reported_as_bubble_unavailable(self, request):
         response = Mock(status_code=200)
         response.raise_for_status.return_value = None
@@ -66,7 +66,7 @@ class BubbleClientTests(unittest.TestCase):
         self.assertIn("operation=search object_type=AgentSession status=200 reason=invalid_json", " ".join(captured.output))
         self.assertNotIn("contains response contents", " ".join(captured.output))
 
-    @patch("agent_api.bubble_client.requests.request")
+    @patch("agent_api.bubble_client.requests.Session.request")
     def test_many_deduplicates_ids_and_uses_bubble_in_constraint(self, request):
         response = Mock(status_code=200)
         response.raise_for_status.return_value = None

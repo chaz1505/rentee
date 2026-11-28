@@ -4,9 +4,11 @@ import json
 import logging
 import os
 import requests
+import threading
 import time
 
 logger = logging.getLogger(__name__)
+BUBBLE_REQUEST_SLOTS = threading.BoundedSemaphore(max(1, int(os.getenv("AGENT_BUBBLE_PROCESS_MAX_IN_FLIGHT", "8"))))
 
 
 class BubbleUnavailable(RuntimeError):
@@ -23,6 +25,15 @@ class BubbleClient:
         self.request_count = 0
         self.request_seconds = 0.0
         self.records_retrieved = 0
+        self._local = threading.local()
+        self._metrics_lock = threading.Lock()
+
+    def _session(self):
+        """Return a connection pool owned by the current thread."""
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = requests.Session()
+        return session
 
     @staticmethod
     def _log_failure(operation, object_type, status, reason):
@@ -35,9 +46,11 @@ class BubbleClient:
 
     def _request(self, method, path, object_type, operation, **kwargs):
         started = time.perf_counter()
-        self.request_count += 1
+        with self._metrics_lock:
+            self.request_count += 1
         try:
-            response = requests.request(method, f"{self.base}/{path.lstrip('/')}", headers=self.headers, timeout=self.timeout, **kwargs)
+            with BUBBLE_REQUEST_SLOTS:
+                response = self._session().request(method, f"{self.base}/{path.lstrip('/')}", headers=self.headers, timeout=self.timeout, **kwargs)
             response.raise_for_status()
             return response
         except requests.Timeout as exc:
@@ -49,7 +62,8 @@ class BubbleClient:
             self._log_failure(operation, object_type, status, reason)
             raise BubbleUnavailable("Bubble data is temporarily unavailable") from exc
         finally:
-            self.request_seconds += time.perf_counter() - started
+            with self._metrics_lock:
+                self.request_seconds += time.perf_counter() - started
 
     def _json(self, response, operation, object_type):
         try:
@@ -80,8 +94,14 @@ class BubbleClient:
         except (TypeError, ValueError) as exc:
             self._log_failure("search", object_type, response.status_code, "invalid_response")
             raise BubbleUnavailable("Bubble returned invalid data") from exc
-        self.records_retrieved += len(rows)
+        with self._metrics_lock:
+            self.records_retrieved += len(rows)
         return rows, remaining
+
+    def count(self, object_type, constraints):
+        """Obtain Bubble's exact result count without downloading the result set."""
+        rows, remaining = self.search(object_type, constraints, 1, 0)
+        return len(rows) + remaining
 
     def one(self, object_type, record_id):
         try:
@@ -91,7 +111,8 @@ class BubbleClient:
                 self._log_failure("get", object_type, response.status_code, "invalid_response")
                 raise BubbleUnavailable("Bubble returned invalid data")
             if record:
-                self.records_retrieved += 1
+                with self._metrics_lock:
+                    self.records_retrieved += 1
             return record or None
         except BubbleUnavailable as exc:
             cause = exc.__cause__

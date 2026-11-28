@@ -30,7 +30,9 @@ class FakeBubble:
         rows=list(self.rows.get(kind, {}).values())
         def matches(row, constraint):
             expected=constraint["value"]
-            return row.get(constraint["key"]) in expected if constraint["constraint_type"] == "in" else row.get(constraint["key"]) == expected
+            if constraint["constraint_type"] == "in": return row.get(constraint["key"]) in expected
+            if constraint["constraint_type"] == "greater than or equal": return str(row.get(constraint["key"]) or "") >= str(expected)
+            return row.get(constraint["key"]) == expected
         filtered=[row for row in rows if all(matches(row,c) for c in constraints)]
         return filtered if maximum is None else filtered[:maximum]
 
@@ -135,6 +137,14 @@ class MatchRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code,200)
         self.assertEqual([item["id"] for item in response.get_json()["items"]],["m1"])
         self.assertTrue(response.get_json()["items"][0]["actionable"])
+
+    def test_low_score_match_is_rejected_before_relationship_fetch(self):
+        self.bubble.rows["match"]["low"]={"_id":"low","lead":"missing-lead","listing":"missing-listing","match_score":20,"lead_owner":"u1"}
+        response=self.client.get("/api/agent/matches")
+        self.assertEqual(response.status_code,200)
+        fetched_ids=set().union(*(ids for kind,ids in self.bubble.many_calls if kind in {"lead","listing"}))
+        self.assertNotIn("missing-lead",fetched_ids)
+        self.assertNotIn("missing-listing",fetched_ids)
 
     def test_old_match_remains_historical_but_not_actionable(self):
         match=self.bubble.rows["match"]["m1"]

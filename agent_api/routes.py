@@ -2,18 +2,28 @@ import datetime as dt
 import logging
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Blueprint, g, jsonify, make_response, request
 
 from .auth import AuthError, COOKIE_NAME, authenticate as _authenticate, cookie_options, redeem, assert_origin
 from .bubble_client import BubbleUnavailable
-from .cache import dashboard_cache, reference_cache
+from .cache import dashboard_cache, network_stats_cache, reference_cache
 from .serializers import inactive, inventory, profile, relation_id, relation_ids
 
 blueprint = Blueprint("agent_api", __name__, url_prefix="/api/agent")
 logger = logging.getLogger(__name__)
 
 DISPLAY_FIELDS = ("name", "Name", "Condo name", "title")
+NETWORK_STATS_LOCK = threading.Lock()
+
+
+def parallel_calls(*calls):
+    """Run a small set of independent Bubble operations with bounded concurrency."""
+    workers = min(4, max(1, int(os.getenv("AGENT_BUBBLE_MAX_PARALLEL_REQUESTS", "4"))), len(calls))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agent-bubble") as executor:
+        return [future.result() for future in [executor.submit(call) for call in calls]]
 
 
 class RelationshipResolver:
@@ -80,20 +90,13 @@ def prefetch_match_records(client, rows, cache):
             if value and (kind, value) not in cache:
                 ids[kind].add(value)
     started = time.perf_counter()
-    for kind, values in ids.items():
-        for record in client.many(kind, values):
+    kinds = [(kind, values) for kind, values in ids.items() if values]
+    results = parallel_calls(*(lambda kind=kind, values=values: client.many(kind, values) for kind, values in kinds)) if kinds else []
+    for (kind, values), result in zip(kinds, results):
+        for record in result:
             cache[(kind, record.get("_id"))] = record
         for value in values:
             cache.setdefault((kind, value), None)
-    owner_ids = {
-        relation_id(record.get("owner"))
-        for (kind, _record_id), record in cache.items()
-        if kind in {"lead", "listing"} and record and relation_id(record.get("owner"))
-    }
-    for user in client.many("user", owner_ids):
-        cache[("user", user.get("_id"))] = user
-    for value in owner_ids:
-        cache.setdefault(("user", value), None)
     add_timing("relationship", time.perf_counter() - started)
 
 
@@ -138,10 +141,12 @@ def cors(response):
         client = getattr(g, "bubble_client", None)
         timings = getattr(g, "agent_timings", {})
         logger.info(
-            "Agent API timing endpoint=%s status=%s total_ms=%.1f bubble_requests=%s bubble_ms=%.1f records_retrieved=%s records_returned=%s relationship_ms=%.1f match_filter_ms=%.1f stats_ms=%.1f cache_hits=%s cache_misses=%s",
+            "Agent API timing endpoint=%s status=%s total_ms=%.1f bubble_requests=%s bubble_ms=%.1f records_retrieved=%s records_returned=%s match_candidates=%s match_listings=%s match_leads=%s match_users=%s match_serialized=%s relationship_ms=%.1f match_filter_ms=%.1f stats_ms=%.1f cache_hits=%s cache_misses=%s",
             request.endpoint or "unknown", response.status_code, total * 1000,
             getattr(client, "request_count", 0), getattr(client, "request_seconds", 0.0) * 1000,
             getattr(client, "records_retrieved", 0), timings.get("records_returned", 0),
+            timings.get("match_candidates", 0), timings.get("match_listings", 0),
+            timings.get("match_leads", 0), timings.get("match_users", 0), timings.get("match_serialized", 0),
             timings.get("relationship", 0.0) * 1000, timings.get("match_filter", 0.0) * 1000,
             timings.get("stats", 0.0) * 1000, timings.get("cache_hits", 0), timings.get("cache_misses", 0),
         )
@@ -221,10 +226,17 @@ def _related_matches(client, kind, record_ids):
 def match_pipeline(client, uid, owned_listings=None, owned_leads=None):
     """Return historical/actionable matches and safe stage diagnostics."""
     started = time.perf_counter()
-    owned_listings = owned_listings if owned_listings is not None else client.all("listing", [{"key":"owner", "constraint_type":"equals", "value":uid}], None)
-    owned_leads = owned_leads if owned_leads is not None else client.all("lead", [{"key":"owner", "constraint_type":"equals", "value":uid}], None)
-    by_lead_owner = client.all("match", [{"key":"lead_owner", "constraint_type":"equals", "value":uid}], None)
-    by_listing_owner = client.all("match", [{"key":"listing_owner", "constraint_type":"equals", "value":uid}], None)
+    if owned_listings is None or owned_leads is None:
+        loaded_listings, loaded_leads = parallel_calls(
+            lambda: client.all("listing", [{"key":"owner", "constraint_type":"equals", "value":uid}], None),
+            lambda: client.all("lead", [{"key":"owner", "constraint_type":"equals", "value":uid}], None),
+        )
+        owned_listings = loaded_listings if owned_listings is None else owned_listings
+        owned_leads = loaded_leads if owned_leads is None else owned_leads
+    by_lead_owner, by_listing_owner = parallel_calls(
+        lambda: client.all("match", [{"key":"lead_owner", "constraint_type":"equals", "value":uid}], None),
+        lambda: client.all("match", [{"key":"listing_owner", "constraint_type":"equals", "value":uid}], None),
+    )
     discovered = _related_matches(client, "listing", [row.get("_id") for row in owned_listings])
     discovered += _related_matches(client, "lead", [row.get("_id") for row in owned_leads])
     combined = by_lead_owner + by_listing_owner + discovered
@@ -239,12 +251,20 @@ def match_pipeline(client, uid, owned_listings=None, owned_leads=None):
         key = row.get("_id") or id(row)
         if key in records: counts["duplicates_removed"] += 1
         else: records[key] = row
-    cache = {}; prefetch_match_records(client, records.values(), cache)
-    qualified = []; threshold = int(os.getenv("AGENT_INBOX_MIN_SCORE", "80"))
+    timings = getattr(g, "agent_timings", None)
+    if timings is not None: timings["match_candidates"] = len(records)
+    threshold = int(os.getenv("AGENT_INBOX_MIN_SCORE", "80")); scored = []
     for row in records.values():
         score = row.get("match_score")
         if isinstance(score, bool) or not isinstance(score, (int, float)): counts["missing_score_excluded"] += 1; continue
         if score < threshold: counts["below_score_excluded"] += 1; continue
+        scored.append(row)
+    cache = {}; prefetch_match_records(client, scored, cache)
+    if timings is not None:
+        timings["match_listings"] = sum(1 for (kind, _record_id), value in cache.items() if kind == "listing" and value)
+        timings["match_leads"] = sum(1 for (kind, _record_id), value in cache.items() if kind == "lead" and value)
+    qualified = []
+    for row in scored:
         lead_id, listing_id = relation_id(row.get("lead")), relation_id(row.get("listing"))
         lead, listing = cache.get(("lead", lead_id)), cache.get(("listing", listing_id))
         lead_owner = relation_id((lead or {}).get("owner")); listing_owner = relation_id((listing or {}).get("owner"))
@@ -262,7 +282,7 @@ def match_pipeline(client, uid, owned_listings=None, owned_leads=None):
             unique[pair] = (row, resolved)
         else: counts["duplicates_removed"] += 1
     historical = list(unique.values()); actionable = []
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=int(os.getenv("AGENT_INBOX_MAX_AGE_DAYS", "30")))
     for row, resolved in historical:
         created = _created_at(row)
         if created is None or created < cutoff: counts["age_excluded_actionable"] += 1; continue
@@ -278,7 +298,10 @@ def matched_inventory(client, record, kind, owner_id, cache=None):
     cache = cache if cache is not None else {}
     key=("user",owner_id)
     started = time.perf_counter()
-    if key not in cache: cache[key]=client.one("user",owner_id)
+    if key not in cache:
+        cache[key]=client.one("user",owner_id)
+        timings=getattr(g,"agent_timings",None)
+        if timings is not None: timings["match_users"]=timings.get("match_users",0)+1
     add_timing("relationship", time.perf_counter() - started)
     relationships = resolver(client).collect([record], [cache[key]])
     return inventory(record, kind, cache[key], True, relationships)
@@ -326,6 +349,7 @@ def own_inventory(kind):
     relationships=resolver(client).collect(rows,[user])
     items=[inventory(row,kind,user,True,relationships) for row in rows]
     g.agent_timings["records_returned"]=len(items)
+    g.agent_timings["match_serialized"]=len(items)
     return jsonify(items=items, page=page, page_size=limit, has_more=remaining>0, next_page=page+1 if remaining>0 else None)
 
 
@@ -404,12 +428,11 @@ def home():
     if hit:
         g.agent_timings["records_returned"]=1
         return jsonify(cached)
-    # The network collections already contain the current agent's inventory;
-    # reuse them instead of issuing two repeated owner queries.
     stats_started=time.perf_counter()
-    network_listings=client.all("listing",[],5000); network_leads=client.all("lead",[],5000); network_matches=client.all("match",[],5000)
-    listings=[x for x in network_listings if relation_id(x.get("owner"))==uid]
-    leads=[x for x in network_leads if relation_id(x.get("owner"))==uid]
+    listings,leads=parallel_calls(
+        lambda: client.all("listing",[{"key":"owner","constraint_type":"equals","value":uid}],None),
+        lambda: client.all("lead",[{"key":"owner","constraint_type":"equals","value":uid}],None),
+    )
     relationships=resolver(client).collect(listings+leads,[user])
     sl=[inventory(x,"listing",user,False,relationships) for x in listings]; sd=[inventory(x,"lead",user,False,relationships) for x in leads]
     valid_rows, actionable_rows, _cache=match_pipeline(client,uid,listings,leads)
@@ -419,18 +442,47 @@ def home():
     def this_week(row):
         try: return dt.datetime.fromisoformat(str(row.get("Created Date") or "").replace("Z","+00:00")).astimezone(myt).date() >= week_start
         except ValueError: return False
-    network_listing_views=[inventory(x,"listing",None,False,relationships) for x in network_listings]; network_lead_views=[inventory(x,"lead",None,False,relationships) for x in network_leads]
-    network_unique={}
-    for row in network_matches:
-        pair=(relation_id(row.get("listing")),relation_id(row.get("lead")))
-        if not all(pair): continue
-        current=network_unique.get(pair)
-        if current is None or (str(row.get("Created Date") or ""),str(row.get("_id"))) > (str(current.get("Created Date") or ""),str(current.get("_id"))): network_unique[pair]=row
-    owners={relation_id(x.get("owner")) for x in network_listings+network_leads if relation_id(x.get("owner"))}
-    network={"active_listings":sum(x["active"] for x in network_listing_views),"active_leads":sum(x["active"] for x in network_lead_views),"agents":len(owners),"matches_this_week":sum(this_week(x) for x in network_unique.values())}
     add_timing("stats",time.perf_counter()-stats_started)
     recent=sorted(valid,key=lambda item:str(item[0].get("Created Date") or ""),reverse=True)[:5]
-    payload=dict(profile=profile(user,relationships),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network,recent_activities=[{"id":row.get("_id"),"created_at":row.get("Created Date"),"score":row.get("match_score")} for row,_side in recent])
+    payload=dict(profile=profile(user,relationships),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),recent_activities=[{"id":row.get("_id"),"created_at":row.get("Created Date"),"score":row.get("match_score")} for row,_side in recent])
     dashboard_cache.set(cache_key,payload,int(os.getenv("AGENT_DASHBOARD_CACHE_TTL_SECONDS","60")))
     g.agent_timings["records_returned"]=1
     return jsonify(payload)
+
+
+def _network_statistics(client):
+    """Calculate exact global statistics without display-only relationship reads."""
+    myt=dt.timezone(dt.timedelta(hours=8)); local_now=dt.datetime.now(dt.timezone.utc).astimezone(myt)
+    week_start=(local_now-dt.timedelta(days=local_now.weekday())).replace(hour=0,minute=0,second=0,microsecond=0)
+    created_constraint={"key":"Created Date","constraint_type":"greater than or equal","value":week_start.astimezone(dt.timezone.utc).isoformat().replace("+00:00","Z")}
+    listings,leads,weekly_matches=parallel_calls(
+        lambda: client.all("listing",[],None),
+        lambda: client.all("lead",[],None),
+        lambda: client.all("match",[created_constraint],None),
+    )
+    unique={}
+    for row in weekly_matches:
+        pair=(relation_id(row.get("listing")),relation_id(row.get("lead")))
+        if not all(pair): continue
+        current=unique.get(pair)
+        if current is None or (str(row.get("Created Date") or ""),str(row.get("_id") or "")) > (str(current.get("Created Date") or ""),str(current.get("_id") or "")):
+            unique[pair]=row
+    owners={relation_id(row.get("owner")) for row in listings+leads if relation_id(row.get("owner"))}
+    return {"active_listings":sum(not inactive(row,"listing") for row in listings),
+            "active_leads":sum(not inactive(row,"lead") for row in leads),
+            "agents":len(owners),"matches_this_week":len(unique)}
+
+
+@blueprint.get("/network-stats")
+def network_stats():
+    _user,_session,client=authenticate()
+    cached,hit=network_stats_cache.get("network"); add_cache(hit)
+    if hit: return jsonify(cached)
+    # One worker refreshes the process-global value; waiters reuse its result.
+    with NETWORK_STATS_LOCK:
+        cached,hit=network_stats_cache.get("network"); add_cache(hit)
+        if hit: return jsonify(cached)
+        started=time.perf_counter(); payload=_network_statistics(client); add_timing("stats",time.perf_counter()-started)
+        network_stats_cache.set("network",payload,int(os.getenv("AGENT_NETWORK_CACHE_TTL_SECONDS","300")))
+        g.agent_timings["records_returned"]=1
+        return jsonify(payload)

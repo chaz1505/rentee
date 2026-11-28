@@ -3,12 +3,15 @@ import unittest
 from flask import Flask
 from unittest.mock import patch
 
-from agent_api.cache import TTLCache
+from agent_api.cache import TTLCache, dashboard_cache, network_stats_cache
 from agent_api.routes import blueprint
 from agent_api.tests.test_routes import FakeBubble
 
 
 class PerformanceTests(unittest.TestCase):
+    def setUp(self):
+        dashboard_cache.clear(); network_stats_cache.clear()
+
     def test_ttl_cache_expires_and_keeps_keys_isolated(self):
         now = [10.0]
         cache = TTLCache(maxsize=2, timer=lambda: now[0])
@@ -39,6 +42,18 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(body["next_page"], 2)
         self.assertEqual(calls[0][0][2:4], (20, 0))
         self.assertEqual(calls[0][0][1][0]["value"], "u1")
+
+    def test_home_has_no_unconstrained_network_scan(self):
+        app = Flask(__name__); app.register_blueprint(blueprint)
+        bubble = FakeBubble(); calls=[]; original=bubble.all
+        def all_rows(kind,constraints,maximum=1000):
+            calls.append((kind,constraints,maximum)); return original(kind,constraints,maximum)
+        bubble.all=all_rows
+        with patch("agent_api.routes.authenticate", return_value=(bubble.rows["user"]["u1"], {}, bubble)):
+            response=app.test_client().get("/api/agent/home")
+        self.assertEqual(response.status_code,200)
+        self.assertNotIn("network",response.get_json())
+        self.assertFalse(any(kind in {"listing","lead","match"} and constraints==[] for kind,constraints,_maximum in calls))
 
 
 if __name__ == "__main__":

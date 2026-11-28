@@ -38,3 +38,4 @@ class TTLCache:
 
 reference_cache = TTLCache(maxsize=5000)
 dashboard_cache = TTLCache(maxsize=512)
+network_stats_cache = TTLCache(maxsize=1)

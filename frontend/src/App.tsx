@@ -15,8 +15,9 @@ function PageSentinel({resource}:{resource:"listings"|"leads"|"matches"}) {
   return <div ref={ref} className="grid min-h-14 place-items-center">{states[resource]==="error"?<button className="text-sm font-semibold text-brand" onClick={()=>loadNext(resource).catch(()=>{})}>Couldn’t load more. Retry</button>:<LoaderCircle className="animate-spin text-brand" size={20}/>}</div>
 }
 function Home() {
-  const { inventory, matches, actionable, home, states, loadHome, profile, logoutLocal } = useStore();
+  const { inventory, matches, actionable, home, network, states, loadHome, loadNetwork, profile, logoutLocal } = useStore();
   useEffect(()=>{loadHome().catch(()=>{})},[loadHome]);
+  useEffect(()=>{loadNetwork().catch(()=>{})},[loadNetwork]);
   const pending=!home&&(states.home==="idle"||states.home==="loading");
   const own = inventory.filter(mine),
     listings = own.filter((i) => i.kind === "listing" && i.availability !== "unavailable"),
@@ -62,7 +63,11 @@ function Home() {
         </section>
         <section>
           <h2 className="mb-3 font-bold">Rentee network</h2>
-          {pending?<StatsSkeleton/>:home?.network?<div className="card grid grid-cols-2 gap-y-5">{[[home.network.active_listings,"Active listings"],[home.network.active_leads,"Active leads"],[home.network.agents,"Agents"],[home.network.matches_this_week,"Matches this week"]].map(([n,l])=><div key={l}><b className="text-lg">{Number(n).toLocaleString()}</b><p className="text-xs text-slate-500">{l}</p></div>)}</div>:<LoadError onRetry={()=>loadHome(true)}/>}
+          {!network&&(states.network==="idle"||states.network==="loading")
+            ? <StatsSkeleton/>
+            : network
+              ? <div className="card grid grid-cols-2 gap-y-5">{[[network.active_listings,"Active listings"],[network.active_leads,"Active leads"],[network.agents,"Agents"],[network.matches_this_week,"Matches this week"]].map(([n,l])=><div key={l}><b className="text-lg">{Number(n).toLocaleString()}</b><p className="text-xs text-slate-500">{l}</p></div>)}</div>
+              : <LoadError onRetry={()=>loadNetwork(true)}/>}
         </section>
         <section>
           <h2 className="mb-3 font-bold">Your workspace</h2>
@@ -230,10 +235,9 @@ function Matches() {
   );
 }
 function InventoryList({ kind }: { kind: "listing" | "lead" }) {
-  const { inventory, matches, actionable, confirm, deactivate, states, loadListings, loadLeads, loadMatches } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, states, loadListings, loadLeads } = useStore();
   const loadKind=kind==="listing"?loadListings:loadLeads,state=kind==="listing"?states.listings:states.leads;
   useEffect(()=>{loadKind().catch(()=>{})},[loadKind]);
-  useEffect(()=>{loadMatches().catch(()=>{})},[loadMatches]);
   const [filter, setFilter] = useState("Active"),
     [select, setSelect] = useState(false),
     [selected, setSelected] = useState<string[]>([]);
@@ -285,7 +289,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
                 </button>
               )}
               <Link to={`/${kind}/${i.id}`}>
-                <InventoryCard item={i} total={c.total} unreviewed={c.new} />
+                <InventoryCard item={i} total={states.matches==="ready"?c.total:undefined} unreviewed={states.matches==="ready"?c.new:undefined} />
               </Link>
               <div className="-mt-2 flex gap-2 rounded-b-2xl border border-t-0 bg-white px-3 pb-3 pt-4">
                 <Link to={`/matches?inventory=${i.id}`} className="btn-secondary flex-1">
@@ -458,10 +462,9 @@ function Explanation({ title, items, good = false }: { title: string; items: str
 }
 function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
   const { id } = useParams();
-  const { inventory, matches, actionable, confirm, deactivate, loadInventoryDetail, loadMatches } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, loadInventoryDetail } = useStore();
   const [detailState,setDetailState]=useState<"loading"|"ready"|"error">(inventory.some(i=>i.id===id&&i.kind===kind)?"ready":"loading");
   useEffect(()=>{if(!id)return;loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))},[id,kind,loadInventoryDetail]);
-  useEffect(()=>{loadMatches().catch(()=>{})},[loadMatches]);
   const item = inventory.find((i) => i.id === id && i.kind === kind);
   if (!item) return detailState==="error"?<DetailError onRetry={()=>{setDetailState("loading");id&&loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))}}/>:<DetailSkeleton title={`${kind === "listing" ? "Listing" : "Lead"} details`}/>;
   const owner = mine(item),
