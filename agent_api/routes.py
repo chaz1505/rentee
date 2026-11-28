@@ -1,13 +1,29 @@
 import datetime as dt
+import logging
 import os
+import time
 
-from flask import Blueprint, jsonify, make_response, request
+from flask import Blueprint, g, jsonify, make_response, request
 
-from .auth import AuthError, COOKIE_NAME, authenticate, cookie_options, redeem, assert_origin
+from .auth import AuthError, COOKIE_NAME, authenticate as _authenticate, cookie_options, redeem, assert_origin
 from .bubble_client import BubbleUnavailable
 from .serializers import inventory, profile, relation_id
 
 blueprint = Blueprint("agent_api", __name__, url_prefix="/api/agent")
+logger = logging.getLogger(__name__)
+
+
+def add_timing(name, seconds):
+    timings = getattr(g, "agent_timings", None)
+    if timings is not None:
+        timings[name] = timings.get(name, 0.0) + seconds
+
+
+def authenticate(client=None):
+    """Attach Bubble counters to this request without changing auth behavior."""
+    result = _authenticate(client)
+    g.bubble_client = result[2]
+    return result
 
 
 @blueprint.errorhandler(AuthError)
@@ -25,6 +41,18 @@ def cors(response):
     if origin in permitted_origins():
         response.headers.update({"Access-Control-Allow-Origin":origin,"Access-Control-Allow-Credentials":"true","Referrer-Policy":"no-referrer","Cache-Control":"no-store"})
         response.vary.add("Origin")
+    started = getattr(g, "agent_started", None)
+    if started is not None:
+        total = time.perf_counter() - started
+        client = getattr(g, "bubble_client", None)
+        timings = getattr(g, "agent_timings", {})
+        logger.info(
+            "Agent API timing endpoint=%s status=%s total_ms=%.1f bubble_requests=%s bubble_ms=%.1f relationship_ms=%.1f match_filter_ms=%.1f stats_ms=%.1f",
+            request.endpoint or "unknown", response.status_code, total * 1000,
+            getattr(client, "request_count", 0), getattr(client, "request_seconds", 0.0) * 1000,
+            timings.get("relationship", 0.0) * 1000, timings.get("match_filter", 0.0) * 1000,
+            timings.get("stats", 0.0) * 1000,
+        )
     return response
 
 
@@ -35,6 +63,8 @@ def options():
     Flask's automatic OPTIONS handlers take precedence over a catch-all OPTIONS
     route, so this must run at blueprint level to cover every Agent endpoint.
     """
+    g.agent_started = time.perf_counter()
+    g.agent_timings = {}
     if request.method != "OPTIONS":
         return None
     assert_origin()
@@ -65,7 +95,9 @@ def matched_records(client, row, uid, cache=None):
         key=(kind,record_id)
         if key not in cache: cache[key]=client.one(kind,record_id)
         return cache[key]
+    started = time.perf_counter()
     lead, listing = cached("lead", lead_id), cached("listing", listing_id)
+    add_timing("relationship", time.perf_counter() - started)
     if not lead or not listing:
         return None
     lead_owner, listing_owner = relation_id(lead.get("owner")), relation_id(listing.get("owner"))
@@ -78,11 +110,14 @@ def matched_records(client, row, uid, cache=None):
 def matched_inventory(client, record, kind, owner_id, cache=None):
     cache = cache if cache is not None else {}
     key=("user",owner_id)
+    started = time.perf_counter()
     if key not in cache: cache[key]=client.one("user",owner_id)
+    add_timing("relationship", time.perf_counter() - started)
     return inventory(record, kind, cache[key], True)
 
 
 def deduplicated_match_rows(client, uid):
+    started = time.perf_counter()
     rows = client.all("match", [{"key":"lead_owner","constraint_type":"equals","value":uid}], 500)+client.all("match", [{"key":"listing_owner","constraint_type":"equals","value":uid}], 500)
     unique={}
     for row in rows:
@@ -90,7 +125,9 @@ def deduplicated_match_rows(client, uid):
         if not lead or not listing or not isinstance(score,(int,float)) or score < int(os.getenv("AGENT_INBOX_MIN_SCORE","80")): continue
         key=(listing,lead); current=unique.get(key)
         if current is None or (str(row.get("Created Date") or ""),str(row.get("_id"))) > (str(current.get("Created Date") or ""),str(current.get("_id"))): unique[key]=row
-    return list(unique.values())
+    result = list(unique.values())
+    add_timing("match_filter", time.perf_counter() - started)
+    return result
 
 
 @blueprint.post("/auth/redeem")
@@ -187,7 +224,12 @@ def match_contact(record_id):
 @blueprint.get("/home")
 def home():
     user,_session,client=authenticate(); uid=user["_id"]
-    listings=client.all("listing",[{"key":"owner","constraint_type":"equals","value":uid}],1000); leads=client.all("lead",[{"key":"owner","constraint_type":"equals","value":uid}],1000)
+    # The network collections already contain the current agent's inventory;
+    # reuse them instead of issuing two repeated owner queries.
+    stats_started=time.perf_counter()
+    network_listings=client.all("listing",[],5000); network_leads=client.all("lead",[],5000); network_matches=client.all("match",[],5000)
+    listings=[x for x in network_listings if relation_id(x.get("owner"))==uid]
+    leads=[x for x in network_leads if relation_id(x.get("owner"))==uid]
     sl=[inventory(x,"listing",user,False) for x in listings]; sd=[inventory(x,"lead",user,False) for x in leads]
     rows=deduplicated_match_rows(client,uid); cache={}; valid=[]
     for row in rows:
@@ -198,7 +240,6 @@ def home():
     def this_week(row):
         try: return dt.datetime.fromisoformat(str(row.get("Created Date") or "").replace("Z","+00:00")).astimezone(myt).date() >= week_start
         except ValueError: return False
-    network_listings=client.all("listing",[],5000); network_leads=client.all("lead",[],5000); network_matches=client.all("match",[],5000)
     network_listing_views=[inventory(x,"listing",None,False) for x in network_listings]; network_lead_views=[inventory(x,"lead",None,False) for x in network_leads]
     network_unique={}
     for row in network_matches:
@@ -208,4 +249,5 @@ def home():
         if current is None or (str(row.get("Created Date") or ""),str(row.get("_id"))) > (str(current.get("Created Date") or ""),str(current.get("_id"))): network_unique[pair]=row
     owners={relation_id(x.get("owner")) for x in network_listings+network_leads if relation_id(x.get("owner"))}
     network={"active_listings":sum(x["active"] for x in network_listing_views),"active_leads":sum(x["active"] for x in network_lead_views),"agents":len(owners),"matches_this_week":sum(this_week(x) for x in network_unique.values())}
+    add_timing("stats",time.perf_counter()-stats_started)
     return jsonify(profile=profile(user),active_listings=sum(x["active"] for x in sl),active_leads=sum(x["active"] for x in sd),listings_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sl),leads_needing_confirmation=sum(x["freshness"]=="needs_confirmation" for x in sd),actionable_matches=actionable,matches_this_week=sum(this_week(row) for row,_side in valid),lifetime_matches=len(valid),network=network)

@@ -12,4 +12,8 @@
  .chip{@apply inline-flex min-h-9 items-center rounded-full px-3 text-sm font-semibold}
  .overflow-x-auto{scrollbar-width:none}.overflow-x-auto::-webkit-scrollbar{display:none}
  .safe-bottom{padding-bottom:max(12px,env(safe-area-inset-bottom))}
+ .skeleton{@apply relative overflow-hidden rounded-lg bg-slate-200/80}
+ .skeleton::after{content:"";position:absolute;inset:0;transform:translateX(-100%);background:linear-gradient(90deg,transparent,rgba(255,255,255,.65),transparent);animation:skeleton-shimmer 1.35s infinite}
 }
+@keyframes skeleton-shimmer{100%{transform:translateX(100%)}}
+@media (prefers-reduced-motion:reduce){.skeleton::after{animation:none}}

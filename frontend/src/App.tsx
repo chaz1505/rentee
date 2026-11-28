@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, ReactNode } from "react";
 import { Routes, Route, Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowRight, Building2, Check, ChevronRight, Clock3, Handshake, LayoutList, ListFilter, MessageCircle, Plus, Search, ShieldCheck, UserRound, Users } from "lucide-react";
+import { ArrowRight, Building2, Check, ChevronRight, Clock3, Handshake, LayoutList, ListFilter, LoaderCircle, MessageCircle, Plus, Search, ShieldCheck, UserRound, Users } from "lucide-react";
 import { agent, Inventory, Match, money } from "./data";
 import { useStore } from "./store";
 import { ConfirmDialog, Filters, Header, InboxZero, InventoryCard, MatchCard, OriginalMessage, Progress, ResetButton, Score, Shell, Status } from "./components";
@@ -10,7 +10,9 @@ const demo = import.meta.env.DEV && import.meta.env.VITE_USE_MOCK_DATA === "true
 const days = (date: string) => Math.floor((Date.now() - new Date(date).getTime()) / 86400000);
 const fresh = (i: Inventory) => (days(i.confirmed) > 30 ? "Needs confirmation" : days(i.posted) < 7 ? "Recently added" : "Recently confirmed");
 function Home() {
-  const { inventory, matches, actionable, home } = useStore();
+  const { inventory, matches, actionable, home, states, loadHome, profile, logoutLocal } = useStore();
+  useEffect(()=>{loadHome().catch(()=>{})},[loadHome]);
+  const pending=!home&&(states.home==="idle"||states.home==="loading");
   const own = inventory.filter(mine),
     listings = own.filter((i) => i.kind === "listing" && i.availability !== "unavailable"),
     leads = own.filter((i) => i.kind === "lead" && i.availability !== "unavailable"),
@@ -38,7 +40,7 @@ function Home() {
       <header className="content flex items-center justify-between pb-5 pt-[max(24px,env(safe-area-inset-top))]">
         <div>
           <div className="text-2xl font-extrabold tracking-tight text-brand">rentee</div>
-          <p className="mt-1 text-sm text-slate-500">Welcome, {home?.profile?.name || "Agent"}</p>
+          <p className="mt-1 text-sm text-slate-500">Welcome, {profile?.name || home?.profile?.name || "Agent"}</p>
         </div>
         <div className="grid size-11 place-items-center rounded-full bg-pale text-brand">
           <UserRound size={21} />
@@ -51,15 +53,15 @@ function Home() {
             <span className="text-xs font-bold uppercase tracking-wider">Matching active</span>
           </div>
           <h1 className="mt-4 text-2xl font-bold leading-tight">Rentee is actively matching your listings and leads.</h1>
-          <p className="mt-3 text-sm text-emerald-100/80">{listings.length + leads.length} active inventory items are working across the network.</p>
+          {pending?<div className="skeleton mt-3 h-4 w-64 bg-white/15"/>:<p className="mt-3 text-sm text-emerald-100/80">{home.active_listings+home.active_leads} active inventory items are working across the network.</p>}
         </section>
         <section>
           <h2 className="mb-3 font-bold">Rentee network</h2>
-          {home?.network ? <div className="card grid grid-cols-2 gap-y-5">{[[home.network.active_listings,"Active listings"],[home.network.active_leads,"Active leads"],[home.network.agents,"Agents"],[home.network.matches_this_week,"Matches this week"]].map(([n,l])=><div key={l}><b className="text-lg">{Number(n).toLocaleString()}</b><p className="text-xs text-slate-500">{l}</p></div>)}</div>:<div className="card text-sm text-slate-500">Network statistics are unavailable.</div>}
+          {pending?<StatsSkeleton/>:home?.network?<div className="card grid grid-cols-2 gap-y-5">{[[home.network.active_listings,"Active listings"],[home.network.active_leads,"Active leads"],[home.network.agents,"Agents"],[home.network.matches_this_week,"Matches this week"]].map(([n,l])=><div key={l}><b className="text-lg">{Number(n).toLocaleString()}</b><p className="text-xs text-slate-500">{l}</p></div>)}</div>:<LoadError onRetry={()=>loadHome(true)}/>}
         </section>
         <section>
           <h2 className="mb-3 font-bold">Your workspace</h2>
-          <div className="grid grid-cols-2 gap-3">
+          {pending?<div className="grid grid-cols-2 gap-3"><StatCardsSkeleton/></div>:<div className="grid grid-cols-2 gap-3">
             {[
               [home?.active_listings ?? listings.length, "Active listings", "/listings"],
               [home?.active_leads ?? leads.length, "Active leads", "/leads"],
@@ -71,14 +73,14 @@ function Home() {
                 <p className="mt-1 text-xs text-slate-500">{l}</p>
               </Link>
             ))}
-          </div>
+          </div>}
         </section>
         <section>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="font-bold">Needs your attention</h2>
             {newCount > 0 && <span className="text-xs font-semibold text-brand">{newCount + needsL + needsQ} items</span>}
           </div>
-          <div className="card divide-y divide-slate-100 p-0">
+          {pending?<div className="card"><div className="skeleton h-16"/><div className="skeleton mt-3 h-16"/></div>:<div className="card divide-y divide-slate-100 p-0">
             {attention.map(({ n, label, to, Icon }) => (
               <Link key={label} to={to} className="flex min-h-16 items-center gap-3 px-4">
                 <div className="grid size-9 place-items-center rounded-xl bg-pale text-brand">
@@ -89,7 +91,7 @@ function Home() {
                 <ChevronRight size={17} className="text-slate-400" />
               </Link>
             ))}
-          </div>
+          </div>}
           {newCount > 0 && (
             <Link className="btn-primary mt-3 w-full" to="/matches">
               Review outstanding matches <ArrowRight size={17} />
@@ -125,13 +127,14 @@ function Home() {
               })}
           </div>
         </section>
-        <button className="btn-secondary w-full" onClick={async()=>{await logout(); location.assign('/login')}}>Log out</button>
+        <button className="btn-secondary w-full" onClick={async()=>{await logout();logoutLocal();location.assign('/login')}}>Log out</button>
       </div>
     </Shell>
   );
 }
 function Matches() {
-  const { inventory, matches, actionable } = useStore();
+  const { inventory, matches, actionable, states, loadMatches } = useStore();
+  useEffect(()=>{loadMatches().catch(()=>{})},[loadMatches]);
   const loc = useLocation(),
     nav = useNavigate(),
     params = new URLSearchParams(loc.search),
@@ -173,7 +176,7 @@ function Matches() {
             {grouped ? <LayoutList size={18} /> : <ListFilter size={18} />}
           </button>
         </div>
-        {shown.length === 0 && filter === "New" ? (
+        {(states.matches==="idle"||states.matches==="loading")&&matches.length===0 ? <CardsSkeleton match/> : states.matches==="error"&&matches.length===0 ? <LoadError onRetry={()=>loadMatches(true)}/> : shown.length === 0 && filter === "New" ? (
           <InboxZero />
         ) : grouped ? (
           Object.entries(groups).map(([id, ms]) => {
@@ -221,7 +224,9 @@ function Matches() {
   );
 }
 function InventoryList({ kind }: { kind: "listing" | "lead" }) {
-  const { inventory, matches, actionable, confirm, deactivate } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, states, loadListings, loadLeads } = useStore();
+  const loadKind=kind==="listing"?loadListings:loadLeads,state=kind==="listing"?states.listings:states.leads;
+  useEffect(()=>{loadKind().catch(()=>{})},[loadKind]);
   const [filter, setFilter] = useState("Active"),
     [select, setSelect] = useState(false),
     [selected, setSelected] = useState<string[]>([]);
@@ -249,6 +254,7 @@ function InventoryList({ kind }: { kind: "listing" | "lead" }) {
         </div>
       </div>
       <div className="content space-y-4">
+        {(state==="idle"||state==="loading")&&all.length===0?<CardsSkeleton/>:state==="error"&&all.length===0?<LoadError onRetry={()=>loadKind(true)}/>:null}
         <Filters items={["Active", "Needs confirmation", "Inactive", "All"]} value={filter} onChange={setFilter} />
         {select && selected.length > 0 && (
           <button
@@ -302,9 +308,11 @@ function MatchDetail() {
   const { id } = useParams(),
     loc = useLocation(),
     nav = useNavigate();
-  const { inventory, matches, actionable } = useStore();
+  const { inventory, matches, actionable, loadMatchDetail } = useStore();
+  const [detailState,setDetailState]=useState<"loading"|"ready"|"error">(matches.some(m=>m.id===id)?"ready":"loading");
+  useEffect(()=>{if(!id)return;loadMatchDetail(id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))},[id,loadMatchDetail]);
   const match = matches.find((m) => m.id === id);
-  if (!match) return <NotFound />;
+  if (!match) return detailState==="error"?<DetailError onRetry={()=>{setDetailState("loading");id&&loadMatchDetail(id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))}}/>:<DetailSkeleton title="Match details"/>;
   const listing = inventory.find((i) => i.id === match.listingId)!,
     lead = inventory.find((i) => i.id === match.leadId)!,
     own = mine(listing) ? listing : lead,
@@ -441,9 +449,11 @@ function Explanation({ title, items, good = false }: { title: string; items: str
 }
 function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
   const { id } = useParams();
-  const { inventory, matches, actionable, confirm, deactivate } = useStore();
+  const { inventory, matches, actionable, confirm, deactivate, loadInventoryDetail } = useStore();
+  const [detailState,setDetailState]=useState<"loading"|"ready"|"error">(inventory.some(i=>i.id===id&&i.kind===kind)?"ready":"loading");
+  useEffect(()=>{if(!id)return;loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))},[id,kind,loadInventoryDetail]);
   const item = inventory.find((i) => i.id === id && i.kind === kind);
-  if (!item) return <NotFound />;
+  if (!item) return detailState==="error"?<DetailError onRetry={()=>{setDetailState("loading");id&&loadInventoryDetail(kind,id).then(()=>setDetailState("ready")).catch(()=>setDetailState("error"))}}/>:<DetailSkeleton title={`${kind === "listing" ? "Listing" : "Lead"} details`}/>;
   const owner = mine(item),
     ms = matches.filter((m) => m.listingId === id || m.leadId === id),
     newCount = ms.filter(actionable).length;
@@ -543,6 +553,12 @@ function InventoryDetail({ kind }: { kind: "listing" | "lead" }) {
     </Shell>
   );
 }
+function StatsSkeleton(){return <div className="card grid grid-cols-2 gap-5">{Array.from({length:4},(_,i)=><div key={i}><div className="skeleton h-6 w-16"/><div className="skeleton mt-2 h-3 w-24"/></div>)}</div>}
+function StatCardsSkeleton(){return <>{Array.from({length:4},(_,i)=><div className="card" key={i}><div className="skeleton h-8 w-14"/><div className="skeleton mt-2 h-3 w-24"/></div>)}</>}
+function CardsSkeleton({match=false}:{match?:boolean}){return <div className="space-y-3" aria-label="Loading content">{Array.from({length:3},(_,i)=><div className="card" key={i}><div className="flex gap-3">{match&&<div className="skeleton size-14 rounded-full"/>}<div className="flex-1"><div className="skeleton h-4 w-2/3"/><div className="skeleton mt-3 h-3 w-1/2"/><div className="skeleton mt-4 h-3 w-full"/></div></div></div>)}</div>}
+function LoadError({onRetry}:{onRetry:()=>void}){return <div className="card text-center"><p className="text-sm text-slate-600">We couldn't load this section.</p><button className="btn-secondary mt-3" onClick={onRetry}>Try again</button></div>}
+function DetailSkeleton({title}:{title:string}){return <Shell nav={false}><Header title={title}/><div className="content pt-5"><CardsSkeleton/></div></Shell>}
+function DetailError({onRetry}:{onRetry:()=>void}){return <Shell nav={false}><Header title="Unable to load"/><div className="content py-10"><LoadError onRetry={onRetry}/></div></Shell>}
 function NotFound() {
   return (
     <Shell nav={false}>
@@ -560,7 +576,9 @@ function Login() {
   const nav = useNavigate(),
     [token, setToken] = useState(""),
     [busy, setBusy] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [slow,setSlow]=useState(false);
+  useEffect(()=>{if(!busy){setSlow(false);return}const timer=window.setTimeout(()=>setSlow(true),5000);return()=>window.clearTimeout(timer)},[busy]);
   useEffect(() => {
     const params = new URLSearchParams(location.hash.slice(1));
     setToken(params.get("token") || "");
@@ -595,21 +613,22 @@ function Login() {
         </p>
         {token && (
           <button disabled={busy} onClick={open} className="btn-primary mt-5 w-full">
-            {busy ? "Opening…" : "Open my workspace"}
+            {busy ? <><LoaderCircle className="animate-spin" size={18}/>Opening your workspace...</> : "Open my workspace"}
           </button>
         )}
+        {slow&&<p className="mt-3 text-center text-xs text-slate-500">Still loading your workspace...</p>}
         {error && <p className="mt-3 text-sm text-red-700">{error}</p>}
       </section>
     </main>
   );
 }
 function Gate({ children }: { children: ReactNode }) {
-  const { loading, authenticated, error, reload } = useStore();
+  const { authLoading, authenticated, error, reload } = useStore();
   if (location.pathname === "/login") return <>{children}</>;
-  if (loading)
+  if (authLoading)
     return (
       <main className="page grid min-h-screen place-items-center">
-        <p>Loading your workspace…</p>
+        <div className="text-center"><LoaderCircle className="mx-auto animate-spin text-brand"/><p className="mt-3 text-sm text-slate-600">Opening your workspace...</p></div>
       </main>
     );
   if (authenticated && new URLSearchParams(location.hash.slice(1)).has("token")) history.replaceState(null,"",location.pathname+location.search);

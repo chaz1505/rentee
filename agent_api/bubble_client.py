@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import requests
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,8 @@ class BubbleClient:
         self.base = base.rstrip("/")
         self.headers = {"Authorization": f"Bearer {os.environ['BUBBLE_API_TOKEN']}", "Content-Type": "application/json"}
         self.timeout = (3.05, float(os.getenv("AGENT_BUBBLE_TIMEOUT_SECONDS", "12")))
+        self.request_count = 0
+        self.request_seconds = 0.0
 
     @staticmethod
     def _log_failure(operation, object_type, status, reason):
@@ -30,6 +33,8 @@ class BubbleClient:
         )
 
     def _request(self, method, path, object_type, operation, **kwargs):
+        started = time.perf_counter()
+        self.request_count += 1
         try:
             response = requests.request(method, f"{self.base}/{path.lstrip('/')}", headers=self.headers, timeout=self.timeout, **kwargs)
             response.raise_for_status()
@@ -42,6 +47,8 @@ class BubbleClient:
             reason = "http_error" if status is not None else "connection_error"
             self._log_failure(operation, object_type, status, reason)
             raise BubbleUnavailable("Bubble data is temporarily unavailable") from exc
+        finally:
+            self.request_seconds += time.perf_counter() - started
 
     def _json(self, response, operation, object_type):
         try:
